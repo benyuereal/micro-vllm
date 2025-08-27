@@ -11,14 +11,14 @@
 - 📦 **生产就绪**: 提供API服务器和完整的管理工具
 
 ## 安装
-bash
+```bash
 
 pip install -r requirements.txt
 
 python setup.py install
-
+```
 ## 快速开始
-python
+```python
 
 from vllm import LLMEngine, SamplingParams
 
@@ -50,16 +50,16 @@ for output in outputs:
 print(f"Prompt: {output.prompt}")
 
 print(f"Generated text: {output.generated_text}")
-
+```
 ## API服务器
 
 启动API服务器：
-bash
+```bash
 
 python -m vllm.server
-
+```
 然后使用curl或客户端发送请求：
-bash
+```bash
 
 curl -X POST "http://localhost:8000/generate" \
 
@@ -78,7 +78,7 @@ curl -X POST "http://localhost:8000/generate" \
 }
 
 }'
-
+```
 ## 性能基准
 
 在NVIDIA A100上测试：
