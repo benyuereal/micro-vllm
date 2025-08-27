@@ -146,9 +146,11 @@ class LLMEngine:
         for response_queue in response_queues:
             response = response_queue.get()
             responses.append(response)
+            # 兼容字典和对象两种类型
+            req_id = response['request_id'] if isinstance(response, dict) else response.request_id
+            if req_id in self.response_queues:
+                del self.response_queues[req_id]
 
-            # 清理响应队列
-            del self.response_queues[response.request_id]
 
         return responses
 

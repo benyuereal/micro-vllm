@@ -6,7 +6,7 @@ from .cache import PagedKVCache
 from .sampling.sampler import Sampler
 from .models.model_registry import get_model
 from .utils.tensor_parallel import TensorParallelManager
-
+from .engine import Response  # 导入Response类
 
 class ModelWorker:
     """模型工作器，负责实际的前向传播和生成"""
@@ -72,6 +72,8 @@ class ModelWorker:
         print(f"ModelWorker initialized with model: {model_name}")
 
     def process_batch(self, requests: List[Any]) -> List[Any]:
+
+        print(f"Processing batch of {len(requests)} requests")
         """处理一批请求"""
         if not self.is_running or not requests:
             return []
@@ -95,19 +97,19 @@ class ModelWorker:
 
             # 准备响应
             responses = self._prepare_responses(requests, next_tokens)
-
+            print(f"Batch processed successfully. Response type: {type(responses[0])}")
             return responses
 
         except Exception as e:
             print(f"Error processing batch: {e}")
-            # 确保正确处理Request对象的属性
+            # 返回Response对象列表
             return [
-                {
-                    "request_id": req.request_id,
-                    "generated_text": "",
-                    "success": False,
-                    "error_message": str(e)
-                }
+                Response(
+                    request_id=req.request_id,
+                    generated_text="",
+                    success=False,
+                    error_message=str(e)
+                )
                 for req in requests
             ]
 
@@ -173,6 +175,9 @@ class ModelWorker:
     def _prepare_responses(self, requests: List[Any], next_tokens: torch.Tensor) -> List[Any]:
         """准备响应数据"""
         responses = []
+        # 确保requests和next_tokens长度匹配
+        assert len(requests) == next_tokens.size(0), \
+            f"Requests count {len(requests)} != tokens count {next_tokens.size(0)}"
 
         for i, req in enumerate(requests):
             # 解码生成的token
@@ -181,12 +186,14 @@ class ModelWorker:
                 skip_special_tokens=True
             )
 
-            responses.append({
-                "request_id": req.request_id,
-                "generated_text": generated_text,
-                "success": True,
-                "error_message": None
-            })
+
+            # 返回Response对象而非字典
+            responses.append(Response(
+                request_id=req.request_id,
+                generated_text=generated_text,
+                success=True,
+                error_message=None
+            ))
 
         return responses
 
