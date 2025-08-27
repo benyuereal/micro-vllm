@@ -7,23 +7,23 @@ from dataclasses import dataclass
 from .worker import ModelWorker
 from .sampling.sampler import SamplingParams
 from .utils.memory_utils import MemoryManager
+from .schema import Request, Response  # 从schema导入
 
-
-@dataclass
-class Request:
-    request_id: int
-    prompt: str
-    sampling_params: SamplingParams
-    arrival_time: float
-    priority: int = 0
-
-
-@dataclass
-class Response:
-    request_id: int
-    generated_text: str
-    success: bool
-    error_message: Optional[str] = None
+# @dataclass
+# class Request:
+#     request_id: int
+#     prompt: str
+#     sampling_params: SamplingParams
+#     arrival_time: float
+#     priority: int = 0
+#
+#
+# @dataclass
+# class Response:
+#     request_id: int
+#     generated_text: str
+#     success: bool
+#     error_message: Optional[str] = None
 
 
 class LLMEngine:

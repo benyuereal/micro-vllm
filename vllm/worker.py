@@ -6,7 +6,7 @@ from .cache import PagedKVCache
 from .sampling.sampler import Sampler
 from .models.model_registry import get_model
 from .utils.tensor_parallel import TensorParallelManager
-from .engine import Response  # 导入Response类
+from .schema import Response  # 从schema导入
 
 class ModelWorker:
     """模型工作器，负责实际的前向传播和生成"""
