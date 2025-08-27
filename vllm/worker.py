@@ -39,6 +39,7 @@ class ModelWorker:
 
         # 加载模型
         self.model = get_model(model_name).initialize(
+            model_name=model_name,
             tensor_parallel_manager=self.tensor_parallel_manager,
             memory_manager=memory_manager
         )
