@@ -1,8 +1,10 @@
 import torch
 import torch.nn as nn
 from transformers import AutoModel, AutoConfig
+from transformers import AutoModelForCausalLM
 from typing import Optional, Tuple
 from .model_registry import register_model
+
 
 
 @register_model("Qwen")
@@ -26,7 +28,7 @@ class QwenModel:
         instance = cls(config)
 
         # 加载模型权重
-        instance.model = AutoModel.from_pretrained(
+        instance.model = AutoModelForCausalLM.from_pretrained(
             model_name,
             config=config,
             trust_remote_code=True,
