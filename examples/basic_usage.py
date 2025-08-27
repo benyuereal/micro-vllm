@@ -10,7 +10,7 @@ from vllm import LLMEngine, SamplingParams
 def main():
     # 初始化引擎
     engine = LLMEngine(
-        model="Qwen/Qwen-7B",
+        model="/data/model/qwen/Qwen-7B-Chat",
         tensor_parallel_size=1,
         max_num_seqs=4,
         max_seq_length=2048
