@@ -1,0 +1,183 @@
+import torch
+import time
+from typing import List, Dict, Any
+from transformers import AutoTokenizer
+from .cache import PagedKVCache
+from .sampling.sampler import Sampler
+from .models.model_registry import get_model
+from .utils.tensor_parallel import TensorParallelManager
+
+
+class ModelWorker:
+    """模型工作器，负责实际的前向传播和生成"""
+
+    def __init__(self,
+                 model_name: str,
+                 tokenizer_name: str,
+                 tensor_parallel_size: int,
+                 max_num_seqs: int,
+                 max_seq_length: int,
+                 device: str,
+                 memory_manager):
+        self.model_name = model_name
+        self.device = device
+        self.max_num_seqs = max_num_seqs
+        self.max_seq_length = max_seq_length
+        self.memory_manager = memory_manager
+
+        # 加载分词器
+        self.tokenizer = AutoTokenizer.from_pretrained(
+            tokenizer_name,
+            trust_remote_code=True
+        )
+
+        if not self.tokenizer.pad_token:
+            self.tokenizer.pad_token = self.tokenizer.eos_token
+
+        # 初始化张量并行管理器
+        self.tensor_parallel_manager = TensorParallelManager(tensor_parallel_size)
+
+        # 加载模型
+        self.model = get_model(model_name).initialize(
+            tensor_parallel_manager=self.tensor_parallel_manager,
+            memory_manager=memory_manager
+        )
+
+        # 初始化KV缓存
+        self.kv_cache = PagedKVCache(
+            num_layers=self.model.config.num_hidden_layers,
+            num_heads=self.model.config.num_attention_heads,
+            head_size=self.model.config.hidden_size // self.model.config.num_attention_heads,
+            page_size=256,  # 每页256个token
+            max_num_seqs=max_num_seqs,
+            memory_manager=memory_manager
+        )
+
+        # 初始化采样器
+        self.sampler = Sampler()
+
+        # 运行状态
+        self.is_running = True
+
+        print(f"ModelWorker initialized with model: {model_name}")
+
+    def process_batch(self, requests: List[Any]) -> List[Any]:
+        """处理一批请求"""
+        if not self.is_running or not requests:
+            return []
+
+        try:
+            # 准备输入数据
+            input_data = self._prepare_inputs(requests)
+
+            # 执行模型前向传播
+            output_data = self._forward_pass(input_data)
+
+            # 采样生成下一个token
+            next_tokens = self.sampler.sample(output_data["logits"], input_data["sampling_params"])
+
+            # 更新KV缓存
+            self.kv_cache.update_cache(
+                output_data["hidden_states"],
+                input_data["sequence_ids"],
+                input_data["positions"]
+            )
+
+            # 准备响应
+            responses = self._prepare_responses(requests, next_tokens)
+
+            return responses
+
+        except Exception as e:
+            print(f"Error processing batch: {e}")
+            # 返回错误响应
+            return [
+                {
+                    "request_id": req.request_id,
+                    "generated_text": "",
+                    "success": False,
+                    "error_message": str(e)
+                }
+                for req in requests
+            ]
+
+    def _prepare_inputs(self, requests: List[Any]) -> Dict[str, Any]:
+        """准备输入数据"""
+        prompts = [req.prompt for req in requests]
+        sampling_params = [req.sampling_params for req in requests]
+        sequence_ids = [req.request_id for req in requests]
+
+        # 分词
+        input_ids = self.tokenizer(
+            prompts,
+            return_tensors="pt",
+            padding=True,
+            truncation=True,
+            max_length=self.max_seq_length
+        ).input_ids.to(self.device)
+
+        # 获取位置信息
+        positions = torch.arange(
+            input_ids.size(1),
+            device=self.device
+        ).unsqueeze(0).expand(input_ids.size(0), -1)
+
+        # 获取历史长度（对于连续生成）
+        past_seq_lengths = [
+            self.kv_cache.get_sequence_length(seq_id) for seq_id in sequence_ids
+        ]
+
+        return {
+            "input_ids": input_ids,
+            "positions": positions,
+            "sequence_ids": sequence_ids,
+            "sampling_params": sampling_params,
+            "past_seq_lengths": past_seq_lengths
+        }
+
+    def _forward_pass(self, input_data: Dict[str, Any]) -> Dict[str, Any]:
+        """执行模型前向传播"""
+        # 获取历史KV缓存
+        past_key_values = self.kv_cache.get_cache(
+            input_data["sequence_ids"],
+            input_data["past_seq_lengths"]
+        )
+
+        # 执行模型前向传播
+        with torch.no_grad():
+            outputs = self.model(
+                input_ids=input_data["input_ids"],
+                positions=input_data["positions"],
+                past_key_values=past_key_values,
+                use_cache=True
+            )
+
+        return {
+            "logits": outputs.logits,
+            "hidden_states": outputs.hidden_states,
+            "past_key_values": outputs.past_key_values
+        }
+
+    def _prepare_responses(self, requests: List[Any], next_tokens: torch.Tensor) -> List[Any]:
+        """准备响应数据"""
+        responses = []
+
+        for i, req in enumerate(requests):
+            # 解码生成的token
+            generated_text = self.tokenizer.decode(
+                next_tokens[i].unsqueeze(0),
+                skip_special_tokens=True
+            )
+
+            responses.append({
+                "request_id": req.request_id,
+                "generated_text": generated_text,
+                "success": True,
+                "error_message": None
+            })
+
+        return responses
+
+    def stop(self):
+        """停止工作器"""
+        self.is_running = False
