@@ -25,6 +25,15 @@ class ModelWorker:
         self.max_seq_length = max_seq_length
         self.memory_manager = memory_manager
 
+        self.device = torch.device(device if torch.cuda.is_available() else "cpu")
+        # 确保设备标识符正确
+        if device.startswith("cuda") and not device.startswith("cuda:"):
+            self.device = "cuda:0"  # 明确指定第一个GPU
+        else:
+            self.device = device
+
+        # 强制设置PyTorch默认设备
+        torch.cuda.set_device(self.device)
         # 加载分词器
         self.tokenizer = AutoTokenizer.from_pretrained(
             tokenizer_name,
@@ -91,7 +100,7 @@ class ModelWorker:
 
         except Exception as e:
             print(f"Error processing batch: {e}")
-            # 返回错误响应
+            # 确保正确处理Request对象的属性
             return [
                 {
                     "request_id": req.request_id,
@@ -122,11 +131,16 @@ class ModelWorker:
             input_ids.size(1),
             device=self.device
         ).unsqueeze(0).expand(input_ids.size(0), -1)
+        positions = positions.to(self.device)
 
         # 获取历史长度（对于连续生成）
         past_seq_lengths = [
             self.kv_cache.get_sequence_length(seq_id) for seq_id in sequence_ids
         ]
+
+        # 确保past_seq_lengths在GPU上（如果是张量）
+        if isinstance(past_seq_lengths, torch.Tensor):
+            past_seq_lengths = past_seq_lengths.to(self.device)
 
         return {
             "input_ids": input_ids,
