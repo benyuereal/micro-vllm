@@ -13,7 +13,8 @@ def main():
         model="/data/model/qwen/Qwen-7B-Chat",
         tensor_parallel_size=1,
         max_num_seqs=4,
-        max_seq_length=2048
+        max_seq_length=2048,
+        tokenizer="/data/model/qwen/Qwen-7B-Chat"
     )
 
     # 设置采样参数
