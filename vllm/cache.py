@@ -207,3 +207,8 @@ class PagedKVCache:
 
                 # 获取序列的所有页面
                 pages = self.sequence_table[seq_id]
+            # 确保返回的缓存张量在正确设备上
+        return [(
+            k.to(self.device) if k.device != self.device else k,
+            v.to(self.device) if v.device != self.device else v
+        ) for k, v in past_key_values]

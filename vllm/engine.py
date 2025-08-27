@@ -83,8 +83,10 @@ class LLMEngine:
 
                     # 将响应放入对应的队列
                     for response in responses:
-                        if response.request_id in self.response_queues:
-                            self.response_queues[response.request_id].put(response)
+                        # 统一处理字典和对象响应
+                        req_id = response["request_id"] if isinstance(response, dict) else response.request_id
+                        if req_id in self.response_queues:
+                            self.response_queues[req_id].put(response)
 
                 # 短暂休眠以避免过度占用CPU
                 time.sleep(0.001)

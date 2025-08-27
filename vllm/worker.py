@@ -134,14 +134,11 @@ class ModelWorker:
         positions = positions.to(self.device)
 
         # 获取历史长度（对于连续生成）
-        past_seq_lengths = [
+
+
+        past_seq_lengths = torch.tensor([
             self.kv_cache.get_sequence_length(seq_id) for seq_id in sequence_ids
-        ]
-
-        # 确保past_seq_lengths在GPU上（如果是张量）
-        if isinstance(past_seq_lengths, torch.Tensor):
-            past_seq_lengths = past_seq_lengths.to(self.device)
-
+        ], device=self.device)  # 确保在GPU上
         return {
             "input_ids": input_ids,
             "positions": positions,
