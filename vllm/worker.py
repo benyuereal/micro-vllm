@@ -202,6 +202,11 @@ class ModelWorker:
                     print(
                         f"First sequence k shape: {past_key_values[0][0][0].shape if hasattr(past_key_values[0][0][0], 'shape') else 'No shape'}")
 
+        # 确保past_key_values连续
+        if past_key_values is not None:
+            past_key_values = [
+                (k.contiguous(), v.contiguous()) for k, v in past_key_values
+            ]
         # 执行模型前向传播
         with torch.no_grad():
             outputs = self.model(
