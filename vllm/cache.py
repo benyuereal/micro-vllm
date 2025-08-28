@@ -249,11 +249,9 @@ class PagedKVCache:
                         k_slice, v_slice = page.get_entries(start_slot, end_slot)
 
                         # 转置为 [num_heads, page_slots, head_size]
-                        k_slice = k_slice.permute(1, 0, 2)
-                        v_slice = v_slice.permute(1, 0, 2)
-                        # 修改这两行：
-                        k_slice = k_slice.contiguous()
-                        v_slice = v_slice.contiguous()
+                        k_slice = k_slice.permute(1, 0, 2).contiguous()
+                        v_slice = v_slice.permute(1, 0, 2).contiguous()
+
 
                         k_slices.append(k_slice)
                         v_slices.append(v_slice)

@@ -172,7 +172,9 @@ class ModelWorker:
         print(f"Input IDs shape: {input_data['input_ids'].shape}")
         print(f"Positions shape: {input_data['positions'].shape}")
 
-
+        # 添加连续性检查
+        print(f"Input IDs contiguous: {input_data['input_ids'].is_contiguous()}")
+        print(f"Positions contiguous: {input_data['positions'].is_contiguous()}")
 
         """执行模型前向传播"""
         # 获取历史KV缓存
@@ -184,6 +186,11 @@ class ModelWorker:
                 input_data["past_seq_lengths"]
             )
 
+        # 检查past_key_values的连续性
+        if past_key_values:
+            for i, (k, v) in enumerate(past_key_values):
+                print(f"Layer {i} k contiguous: {k.is_contiguous()}")
+                print(f"Layer {i} v contiguous: {v.is_contiguous()}")
         if past_key_values is not None:
             print(f"Past KV length: {len(past_key_values)}")
             print(f"First layer k shape: {past_key_values[0][0].shape}")
