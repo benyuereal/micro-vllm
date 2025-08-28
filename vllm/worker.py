@@ -166,24 +166,6 @@ class ModelWorker:
                     print(
                         f"First sequence k shape: {past_key_values[0][0][0].shape if hasattr(past_key_values[0][0][0], 'shape') else 'No shape'}")
 
-        # 修复：正确处理缓存结构
-        if past_key_values is not None:
-            # 将列表转换为模型需要的嵌套元组结构
-            new_past_key_values = []
-            for layer in past_key_values:
-                # 每层包含(k_list, v_list)
-                if len(layer) != 2:
-                    raise ValueError(f"Invalid layer structure: expected 2 elements, got {len(layer)}")
-
-                k_list, v_list = layer
-                # 创建每层的(k, v)元组对
-                layer_cache = []
-                for k, v in zip(k_list, v_list):
-                    layer_cache.append((k, v))
-                new_past_key_values.append(tuple(layer_cache))
-
-            past_key_values = tuple(new_past_key_values)
-
         # 执行模型前向传播
         with torch.no_grad():
             outputs = self.model(

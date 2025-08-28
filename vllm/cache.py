@@ -186,8 +186,8 @@ class PagedKVCache:
 
     def get_cache(self,
                   sequence_ids: List[int],
-                  past_seq_lengths: List[int]) -> List[Tuple[List[torch.Tensor], List[torch.Tensor]]]:
-        """获取KV缓存，返回格式为每层一个元组(k_list, v_list)"""
+                  past_seq_lengths: List[int]) -> List[Tuple[torch.Tensor, torch.Tensor]]:
+        """获取KV缓存，返回格式为每层一个元组(k_tensor, v_tensor)"""
         batch_size = len(sequence_ids)
         past_key_values = []
 
@@ -238,7 +238,15 @@ class PagedKVCache:
                 k_list.append(k_tensor)
                 v_list.append(v_tensor)
 
+            # 将列表转换为批次张量 [batch_size, seq_len, num_heads, head_size]
+            k_batch = torch.stack(k_list)  # [batch, seq_len, num_heads, head_size]
+            v_batch = torch.stack(v_list)
+
+            # 调整维度顺序 [batch, num_heads, seq_len, head_size]
+            k_batch = k_batch.permute(0, 2, 1, 3)
+            v_batch = v_batch.permute(0, 2, 1, 3)
+
             # 将当前层的缓存添加到结果中
-            past_key_values.append((k_list, v_list))
+            past_key_values.append((k_batch, v_batch))
 
         return past_key_values

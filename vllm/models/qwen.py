@@ -70,17 +70,17 @@ class QwenModel:
         """准备注意力掩码（兼容分页缓存结构）"""
         batch_size, seq_length = input_ids.shape
 
-        # 如果past_key_values是元组格式（模型输出格式），提取实际长度
-        past_lengths = []
+        # 如果past_key_values存在，提取实际长度
         if past_key_values is not None:
             # 获取第一个序列在第一个层的k缓存长度
-            for i in range(batch_size):
-                if i < len(past_key_values[0][0]):  # 检查索引有效性
-                    # 注意：past_key_values是 (层数) x (k/v) x (序列) 的结构
-                    seq_k = past_key_values[0][0][i]  # 取第1层第i序列的k缓存
-                    past_lengths.append(seq_k.size(0))
-                else:
-                    past_lengths.append(0)
+            if past_key_values and len(past_key_values) > 0:
+                # 取第0层的k缓存 [batch, num_heads, seq_len, head_size]
+                k_batch = past_key_values[0][0]
+                # 所有序列共享相同的缓存长度
+                past_length = k_batch.size(2)  # 取seq_len维度
+                past_lengths = [past_length] * batch_size
+            else:
+                past_lengths = [0] * batch_size
         else:
             past_lengths = [0] * batch_size
 
