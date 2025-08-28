@@ -176,25 +176,46 @@ class ModelWorker:
         """准备响应数据"""
         responses = []
         # 确保requests和next_tokens长度匹配
-        assert len(requests) == next_tokens.size(0), \
-            f"Requests count {len(requests)} != tokens count {next_tokens.size(0)}"
+        # 检查张量维度是否匹配
+        if next_tokens.size(0) != len(requests):
+            print(f"Warning: Token count {next_tokens.size(0)} != request count {len(requests)}")
+            # 填充缺失的token
+            next_tokens = torch.cat([
+                next_tokens,
+                torch.full((len(requests) - next_tokens.size(0),), -1, device=self.device)
+            ])
 
         for i, req in enumerate(requests):
-            # 解码生成的token
-            generated_text = self.tokenizer.decode(
-                next_tokens[i].unsqueeze(0),
-                skip_special_tokens=True
-            )
+            token_tensor = next_tokens[i].unsqueeze(0)
 
+            # 检查token有效性
+            if token_tensor.item() == -1:
+                responses.append(Response(
+                    request_id=req.request_id,
+                    generated_text="",
+                    success=False,
+                    error_message="Token generation failed"
+                ))
+                continue
 
-            # 返回Response对象而非字典
+            try:
+                # 安全解码
+                generated_text = self.tokenizer.decode(
+                    token_tensor,
+                    skip_special_tokens=True
+                )
+            except Exception as e:
+                generated_text = ""
+                error_msg = f"Decoding error: {str(e)}"
+            else:
+                error_msg = None
+
             responses.append(Response(
                 request_id=req.request_id,
                 generated_text=generated_text,
-                success=True,
-                error_message=None
+                success=(generated_text != ""),
+                error_message=error_msg
             ))
-
         return responses
 
     def stop(self):
