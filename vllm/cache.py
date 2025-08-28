@@ -200,15 +200,38 @@ class PagedKVCache:
                 seq_length = past_seq_lengths[i]
 
                 if seq_id not in self.sequence_table or seq_length == 0:
-                    # 没有历史缓存
+                    # 创建空张量
                     layer_k.append(torch.zeros(0, self.num_heads, self.head_size, device=self.device))
                     layer_v.append(torch.zeros(0, self.num_heads, self.head_size, device=self.device))
                     continue
 
                 # 获取序列的所有页面
                 pages = self.sequence_table[seq_id]
-            # 确保返回的缓存张量在正确设备上
-        return [(
-            k.to(self.device) if k.device != self.device else k,
-            v.to(self.device) if v.device != self.device else v
-        ) for k, v in past_key_values]
+                start_page = 0
+                end_page = (seq_length - 1) // self.page_size + 1
+
+                k_slices = []
+                v_slices = []
+                for page_idx in range(start_page, end_page):
+                    page_id = pages[page_idx]
+                    page = self.page_pool[page_id]
+
+                    # 计算页面内的槽位
+                    start_slot = 0
+                    end_slot = self.page_size
+                    if page_idx == end_page - 1:  # 最后一页
+                        end_slot = seq_length % self.page_size or self.page_size
+
+                    # 获取数据
+                    k_slice, v_slice = page.get_entries(start_slot, end_slot)
+                    k_slices.append(k_slice)
+                    v_slices.append(v_slice)
+
+                # 拼接所有切片
+                layer_k.append(torch.cat(k_slices, dim=0))
+                layer_v.append(torch.cat(v_slices, dim=0))
+
+            # 将当前层的缓存添加到结果中
+            past_key_values.append((layer_k, layer_v))
+
+        return past_key_values
