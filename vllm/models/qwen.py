@@ -53,6 +53,14 @@ class QwenModel:
                  past_key_values: Optional[Tuple] = None,
                  use_cache: bool = False):
         """前向传播"""
+        # 添加：
+        input_ids = input_ids.contiguous()
+        positions = positions.contiguous()
+
+        if past_key_values is not None:
+            past_key_values = [
+                (k.contiguous(), v.contiguous()) for k, v in past_key_values
+            ]
         # 准备注意力掩码
         attention_mask = self._prepare_attention_mask(input_ids, past_key_values)
 
