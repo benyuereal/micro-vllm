@@ -25,12 +25,11 @@ class ModelWorker:
         self.max_seq_length = max_seq_length
         self.memory_manager = memory_manager
 
-        self.device = torch.device(device if torch.cuda.is_available() else "cpu")
         # 确保设备标识符正确
-        if device.startswith("cuda") and not device.startswith("cuda:"):
-            self.device = "cuda:0"  # 明确指定第一个GPU
-        else:
-            self.device = device
+        self.device = torch.device(device)
+        if "cuda" in str(self.device) and not torch.cuda.is_available():
+            raise RuntimeError("CUDA device requested but not available")
+
 
         # 强制设置PyTorch默认设备
         torch.cuda.set_device(self.device)
@@ -60,7 +59,8 @@ class ModelWorker:
             head_size=self.model.config.hidden_size // self.model.config.num_attention_heads,
             page_size=256,  # 每页256个token
             max_num_seqs=max_num_seqs,
-            memory_manager=memory_manager
+            memory_manager=memory_manager,
+            device = self.device  # 确保传递当前设备
         )
 
         # 初始化采样器
@@ -150,6 +150,12 @@ class ModelWorker:
         }
 
     def _forward_pass(self, input_data: Dict[str, Any]) -> Dict[str, Any]:
+        # 设备检查 ↓↓↓
+        print(f"Model device: {next(self.model.model.parameters()).device}")
+        print(f"Input IDs device: {input_data['input_ids'].device}")
+        print(f"Positions device: {input_data['positions'].device}")
+
+
         """执行模型前向传播"""
         # 获取历史KV缓存
         past_key_values = self.kv_cache.get_cache(
@@ -158,6 +164,8 @@ class ModelWorker:
         )
         print(f"Past KV type: {type(past_key_values)}")
         if past_key_values and len(past_key_values) > 0:
+            first_tensor = past_key_values[0][0]
+            print(f"First KV tensor device: {first_tensor.device}")
             print(f"First layer type: {type(past_key_values[0])}")
             if len(past_key_values[0]) > 0:
                 print(f"First layer k type: {type(past_key_values[0][0])}")

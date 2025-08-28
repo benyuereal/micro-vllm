@@ -37,7 +37,7 @@ class Page:
 
     def get_entries(self, start_slot: int, end_slot: int) -> Tuple[torch.Tensor, torch.Tensor]:
         """获取指定范围的键值对"""
-        return self.k_data[start_slot:end_slot], self.v_data[start_slot:end_slot]
+        return self.k_data[start_slot:end_slot].to(self.device), self.v_data[start_slot:end_slot].to(self.device)
 
 
 class PagedKVCache:
@@ -50,7 +50,7 @@ class PagedKVCache:
                  page_size: int = 256,
                  max_num_seqs: int = 256,
                  memory_manager=None,
-                 device: str = "cpu"):
+                 device: str = "cuda"):
         self.num_layers = num_layers
         self.num_heads = num_heads
         self.head_size = head_size
