@@ -50,7 +50,8 @@ class PagedKVCache:
                  page_size: int = 256,
                  max_num_seqs: int = 256,
                  memory_manager=None,
-                 device: str = "cuda"):
+                 device: str = "cuda",
+                 max_seq_length: int = 2048,):
         self.num_layers = num_layers
         self.num_heads = num_heads
         self.head_size = head_size
@@ -62,6 +63,7 @@ class PagedKVCache:
         if device == "cuda" and torch.cuda.is_available():
             device = f"cuda:{torch.cuda.current_device()}"
         self.device = device
+        self.max_seq_length = max_seq_length  # 新增
 
         # 初始化页面池
         self.page_pool = []
@@ -195,52 +197,72 @@ class PagedKVCache:
         batch_size = len(sequence_ids)
         past_key_values = []
 
+        # 获取当前批次的最大序列长度
+        max_actual_length = max(past_seq_lengths) if batch_size > 0 else 0
+        # 确保不超过最大序列长度
+        max_length = min(max_actual_length, self.max_seq_length)
+
         for layer_idx in range(self.num_layers):
             k_list = []
             v_list = []
 
             for i in range(batch_size):
                 seq_id = sequence_ids[i]
-                seq_length = past_seq_lengths[i]
+                seq_length = min(past_seq_lengths[i], self.max_seq_length)  # 确保不超过最大长度
 
-                # 修复点：对空缓存返回真正的空张量
+                # 修复点：统一返回固定形状的张量
                 if seq_id not in self.sequence_table or seq_length == 0:
-                    # 创建形状兼容的空张量 [0, num_heads, head_size]
-                    empty_k = torch.zeros(0, self.num_heads, self.head_size, device=self.device)
-                    empty_v = torch.zeros(0, self.num_heads, self.head_size, device=self.device)
-                    k_list.append(empty_k)
-                    v_list.append(empty_v)
-                    continue
-
-                # 获取序列的所有页面
-                pages = self.sequence_table[seq_id]
-                start_page = 0
-                end_page = (seq_length - 1) // self.page_size + 1
-
-                k_slices = []
-                v_slices = []
-                for page_idx in range(start_page, end_page):
-                    page_id = pages[page_idx]
-                    page = self.page_pool[page_id]
-
-                    # 计算页面内的槽位
-                    start_slot = 0
-                    end_slot = self.page_size
-                    if page_idx == end_page - 1:  # 最后一页
-                        end_slot = seq_length % self.page_size or self.page_size
-
-                    # 获取数据
-                    k_slice, v_slice = page.get_entries(start_slot, end_slot)
-                    k_slices.append(k_slice)
-                    v_slices.append(v_slice)
-
-                # 拼接所有切片
-                if k_slices:
-                    k_tensor = torch.cat(k_slices, dim=0)
-                    v_tensor = torch.cat(v_slices, dim=0)
+                    # 创建形状兼容的全零张量 [max_length, num_heads, head_size]
+                    k_tensor = torch.zeros(
+                        max_length, self.num_heads, self.head_size,
+                        device=self.device
+                    )
+                    v_tensor = torch.zeros(
+                        max_length, self.num_heads, self.head_size,
+                        device=self.device
+                    )
                 else:
-                    k_tensor = torch.zeros(0, self.num_heads, self.head_size, device=self.device)
-                    v_tensor = torch.zeros(0, self.num_heads, self.head_size, device=self.device)
+                    # 获取序列的所有页面
+                    pages = self.sequence_table[seq_id]
+                    start_page = 0
+                    end_page = (seq_length - 1) // self.page_size + 1
+
+                    k_slices = []
+                    v_slices = []
+                    for page_idx in range(start_page, end_page):
+                        page_id = pages[page_idx]
+                        page = self.page_pool[page_id]
+
+                        # 计算页面内的槽位
+                        start_slot = 0
+                        end_slot = self.page_size
+                        if page_idx == end_page - 1:  # 最后一页
+                            end_slot = seq_length % self.page_size or self.page_size
+
+                        # 获取数据
+                        k_slice, v_slice = page.get_entries(start_slot, end_slot)
+                        k_slices.append(k_slice)
+                        v_slices.append(v_slice)
+
+                    # 拼接所有切片
+                    if k_slices:
+                        k_tensor = torch.cat(k_slices, dim=0)
+                        v_tensor = torch.cat(v_slices, dim=0)
+                    else:
+                        k_tensor = torch.zeros(
+                            max_length, self.num_heads, self.head_size,
+                            device=self.device
+                        )
+                        v_tensor = torch.zeros(
+                            max_length, self.num_heads, self.head_size,
+                            device=self.device
+                        )
+
+                    # 如果实际长度小于当前批次最大长度，填充零
+                    if k_tensor.size(0) < max_length:
+                        padding_size = max_length - k_tensor.size(0)
+                        k_tensor = F.pad(k_tensor, (0, 0, 0, 0, 0, padding_size))
+                        v_tensor = F.pad(v_tensor, (0, 0, 0, 0, 0, padding_size))
 
                 k_list.append(k_tensor)
                 v_list.append(v_tensor)

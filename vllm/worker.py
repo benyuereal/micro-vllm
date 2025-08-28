@@ -71,7 +71,9 @@ class ModelWorker:
             page_size=256,  # 每页256个token
             max_num_seqs=max_num_seqs,
             memory_manager=memory_manager,
-            device = self.device  # 确保传递当前设备
+            device = self.device,  # 确保传递当前设备
+            max_seq_length=max_seq_length,  # 传入最大序列长度
+
         )
 
         # 初始化采样器
