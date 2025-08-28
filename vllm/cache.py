@@ -203,10 +203,13 @@ class PagedKVCache:
                 seq_id = sequence_ids[i]
                 seq_length = past_seq_lengths[i]
 
+                # 修复点：对空缓存返回真正的空张量
                 if seq_id not in self.sequence_table or seq_length == 0:
-                    # 创建空张量
-                    k_list.append(torch.zeros(0, self.num_heads, self.head_size, device=self.device))
-                    v_list.append(torch.zeros(0, self.num_heads, self.head_size, device=self.device))
+                    # 创建形状兼容的空张量 [0, num_heads, head_size]
+                    empty_k = torch.zeros(0, self.num_heads, self.head_size, device=self.device)
+                    empty_v = torch.zeros(0, self.num_heads, self.head_size, device=self.device)
+                    k_list.append(empty_k)
+                    v_list.append(empty_v)
                     continue
 
                 # 获取序列的所有页面
