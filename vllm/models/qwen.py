@@ -76,8 +76,15 @@ class QwenModel:
         ).unsqueeze(0).unsqueeze(0)
 
         # 如果有历史缓存，扩展掩码
-        if past_key_values is not None:
-            past_length = past_key_values[0][0].size(2) if past_key_values[0][0].nelement() > 0 else 0
+        if past_key_values is not None and len(past_key_values) > 0:
+            # 获取第一个序列的历史长度（所有层的历史长度相同）
+            if len(past_key_values[0][0]) > 0:  # 确保有缓存
+                # 获取第一个序列在第一层的键缓存张量
+                first_seq_k_cache = past_key_values[0][0][0]
+                past_length = first_seq_k_cache.size(0)  # 序列长度维度
+            else:
+                past_length = 0
+
             total_length = past_length + seq_length
 
             # 创建扩展的掩码
@@ -87,9 +94,12 @@ class QwenModel:
             )
 
             # 应用因果掩码
-            extended_mask[:, :, :, :past_length] = True  # 历史部分全部可见
+            # 历史部分全部可见
+            extended_mask[:, :, :, :past_length] = True
+            # 当前部分应用因果掩码
             extended_mask[:, :, :, past_length:] = causal_mask
 
             return extended_mask
 
+        # 没有历史缓存
         return causal_mask.expand(batch_size, 1, seq_length, seq_length)
