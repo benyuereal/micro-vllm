@@ -81,16 +81,19 @@ class QwenModel:
         """准备注意力掩码（兼容分页缓存结构和分组查询注意力）"""
         batch_size, seq_length = input_ids.shape
 
+        # 确保输入张量连续
+        input_ids = input_ids.contiguous()
+
         # 如果没有历史缓存，只需创建因果掩码
         if past_key_values is None:
             # 创建因果掩码 [batch_size, 1, target_length, target_length]
             attention_mask = torch.tril(
                 torch.ones(seq_length, seq_length, dtype=torch.bool, device=input_ids.device)
-            ).unsqueeze(0).unsqueeze(0)  # [1, 1, seq_length, seq_length]
+            ).reshape(1, 1, seq_length, seq_length)  # 使用reshape替代view
 
             # 扩展掩码到键值头数（使用配置中的值）
             attention_mask = attention_mask.expand(batch_size, self.num_key_value_heads, seq_length, seq_length)
-            return attention_mask
+            return attention_mask.contiguous()  # 确保返回连续张量
 
         # 获取每个序列的实际历史长度
         # 注意：past_key_values 的结构是：
@@ -99,14 +102,14 @@ class QwenModel:
         # 我们使用第一个序列的k缓存来确定历史长度
         first_layer_k = past_key_values[0][0]  # 获取第一层的k缓存
         past_lengths = first_layer_k.size(2)  # 获取历史长度维度
-        num_kv_heads = first_layer_k.size(1)  # 获取键值头数 [关键修改]
+        num_kv_heads = first_layer_k.size(1)  # 获取键值头数
 
         # 创建扩展的注意力掩码 [batch_size, 1, seq_length, total_length]
         total_length = past_lengths + seq_length
         extended_attention_mask = torch.zeros(
             batch_size, 1, seq_length, total_length,
             dtype=torch.bool, device=input_ids.device
-        )
+        ).contiguous()  # 创建时直接确保连续
 
         # 填充掩码：
         # - 历史部分：全部可见（1表示不掩盖）
@@ -119,14 +122,22 @@ class QwenModel:
         # 创建一个左下三角矩阵（包括对角线）作为当前部分的掩码
         causal_mask = torch.tril(
             torch.ones(seq_length, seq_length, dtype=torch.bool, device=input_ids.device)
-        ).unsqueeze(0).unsqueeze(0)  # [1, 1, seq_length, seq_length]
+        ).reshape(1, 1, seq_length, seq_length)  # 使用reshape替代view
+
+        # 确保因果掩码连续
+        causal_mask = causal_mask.contiguous()
 
         # 将因果掩码放置在从past_lengths开始的列位置
         extended_attention_mask[:, :, :, past_lengths:past_lengths + seq_length] = causal_mask
 
-        # 扩展掩码到键值头数 [关键修改]
+        # 扩展掩码到键值头数
         extended_attention_mask = extended_attention_mask.repeat(1, num_kv_heads, 1, 1)
 
         # 在返回前添加连续化操作
         extended_attention_mask = extended_attention_mask.contiguous()
+
+        # 调试信息 - 实际部署时可移除
+        print(f"Attention mask contiguous: {extended_attention_mask.is_contiguous()}")
+        print(f"Attention mask shape: {extended_attention_mask.shape}")
+
         return extended_attention_mask

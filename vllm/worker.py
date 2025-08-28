@@ -147,7 +147,7 @@ class ModelWorker:
             input_ids.size(1),
             device=self.device
         ).unsqueeze(0).expand(input_ids.size(0), -1)
-        positions = positions.to(self.device)
+        positions = positions.to(self.device).contiguous()
 
         # 获取历史长度（对于连续生成）
 
@@ -217,8 +217,8 @@ class ModelWorker:
         # 执行模型前向传播
         with torch.no_grad():
             outputs = self.model(
-                input_ids=input_data["input_ids"],
-                positions=input_data["positions"],
+                input_ids=input_data["input_ids"].contiguous(),
+                positions=input_data["positions"].contiguous(),
                 past_key_values=past_key_values,
                 use_cache=True
             )
