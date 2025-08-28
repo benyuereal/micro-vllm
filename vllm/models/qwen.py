@@ -67,42 +67,44 @@ class QwenModel:
     def _prepare_attention_mask(self,
                                 input_ids: torch.Tensor,
                                 past_key_values: Optional[Tuple] = None) -> torch.Tensor:
-        """准备注意力掩码"""
+        """准备注意力掩码（兼容分页缓存结构）"""
         batch_size, seq_length = input_ids.shape
 
-        # 创建因果注意力掩码
+        # 创建当前token的因果掩码
         causal_mask = torch.tril(
             torch.ones(seq_length, seq_length, dtype=torch.bool, device=input_ids.device)
-        ).unsqueeze(0).unsqueeze(0)
+        ).unsqueeze(0).unsqueeze(0)  # [1, 1, T, T]
 
-        # 如果有历史缓存，扩展掩码
-        if past_key_values is not None and len(past_key_values) > 0:
-            # 确保缓存结构正确
-            if (len(past_key_values[0]) > 0 and
-                    len(past_key_values[0][0]) > 0 and
-                    isinstance(past_key_values[0][0][0], torch.Tensor)):
+        # 无历史缓存时直接返回
+        if past_key_values is None or len(past_key_values) == 0:
+            return causal_mask.expand(batch_size, 1, seq_length, seq_length)
 
-                # 获取第一个序列的历史长度
-                first_seq_k_cache = past_key_values[0][0][0]
-                past_length = first_seq_k_cache.size(0)  # 序列长度维度
+        # 计算批次中各序列的历史长度
+        past_lengths = []
+        for i in range(batch_size):
+            if i < len(past_key_values[0][0]):  # 检查索引有效性
+                seq_k = past_key_values[0][0][i]  # 取第1层第i序列的k缓存
+                past_lengths.append(seq_k.size(0))
             else:
-                past_length = 0
+                past_lengths.append(0)
 
-            total_length = past_length + seq_length
+        # 创建扩展注意力掩码
+        max_past_len = max(past_lengths) if past_lengths else 0
+        total_length = max_past_len + seq_length
+        extended_mask = torch.zeros(
+            batch_size, 1, seq_length, total_length,
+            dtype=torch.bool, device=input_ids.device
+        )
 
-            # 创建扩展的掩码
-            extended_mask = torch.ones(
-                batch_size, 1, seq_length, total_length,
-                dtype=torch.bool, device=input_ids.device
-            )
+        # 填充掩码：
+        # - 历史部分：全部可见（True）
+        # - 当前部分：因果可见（左下三角）
+        for i, past_len in enumerate(past_lengths):
+            # 历史部分
+            if past_len > 0:
+                extended_mask[i, :, :, :past_len] = True
 
-            # 应用因果掩码
-            # 历史部分全部可见
-            extended_mask[:, :, :, :past_length] = True
-            # 当前部分应用因果掩码
-            extended_mask[:, :, :, past_length:] = causal_mask
+            # 当前部分（因果）
+            extended_mask[i, :, :, past_len:past_len + seq_length] = causal_mask
 
-            return extended_mask
-
-        # 没有历史缓存
-        return causal_mask.expand(batch_size, 1, seq_length, seq_length)
+        return extended_mask
