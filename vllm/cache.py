@@ -199,6 +199,8 @@ class PagedKVCache:
 
         # 获取当前批次的最大序列长度
         max_actual_length = max(past_seq_lengths) if batch_size > 0 else 0
+        if max_actual_length == 0:  # 没有历史缓存
+            return None  # 直接返回None
         # 确保不超过最大序列长度
         max_length = min(max_actual_length, self.max_seq_length)
 

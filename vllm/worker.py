@@ -171,10 +171,16 @@ class ModelWorker:
 
         """执行模型前向传播"""
         # 获取历史KV缓存
-        past_key_values = self.kv_cache.get_cache(
-            input_data["sequence_ids"],
-            input_data["past_seq_lengths"]
-        )
+        # 获取历史KV缓存（可能为None）
+        past_key_values = None
+        if input_data["past_seq_lengths"].sum().item() > 0:  # 只有存在历史缓存时才获取
+            past_key_values = self.kv_cache.get_cache(
+                input_data["sequence_ids"],
+                input_data["past_seq_lengths"]
+            )
+
+        # 打印调试信息
+        print(f"Past KV is None: {past_key_values is None}")
         print(f"Past KV type: {type(past_key_values)}")
         if past_key_values and len(past_key_values) > 0:
             first_tensor = past_key_values[0][0]
