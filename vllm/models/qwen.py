@@ -91,8 +91,8 @@ class QwenModel:
                 torch.ones(seq_length, seq_length, dtype=torch.bool, device=input_ids.device)
             ).reshape(1, 1, seq_length, seq_length)  # 使用reshape替代view
 
-            # 扩展掩码到键值头数（使用配置中的值）
-            attention_mask = attention_mask.expand(batch_size, self.num_key_value_heads, seq_length, seq_length)
+            # 扩展掩码到批次大小
+            attention_mask = attention_mask.expand(batch_size, -1, -1, -1)
             return attention_mask.contiguous()  # 确保返回连续张量
 
         # 获取每个序列的实际历史长度
@@ -104,12 +104,16 @@ class QwenModel:
         past_lengths = first_layer_k.size(2)  # 获取历史长度维度
         num_kv_heads = first_layer_k.size(1)  # 获取键值头数
 
-        # 创建扩展的注意力掩码 [batch_size, 1, seq_length, total_length]
+        # 创建扩展的注意力掩码 [batch_size, num_key_value_heads, seq_length, total_length]
         total_length = past_lengths + seq_length
         extended_attention_mask = torch.zeros(
-            batch_size, 1, seq_length, total_length,
-            dtype=torch.bool, device=input_ids.device
-        ).contiguous()  # 创建时直接确保连续
+            batch_size,
+            num_kv_heads,  # 直接使用实际的键值头数量
+            seq_length,
+            total_length,
+            dtype=torch.bool,
+            device=input_ids.device
+        ).contiguous()
 
         # 填充掩码：
         # - 历史部分：全部可见（1表示不掩盖）
@@ -127,17 +131,11 @@ class QwenModel:
         # 确保因果掩码连续
         causal_mask = causal_mask.contiguous()
 
-        # 将因果掩码放置在从past_lengths开始的列位置
+        # 将因果掩码复制到每个头
         extended_attention_mask[:, :, :, past_lengths:past_lengths + seq_length] = causal_mask
 
-        # 扩展掩码到键值头数
-        extended_attention_mask = extended_attention_mask.repeat(1, num_kv_heads, 1, 1)
-
-        # 在返回前添加连续化操作
-        extended_attention_mask = extended_attention_mask.contiguous()
-
         # 调试信息 - 实际部署时可移除
-        print(f"Attention mask contiguous: {extended_attention_mask.is_contiguous()}")
-        print(f"Attention mask shape: {extended_attention_mask.shape}")
+        print(f"Final attention mask shape: {extended_attention_mask.shape}")
+        print(f"Mask device: {extended_attention_mask.device}")
 
-        return extended_attention_mask
+        return extended_attention_mask.contiguous()  # 确保返回连续张量
