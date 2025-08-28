@@ -168,6 +168,10 @@ class ModelWorker:
         print(f"Model device: {next(self.model.model.parameters()).device}")
         print(f"Input IDs device: {input_data['input_ids'].device}")
         print(f"Positions device: {input_data['positions'].device}")
+        # 打印调试信息
+        print(f"Input IDs shape: {input_data['input_ids'].shape}")
+        print(f"Positions shape: {input_data['positions'].shape}")
+
 
 
         """执行模型前向传播"""
@@ -180,6 +184,10 @@ class ModelWorker:
                 input_data["past_seq_lengths"]
             )
 
+        if past_key_values is not None:
+            print(f"Past KV length: {len(past_key_values)}")
+            print(f"First layer k shape: {past_key_values[0][0].shape}")
+            print(f"First layer v shape: {past_key_values[0][1].shape}")
         # 打印调试信息
         print(f"Past KV is None: {past_key_values is None}")
         print(f"Past KV type: {type(past_key_values)}")

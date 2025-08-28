@@ -27,9 +27,9 @@ def main():
     # 准备提示
     prompts = [
         "Hello, my name is",
-        # "The future of AI is",
-        # "Once upon a time",
-        # "In a galaxy far far away"
+        "The future of AI is",
+        "Once upon a time",
+        "In a galaxy far far away"
     ]
 
     print("开始生成...")

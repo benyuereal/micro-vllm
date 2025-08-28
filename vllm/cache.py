@@ -193,35 +193,38 @@ class PagedKVCache:
 
     def get_cache(self,
                   sequence_ids: List[int],
-                  past_seq_lengths: List[int]) -> List[Tuple[torch.Tensor, torch.Tensor]]:
+                  past_seq_lengths: List[int]) -> Optional[List[Tuple[torch.Tensor, torch.Tensor]]]:
         """获取KV缓存，返回格式为每层一个元组(k_tensor, v_tensor)"""
         batch_size = len(sequence_ids)
-        past_key_values = []
 
         # 获取当前批次的最大序列长度
         max_actual_length = max(past_seq_lengths) if batch_size > 0 else 0
         if max_actual_length == 0:  # 没有历史缓存
-            return None  # 直接返回None
+            return None
+
         # 确保不超过最大序列长度
         max_length = min(max_actual_length, self.max_seq_length)
 
+        # 初始化past_key_values结构
+        past_key_values = []
+
+        # 对于每层缓存，创建空列表
         for layer_idx in range(self.num_layers):
             k_list = []
             v_list = []
 
             for i in range(batch_size):
                 seq_id = sequence_ids[i]
-                seq_length = min(past_seq_lengths[i], self.max_seq_length)  # 确保不超过最大长度
+                seq_length = min(past_seq_lengths[i], self.max_seq_length)
 
-                # 修复点：统一返回固定形状的张量
                 if seq_id not in self.sequence_table or seq_length == 0:
-                    # 创建形状兼容的全零张量 [max_length, num_heads, head_size]
+                    # 创建兼容形状的全零张量 [num_heads, seq_len, head_size]
                     k_tensor = torch.zeros(
-                        max_length, self.num_key_value_heads, self.head_size,  # 关键修改
+                        self.num_key_value_heads, max_length, self.head_size,
                         device=self.device
                     )
                     v_tensor = torch.zeros(
-                        max_length, self.num_key_value_heads, self.head_size,  # 关键修改
+                        self.num_key_value_heads, max_length, self.head_size,
                         device=self.device
                     )
                 else:
@@ -242,41 +245,42 @@ class PagedKVCache:
                         if page_idx == end_page - 1:  # 最后一页
                             end_slot = seq_length % self.page_size or self.page_size
 
-                        # 获取数据
+                        # 获取数据 [page_slots, num_heads, head_size]
                         k_slice, v_slice = page.get_entries(start_slot, end_slot)
+
+                        # 转置为 [num_heads, page_slots, head_size]
+                        k_slice = k_slice.permute(1, 0, 2)
+                        v_slice = v_slice.permute(1, 0, 2)
+
                         k_slices.append(k_slice)
                         v_slices.append(v_slice)
 
-                    # 拼接所有切片
+                    # 拼接所有切片 [num_heads, total_slots, head_size]
                     if k_slices:
-                        k_tensor = torch.cat(k_slices, dim=0).contiguous()
-                        v_tensor = torch.cat(v_slices, dim=0).contiguous()
+                        k_tensor = torch.cat(k_slices, dim=1)
+                        v_tensor = torch.cat(v_slices, dim=1)
                     else:
                         k_tensor = torch.zeros(
-                            max_length, self.num_heads, self.head_size,
+                            self.num_key_value_heads, max_length, self.head_size,
                             device=self.device
-                        ).contiguous()
+                        )
                         v_tensor = torch.zeros(
-                            max_length, self.num_heads, self.head_size,
+                            self.num_key_value_heads, max_length, self.head_size,
                             device=self.device
-                        ).contiguous()
+                        )
 
                     # 如果实际长度小于当前批次最大长度，填充零
-                    if k_tensor.size(0) < max_length:
-                        padding_size = max_length - k_tensor.size(0)
-                        k_tensor = F.pad(k_tensor, (0, 0, 0, 0, 0, padding_size))
-                        v_tensor = F.pad(v_tensor, (0, 0, 0, 0, 0, padding_size))
+                    if k_tensor.size(1) < max_length:
+                        padding_size = max_length - k_tensor.size(1)
+                        k_tensor = F.pad(k_tensor, (0, 0, 0, padding_size))
+                        v_tensor = F.pad(v_tensor, (0, 0, 0, padding_size))
 
                 k_list.append(k_tensor)
                 v_list.append(v_tensor)
 
-            # 将列表转换为批次张量 [batch_size, seq_len, num_heads, head_size]
-            k_batch = torch.stack(k_list)  # [batch, seq_len, num_heads, head_size]
+            # 将列表转换为批次张量 [batch_size, num_heads, seq_len, head_size]
+            k_batch = torch.stack(k_list)
             v_batch = torch.stack(v_list)
-
-            # 调整维度顺序 [batch, num_heads, seq_len, head_size]
-            k_batch = k_batch.permute(0, 2, 1, 3).contiguous()
-            v_batch = v_batch.permute(0, 2, 1, 3).contiguous()
 
             # 将当前层的缓存添加到结果中
             past_key_values.append((k_batch, v_batch))
