@@ -186,14 +186,14 @@ class PagedKVCache:
 
     def get_cache(self,
                   sequence_ids: List[int],
-                  past_seq_lengths: List[int]) -> Optional[List[Tuple[List[torch.Tensor], List[torch.Tensor]]]]:
-        """获取KV缓存，返回格式为 List[Tuple(k_list, v_list)] 每层一个元组"""
+                  past_seq_lengths: List[int]) -> List[Tuple[List[torch.Tensor], List[torch.Tensor]]]:
+        """获取KV缓存，返回格式为每层一个元组(k_list, v_list)"""
         batch_size = len(sequence_ids)
         past_key_values = []
 
         for layer_idx in range(self.num_layers):
-            layer_k = []
-            layer_v = []
+            k_list = []
+            v_list = []
 
             for i in range(batch_size):
                 seq_id = sequence_ids[i]
@@ -201,8 +201,8 @@ class PagedKVCache:
 
                 if seq_id not in self.sequence_table or seq_length == 0:
                     # 创建空张量
-                    layer_k.append(torch.zeros(0, self.num_heads, self.head_size, device=self.device))
-                    layer_v.append(torch.zeros(0, self.num_heads, self.head_size, device=self.device))
+                    k_list.append(torch.zeros(0, self.num_heads, self.head_size, device=self.device))
+                    v_list.append(torch.zeros(0, self.num_heads, self.head_size, device=self.device))
                     continue
 
                 # 获取序列的所有页面
@@ -235,10 +235,10 @@ class PagedKVCache:
                     k_tensor = torch.zeros(0, self.num_heads, self.head_size, device=self.device)
                     v_tensor = torch.zeros(0, self.num_heads, self.head_size, device=self.device)
 
-                layer_k.append(k_tensor)
-                layer_v.append(v_tensor)
+                k_list.append(k_tensor)
+                v_list.append(v_tensor)
 
             # 将当前层的缓存添加到结果中
-            past_key_values.append((layer_k, layer_v))
+            past_key_values.append((k_list, v_list))
 
         return past_key_values
