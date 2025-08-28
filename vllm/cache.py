@@ -180,9 +180,9 @@ class PagedKVCache:
                 page_id = pages[page_idx]
                 page = self.page_pool[page_id]
 
-                # 获取当前层的键值（简化实现）
-                k_data = hidden_states[i, j, :].view(self.num_heads, self.head_size)
-                v_data = hidden_states[i, j, :].view(self.num_heads, self.head_size)
+                # 修复点：使用reshape代替view，并确保连续
+                k_data = hidden_states[i, j, :].reshape(self.num_heads, self.head_size).contiguous()
+                v_data = hidden_states[i, j, :].reshape(self.num_heads, self.head_size).contiguous()
 
                 # 添加到页面
                 if slot_idx >= page.used_slots:
