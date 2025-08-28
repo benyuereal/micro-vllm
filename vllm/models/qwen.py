@@ -32,7 +32,8 @@ class QwenModel:
             model_name,
             config=config,
             trust_remote_code=True,
-            torch_dtype=torch.float16
+            torch_dtype=torch.float16,
+            device_map="auto"  # +++ 添加自动设备映射 +++
         )
 
         # 应用张量并行

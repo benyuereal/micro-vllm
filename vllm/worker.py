@@ -60,6 +60,8 @@ class ModelWorker:
             tensor_parallel_manager=self.tensor_parallel_manager,
             memory_manager=memory_manager
         )
+        # +++ 添加模型迁移到GPU +++
+        self.model.model.to(self.device)  # 确保模型迁移到指定设备
 
         # 初始化KV缓存
         self.kv_cache = PagedKVCache(
