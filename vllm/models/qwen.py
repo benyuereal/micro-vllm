@@ -79,7 +79,10 @@ class QwenModel:
             attention_mask = torch.tril(
                 torch.ones(seq_length, seq_length, dtype=torch.bool, device=input_ids.device)
             ).unsqueeze(0).unsqueeze(0)  # [1, 1, seq_length, seq_length]
-            return attention_mask.expand(batch_size, 1, seq_length, seq_length)
+
+            # 扩展掩码到键值头数（使用配置中的值）
+            attention_mask = attention_mask.expand(batch_size, self.num_key_value_heads, seq_length, seq_length)
+            return attention_mask
 
         # 获取每个序列的实际历史长度
         # 注意：past_key_values 的结构是：
@@ -88,6 +91,7 @@ class QwenModel:
         # 我们使用第一个序列的k缓存来确定历史长度
         first_layer_k = past_key_values[0][0]  # 获取第一层的k缓存
         past_lengths = first_layer_k.size(2)  # 获取历史长度维度
+        num_kv_heads = first_layer_k.size(1)  # 获取键值头数 [关键修改]
 
         # 创建扩展的注意力掩码 [batch_size, 1, seq_length, total_length]
         total_length = past_lengths + seq_length
@@ -111,5 +115,8 @@ class QwenModel:
 
         # 将因果掩码放置在从past_lengths开始的列位置
         extended_attention_mask[:, :, :, past_lengths:past_lengths + seq_length] = causal_mask
+
+        # 扩展掩码到键值头数 [关键修改]
+        extended_attention_mask = extended_attention_mask.repeat(1, num_kv_heads, 1, 1)
 
         return extended_attention_mask
