@@ -77,9 +77,12 @@ class QwenModel:
 
         # 如果有历史缓存，扩展掩码
         if past_key_values is not None and len(past_key_values) > 0:
-            # 获取第一个序列的历史长度（所有层的历史长度相同）
-            if len(past_key_values[0][0]) > 0:  # 确保有缓存
-                # 获取第一个序列在第一层的键缓存张量
+            # 确保缓存结构正确
+            if (len(past_key_values[0]) > 0 and
+                    len(past_key_values[0][0]) > 0 and
+                    isinstance(past_key_values[0][0][0], torch.Tensor)):
+
+                # 获取第一个序列的历史长度
                 first_seq_k_cache = past_key_values[0][0][0]
                 past_length = first_seq_k_cache.size(0)  # 序列长度维度
             else:

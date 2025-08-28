@@ -227,9 +227,15 @@ class PagedKVCache:
                     k_slices.append(k_slice)
                     v_slices.append(v_slice)
 
-                # 拼接所有切片
-                layer_k.append(torch.cat(k_slices, dim=0))
-                layer_v.append(torch.cat(v_slices, dim=0))
+                # 拼接所有切片 - 确保结果是张量
+                if k_slices:
+                    k_tensor = torch.cat(k_slices, dim=0)
+                    v_tensor = torch.cat(v_slices, dim=0)
+                    layer_k.append(k_tensor)
+                    layer_v.append(v_tensor)
+                else:
+                    layer_k.append(torch.zeros(0, self.num_heads, self.head_size, device=self.device))
+                    layer_v.append(torch.zeros(0, self.num_heads, self.head_size, device=self.device))
 
             # 将当前层的缓存添加到结果中
             past_key_values.append((layer_k, layer_v))

@@ -156,7 +156,15 @@ class ModelWorker:
             input_data["sequence_ids"],
             input_data["past_seq_lengths"]
         )
-
+        print(f"Past KV type: {type(past_key_values)}")
+        if past_key_values and len(past_key_values) > 0:
+            print(f"First layer type: {type(past_key_values[0])}")
+            if len(past_key_values[0]) > 0:
+                print(f"First layer k type: {type(past_key_values[0][0])}")
+                if len(past_key_values[0][0]) > 0:
+                    print(f"First sequence k type: {type(past_key_values[0][0][0])}")
+                    print(
+                        f"First sequence k shape: {past_key_values[0][0][0].shape if hasattr(past_key_values[0][0][0], 'shape') else 'No shape'}")
         # 执行模型前向传播
         with torch.no_grad():
             outputs = self.model(
