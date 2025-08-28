@@ -41,6 +41,10 @@ class LLMEngine:
         self.tensor_parallel_size = tensor_parallel_size
         self.max_num_seqs = max_num_seqs
         self.max_seq_length = max_seq_length
+        # 设备自动补全
+        if device == "cuda" and torch.cuda.is_available():
+            device = f"cuda:{torch.cuda.current_device()}"
+            print("Using CUDA device:", device)
         self.device = device
 
         # 初始化内存管理器

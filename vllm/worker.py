@@ -25,10 +25,19 @@ class ModelWorker:
         self.max_seq_length = max_seq_length
         self.memory_manager = memory_manager
 
-        # 确保设备标识符正确
+        # 修复设备设置 (添加以下代码)
+        if device == "cuda" and torch.cuda.is_available():
+            device = f"cuda:{torch.cuda.current_device()}"
+
         self.device = torch.device(device)
-        if "cuda" in str(self.device) and not torch.cuda.is_available():
-            raise RuntimeError("CUDA device requested but not available")
+
+        # 替换原有的设置代码
+        if "cuda" in str(self.device):
+            if not torch.cuda.is_available():
+                raise RuntimeError("CUDA device requested but not available")
+            print( torch.cuda.is_available())
+            torch.cuda.set_device(self.device)
+
 
 
         # 强制设置PyTorch默认设备

@@ -58,6 +58,10 @@ class PagedKVCache:
         self.max_num_seqs = max_num_seqs
         self.memory_manager = memory_manager
         self.device = device
+        # 设备自动补全
+        if device == "cuda" and torch.cuda.is_available():
+            device = f"cuda:{torch.cuda.current_device()}"
+        self.device = device
 
         # 初始化页面池
         self.page_pool = []
