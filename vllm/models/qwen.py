@@ -119,4 +119,6 @@ class QwenModel:
         # 扩展掩码到键值头数 [关键修改]
         extended_attention_mask = extended_attention_mask.repeat(1, num_kv_heads, 1, 1)
 
+        # 在返回前添加连续化操作
+        extended_attention_mask = extended_attention_mask.contiguous()
         return extended_attention_mask

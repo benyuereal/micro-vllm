@@ -249,17 +249,17 @@ class PagedKVCache:
 
                     # 拼接所有切片
                     if k_slices:
-                        k_tensor = torch.cat(k_slices, dim=0)
-                        v_tensor = torch.cat(v_slices, dim=0)
+                        k_tensor = torch.cat(k_slices, dim=0).contiguous()
+                        v_tensor = torch.cat(v_slices, dim=0).contiguous()
                     else:
                         k_tensor = torch.zeros(
                             max_length, self.num_heads, self.head_size,
                             device=self.device
-                        )
+                        ).contiguous()
                         v_tensor = torch.zeros(
                             max_length, self.num_heads, self.head_size,
                             device=self.device
-                        )
+                        ).contiguous()
 
                     # 如果实际长度小于当前批次最大长度，填充零
                     if k_tensor.size(0) < max_length:
@@ -275,8 +275,8 @@ class PagedKVCache:
             v_batch = torch.stack(v_list)
 
             # 调整维度顺序 [batch, num_heads, seq_len, head_size]
-            k_batch = k_batch.permute(0, 2, 1, 3)
-            v_batch = v_batch.permute(0, 2, 1, 3)
+            k_batch = k_batch.permute(0, 2, 1, 3).contiguous()
+            v_batch = v_batch.permute(0, 2, 1, 3).contiguous()
 
             # 将当前层的缓存添加到结果中
             past_key_values.append((k_batch, v_batch))
