@@ -84,16 +84,20 @@ class QwenModel:
         # 确保输入张量连续
         input_ids = input_ids.contiguous()
 
-        # 如果没有历史缓存，只需创建因果掩码
+        # 删除原有的扩展操作，直接返回2D/3D掩码
         if past_key_values is None:
-            # 创建因果掩码 [batch_size, 1, target_length, target_length]
+            print("Using CUDA device -->:", self.model.device)
+            if self.model is None:
+                device = "cuda:0"
+            else:
+                device = self.model.device
+            # 创建2D因果掩码 [seq_len, seq_len]
             attention_mask = torch.tril(
-                torch.ones(seq_length, seq_length, dtype=torch.bool, device=input_ids.device)
-            ).reshape(1, 1, seq_length, seq_length)  # 使用reshape替代view
-
-            # 扩展掩码到批次大小
-            attention_mask = attention_mask.expand(batch_size, -1, -1, -1)
-            return attention_mask.contiguous()  # 确保返回连续张量
+                torch.ones(seq_length, seq_length, dtype=torch.bool, device=device)
+            )
+            # 扩展为3D [batch_size, seq_len, seq_len]
+            attention_mask = attention_mask.unsqueeze(0).expand(batch_size, -1, -1)
+            return attention_mask
 
         # 获取每个序列的实际历史长度
         # 注意：past_key_values 的结构是：
