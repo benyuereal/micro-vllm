@@ -186,8 +186,8 @@ class PagedKVCache:
 
     def get_cache(self,
                   sequence_ids: List[int],
-                  past_seq_lengths: List[int]) -> List[Tuple[torch.Tensor, torch.Tensor]]:
-        """获取KV缓存"""
+                  past_seq_lengths: List[int]) -> Optional[List[Tuple[List[torch.Tensor], List[torch.Tensor]]]]:
+        """获取KV缓存，返回格式为 List[Tuple(k_list, v_list)] 每层一个元组"""
         batch_size = len(sequence_ids)
         past_key_values = []
 
@@ -227,15 +227,16 @@ class PagedKVCache:
                     k_slices.append(k_slice)
                     v_slices.append(v_slice)
 
-                # 拼接所有切片 - 确保结果是张量
+                # 拼接所有切片
                 if k_slices:
                     k_tensor = torch.cat(k_slices, dim=0)
                     v_tensor = torch.cat(v_slices, dim=0)
-                    layer_k.append(k_tensor)
-                    layer_v.append(v_tensor)
                 else:
-                    layer_k.append(torch.zeros(0, self.num_heads, self.head_size, device=self.device))
-                    layer_v.append(torch.zeros(0, self.num_heads, self.head_size, device=self.device))
+                    k_tensor = torch.zeros(0, self.num_heads, self.head_size, device=self.device)
+                    v_tensor = torch.zeros(0, self.num_heads, self.head_size, device=self.device)
+
+                layer_k.append(k_tensor)
+                layer_v.append(v_tensor)
 
             # 将当前层的缓存添加到结果中
             past_key_values.append((layer_k, layer_v))

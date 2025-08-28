@@ -165,6 +165,14 @@ class ModelWorker:
                     print(f"First sequence k type: {type(past_key_values[0][0][0])}")
                     print(
                         f"First sequence k shape: {past_key_values[0][0][0].shape if hasattr(past_key_values[0][0][0], 'shape') else 'No shape'}")
+
+        # 修复：将缓存结构转换为模型需要的格式
+        if past_key_values is not None:
+            # 将列表转换为模型需要的嵌套元组结构
+            past_key_values = tuple(
+                tuple((k, v) for k, v in layer_cache)
+                for layer_cache in past_key_values
+            )
         # 执行模型前向传播
         with torch.no_grad():
             outputs = self.model(

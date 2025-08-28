@@ -70,26 +70,31 @@ class QwenModel:
         """准备注意力掩码（兼容分页缓存结构）"""
         batch_size, seq_length = input_ids.shape
 
+        # 如果past_key_values是元组格式（模型输出格式），提取实际长度
+        past_lengths = []
+        if past_key_values is not None:
+            # 获取第一个序列在第一个层的k缓存长度
+            for i in range(batch_size):
+                if i < len(past_key_values[0][0]):  # 检查索引有效性
+                    # 注意：past_key_values是 (层数) x (k/v) x (序列) 的结构
+                    seq_k = past_key_values[0][0][i]  # 取第1层第i序列的k缓存
+                    past_lengths.append(seq_k.size(0))
+                else:
+                    past_lengths.append(0)
+        else:
+            past_lengths = [0] * batch_size
+
         # 创建当前token的因果掩码
         causal_mask = torch.tril(
             torch.ones(seq_length, seq_length, dtype=torch.bool, device=input_ids.device)
         ).unsqueeze(0).unsqueeze(0)  # [1, 1, T, T]
 
         # 无历史缓存时直接返回
-        if past_key_values is None or len(past_key_values) == 0:
+        if max(past_lengths) == 0:
             return causal_mask.expand(batch_size, 1, seq_length, seq_length)
 
-        # 计算批次中各序列的历史长度
-        past_lengths = []
-        for i in range(batch_size):
-            if i < len(past_key_values[0][0]):  # 检查索引有效性
-                seq_k = past_key_values[0][0][i]  # 取第1层第i序列的k缓存
-                past_lengths.append(seq_k.size(0))
-            else:
-                past_lengths.append(0)
-
         # 创建扩展注意力掩码
-        max_past_len = max(past_lengths) if past_lengths else 0
+        max_past_len = max(past_lengths)
         total_length = max_past_len + seq_length
         extended_mask = torch.zeros(
             batch_size, 1, seq_length, total_length,
