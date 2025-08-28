@@ -14,6 +14,8 @@ class QwenModel:
     def __init__(self, config):
         self.config = config
         self.model = None
+        # 添加键值头数量配置
+        self.num_key_value_heads = getattr(config, "num_key_value_heads", config.num_attention_heads)
 
     @classmethod
     def initialize(cls,
@@ -68,49 +70,46 @@ class QwenModel:
     def _prepare_attention_mask(self,
                                 input_ids: torch.Tensor,
                                 past_key_values: Optional[Tuple] = None) -> torch.Tensor:
-        """准备注意力掩码（兼容分页缓存结构）"""
+        """准备注意力掩码（兼容分页缓存结构和分组查询注意力）"""
         batch_size, seq_length = input_ids.shape
 
-        # 如果past_key_values存在，提取实际长度
-        if past_key_values is not None:
-            # 获取第一个序列在第一个层的k缓存长度
-            if past_key_values and len(past_key_values) > 0:
-                # 取第0层的k缓存 [batch, num_heads, seq_len, head_size]
-                k_batch = past_key_values[0][0]
-                # 所有序列共享相同的缓存长度
-                past_length = k_batch.size(2)  # 取seq_len维度
-                past_lengths = [past_length] * batch_size
-            else:
-                past_lengths = [0] * batch_size
-        else:
-            past_lengths = [0] * batch_size
+        # 如果没有历史缓存，只需创建因果掩码
+        if past_key_values is None:
+            # 创建因果掩码 [batch_size, 1, target_length, target_length]
+            attention_mask = torch.tril(
+                torch.ones(seq_length, seq_length, dtype=torch.bool, device=input_ids.device)
+            ).unsqueeze(0).unsqueeze(0)  # [1, 1, seq_length, seq_length]
+            return attention_mask.expand(batch_size, 1, seq_length, seq_length)
 
-        # 创建当前token的因果掩码
-        causal_mask = torch.tril(
-            torch.ones(seq_length, seq_length, dtype=torch.bool, device=input_ids.device)
-        ).unsqueeze(0).unsqueeze(0)  # [1, 1, T, T]
+        # 获取每个序列的实际历史长度
+        # 注意：past_key_values 的结构是：
+        # 元组(每层一个元组(每层包含k_cache, v_cache))
+        # k_cache 形状为 [batch_size, num_key_value_heads, past_length, head_size]
+        # 我们使用第一个序列的k缓存来确定历史长度
+        first_layer_k = past_key_values[0][0]  # 获取第一层的k缓存
+        past_lengths = first_layer_k.size(2)  # 获取历史长度维度
 
-        # 无历史缓存时直接返回
-        if max(past_lengths) == 0:
-            return causal_mask.expand(batch_size, 1, seq_length, seq_length)
-
-        # 创建扩展注意力掩码
-        max_past_len = max(past_lengths)
-        total_length = max_past_len + seq_length
-        extended_mask = torch.zeros(
+        # 创建扩展的注意力掩码 [batch_size, 1, seq_length, total_length]
+        total_length = past_lengths + seq_length
+        extended_attention_mask = torch.zeros(
             batch_size, 1, seq_length, total_length,
             dtype=torch.bool, device=input_ids.device
         )
 
         # 填充掩码：
-        # - 历史部分：全部可见（True）
-        # - 当前部分：因果可见（左下三角）
-        for i, past_len in enumerate(past_lengths):
-            # 历史部分
-            if past_len > 0:
-                extended_mask[i, :, :, :past_len] = True
+        # - 历史部分：全部可见（1表示不掩盖）
+        # - 当前部分：因果可见（左下三角为1）
 
-            # 当前部分（因果）
-            extended_mask[i, :, :, past_len:past_len + seq_length] = causal_mask
+        # 历史部分（从位置0到past_lengths）全部可见
+        extended_attention_mask[:, :, :, :past_lengths] = 1
 
-        return extended_mask
+        # 当前部分：因果掩码（只允许每个token关注自身及之前的token）
+        # 创建一个左下三角矩阵（包括对角线）作为当前部分的掩码
+        causal_mask = torch.tril(
+            torch.ones(seq_length, seq_length, dtype=torch.bool, device=input_ids.device)
+        ).unsqueeze(0).unsqueeze(0)  # [1, 1, seq_length, seq_length]
+
+        # 将因果掩码放置在从past_lengths开始的列位置
+        extended_attention_mask[:, :, :, past_lengths:past_lengths + seq_length] = causal_mask
+
+        return extended_attention_mask

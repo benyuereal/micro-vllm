@@ -46,6 +46,7 @@ class PagedKVCache:
     def __init__(self,
                  num_layers: int,
                  num_heads: int,
+                 num_key_value_heads: int,  # 新增参数
                  head_size: int,
                  page_size: int = 256,
                  max_num_seqs: int = 256,
@@ -72,7 +73,7 @@ class PagedKVCache:
         # 序列管理
         self.sequence_table = {}  # sequence_id -> List[Page]
         self.sequence_lengths = {}  # sequence_id -> length
-
+        self.num_key_value_heads = num_key_value_heads  # 保存键值头数量
         # 初始化页面
         self._init_pages()
 
@@ -216,11 +217,11 @@ class PagedKVCache:
                 if seq_id not in self.sequence_table or seq_length == 0:
                     # 创建形状兼容的全零张量 [max_length, num_heads, head_size]
                     k_tensor = torch.zeros(
-                        max_length, self.num_heads, self.head_size,
+                        max_length, self.num_key_value_heads, self.head_size,  # 关键修改
                         device=self.device
                     )
                     v_tensor = torch.zeros(
-                        max_length, self.num_heads, self.head_size,
+                        max_length, self.num_key_value_heads, self.head_size,  # 关键修改
                         device=self.device
                     )
                 else:

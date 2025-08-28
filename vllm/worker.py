@@ -62,11 +62,12 @@ class ModelWorker:
         )
         # +++ 添加模型迁移到GPU +++
         self.model.model.to(self.device)  # 确保模型迁移到指定设备
-
+        num_key_value_heads = getattr(self.model.config, "num_key_value_heads", self.model.config.num_attention_heads)
         # 初始化KV缓存
         self.kv_cache = PagedKVCache(
             num_layers=self.model.config.num_hidden_layers,
             num_heads=self.model.config.num_attention_heads,
+            num_key_value_heads=num_key_value_heads,  # 关键添加
             head_size=self.model.config.hidden_size // self.model.config.num_attention_heads,
             page_size=256,  # 每页256个token
             max_num_seqs=max_num_seqs,
