@@ -94,13 +94,18 @@ class QwenModel:
 
             # 创建4D因果掩码 [batch_size, num_heads, seq_len, seq_len]
             # 注意：这里使用 num_key_value_heads 而不是 num_attention_heads
-            attention_mask = torch.tril(
-                torch.ones(seq_length, seq_length, dtype=torch.bool, device=device)
+            # 使用 ones 而不是 tril 创建基础掩码
+            attention_mask = torch.ones(
+                seq_length, seq_length, dtype=torch.bool, device=device
             )
+            # 创建下三角掩码（包括对角线）
+            causal_mask = torch.tril(attention_mask)
+
             # 扩展为4D [batch_size, num_key_value_heads, seq_len, seq_len]
-            attention_mask = attention_mask.unsqueeze(0).unsqueeze(0)
-            attention_mask = attention_mask.expand(batch_size, self.num_key_value_heads, -1, -1)
-            return attention_mask
+            # 使用 reshape 而不是 view，并确保连续
+            causal_mask = causal_mask.reshape(1, 1, seq_length, seq_length)
+            causal_mask = causal_mask.expand(batch_size, self.num_key_value_heads, -1, -1)
+            return causal_mask.contiguous()
 
         # 获取每个序列的实际历史长度
         first_layer_k = past_key_values[0][0]  # 获取第一层的k缓存
@@ -116,7 +121,7 @@ class QwenModel:
             total_length,
             dtype=torch.bool,
             device=input_ids.device
-        ).contiguous()
+        )
 
         # 填充掩码：
         # - 历史部分：全部可见（1表示不掩盖）
@@ -129,12 +134,11 @@ class QwenModel:
         # 创建一个左下三角矩阵（包括对角线）作为当前部分的掩码
         causal_mask = torch.tril(
             torch.ones(seq_length, seq_length, dtype=torch.bool, device=input_ids.device)
-        ).reshape(1, 1, seq_length, seq_length)  # 使用reshape替代view
+        )
+        causal_mask = causal_mask.reshape(1, 1, seq_length, seq_length)  # 使用reshape
+        causal_mask = causal_mask.expand(batch_size, num_kv_heads, -1, -1)
 
-        # 确保因果掩码连续
-        causal_mask = causal_mask.contiguous()
-
-        # 将因果掩码复制到每个头
+        # 将因果掩码复制到当前部分
         extended_attention_mask[:, :, :, past_lengths:past_lengths + seq_length] = causal_mask
 
         # 调试信息 - 实际部署时可移除
