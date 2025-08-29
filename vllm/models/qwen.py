@@ -75,6 +75,7 @@ class QwenModel:
 
         return outputs
 
+    # qwen.py 中的 _prepare_attention_mask 方法
     def _prepare_attention_mask(self,
                                 input_ids: torch.Tensor,
                                 past_key_values: Optional[Tuple] = None) -> torch.Tensor:
@@ -84,26 +85,24 @@ class QwenModel:
         # 确保输入张量连续
         input_ids = input_ids.contiguous()
 
-        # 删除原有的扩展操作，直接返回2D/3D掩码
         if past_key_values is None:
             print("Using CUDA device -->:", self.model.device)
             if self.model is None:
                 device = "cuda:0"
             else:
                 device = self.model.device
-            # 创建2D因果掩码 [seq_len, seq_len]
+
+            # 创建4D因果掩码 [batch_size, num_heads, seq_len, seq_len]
+            # 注意：这里使用 num_key_value_heads 而不是 num_attention_heads
             attention_mask = torch.tril(
                 torch.ones(seq_length, seq_length, dtype=torch.bool, device=device)
             )
-            # 扩展为3D [batch_size, seq_len, seq_len]
-            attention_mask = attention_mask.unsqueeze(0).expand(batch_size, -1, -1)
+            # 扩展为4D [batch_size, num_key_value_heads, seq_len, seq_len]
+            attention_mask = attention_mask.unsqueeze(0).unsqueeze(0)
+            attention_mask = attention_mask.expand(batch_size, self.num_key_value_heads, -1, -1)
             return attention_mask
 
         # 获取每个序列的实际历史长度
-        # 注意：past_key_values 的结构是：
-        # 元组(每层一个元组(每层包含k_cache, v_cache))
-        # k_cache 形状为 [batch_size, num_key_value_heads, past_length, head_size]
-        # 我们使用第一个序列的k缓存来确定历史长度
         first_layer_k = past_key_values[0][0]  # 获取第一层的k缓存
         past_lengths = first_layer_k.size(2)  # 获取历史长度维度
         num_kv_heads = first_layer_k.size(1)  # 获取键值头数
