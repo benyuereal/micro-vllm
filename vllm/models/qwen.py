@@ -68,7 +68,7 @@ class QwenModel:
             past_key_values=past_key_values,
             use_cache=use_cache,
             output_hidden_states=True,
-            return_dict=True  # 强制返回字典形式
+            return_dict=True
         )
 
         # 统一输出格式
@@ -82,17 +82,24 @@ class QwenModel:
         else:
             logits = outputs.logits
             past_key_values = outputs.past_key_values
-            # 确保 hidden_states 存在
-            hidden_states = outputs.get("hidden_states", logits)
+
+            # 优先获取last_hidden_state（最终隐藏层）
+            if hasattr(outputs, 'last_hidden_state'):
+                hidden_states = outputs.last_hidden_state
+            # 次选hidden_states（需要取最后一层）
+            elif hasattr(outputs, 'hidden_states'):
+                hidden_states = outputs.hidden_states[-1]  # 取最后一层
+            else:
+                hidden_states = logits
+                print("Warning: Using logits as fallback for hidden_states")
 
         # +++ 关键修复：返回字典必须包含 hidden_states +++
         # 确保字典包含 hidden_states
-        print("hidden_states", hidden_states)
-        print("past_key_values", past_key_values)
+        print("hidden_states:", hidden_states.shape)
         return {
             "logits": logits,
             "past_key_values": past_key_values,
-            "hidden_states": hidden_states  # 明确添加最后一层隐藏状态
+            "hidden_states": hidden_states
         }
 
     # qwen.py 中的 _prepare_attention_mask 方法
