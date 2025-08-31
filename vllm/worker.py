@@ -237,25 +237,43 @@ class ModelWorker:
                 use_cache=True
             )
 
-        # 关键修复：正确获取隐藏状态
-        # 检查是否有返回隐藏状态
-        if hasattr(outputs, 'hidden_states'):
-            # 使用最后一层隐藏状态
-            hidden_states = outputs.hidden_states[-1]
-        elif hasattr(outputs, 'last_hidden_state'):
-            hidden_states = outputs.last_hidden_state
+        # 关键修复：使用字典键访问
+        if isinstance(outputs, dict):
+            # 字典访问
+            logits = outputs["logits"]
+            past_key_values = outputs.get("past_key_values")
+
+            # 获取隐藏状态
+            if "hidden_states" in outputs:
+                hidden_states = outputs["hidden_states"]
+            else:
+                # 使用logits作为回退
+                print("Warning: Using logits as fallback for hidden_states")
+                hidden_states = logits
         else:
-            # 回退方案：使用 logits 作为替代
-            print("Warning: Using logits as fallback for hidden_states")
-            hidden_states = outputs.logits
+            # 处理其他输出类型（如元组）
+            print(f"Unexpected output type: {type(outputs)}")
+            # 尝试获取logits和past_key_values
+            logits = outputs.logits
+            past_key_values = outputs.past_key_values if hasattr(outputs, "past_key_values") else None
+
+            # 尝试获取隐藏状态
+            if hasattr(outputs, 'hidden_states'):
+                hidden_states = outputs.hidden_states
+            elif hasattr(outputs, 'last_hidden_state'):
+                hidden_states = outputs.last_hidden_state
+            else:
+                print("Warning: Using logits as fallback for hidden_states")
+                hidden_states = logits
 
         # 打印确认形状
+        print(f"Logits shape: {logits.shape}")
         print(f"Hidden states shape: {hidden_states.shape}")
 
         # 确保返回三个关键值
         return {
-            "logits": outputs.logits,
-            "past_key_values": outputs.past_key_values,
+            "logits": logits,
+            "past_key_values": past_key_values,
             "hidden_states": hidden_states
         }
 

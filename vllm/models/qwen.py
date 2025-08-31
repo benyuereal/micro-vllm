@@ -84,7 +84,8 @@ class QwenModel:
             logits = outputs.logits
             past_key_values = outputs.past_key_values
             hidden_states = outputs.get("hidden_states", logits)  # 兼容无hidden_states的情况
-
+        # 在返回前添加
+        print(f"Returning outputs of type: {type({'logits': logits})}")
         # 确保返回三个关键值
         return {
             "logits": logits,
