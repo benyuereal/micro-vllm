@@ -96,6 +96,11 @@ class QwenModel:
         # +++ 关键修复：返回字典必须包含 hidden_states +++
         # 确保字典包含 hidden_states
         print("hidden_states:", hidden_states.shape)
+        # 修改隐藏状态获取逻辑
+        hidden_states = outputs.get("last_hidden_state",
+                                    outputs.get("hidden_states", logits))
+        print("hidden_states -->:", hidden_states.shape)
+
         return {
             "logits": logits,
             "past_key_values": past_key_values,
