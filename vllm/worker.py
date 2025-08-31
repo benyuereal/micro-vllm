@@ -88,22 +88,34 @@ class ModelWorker:
 
         print(f"ModelWorker initialized with model: {model_name}")
 
+    # 在 ModelWorker 类中修改 process_batch 方法
     def process_batch(self, requests: List[Any]) -> List[Any]:
-
         print(f"Processing batch of {len(requests)} requests")
-        """处理一批请求"""
         if not self.is_running or not requests:
             return []
 
         try:
             # 准备输入数据
             input_data = self._prepare_inputs(requests)
-
             # 执行模型前向传播
             output_data = self._forward_pass(input_data)
 
-            # 采样生成下一个token
-            next_tokens = self.sampler.sample(output_data["logits"], input_data["sampling_params"])
+            # 获取最后一个token的logits [batch_size, vocab_size]
+            last_logits = output_data["logits"][:, -1, :]
+
+            # 逐个样本采样（修复点）
+            next_tokens_list = []
+            for i in range(last_logits.size(0)):
+                # 当前样本的logits [1, vocab_size]
+                logits_i = last_logits[i].unsqueeze(0)
+                # 当前样本的采样参数（单个对象）
+                sampling_param_i = input_data["sampling_params"][i]
+                # 采样
+                next_token_i = self.sampler.sample(logits_i, sampling_param_i)
+                next_tokens_list.append(next_token_i)
+
+            # 合并结果 [batch_size]
+            next_tokens = torch.cat(next_tokens_list, dim=0)
 
             # 更新KV缓存
             self.kv_cache.update_cache(
@@ -119,7 +131,6 @@ class ModelWorker:
 
         except Exception as e:
             print(f"Error processing batch: {e}")
-            # 返回Response对象列表
             return [
                 Response(
                     request_id=req.request_id,
