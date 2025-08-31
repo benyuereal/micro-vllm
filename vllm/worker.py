@@ -237,10 +237,24 @@ class ModelWorker:
                 use_cache=True
             )
 
-        return {
-            "logits": outputs.logits,
-            "past_key_values": outputs.past_key_values
-        }
+            # 关键修复：获取隐藏状态
+            # 如果模型有 hidden_states 输出则直接使用，否则使用最后一层的隐藏状态
+            if hasattr(outputs, 'hidden_states'):
+                hidden_states = outputs.hidden_states
+            elif hasattr(outputs, 'last_hidden_state'):
+                hidden_states = outputs.last_hidden_state
+            else:
+                # 默认使用 logits 作为替代
+                hidden_states = outputs.logits
+
+            print("hidden_states shape:", hidden_states.shape)
+
+            # 确保返回三个关键值
+            return {
+                "logits": outputs.logits,
+                "past_key_values": outputs.past_key_values,
+                "hidden_states": hidden_states  # 添加缺失的第三个值
+            }
 
     def _prepare_responses(self, requests: List[Any], next_tokens: torch.Tensor) -> List[Any]:
         """准备响应数据"""
