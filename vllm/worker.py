@@ -1,13 +1,12 @@
 import torch
 import time
-import traceback
 from typing import List, Dict, Any
 from transformers import AutoTokenizer
 from .cache import PagedKVCache
 from .sampling.sampler import Sampler
 from .models.model_registry import get_model
 from .utils.tensor_parallel import TensorParallelManager
-from .schema import Response
+from .schema import Response  # 从schema导入
 
 
 class ModelWorker:
@@ -21,21 +20,19 @@ class ModelWorker:
                  max_seq_length: int,
                  device: str,
                  memory_manager):
-
         self.model_name = model_name
         self.device = device
         self.max_num_seqs = max_num_seqs
         self.max_seq_length = max_seq_length
         self.memory_manager = memory_manager
 
-        # 设备设置
+        # 修复设备设置
         if device == "cuda" and torch.cuda.is_available():
             device = f"cuda:{torch.cuda.current_device()}"
         self.device = torch.device(device)
 
         if "cuda" in str(self.device) and not torch.cuda.is_available():
             raise RuntimeError("CUDA device requested but not available")
-
         torch.cuda.set_device(self.device)
 
         # 加载分词器
@@ -56,22 +53,20 @@ class ModelWorker:
             tensor_parallel_manager=self.tensor_parallel_manager,
             memory_manager=memory_manager
         )
-        self.model.model.to(self.device)
-
-        num_key_value_heads = getattr(self.model.config, "num_key_value_heads",
-                                      self.model.config.num_attention_heads)
+        self.model.model.to(self.device)  # 确保模型迁移到指定设备
+        num_key_value_heads = getattr(self.model.config, "num_key_value_heads", self.model.config.num_attention_heads)
 
         # 初始化KV缓存
         self.kv_cache = PagedKVCache(
             num_layers=self.model.config.num_hidden_layers,
             num_heads=self.model.config.num_attention_heads,
-            num_key_value_heads=num_key_value_heads,
+            num_key_value_heads=num_key_value_heads,  # 关键添加
             head_size=self.model.config.hidden_size // self.model.config.num_attention_heads,
-            page_size=256,
+            page_size=256,  # 每页256个token
             max_num_seqs=max_num_seqs,
             memory_manager=memory_manager,
-            device=self.device,
-            max_seq_length=max_seq_length,
+            device=self.device,  # 确保传递当前设备
+            max_seq_length=max_seq_length,  # 传入最大序列长度
         )
 
         print(f"Model config - num_attention_heads: {self.model.config.num_attention_heads}")
@@ -79,7 +74,10 @@ class ModelWorker:
 
         # 初始化采样器
         self.sampler = Sampler()
+
+        # 运行状态
         self.is_running = True
+
         print(f"ModelWorker initialized with model: {model_name}")
 
     def process_batch(self, requests: List[Any]) -> List[Any]:
@@ -90,28 +88,31 @@ class ModelWorker:
         try:
             # 准备输入数据
             input_data = self._prepare_inputs(requests)
-            print(f"Input IDs shape: {input_data['input_ids'].shape}")
-
             # 执行模型前向传播
             output_data = self._forward_pass(input_data)
 
-            # 获取最后一个token的logits
+            # 获取最后一个token的logits [batch_size, vocab_size]
             last_logits = output_data["logits"][:, -1, :]
-            print(f"Last token logits shape: {last_logits.shape}")
+            print(f"Last token logits shape: {last_logits.shape}")  # 调试日志
 
             # 逐个样本采样
             next_tokens_list = []
             for i in range(last_logits.size(0)):
+                # 当前样本的logits [vocab_size]
                 logits_i = last_logits[i]
+                # 调试日志：显示采样前的logits维度
+                print(f"Sampling for sample {i}, logits shape: {logits_i.shape}")
+
+                # 当前样本的采样参数
                 sampling_param_i = input_data["sampling_params"][i]
+                # 采样
                 next_token_i = self.sampler.sample(logits_i, sampling_param_i)
                 next_tokens_list.append(next_token_i)
 
-            # 合并结果
+            # 合并结果 [batch_size]
             next_tokens = torch.cat(next_tokens_list, dim=0)
 
             # 更新KV缓存
-            print(f"Updating cache for {len(input_data['sequence_ids'])} sequences")
             self.kv_cache.update_cache(
                 output_data["hidden_states"],
                 input_data["sequence_ids"],
@@ -120,10 +121,11 @@ class ModelWorker:
 
             # 准备响应
             responses = self._prepare_responses(requests, next_tokens)
-            print(f"Batch processed successfully")
+            print(f"Batch processed successfully. Response type: {type(responses[0])}")
             return responses
 
         except Exception as e:
+            import traceback
             print(f"Error processing batch: {e}\n{traceback.format_exc()}")
             return [
                 Response(
@@ -136,6 +138,7 @@ class ModelWorker:
             ]
 
     def _prepare_inputs(self, requests: List[Any]) -> Dict[str, Any]:
+        """准备输入数据"""
         prompts = [req.prompt for req in requests]
         sampling_params = [req.sampling_params for req in requests]
         sequence_ids = [req.request_id for req in requests]
@@ -149,18 +152,19 @@ class ModelWorker:
             max_length=self.max_seq_length
         ).input_ids.to(self.device)
 
-        # 位置信息
+        # 获取位置信息
         positions = torch.arange(
             input_ids.size(1),
             device=self.device
         ).unsqueeze(0).expand(input_ids.size(0), -1)
         positions = positions.to(self.device).contiguous()
 
-        # 历史长度
-        past_seq_lengths = [
-            self.kv_cache.get_sequence_length(seq_id) for seq_id in sequence_ids
-        ]
+        # 获取历史长度（对于连续生成）
 
+
+        past_seq_lengths = torch.tensor([
+            self.kv_cache.get_sequence_length(seq_id) for seq_id in sequence_ids
+        ], device=self.device)  # 确保在GPU上
         return {
             "input_ids": input_ids,
             "positions": positions,
@@ -170,23 +174,56 @@ class ModelWorker:
         }
 
     def _forward_pass(self, input_data: Dict[str, Any]) -> Dict[str, Any]:
+        # 设备检查 ↓↓↓
         print(f"Model device: {next(self.model.model.parameters()).device}")
         print(f"Input IDs device: {input_data['input_ids'].device}")
+        print(f"Positions device: {input_data['positions'].device}")
+        # 打印调试信息
+        print(f"Input IDs shape: {input_data['input_ids'].shape}")
+        print(f"Positions shape: {input_data['positions'].shape}")
 
+        # 添加连续性检查
+        print(f"Input IDs contiguous: {input_data['input_ids'].is_contiguous()}")
+        print(f"Positions contiguous: {input_data['positions'].is_contiguous()}")
+
+        """执行模型前向传播"""
         # 获取历史KV缓存
+        # 获取历史KV缓存（可能为None）
         past_key_values = None
-        if any(length > 0 for length in input_data["past_seq_lengths"]):
+        if input_data["past_seq_lengths"].sum().item() > 0:  # 只有存在历史缓存时才获取
             past_key_values = self.kv_cache.get_cache(
                 input_data["sequence_ids"],
                 input_data["past_seq_lengths"]
             )
 
-        # 确保past_key_values连续
+        # 检查past_key_values的连续性
         if past_key_values:
+            for i, (k, v) in enumerate(past_key_values):
+                print(f"Layer {i} k contiguous: {k.is_contiguous()}")
+                print(f"Layer {i} v contiguous: {v.is_contiguous()}")
+        if past_key_values is not None:
+            print(f"Past KV length: {len(past_key_values)}")
+            print(f"First layer k shape: {past_key_values[0][0].shape}")
+            print(f"First layer v shape: {past_key_values[0][1].shape}")
+        # 打印调试信息
+        print(f"Past KV is None: {past_key_values is None}")
+        print(f"Past KV type: {type(past_key_values)}")
+        if past_key_values and len(past_key_values) > 0:
+            first_tensor = past_key_values[0][0]
+            print(f"First KV tensor device: {first_tensor.device}")
+            print(f"First layer type: {type(past_key_values[0])}")
+            if len(past_key_values[0]) > 0:
+                print(f"First layer k type: {type(past_key_values[0][0])}")
+                if len(past_key_values[0][0]) > 0:
+                    print(f"First sequence k type: {type(past_key_values[0][0][0])}")
+                    print(
+                        f"First sequence k shape: {past_key_values[0][0][0].shape if hasattr(past_key_values[0][0][0], 'shape') else 'No shape'}")
+
+        # 确保past_key_values连续
+        if past_key_values is not None:
             past_key_values = [
                 (k.contiguous(), v.contiguous()) for k, v in past_key_values
             ]
-
         # 执行模型前向传播
         with torch.no_grad():
             outputs = self.model(
@@ -196,35 +233,54 @@ class ModelWorker:
                 use_cache=True
             )
 
-        # 统一输出格式
+        # ======== 修复点：使用字典键访问而不是属性访问 ========
         if isinstance(outputs, dict):
+            # 使用字典键访问
             logits = outputs["logits"]
             past_key_values = outputs.get("past_key_values", None)
+
+            # 获取隐藏状态
             hidden_states = outputs.get("hidden_states", logits)
+
+            # 如果hidden_states是元组（包含所有层），则取最后一层
+            if isinstance(hidden_states, tuple):
+                hidden_states = hidden_states[-1]
         else:
+            # 处理其他输出类型（如元组）
+            print(f"Unexpected output type: {type(outputs)}")
+            # 尝试获取logits和past_key_values
             if hasattr(outputs, 'logits'):
                 logits = outputs.logits
-            elif isinstance(outputs, tuple) and len(outputs) > 0:
-                logits = outputs[0]
             else:
-                raise ValueError("Cannot get logits from model outputs")
+                # 如果连logits属性都没有，则尝试第一个元素
+                if isinstance(outputs, tuple) and len(outputs) > 0:
+                    logits = outputs[0]
+                else:
+                    raise ValueError("Cannot get logits from model outputs")
 
             past_key_values = outputs.past_key_values if hasattr(outputs, "past_key_values") else None
 
+            # 尝试获取隐藏状态
             if hasattr(outputs, 'hidden_states'):
                 hidden_states = outputs.hidden_states
             elif hasattr(outputs, 'last_hidden_state'):
                 hidden_states = outputs.last_hidden_state
             else:
+                print("Warning: Using logits as fallback for hidden_states")
                 hidden_states = logits
 
-        # 确保hidden_states是张量
-        if not isinstance(hidden_states, torch.Tensor):
-            hidden_states = logits
+            # 如果hidden_states是元组，取最后一层
+            if isinstance(hidden_states, tuple):
+                hidden_states = hidden_states[-1]
 
+        # 确保hidden_states是张量（重要！）
+        if not isinstance(hidden_states, torch.Tensor):
+            hidden_states = logits  # 回退使用logits
+        # 打印确认形状
         print(f"Logits shape: {logits.shape}")
         print(f"Hidden states shape: {hidden_states.shape}")
 
+        # 确保返回三个关键值
         return {
             "logits": logits,
             "past_key_values": past_key_values,
@@ -232,29 +288,51 @@ class ModelWorker:
         }
 
     def _prepare_responses(self, requests: List[Any], next_tokens: torch.Tensor) -> List[Any]:
+        """准备响应数据"""
         responses = []
+        # 确保requests和next_tokens长度匹配
+        # 检查张量维度是否匹配
+        if next_tokens.size(0) != len(requests):
+            print(f"Warning: Token count {next_tokens.size(0)} != request count {len(requests)}")
+            # 填充缺失的token
+            next_tokens = torch.cat([
+                next_tokens,
+                torch.full((len(requests) - next_tokens.size(0),), -1, device=self.device)
+            ])
 
         for i, req in enumerate(requests):
             token_tensor = next_tokens[i].unsqueeze(0)
 
+            # 检查token有效性
+            if token_tensor.item() == -1:
+                responses.append(Response(
+                    request_id=req.request_id,
+                    generated_text="",
+                    success=False,
+                    error_message="Token generation failed"
+                ))
+                continue
+
             try:
+                # 安全解码
                 generated_text = self.tokenizer.decode(
                     token_tensor,
                     skip_special_tokens=True
                 )
-                error_msg = None
             except Exception as e:
                 generated_text = ""
                 error_msg = f"Decoding error: {str(e)}"
+            else:
+                error_msg = None
 
             responses.append(Response(
                 request_id=req.request_id,
                 generated_text=generated_text,
-                success=bool(generated_text),
+                success=(generated_text != ""),
                 error_message=error_msg
             ))
-
         return responses
 
     def stop(self):
+        """停止工作器"""
         self.is_running = False
