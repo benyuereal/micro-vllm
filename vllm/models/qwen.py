@@ -82,67 +82,45 @@ class QwenModel:
         """准备注意力掩码（兼容分页缓存结构和分组查询注意力）"""
         batch_size, seq_length = input_ids.shape
 
-        # 确保输入张量连续
-        input_ids = input_ids.contiguous()
-
         if past_key_values is None:
-            print("Using CUDA device -->:", self.model.device)
-            if self.model is None:
-                device = "cuda:0"
-            else:
-                device = self.model.device
-
-            # 创建4D因果掩码 [batch_size, num_heads, seq_len, seq_len]
-            # 注意：这里使用 num_key_value_heads 而不是 num_attention_heads
-            # 使用 ones 而不是 tril 创建基础掩码
-            attention_mask = torch.ones(
-                seq_length, seq_length, dtype=torch.bool, device=device
+            print("past_key_values is None")
+            # 没有历史缓存时，创建标准因果掩码
+            device = self.model.device if self.model else input_ids.device
+            # 创建左下三角因果掩码 [seq_len, seq_len]
+            causal_mask = torch.tril(
+                torch.ones(seq_length, seq_length, dtype=torch.bool, device=device)
             )
-            # 创建下三角掩码（包括对角线）
-            causal_mask = torch.tril(attention_mask)
-
-            # 扩展为4D [batch_size, num_key_value_heads, seq_len, seq_len]
-            # 使用 reshape 而不是 view，并确保连续
+            # 扩展为 [batch_size, 1, seq_len, seq_len]
             causal_mask = causal_mask.reshape(1, 1, seq_length, seq_length)
-            causal_mask = causal_mask.expand(batch_size, self.num_key_value_heads, -1, -1)
+            causal_mask = causal_mask.expand(batch_size, 1, -1, -1)
             return causal_mask.contiguous()
 
-        # 获取每个序列的实际历史长度
-        first_layer_k = past_key_values[0][0]  # 获取第一层的k缓存
-        past_lengths = first_layer_k.size(2)  # 获取历史长度维度
-        num_kv_heads = first_layer_k.size(1)  # 获取键值头数
-
-        # 创建扩展的注意力掩码 [batch_size, num_key_value_heads, seq_length, total_length]
+        # 有历史缓存时的处理（保持不变）
+        first_layer_k = past_key_values[0][0]
+        past_lengths = first_layer_k.size(2)
         total_length = past_lengths + seq_length
+
+        # 创建扩展的注意力掩码 [batch_size, 1, seq_length, total_length]
         extended_attention_mask = torch.zeros(
             batch_size,
-            num_kv_heads,  # 直接使用实际的键值头数量
+            1,  # 关键修改：使用1而不是num_kv_heads
             seq_length,
             total_length,
             dtype=torch.bool,
             device=input_ids.device
         )
 
-        # 填充掩码：
-        # - 历史部分：全部可见（1表示不掩盖）
-        # - 当前部分：因果可见（左下三角为1）
-
-        # 历史部分（从位置0到past_lengths）全部可见
+        # 填充掩码
         extended_attention_mask[:, :, :, :past_lengths] = 1
 
-        # 当前部分：因果掩码（只允许每个token关注自身及之前的token）
-        # 创建一个左下三角矩阵（包括对角线）作为当前部分的掩码
+        # 添加当前序列的因果掩码
         causal_mask = torch.tril(
             torch.ones(seq_length, seq_length, dtype=torch.bool, device=input_ids.device)
         )
-        causal_mask = causal_mask.reshape(1, 1, seq_length, seq_length)  # 使用reshape
-        causal_mask = causal_mask.expand(batch_size, num_kv_heads, -1, -1)
+        causal_mask = causal_mask.reshape(1, 1, seq_length, seq_length)
+        causal_mask = causal_mask.expand(batch_size, 1, -1, -1)
 
         # 将因果掩码复制到当前部分
         extended_attention_mask[:, :, :, past_lengths:past_lengths + seq_length] = causal_mask
 
-        # 调试信息 - 实际部署时可移除
-        print(f"Final attention mask shape: {extended_attention_mask.shape}")
-        print(f"Mask device: {extended_attention_mask.device}")
-
-        return extended_attention_mask.contiguous()  # 确保返回连续张量
+        return extended_attention_mask.contiguous()
