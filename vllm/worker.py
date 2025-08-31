@@ -77,6 +77,9 @@ class ModelWorker:
 
         )
 
+        print(f"Model config - num_attention_heads: {self.model.config.num_attention_heads}")
+        print(f"Model config - num_key_value_heads: {num_key_value_heads}")
+
         # 初始化采样器
         self.sampler = Sampler()
 

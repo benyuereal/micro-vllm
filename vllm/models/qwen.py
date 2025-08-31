@@ -79,48 +79,55 @@ class QwenModel:
     def _prepare_attention_mask(self,
                                 input_ids: torch.Tensor,
                                 past_key_values: Optional[Tuple] = None) -> torch.Tensor:
-        """准备注意力掩码（兼容分页缓存结构和分组查询注意力）"""
+        """准备注意力掩码（兼容Qwen模型要求）"""
         batch_size, seq_length = input_ids.shape
+        device = input_ids.device
+
+        print(f"Preparing attention mask for seq_length={seq_length}")
 
         if past_key_values is None:
-            print("past_key_values is None")
-            # 没有历史缓存时，创建标准因果掩码
-            device = self.model.device if self.model else input_ids.device
-            # 创建左下三角因果掩码 [seq_len, seq_len]
+            print("No past key values - creating causal mask")
+            # Qwen模型在首次生成时需要特殊的4D因果掩码
+            # 创建 [seq_length, seq_length] 的因果掩码
             causal_mask = torch.tril(
                 torch.ones(seq_length, seq_length, dtype=torch.bool, device=device)
             )
-            # 扩展为 [batch_size, 1, seq_len, seq_len]
-            causal_mask = causal_mask.reshape(1, 1, seq_length, seq_length)
+
+            # 扩展为 [batch_size, 1, seq_length, seq_length]
+            causal_mask = causal_mask.unsqueeze(0).unsqueeze(0)  # 添加batch和head维度
             causal_mask = causal_mask.expand(batch_size, 1, -1, -1)
+
+            print(f"Causal mask shape: {causal_mask.shape}")
             return causal_mask.contiguous()
 
-        # 有历史缓存时的处理（保持不变）
+        print("Using past key values - creating extended mask")
+        # 有历史缓存时的处理
         first_layer_k = past_key_values[0][0]
-        past_lengths = first_layer_k.size(2)
+        past_lengths = first_layer_k.size(2)  # [batch, heads, seq_len, head_dim]
         total_length = past_lengths + seq_length
 
         # 创建扩展的注意力掩码 [batch_size, 1, seq_length, total_length]
         extended_attention_mask = torch.zeros(
             batch_size,
-            1,  # 关键修改：使用1而不是num_kv_heads
+            1,  # 单头掩码，模型会广播到多头
             seq_length,
             total_length,
             dtype=torch.bool,
-            device=input_ids.device
+            device=device
         )
 
-        # 填充掩码
+        # 历史部分全部可见
         extended_attention_mask[:, :, :, :past_lengths] = 1
 
-        # 添加当前序列的因果掩码
+        # 当前部分：因果掩码（只允许关注自身及之前的token）
         causal_mask = torch.tril(
-            torch.ones(seq_length, seq_length, dtype=torch.bool, device=input_ids.device)
+            torch.ones(seq_length, seq_length, dtype=torch.bool, device=device)
         )
-        causal_mask = causal_mask.reshape(1, 1, seq_length, seq_length)
+        causal_mask = causal_mask.unsqueeze(0).unsqueeze(0)  # [1, 1, seq_len, seq_len]
         causal_mask = causal_mask.expand(batch_size, 1, -1, -1)
 
-        # 将因果掩码复制到当前部分
+        # 将因果掩码应用到当前部分
         extended_attention_mask[:, :, :, past_lengths:past_lengths + seq_length] = causal_mask
 
+        print(f"Extended mask shape: {extended_attention_mask.shape}")
         return extended_attention_mask.contiguous()
