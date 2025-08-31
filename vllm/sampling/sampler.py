@@ -23,15 +23,17 @@ class Sampler:
 
     def sample(self, logits: torch.Tensor, sampling_params: SamplingParams) -> torch.Tensor:
         """从logits中采样"""
+        # 修复点：显式处理不同维度的输入
+        if logits.dim() == 1:
+            # 处理一维输入 (vocab_size)
+            logits = logits.unsqueeze(0).unsqueeze(0)  # [1, 1, vocab_size]
+        elif logits.dim() == 2:
+            # 处理二维输入 (batch_size, vocab_size)
+            logits = logits.unsqueeze(1)  # [batch_size, 1, vocab_size]
+
+        # 现在logits总是三维
         batch_size, seq_len, vocab_size = logits.shape
-
-        # 修复：处理二维输入（单个样本）
-        if logits.dim() == 2:
-            # 添加虚拟序列维度 [batch_size, seq_len=1, vocab_size]
-            logits = logits.unsqueeze(1)
-
-        # 获取最后一个token的logits
-        last_logits = logits[:, -1, :]
+        last_logits = logits[:, -1, :]  # 获取最后一个token的logits [batch_size, vocab_size]
 
         # 应用温度调节
         if sampling_params.temperature > 0:
@@ -57,7 +59,6 @@ class Sampler:
 
         # 采样
         next_tokens = torch.multinomial(probs, num_samples=1).squeeze(-1)
-
         return next_tokens
 
     def _apply_repetition_penalty(self, logits: torch.Tensor, penalty: float):

@@ -8,6 +8,7 @@ from .models.model_registry import get_model
 from .utils.tensor_parallel import TensorParallelManager
 from .schema import Response  # 从schema导入
 
+
 class ModelWorker:
     """模型工作器，负责实际的前向传播和生成"""
 
@@ -25,23 +26,15 @@ class ModelWorker:
         self.max_seq_length = max_seq_length
         self.memory_manager = memory_manager
 
-        # 修复设备设置 (添加以下代码)
+        # 修复设备设置
         if device == "cuda" and torch.cuda.is_available():
             device = f"cuda:{torch.cuda.current_device()}"
-
         self.device = torch.device(device)
 
-        # 替换原有的设置代码
-        if "cuda" in str(self.device):
-            if not torch.cuda.is_available():
-                raise RuntimeError("CUDA device requested but not available")
-            print( torch.cuda.is_available())
-            torch.cuda.set_device(self.device)
-
-
-
-        # 强制设置PyTorch默认设备
+        if "cuda" in str(self.device) and not torch.cuda.is_available():
+            raise RuntimeError("CUDA device requested but not available")
         torch.cuda.set_device(self.device)
+
         # 加载分词器
         self.tokenizer = AutoTokenizer.from_pretrained(
             tokenizer_name,
@@ -60,9 +53,9 @@ class ModelWorker:
             tensor_parallel_manager=self.tensor_parallel_manager,
             memory_manager=memory_manager
         )
-        # +++ 添加模型迁移到GPU +++
         self.model.model.to(self.device)  # 确保模型迁移到指定设备
         num_key_value_heads = getattr(self.model.config, "num_key_value_heads", self.model.config.num_attention_heads)
+
         # 初始化KV缓存
         self.kv_cache = PagedKVCache(
             num_layers=self.model.config.num_hidden_layers,
@@ -72,9 +65,8 @@ class ModelWorker:
             page_size=256,  # 每页256个token
             max_num_seqs=max_num_seqs,
             memory_manager=memory_manager,
-            device = self.device,  # 确保传递当前设备
+            device=self.device,  # 确保传递当前设备
             max_seq_length=max_seq_length,  # 传入最大序列长度
-
         )
 
         print(f"Model config - num_attention_heads: {self.model.config.num_attention_heads}")
@@ -88,7 +80,6 @@ class ModelWorker:
 
         print(f"ModelWorker initialized with model: {model_name}")
 
-    # 在 ModelWorker 类中修改 process_batch 方法
     def process_batch(self, requests: List[Any]) -> List[Any]:
         print(f"Processing batch of {len(requests)} requests")
         if not self.is_running or not requests:
@@ -102,13 +93,17 @@ class ModelWorker:
 
             # 获取最后一个token的logits [batch_size, vocab_size]
             last_logits = output_data["logits"][:, -1, :]
+            print(f"Last token logits shape: {last_logits.shape}")  # 调试日志
 
-            # 逐个样本采样（修复点）
+            # 逐个样本采样
             next_tokens_list = []
             for i in range(last_logits.size(0)):
-                # 当前样本的logits [1, vocab_size]
-                logits_i = last_logits[i].unsqueeze(0)
-                # 当前样本的采样参数（单个对象）
+                # 当前样本的logits [vocab_size]
+                logits_i = last_logits[i]
+                # 调试日志：显示采样前的logits维度
+                print(f"Sampling for sample {i}, logits shape: {logits_i.shape}")
+
+                # 当前样本的采样参数
                 sampling_param_i = input_data["sampling_params"][i]
                 # 采样
                 next_token_i = self.sampler.sample(logits_i, sampling_param_i)
@@ -130,7 +125,8 @@ class ModelWorker:
             return responses
 
         except Exception as e:
-            print(f"Error processing batch: {e}")
+            import traceback
+            print(f"Error processing batch: {e}\n{traceback.format_exc()}")
             return [
                 Response(
                     request_id=req.request_id,
