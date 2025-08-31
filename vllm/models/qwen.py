@@ -47,7 +47,12 @@ class QwenModel:
 
         return instance
 
-    def __call__(self, input_ids, positions, past_key_values=None, use_cache=False):
+    # 在文档3的 QwenModel 类中修改 __call__ 方法
+    def __call__(self,
+                 input_ids: torch.Tensor,
+                 positions: torch.Tensor,
+                 past_key_values: Optional[Tuple] = None,
+                 use_cache: bool = False):
         # 确保输入连续
         input_ids = input_ids.contiguous()
         positions = positions.contiguous()
@@ -55,14 +60,17 @@ class QwenModel:
         # 准备注意力掩码
         attention_mask = self._prepare_attention_mask(input_ids, past_key_values)
 
-        # 执行前向传播
+        # 执行模型前向传播 - 关键修复：添加 output_hidden_states=True
         outputs = self.model(
             input_ids=input_ids,
             attention_mask=attention_mask,
             position_ids=positions,
             past_key_values=past_key_values,
-            use_cache=use_cache
+            use_cache=use_cache,
+            output_hidden_states=True  # 确保返回隐藏状态
         )
+
+        # 返回完整输出对象
         return outputs
 
     # qwen.py 中的 _prepare_attention_mask 方法
