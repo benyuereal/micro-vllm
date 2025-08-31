@@ -71,31 +71,22 @@ class QwenModel:
             return_dict=True
         )
 
-        # 统一输出格式
-        if not isinstance(outputs, dict):
-            # 处理元组输出
-            if isinstance(outputs, tuple) and len(outputs) == 2:
-                logits, past_key_values = outputs
-                hidden_states = logits  # 默认使用logits
-            else:
-                raise ValueError(f"Unexpected model output type: {type(outputs)}")
+        # 统一输出格式 - 确保包含所有必要字段
+        logits = outputs.logits
+        past_key_values = outputs.past_key_values
+
+        # 获取隐藏状态（优先使用 last_hidden_state）
+        if hasattr(outputs, 'last_hidden_state'):
+            hidden_states = outputs.last_hidden_state
+        elif hasattr(outputs, 'hidden_states'):
+            # 取最后一层隐藏状态
+            hidden_states = outputs.hidden_states[-1]
         else:
-            logits = outputs.logits
-            past_key_values = outputs.past_key_values
+            # 回退到使用 logits
+            hidden_states = logits
+            print("警告：使用 logits 作为隐藏状态")
 
-            # 优先获取last_hidden_state（最终隐藏层）
-            if hasattr(outputs, 'last_hidden_state'):
-                hidden_states = outputs.last_hidden_state
-            # 次选hidden_states（需要取最后一层）
-            elif hasattr(outputs, 'hidden_states'):
-                hidden_states = outputs.hidden_states[-1]  # 取最后一层
-            else:
-                hidden_states = logits
-                print("Warning: Using logits as fallback for hidden_states")
-
-        # +++ 关键修复：返回字典必须包含 hidden_states +++
-        # 确保字典包含 hidden_states
-        print("hidden_states:", hidden_states.shape)
+        # +++ 关键修复：返回字典必须包含所有三个字段 +++
         return {
             "logits": logits,
             "past_key_values": past_key_values,

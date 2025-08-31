@@ -178,23 +178,18 @@ class ModelWorker:
         }
 
     def _forward_pass(self, input_data: Dict[str, Any]) -> Dict[str, Any]:
-        # 设备检查 ↓↓↓
+        # 设备检查
         print(f"Model device: {next(self.model.model.parameters()).device}")
         print(f"Input IDs device: {input_data['input_ids'].device}")
         print(f"Positions device: {input_data['positions'].device}")
-        # 打印调试信息
         print(f"Input IDs shape: {input_data['input_ids'].shape}")
         print(f"Positions shape: {input_data['positions'].shape}")
-
-        # 添加连续性检查
         print(f"Input IDs contiguous: {input_data['input_ids'].is_contiguous()}")
         print(f"Positions contiguous: {input_data['positions'].is_contiguous()}")
 
-        """执行模型前向传播"""
         # 获取历史KV缓存
-        # 获取历史KV缓存（可能为None）
         past_key_values = None
-        if input_data["past_seq_lengths"].sum().item() > 0:  # 只有存在历史缓存时才获取
+        if input_data["past_seq_lengths"].sum().item() > 0:
             past_key_values = self.kv_cache.get_cache(
                 input_data["sequence_ids"],
                 input_data["past_seq_lengths"]
@@ -205,29 +200,20 @@ class ModelWorker:
             for i, (k, v) in enumerate(past_key_values):
                 print(f"Layer {i} k contiguous: {k.is_contiguous()}")
                 print(f"Layer {i} v contiguous: {v.is_contiguous()}")
-        if past_key_values is not None:
-            print(f"Past KV length: {len(past_key_values)}")
-            print(f"First layer k shape: {past_key_values[0][0].shape}")
-            print(f"First layer v shape: {past_key_values[0][1].shape}")
+
         # 打印调试信息
         print(f"Past KV is None: {past_key_values is None}")
         print(f"Past KV type: {type(past_key_values)}")
         if past_key_values and len(past_key_values) > 0:
             first_tensor = past_key_values[0][0]
             print(f"First KV tensor device: {first_tensor.device}")
-            print(f"First layer type: {type(past_key_values[0])}")
-            if len(past_key_values[0]) > 0:
-                print(f"First layer k type: {type(past_key_values[0][0])}")
-                if len(past_key_values[0][0]) > 0:
-                    print(f"First sequence k type: {type(past_key_values[0][0][0])}")
-                    print(
-                        f"First sequence k shape: {past_key_values[0][0][0].shape if hasattr(past_key_values[0][0][0], 'shape') else 'No shape'}")
 
         # 确保past_key_values连续
         if past_key_values is not None:
             past_key_values = [
                 (k.contiguous(), v.contiguous()) for k, v in past_key_values
             ]
+
         # 执行模型前向传播
         with torch.no_grad():
             outputs = self.model(
@@ -237,49 +223,50 @@ class ModelWorker:
                 use_cache=True
             )
 
-        # ======== 修复点：使用字典键访问而不是属性访问 ========
+        # ======== 关键修复：重构输出处理逻辑 ========
+        # 确保正确处理所有输出类型并返回 hidden_states
+
+        # 处理 logits
         if isinstance(outputs, dict):
-            # 使用字典键访问
             logits = outputs["logits"]
-            past_key_values = outputs.get("past_key_values", None)
-
-            # 获取隐藏状态
-            hidden_states = outputs.get("hidden_states", logits)
-
-            # 如果hidden_states是元组（包含所有层），则取最后一层
-            if isinstance(hidden_states, tuple):
-                hidden_states = hidden_states[-1]
+        elif hasattr(outputs, 'logits'):
+            logits = outputs.logits
+        elif isinstance(outputs, tuple) and len(outputs) > 0:
+            logits = outputs[0]
         else:
-            # 处理其他输出类型（如元组）
-            print(f"Unexpected output type: {type(outputs)}")
-            # 尝试获取logits和past_key_values
-            if hasattr(outputs, 'logits'):
-                logits = outputs.logits
-            else:
-                # 如果连logits属性都没有，则尝试第一个元素
-                if isinstance(outputs, tuple) and len(outputs) > 0:
-                    logits = outputs[0]
-                else:
-                    raise ValueError("Cannot get logits from model outputs")
+            raise ValueError("无法从模型输出中获取 logits")
 
-            past_key_values = outputs.past_key_values if hasattr(outputs, "past_key_values") else None
+        # 处理 past_key_values
+        if isinstance(outputs, dict):
+            past_key_values = outputs.get("past_key_values", None)
+        elif hasattr(outputs, 'past_key_values'):
+            past_key_values = outputs.past_key_values
+        else:
+            past_key_values = None
 
-            # 尝试获取隐藏状态
-            if hasattr(outputs, 'hidden_states'):
-                hidden_states = outputs.hidden_states
-            elif hasattr(outputs, 'last_hidden_state'):
-                hidden_states = outputs.last_hidden_state
-            else:
-                print("Warning: Using logits as fallback for hidden_states")
-                hidden_states = logits
+        # 处理 hidden_states - 核心修复点
+        if isinstance(outputs, dict) and "hidden_states" in outputs:
+            # 优先使用字典中的 hidden_states
+            hidden_states = outputs["hidden_states"]
+        elif hasattr(outputs, 'last_hidden_state'):
+            # 使用 last_hidden_state
+            hidden_states = outputs.last_hidden_state
+        elif hasattr(outputs, 'hidden_states'):
+            # 使用 hidden_states（取最后一层）
+            hidden_states = outputs.hidden_states[-1]
+        else:
+            # 最后回退到使用 logits
+            print("警告：使用 logits 作为 hidden_states 的替代")
+            hidden_states = logits
 
-            # 如果hidden_states是元组，取最后一层
-            if isinstance(hidden_states, tuple):
-                hidden_states = hidden_states[-1]
+        # 如果 hidden_states 是元组，取最后一层
+        if isinstance(hidden_states, tuple):
+            hidden_states = hidden_states[-1]
 
-        # 确保hidden_states是张量（重要！）
+        # 确保 hidden_states 是张量
         if not isinstance(hidden_states, torch.Tensor):
-            hidden_states = logits  # 回退使用logits
+            hidden_states = logits
+
         # 打印确认形状
         print(f"Logits shape: {logits.shape}")
         print(f"Hidden states shape: {hidden_states.shape}")
