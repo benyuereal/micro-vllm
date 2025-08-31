@@ -244,9 +244,8 @@ class ModelWorker:
             past_key_values = outputs.get("past_key_values", None)
 
             # 获取隐藏状态
-            # 优先使用last_hidden_state
-            hidden_states = outputs.get("last_hidden_state",
-                                        outputs.get("hidden_states", logits))
+            hidden_states = outputs.get("hidden_states", logits)
+
             # 如果hidden_states是元组（包含所有层），则取最后一层
             if isinstance(hidden_states, tuple):
                 hidden_states = hidden_states[-1]
