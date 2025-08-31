@@ -237,27 +237,31 @@ class ModelWorker:
                 use_cache=True
             )
 
-
-        # 关键修复：使用字典键访问
-        # ======== 关键修复：处理隐藏状态 ========
+        # ======== 修复点：使用字典键访问而不是属性访问 ========
         if isinstance(outputs, dict):
-            logits = outputs.logits
-            past_key_values = outputs.past_key_values
+            # 使用字典键访问
+            logits = outputs["logits"]
+            past_key_values = outputs.get("past_key_values", None)
 
-            # 统一处理隐藏状态（可能是元组或张量）
-            if "hidden_states" in outputs:
-                hidden_states = outputs["hidden_states"]
-                # 如果是元组（包含所有层的状态），取最后一层
-                if isinstance(hidden_states, tuple):
-                    hidden_states = hidden_states[-1]  # 取最后一层隐藏状态
-            else:
-                hidden_states = logits
+            # 获取隐藏状态
+            hidden_states = outputs.get("hidden_states", logits)
+
+            # 如果hidden_states是元组（包含所有层），则取最后一层
+            if isinstance(hidden_states, tuple):
+                hidden_states = hidden_states[-1]
         else:
-
             # 处理其他输出类型（如元组）
             print(f"Unexpected output type: {type(outputs)}")
             # 尝试获取logits和past_key_values
-            logits = outputs.logits
+            if hasattr(outputs, 'logits'):
+                logits = outputs.logits
+            else:
+                # 如果连logits属性都没有，则尝试第一个元素
+                if isinstance(outputs, tuple) and len(outputs) > 0:
+                    logits = outputs[0]
+                else:
+                    raise ValueError("Cannot get logits from model outputs")
+
             past_key_values = outputs.past_key_values if hasattr(outputs, "past_key_values") else None
 
             # 尝试获取隐藏状态
@@ -268,6 +272,10 @@ class ModelWorker:
             else:
                 print("Warning: Using logits as fallback for hidden_states")
                 hidden_states = logits
+
+            # 如果hidden_states是元组，取最后一层
+            if isinstance(hidden_states, tuple):
+                hidden_states = hidden_states[-1]
 
         # 确保hidden_states是张量（重要！）
         if not isinstance(hidden_states, torch.Tensor):
