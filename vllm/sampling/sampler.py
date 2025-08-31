@@ -25,6 +25,11 @@ class Sampler:
         """从logits中采样"""
         batch_size, seq_len, vocab_size = logits.shape
 
+        # 修复：处理二维输入（单个样本）
+        if logits.dim() == 2:
+            # 添加虚拟序列维度 [batch_size, seq_len=1, vocab_size]
+            logits = logits.unsqueeze(1)
+
         # 获取最后一个token的logits
         last_logits = logits[:, -1, :]
 
