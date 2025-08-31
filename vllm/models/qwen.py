@@ -73,24 +73,26 @@ class QwenModel:
 
         # 统一输出格式
         if not isinstance(outputs, dict):
-            # 处理元组输出 (Qwen可能返回元组)
+            # 处理元组输出
             if isinstance(outputs, tuple) and len(outputs) == 2:
                 logits, past_key_values = outputs
-                hidden_states = logits  # 使用logits作为hidden_states的替代
+                hidden_states = logits  # 默认使用logits
             else:
                 raise ValueError(f"Unexpected model output type: {type(outputs)}")
         else:
-            print("Warning: Using logits as fallback for hidden_states")
             logits = outputs.logits
             past_key_values = outputs.past_key_values
-            hidden_states = outputs.get("hidden_states", logits)  # 兼容无hidden_states的情况
-        # 在返回前添加
-        print(f"Returning outputs of type: {type({'logits': logits})}")
-        # 确保返回三个关键值
+            # 确保 hidden_states 存在
+            hidden_states = outputs.get("hidden_states", logits)
+
+        # +++ 关键修复：返回字典必须包含 hidden_states +++
+        # 确保字典包含 hidden_states
+        print("hidden_states", hidden_states)
+        print("past_key_values", past_key_values)
         return {
             "logits": logits,
             "past_key_values": past_key_values,
-            "hidden_states": hidden_states
+            "hidden_states": hidden_states  # 明确添加最后一层隐藏状态
         }
 
     # qwen.py 中的 _prepare_attention_mask 方法
