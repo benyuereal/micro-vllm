@@ -237,20 +237,23 @@ class ModelWorker:
                 use_cache=True
             )
 
-        # 关键修复：使用字典键访问
-        if isinstance(outputs, dict):
-            # 字典访问
-            logits = outputs["logits"]
-            past_key_values = outputs.get("past_key_values")
 
-            # 获取隐藏状态
+        # 关键修复：使用字典键访问
+        # ======== 关键修复：处理隐藏状态 ========
+        if isinstance(outputs, dict):
+            logits = outputs.logits
+            past_key_values = outputs.past_key_values
+
+            # 统一处理隐藏状态（可能是元组或张量）
             if "hidden_states" in outputs:
                 hidden_states = outputs["hidden_states"]
+                # 如果是元组（包含所有层的状态），取最后一层
+                if isinstance(hidden_states, tuple):
+                    hidden_states = hidden_states[-1]  # 取最后一层隐藏状态
             else:
-                # 使用logits作为回退
-                print("Warning: Using logits as fallback for hidden_states")
                 hidden_states = logits
         else:
+
             # 处理其他输出类型（如元组）
             print(f"Unexpected output type: {type(outputs)}")
             # 尝试获取logits和past_key_values
@@ -266,6 +269,9 @@ class ModelWorker:
                 print("Warning: Using logits as fallback for hidden_states")
                 hidden_states = logits
 
+        # 确保hidden_states是张量（重要！）
+        if not isinstance(hidden_states, torch.Tensor):
+            hidden_states = logits  # 回退使用logits
         # 打印确认形状
         print(f"Logits shape: {logits.shape}")
         print(f"Hidden states shape: {hidden_states.shape}")
