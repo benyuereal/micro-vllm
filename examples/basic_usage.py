@@ -26,6 +26,7 @@ def main():
 
     # 准备提示
     prompts = [
+        "hello, how are you?",
         "Hello, my name is",
         "The future of AI is",
         "Once upon a time",
