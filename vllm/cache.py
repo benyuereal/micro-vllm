@@ -52,7 +52,7 @@ class PagedKVCache:
                  max_num_seqs: int = 256,
                  memory_manager=None,
                  device: str = "cuda",
-                 max_seq_length: int = 2048,):
+                 max_seq_length: int = 2048, ):
         self.num_layers = num_layers
         self.num_heads = num_heads
         self.head_size = head_size
@@ -161,21 +161,33 @@ class PagedKVCache:
             pages = self.sequence_table[seq_id]
             current_length = self.sequence_lengths[seq_id]
 
-            # 计算需要的新页面数
-            needed_slots = seq_len
-            current_slots = current_length % self.page_size
-            needed_pages = (current_slots + needed_slots - 1) // self.page_size
+            # 计算需要的新页面数 - 修复逻辑
+            total_slots_needed = current_length + seq_len
+            total_pages_needed = (total_slots_needed + self.page_size - 1) // self.page_size
+            new_pages_needed = max(0, total_pages_needed - len(pages))
 
-            # 分配新页面
-            for _ in range(needed_pages - len(pages)):
-                new_page_id = self.allocate_page()
-                pages.append(new_page_id)
+            # 分配新页面 - 确保至少有一个页面
+            if new_pages_needed > 0 or len(pages) == 0:
+                for _ in range(new_pages_needed):
+                    new_page_id = self.allocate_page()
+                    pages.append(new_page_id)
+                # 确保即使不需要新页面，也至少有一个页面
+                if len(pages) == 0:
+                    new_page_id = self.allocate_page()
+                    pages.append(new_page_id)
 
             # 更新缓存
             for j in range(seq_len):
                 pos = current_length + j
                 page_idx = pos // self.page_size
                 slot_idx = pos % self.page_size
+
+                # 确保页面索引有效
+                if page_idx >= len(pages):
+                    # 如果页面不足，分配新页面
+                    new_page_id = self.allocate_page()
+                    pages.append(new_page_id)
+                    page_idx = len(pages) - 1  # 使用新分配的页面
 
                 page_id = pages[page_idx]
                 page = self.page_pool[page_id]
@@ -251,7 +263,6 @@ class PagedKVCache:
                         # 转置为 [num_heads, page_slots, head_size]
                         k_slice = k_slice.permute(1, 0, 2).contiguous()
                         v_slice = v_slice.permute(1, 0, 2).contiguous()
-
 
                         k_slices.append(k_slice)
                         v_slices.append(v_slice)
