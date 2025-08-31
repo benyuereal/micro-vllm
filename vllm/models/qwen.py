@@ -60,18 +60,37 @@ class QwenModel:
         # 准备注意力掩码
         attention_mask = self._prepare_attention_mask(input_ids, past_key_values)
 
-        # 执行模型前向传播 - 关键修复：添加 output_hidden_states=True
+        # 修改输出处理逻辑
         outputs = self.model(
             input_ids=input_ids,
             attention_mask=attention_mask,
             position_ids=positions,
             past_key_values=past_key_values,
             use_cache=use_cache,
-            output_hidden_states=True  # 确保返回隐藏状态
+            output_hidden_states=True,
+            return_dict=True  # 强制返回字典形式
         )
 
-        # 返回完整输出对象
-        return outputs
+        # 统一输出格式
+        if not isinstance(outputs, dict):
+            # 处理元组输出 (Qwen可能返回元组)
+            if isinstance(outputs, tuple) and len(outputs) == 2:
+                logits, past_key_values = outputs
+                hidden_states = logits  # 使用logits作为hidden_states的替代
+            else:
+                raise ValueError(f"Unexpected model output type: {type(outputs)}")
+        else:
+            print("Warning: Using logits as fallback for hidden_states")
+            logits = outputs.logits
+            past_key_values = outputs.past_key_values
+            hidden_states = outputs.get("hidden_states", logits)  # 兼容无hidden_states的情况
+
+        # 确保返回三个关键值
+        return {
+            "logits": logits,
+            "past_key_values": past_key_values,
+            "hidden_states": hidden_states
+        }
 
     # qwen.py 中的 _prepare_attention_mask 方法
     def _prepare_attention_mask(self,
