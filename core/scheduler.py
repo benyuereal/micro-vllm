@@ -2,8 +2,7 @@
 from collections import deque
 import random
 
-from core import Sequence
-
+from .sequence import Sequence
 
 class Scheduler:
     def __init__(self, max_batch_size=8, max_queue_size=128):
