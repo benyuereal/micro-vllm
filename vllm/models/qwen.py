@@ -60,7 +60,7 @@ class QwenModel:
         # 准备注意力掩码
         attention_mask = self._prepare_attention_mask(input_ids, past_key_values)
 
-        # 修改输出处理逻辑
+        # 调用模型
         outputs = self.model(
             input_ids=input_ids,
             attention_mask=attention_mask,
@@ -72,30 +72,20 @@ class QwenModel:
         )
 
         # 统一输出格式
-        if not isinstance(outputs, dict):
-            # 处理元组输出
-            if isinstance(outputs, tuple) and len(outputs) == 2:
-                logits, past_key_values = outputs
-                hidden_states = logits  # 默认使用logits
-            else:
-                raise ValueError(f"Unexpected model output type: {type(outputs)}")
+        logits = outputs.logits
+        past_key_values = outputs.past_key_values
+
+        # 优先使用last_hidden_state
+        if hasattr(outputs, 'last_hidden_state'):
+            hidden_states = outputs.last_hidden_state
+        # 其次使用hidden_states（取最后一层）
+        elif hasattr(outputs, 'hidden_states') and outputs.hidden_states is not None:
+            hidden_states = outputs.hidden_states[-1]
         else:
-            logits = outputs.logits
-            past_key_values = outputs.past_key_values
+            # 回退使用logits
+            hidden_states = logits
 
-            # 优先获取last_hidden_state（最终隐藏层）
-            if hasattr(outputs, 'last_hidden_state'):
-                hidden_states = outputs.last_hidden_state
-            # 次选hidden_states（需要取最后一层）
-            elif hasattr(outputs, 'hidden_states'):
-                hidden_states = outputs.hidden_states[-1]  # 取最后一层
-            else:
-                hidden_states = logits
-                print("Warning: Using logits as fallback for hidden_states")
-
-        # +++ 关键修复：返回字典必须包含 hidden_states +++
-        # 确保字典包含 hidden_states
-        print("hidden_states:", hidden_states.shape)
+        # 确保返回三个关键值
         return {
             "logits": logits,
             "past_key_values": past_key_values,
