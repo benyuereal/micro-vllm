@@ -310,7 +310,7 @@ class ModelWorker:
         }
 
     def _forward_pass(self, input_data: Dict[str, Any]) -> Dict[str, Any]:
-        """执行模型前向传播（完整修复版）"""
+        """执行模型前向传播（修复版）"""
         # 打印调试信息
         print(f"Input IDs shape: {input_data['input_ids'].shape}")
         print(f"Positions shape: {input_data['positions'].shape}")
@@ -318,31 +318,11 @@ class ModelWorker:
         # 确保张量连续
         input_ids = input_data["input_ids"].contiguous()
         positions = input_data["positions"].contiguous()
+        past_key_values = input_data.get("past_key_values", None)
 
         # 获取历史KV缓存
-        past_key_values = None
-        if input_data["past_seq_lengths"].sum().item() > 0:
-            try:
-                # 转换past_seq_lengths为列表
-                past_lengths_list = input_data["past_seq_lengths"].cpu().tolist()
-                past_key_values = self.kv_cache.get_cache(
-                    input_data["sequence_ids"],
-                    past_lengths_list
-                )
-
-                # 确保缓存张量连续
-                if past_key_values:
-                    past_key_values = [
-                        (k.contiguous(), v.contiguous())
-                        for k, v in past_key_values
-                    ]
-            except Exception as e:
-                print(f"Error getting KV cache: {e}")
-                past_key_values = None
-
-        # 打印缓存信息
         print(f"Past KV is None: {past_key_values is None}")
-        if past_key_values:
+        if past_key_values is not None:
             print(f"Past KV length: {len(past_key_values)}")
             if len(past_key_values) > 0:
                 first_layer = past_key_values[0]
