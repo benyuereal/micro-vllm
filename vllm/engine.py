@@ -155,6 +155,11 @@ class LLMEngine:
             if req_id in self.response_queues:
                 del self.response_queues[req_id]
 
+        # 在响应后清除缓存
+        for response in responses:
+            req_id = response.request_id
+            if req_id in self.worker.sequence_kv_cache:  # 新增
+                del self.worker.sequence_kv_cache[req_id]
 
         return responses
 
