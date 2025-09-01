@@ -148,13 +148,8 @@ class QwenModelAdapter:
             # 合并所有序列
             input_ids = torch.cat(padded_input_ids, dim=0)
             position_ids = torch.cat(padded_position_ids, dim=0)
-
-            # 合并注意力掩码并转换为四维格式 [batch, 1, tgt_len, src_len]
-            if any(m is not None for m in padded_attention_mask):
-                attention_mask = torch.cat(padded_attention_mask, dim=0)
-                attention_mask = attention_mask.unsqueeze(1)  # 增加维度使其成为四维
-            else:
-                attention_mask = None
+            attention_mask = torch.cat(padded_attention_mask, dim=0) if any(
+                m is not None for m in padded_attention_mask) else None
         else:
             # 解码阶段不需要填充
             input_ids = torch.cat(input_ids_list, dim=0)
@@ -183,7 +178,7 @@ class QwenModelAdapter:
         return {
             "input_ids": input_ids,
             "position_ids": position_ids,
-            "attention_mask": attention_mask,  # 现在是四维张量
+            "attention_mask": attention_mask,
             "past_key_values": past_key_values,
             "use_cache": True
         }
