@@ -86,31 +86,22 @@ class ModelWorker:
             return []
 
         try:
-            # 调试信息：显示当前序列状态
-            print("Current batch sequence states:")
+            # 初始化请求状态
             for req in requests:
-                # 确保 prompt_ids 存在且有效
-                if not hasattr(req, 'prompt_ids') or req.prompt_ids is None:
-                    # 初始化 prompt_ids
-                    req.prompt_ids = self.tokenizer.encode(
-                        req.prompt,
-                        return_tensors="pt",
-                        padding=False,
-                        truncation=True,
-                        max_length=self.max_seq_length
-                    ).to(self.device).squeeze(0)
-                seq_length = self.kv_cache.get_sequence_length(req.request_id)
-                print(f"Request {req.request_id}: "
-                      f"Prompt len={len(req.prompt_ids) if hasattr(req, 'prompt_ids') else 0}, "
-                      f"Generated tokens={len(getattr(req, 'generated_token_ids', []))}, "
-                      f"Cache length={seq_length}")
-
-            # 维护每个请求的生成状态
-            for req in requests:
+                # 确保请求有必要的属性
                 if not hasattr(req, 'generated_token_ids'):
-                    req.generated_token_ids = []  # 存储已生成的token IDs
+                    req.generated_token_ids = []
+                if not hasattr(req, 'remaining_tokens'):
+                    req.remaining_tokens = req.sampling_params.max_tokens
+                if not hasattr(req, 'is_completed'):
+                    req.is_completed = False
+                if not hasattr(req, 'start_time'):
+                    req.start_time = time.time()
+                if not hasattr(req, 'last_decoded_index'):
+                    req.last_decoded_index = 0
 
-                    # 编码提示文本
+                # 编码提示文本（如果尚未编码）
+                if not hasattr(req, 'prompt_ids') or req.prompt_ids is None:
                     req.prompt_ids = self.tokenizer.encode(
                         req.prompt,
                         return_tensors="pt",
@@ -119,105 +110,108 @@ class ModelWorker:
                         max_length=self.max_seq_length
                     ).to(self.device).squeeze(0)
 
-                    req.remaining_tokens = req.sampling_params.max_tokens
-                    req.is_completed = False
-                    req.start_time = time.time()
-                    req.last_decoded_index = 0  # 初始化最后解码位置
-
-                    # 初始化KV缓存
+                # 初始化KV缓存
+                if req.request_id not in self.kv_cache.sequence_table:
                     self.kv_cache.add_sequence(req.request_id)
 
-                # 确保请求有last_decoded_index属性
-                if not hasattr(req, 'last_decoded_index'):
-                    req.last_decoded_index = len(req.generated_token_ids)
+            # 获取最大生成步数（所有请求的最大token数）
+            max_steps = max(req.sampling_params.max_tokens for req in requests)
 
-            # 准备当前步的输入
-            input_ids_batch = []
-            positions_batch = []
-            sequence_ids = []
-            past_seq_lengths = []
-            sampling_params_list = []
+            # 循环生成token直到所有请求完成或达到最大步数
+            for step in range(max_steps):
+                # 检查是否所有请求都已完成
+                all_completed = all(req.is_completed for req in requests)
+                if all_completed:
+                    break
 
-            for req in requests:
-                if req.is_completed:
+                # 准备当前步的输入
+                input_ids_batch = []
+                positions_batch = []
+                sequence_ids = []
+                past_seq_lengths = []
+                active_indices = []  # 活跃请求的索引
+
+                for i, req in enumerate(requests):
+                    if req.is_completed:
+                        continue
+
+                    active_indices.append(i)
+
+                    if len(req.generated_token_ids) == 0:
+                        # 第一次生成：使用完整prompt
+                        input_ids = req.prompt_ids
+                        positions = torch.arange(len(input_ids), device=self.device)
+                    else:
+                        # 后续生成：只使用最新生成的token
+                        input_ids = torch.tensor([req.generated_token_ids[-1]], device=self.device)
+                        positions = torch.tensor([len(req.prompt_ids) + len(req.generated_token_ids) - 1],
+                                                 device=self.device)
+
+                    input_ids_batch.append(input_ids)
+                    positions_batch.append(positions)
+                    sequence_ids.append(req.request_id)
+                    past_seq_lengths.append(self.kv_cache.get_sequence_length(req.request_id))
+
+                # 如果没有活跃请求，跳过本次迭代
+                if not active_indices:
                     continue
 
-                if len(req.generated_token_ids) == 0:
-                    # 第一次生成：使用完整prompt
-                    input_ids = req.prompt_ids
-                    positions = torch.arange(len(input_ids), device=self.device)
-                else:
-                    # 后续生成：只使用最新生成的token
-                    input_ids = torch.tensor([req.generated_token_ids[-1]], device=self.device)
-                    positions = torch.tensor([len(req.prompt_ids) + len(req.generated_token_ids) - 1],
-                                             device=self.device)
+                # 填充batch
+                max_len = max(len(ids) for ids in input_ids_batch) if input_ids_batch else 1
+                padded_input_ids = torch.full((len(active_indices), max_len), self.tokenizer.pad_token_id,
+                                              device=self.device)
+                padded_positions = torch.full((len(active_indices), max_len), -1, device=self.device)
 
-                input_ids_batch.append(input_ids)
-                positions_batch.append(positions)
-                sequence_ids.append(req.request_id)
-                past_seq_lengths.append(self.kv_cache.get_sequence_length(req.request_id))
-                sampling_params_list.append(req.sampling_params)
+                for i, (ids, pos) in enumerate(zip(input_ids_batch, positions_batch)):
+                    padded_input_ids[i, :len(ids)] = ids
+                    if len(pos) > 0:  # 确保位置张量非空
+                        padded_positions[i, :len(pos)] = pos
 
-            # 填充batch
-            max_len = max(len(ids) for ids in input_ids_batch) if input_ids_batch else 1
-            padded_input_ids = torch.full((len(input_ids_batch), max_len), self.tokenizer.pad_token_id,
-                                          device=self.device)
-            padded_positions = torch.full((len(positions_batch), max_len), -1, device=self.device)
+                # 准备输入数据
+                input_data = {
+                    "input_ids": padded_input_ids,
+                    "positions": padded_positions,
+                    "sequence_ids": sequence_ids,
+                    "past_seq_lengths": torch.tensor(past_seq_lengths, device=self.device)
+                }
 
-            for i, (ids, pos) in enumerate(zip(input_ids_batch, positions_batch)):
-                padded_input_ids[i, :len(ids)] = ids
-                if len(pos) > 0:  # 确保位置张量非空
-                    padded_positions[i, :len(pos)] = pos
+                # 执行前向传播
+                output_data = self._forward_pass(input_data)
 
-            # 准备输入数据
-            input_data = {
-                "input_ids": padded_input_ids,
-                "positions": padded_positions,
-                "sequence_ids": sequence_ids,
-                "sampling_params": sampling_params_list,
-                "past_seq_lengths": torch.tensor(past_seq_lengths, device=self.device)
-            }
+                # 获取最后一个token的logits
+                last_logits = output_data["logits"][:, -1, :]
+                print(f"Step {step + 1}: Last token logits shape: {last_logits.shape}")
 
-            # 执行前向传播
-            output_data = self._forward_pass(input_data)
+                # 逐个样本采样
+                next_tokens_list = []
+                for idx, i in enumerate(active_indices):
+                    req = requests[i]
+                    logits_i = last_logits[idx]
+                    next_token = self.sampler.sample(logits_i.unsqueeze(0), req.sampling_params)
+                    next_tokens_list.append(next_token)
 
-            # 获取最后一个token的logits
-            last_logits = output_data["logits"][:, -1, :]
-            print(f"Last token logits shape: {last_logits.shape}")
+                    # 更新请求状态
+                    req.generated_token_ids.append(next_token.item())
+                    req.remaining_tokens -= 1
 
-            # 逐个样本采样
-            next_tokens_list = []
-            for i, req in enumerate(requests):
-                if req.is_completed:
-                    next_tokens_list.append(torch.tensor([self.tokenizer.pad_token_id], device=self.device))
-                    continue
+                    # 检查完成条件
+                    if (req.remaining_tokens <= 0 or
+                            next_token.item() == self.tokenizer.eos_token_id or
+                            time.time() - req.start_time > 30):  # 超时保护
+                        req.is_completed = True
 
-                logits_i = last_logits[i]
-                next_token = self.sampler.sample(logits_i.unsqueeze(0), req.sampling_params)
-                next_tokens_list.append(next_token)
-
-                # 更新请求状态
-                req.generated_token_ids.append(next_token.item())
-                req.remaining_tokens -= 1
-
-                # 检查完成条件
-                if (req.remaining_tokens <= 0 or
-                        next_token.item() == self.tokenizer.eos_token_id or
-                        time.time() - req.start_time > 30):  # 超时保护
-                    req.is_completed = True
-
-            # 更新KV缓存
-            if output_data["hidden_states"] is not None:
-                # 确保形状兼容
-                hidden_states = output_data["hidden_states"]
-                if hidden_states.dim() == 3:  # [batch, seq, dim]
-                    self.kv_cache.update_cache(
-                        hidden_states,  # 使用全部隐藏状态
-                        sequence_ids,
-                        padded_positions
-                    )
-                else:
-                    print(f"Warning: Unexpected hidden states shape {hidden_states.shape}")
+                # 更新KV缓存
+                if output_data["hidden_states"] is not None:
+                    hidden_states = output_data["hidden_states"]
+                    if hidden_states.dim() == 3:  # [batch, seq, dim]
+                        # 只更新最后一个token的隐藏状态
+                        self.kv_cache.update_cache(
+                            hidden_states[:, -1:, :],  # 只取最后一个token
+                            sequence_ids,
+                            padded_positions[:, -1:]  # 只取最后一个位置
+                        )
+                    else:
+                        print(f"Warning: Unexpected hidden states shape {hidden_states.shape}")
 
             # 准备响应
             responses = []
@@ -225,8 +219,8 @@ class ModelWorker:
                 if req.is_completed:
                     # 完整解码生成的文本
                     full_ids = torch.cat([
-                        req.prompt_ids,
-                        torch.tensor(req.generated_token_ids, device=self.device)
+                        req.prompt_ids.cpu(),
+                        torch.tensor(req.generated_token_ids)
                     ])
                     generated_text = self.tokenizer.decode(
                         full_ids[len(req.prompt_ids):],
@@ -259,11 +253,11 @@ class ModelWorker:
                         request_id=req.request_id,
                         generated_text=new_text,
                         success=False,
-                        error_message=None
+                        error_message="Generation not completed"
                     ))
 
-            print(
-                f"Batch processed successfully. Completed requests: {sum(1 for r in requests if r.is_completed)}/{len(requests)}")
+            completed_count = sum(1 for r in responses if r.success)
+            print(f"Batch processed successfully. Completed requests: {completed_count}/{len(requests)}")
             return responses
 
         except Exception as e:

@@ -7,23 +7,9 @@ from dataclasses import dataclass
 from .worker import ModelWorker
 from .sampling.sampler import SamplingParams
 from .utils.memory_utils import MemoryManager
-from .schema import Request, Response  # 从schema导入
-
-# @dataclass
-# class Request:
-#     request_id: int
-#     prompt: str
-#     sampling_params: SamplingParams
-#     arrival_time: float
-#     priority: int = 0
-#
-#
-# @dataclass
-# class Response:
-#     request_id: int
-#     generated_text: str
-#     success: bool
-#     error_message: Optional[str] = None
+from .schema import Request, Response
+from .request_queue import RequestQueue  # 新增
+from .response import batch_format_responses  # 新增
 
 
 class LLMEngine:
@@ -35,7 +21,8 @@ class LLMEngine:
                  tensor_parallel_size: int = 1,
                  max_num_seqs: int = 256,
                  max_seq_length: int = 2048,
-                 device: str = "cuda"):
+                 device: str = "cuda",
+                 max_batch_size: int = 32):  # 添加批量大小参数
         self.model_name = model
         self.tokenizer_name = tokenizer or model
         self.tensor_parallel_size = tensor_parallel_size
@@ -61,12 +48,8 @@ class LLMEngine:
             memory_manager=self.memory_manager
         )
 
-        # 请求队列
-        self.request_queue = Queue()
-        self.response_queues = {}
-
-        # 请求计数器
-        self.request_counter = 0
+        # 使用RequestQueue管理请求
+        self.request_queue_manager = RequestQueue(max_batch_size=max_batch_size)
 
         # 启动工作线程
         self.worker_thread = threading.Thread(target=self._worker_loop, daemon=True)
@@ -75,63 +58,24 @@ class LLMEngine:
         print(f"LLMEngine initialized with model: {model}")
 
     def _worker_loop(self):
-        """工作线程主循环（修复版：支持连续批处理）"""
-        # 活动请求池
-        active_requests = {}
-
+        """工作线程主循环（集成RequestQueue）"""
         while self.worker.is_running:
             try:
-                # 添加新请求到活动池
-                while not self.request_queue.empty():
-                    req = self.request_queue.get_nowait()
-                    req_id = req.request_id
-
-                    # 初始化生成状态
-                    if not hasattr(req, 'generated_token_ids'):
-                        req.generated_token_ids = []
-                        req.prompt_ids = self.worker.tokenizer.encode(
-                            req.prompt, return_tensors="pt"
-                        ).to(self.worker.device).squeeze(0)
-                        req.remaining_tokens = req.sampling_params.max_tokens
-                        req.is_completed = False
-                        req.start_time = time.time()
-
-                    # 添加到活动请求池
-                    active_requests[req_id] = (req, self.response_queues[req_id])
-
-                # 如果没有活动请求，短暂休眠
-                if not active_requests:
+                # 获取下一个批次
+                batch, response_queues = self.request_queue_manager.get_next_batch()
+                if not batch:
                     time.sleep(0.01)
                     continue
 
-                # 准备批次（最多max_num_seqs个请求）
-                batch_requests = []
-                for req, queue in active_requests.values():
-                    if not req.is_completed:
-                        batch_requests.append(req)
-                        if len(batch_requests) >= self.max_num_seqs:
-                            break
-
                 # 处理批次
-                if batch_requests:
-                    responses = self.worker.process_batch(batch_requests)
+                responses = self.worker.process_batch(batch)
 
-                    # 处理响应并更新活动池
-                    for response in responses:
-                        req_id = response.request_id
-                        if req_id in active_requests:
-                            req, queue = active_requests[req_id]
+                # 发送响应
+                for response in responses:
+                    self.request_queue_manager.send_response(response.request_id, response)
+                    if response.success:
+                        self.request_queue_manager.cleanup_request(response.request_id)
 
-                            # 发送响应
-                            queue.put(response)
-
-                            # 如果请求完成，从活动池移除
-                            if response.success:
-                                del active_requests[req_id]
-                                if req_id in self.response_queues:
-                                    del self.response_queues[req_id]
-
-                # 短暂休眠以避免过度占用CPU
                 time.sleep(0.001)
 
             except Exception as e:
@@ -140,79 +84,46 @@ class LLMEngine:
                 traceback.print_exc()
                 time.sleep(0.1)
 
-    def _get_batch_requests(self) -> List[Request]:
-        """从队列中获取一批请求，实现Continuous Batching"""
-        batch_requests = []
-
-        try:
-            # 获取第一个请求
-            first_request = self.request_queue.get_nowait()
-            batch_requests.append(first_request)
-
-            # 尝试获取更多请求，直到达到批处理大小或队列为空
-            while len(batch_requests) < self.max_num_seqs:
-                request = self.request_queue.get_nowait()
-                batch_requests.append(request)
-
-        except Empty:
-            pass  # 队列为空是正常情况
-
-        return batch_requests
-
     def generate(self,
                  prompts: List[str],
-                 sampling_params: SamplingParams) -> List[Response]:
-        """生成文本"""
+                 sampling_params: SamplingParams,
+                 as_json: bool = False) -> List[Any]:
+        """生成文本（支持响应格式化）"""
         responses = []
-        response_queues = []
 
         # 为每个提示创建请求
         for prompt in prompts:
-            self.request_counter += 1
-            request_id = self.request_counter
+            request_id = self.request_queue_manager.get_next_request_id()
 
-            # 创建响应队列
-            response_queue = Queue()
-            self.response_queues[request_id] = response_queue
-            response_queues.append(response_queue)
-
-            # 创建请求并初始化所有状态
+            # 创建请求
             request = Request(
                 request_id=request_id,
                 prompt=prompt,
                 sampling_params=sampling_params,
-                arrival_time=time.time(),
-                # 初始化状态字段
-                generated_token_ids=[],
-                remaining_tokens=sampling_params.max_tokens,
-                is_completed=False,
-                start_time=time.time(),
-                last_decoded_index=0  # 初始化最后解码位置
+                arrival_time=time.time()
             )
 
-            # 将请求加入队列
-            self.request_queue.put(request)
+            # 添加到请求队列
+            self.request_queue_manager.add_request(request)
 
-        # 等待所有响应
-        for response_queue in response_queues:
-            try:
-                response = response_queue.get(timeout=30)  # 设置超时避免无限等待
-                responses.append(response)
+        # 获取批次并处理
+        while True:
+            batch, response_queues = self.request_queue_manager.get_next_batch()
+            if not batch:
+                break
 
-                # 兼容字典和对象两种类型
-                req_id = response['request_id'] if isinstance(response, dict) else response.request_id
-                if req_id in self.response_queues:
-                    del self.response_queues[req_id]
-            except Empty:
-                # 超时处理
-                responses.append(Response(
-                    request_id=request_id,
-                    generated_text="",
-                    success=False,
-                    error_message="Timeout waiting for response"
-                ))
+            # 处理批次
+            worker_responses = self.worker.process_batch(batch)
 
-        return responses
+            # 发送响应
+            for response in worker_responses:
+                self.request_queue_manager.send_response(response.request_id, response)
+                if response.success:
+                    self.request_queue_manager.cleanup_request(response.request_id)
+                    responses.append(response)
+
+        # 格式化响应
+        return batch_format_responses(responses, as_json=as_json)
 
     def shutdown(self):
         """关闭引擎"""
