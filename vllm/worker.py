@@ -181,10 +181,11 @@ class ModelWorker:
 
             # 更新KV缓存（仅使用新生成的token）
             if output_data["hidden_states"] is not None:
+                # 改为：使用整个输出隐藏状态更新缓存
                 self.kv_cache.update_cache(
-                    output_data["hidden_states"][:, -1:, :],  # 只取最后一个token的隐藏状态
+                    output_data["hidden_states"],  # 使用全部隐藏状态
                     sequence_ids,
-                    padded_positions[:, -1].unsqueeze(1)  # 只取最后一个位置
+                    padded_positions
                 )
 
             # 在更新缓存后添加调试信息
@@ -219,12 +220,15 @@ class ModelWorker:
                     self.kv_cache.remove_sequence(req.request_id)
                 else:
                     # 返回中间结果（当前生成的token）
+                    # 改为：累积解码所有生成的token
+                    full_tokens = torch.cat([req.prompt_ids, torch.tensor(req.generated_token_ids, device=self.device)])
+                    new_text = self.tokenizer.decode(
+                        full_tokens[len(req.prompt_ids):],
+                        skip_special_tokens=True
+                    )
                     responses.append(Response(
                         request_id=req.request_id,
-                        generated_text=self.tokenizer.decode(
-                            [req.generated_token_ids[-1]],
-                            skip_special_tokens=True
-                        ),
+                        generated_text=new_text,
                         success=False,
                         error_message=None
                     ))

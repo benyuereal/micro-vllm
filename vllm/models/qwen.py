@@ -93,10 +93,10 @@ class QwenModel:
         }
 
     # qwen.py 中的 _prepare_attention_mask 方法
+    # qwen.py 中的 _prepare_attention_mask 方法
     def _prepare_attention_mask(self,
                                 input_ids: torch.Tensor,
                                 past_key_values: Optional[Tuple] = None) -> torch.Tensor:
-        """准备符合Qwen要求的注意力掩码"""
         batch_size, seq_length = input_ids.shape
         device = input_ids.device
 
@@ -106,21 +106,14 @@ class QwenModel:
 
         # 获取历史长度
         past_length = 0
-        if past_key_values is not None and len(past_key_values) > 0:
-            first_layer_k = past_key_values[0][0]
-            if first_layer_k is not None:
-                # 张量形状: [batch, num_heads, seq_len, head_dim]
-                past_length = first_layer_k.size(2)
+        if past_key_values and past_key_values[0][0] is not None:
+            past_length = past_key_values[0][0].size(2)
 
-        # 创建扩展掩码 [batch_size, total_length]
+        # 创建因果掩码 (布尔类型)
         total_length = past_length + seq_length
-        attention_mask = torch.ones(batch_size, total_length, dtype=torch.long, device=device)
+        causal_mask = torch.tril(
+            torch.ones(total_length, total_length, dtype=torch.bool, device=device)
+        )
 
-        # 创建因果掩码（下三角矩阵）
-        causal_mask = torch.tril(torch.ones(total_length, total_length, device=device)).unsqueeze(0)
-        attention_mask = attention_mask.unsqueeze(1) & causal_mask
-
-        # 压缩维度: [batch_size, 1, total_length, total_length] -> [batch_size, total_length]
-        attention_mask = attention_mask[:, 0, 0]  # 取第一个token的掩码作为代表
-
-        return attention_mask.contiguous()
+        # 提取当前序列的掩码部分
+        return causal_mask[past_length:, :].unsqueeze(0)  # [1, current_len, total_len]
