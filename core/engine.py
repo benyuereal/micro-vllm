@@ -59,7 +59,10 @@ class InferenceEngine:
 
         results = {}
         for i, seq in enumerate(batch_sequences):
-            seq_logits = logits[i:i + 1, input_lengths[i] - 1:input_lengths[i], :]
+            # 修改这里：直接取最后一个token的logits，确保形状为 (1, vocab_size)
+            last_token_idx = input_lengths[i] - 1
+            seq_logits = logits[i:i + 1, last_token_idx, :]  # 形状 (1, V)
+
             results[seq.seq_id] = seq_logits
             self.cache.allocate(seq.seq_id, tuple(pk[i:i + 1] for pk in past_key_values))
             seq.prefill_done = True
@@ -103,12 +106,17 @@ class InferenceEngine:
         # 返回每个序列的logits
         return {seq.seq_id: logits[i:i + 1, -1, :] for i, seq in enumerate(sequences)}
 
+    # core/engine.py (修改部分)
     def sample_next_tokens(self, logits_dict: Dict[int, torch.Tensor],
                            temperature: float = 0.7, top_p: float = 0.9) -> Dict[int, int]:
         """批量采样下一个token"""
         next_tokens = {}
 
         for seq_id, logits in logits_dict.items():
+            # 确保logits是2维：[batch_size, vocab_size]
+            if logits.dim() == 3:
+                logits = logits.squeeze(1)  # 从 (1, 1, V) -> (1, V)
+
             # 应用温度
             logits = logits / temperature
 
@@ -124,8 +132,12 @@ class InferenceEngine:
             indices_to_remove = sorted_indices[sorted_indices_to_remove]
             logits.scatter_(dim=-1, index=indices_to_remove, value=float('-inf'))
 
-            # 从剩余token中采样
+            # 确保概率分布是有效的2维张量
             probs = F.softmax(logits, dim=-1)
+            if probs.dim() == 1:
+                probs = probs.unsqueeze(0)  # 从 (V) -> (1, V)
+
+            # 从剩余token中采样
             next_token = torch.multinomial(probs, num_samples=1).item()
             next_tokens[seq_id] = next_token
 
