@@ -16,7 +16,7 @@ if __name__ == "__main__":
         "Python编程有什么优势"
     ]
 
-    print("Generating responses...")
+    print(f"Generating responses for {len(prompts)} prompts...")
     start_time = time.time()
     results = engine.generate(prompts, max_tokens=50)
     gen_time = time.time() - start_time
@@ -27,8 +27,14 @@ if __name__ == "__main__":
         if seq_id in results:
             print(f"Prompt {i + 1}: {prompt}")
             print(f"Response: {results[seq_id]}")
+            print(f"Length: {len(results[seq_id].split())} tokens")
             print("-" * 80)
         else:
             print(f"Prompt {i + 1}: {prompt} - No response generated")
 
-    print(f"\nGenerated {len(prompts)} responses in {gen_time:.2f} seconds")
+    tokens_generated = sum(len(response.split()) for response in results.values())
+    tokens_per_sec = tokens_generated / gen_time if gen_time > 0 else 0
+
+    print(f"\nGenerated {tokens_generated} tokens in {gen_time:.2f} seconds")
+    print(f"Throughput: {tokens_per_sec:.2f} tokens/sec")
+    print("Done!")
