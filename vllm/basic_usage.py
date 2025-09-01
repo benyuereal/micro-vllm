@@ -76,24 +76,43 @@ class ModelTester:
         print_colored("\n[Direct Inference Test]", "yellow")
         print_colored(f"Prompt: {prompt}", "blue")
 
-        start_time = time.time()
-        inputs = self.tokenizer(prompt, return_tensors="pt").to(Config.DEVICE)
+        try:
+            inputs = self.tokenizer(prompt, return_tensors="pt").to(Config.DEVICE)
 
-        with torch.no_grad():
-            outputs = self.model.generate(
-                **inputs,
-                max_new_tokens=max_tokens,
-                do_sample=True,
-                temperature=0.7,
-                top_p=0.9
-            )
+            # 添加显存监控
+            torch.cuda.empty_cache()
+            start_mem = torch.cuda.memory_allocated()
 
-        response = self.tokenizer.decode(outputs[0], skip_special_tokens=True)
-        inference_time = time.time() - start_time
+            with torch.no_grad():
+                outputs = self.model.generate(
+                    **inputs,
+                    max_new_tokens=max_tokens,
+                    do_sample=True,
+                    temperature=0.7,
+                    top_p=0.9
+                )
 
-        print_colored(f"Response: {response}", "green")
-        print_colored(f"Time: {inference_time:.4f}s | Tokens: {len(outputs[0])}", "blue")
-        return response
+            end_mem = torch.cuda.memory_allocated()
+            print_colored(f"Memory used: {(end_mem - start_mem) / 1024 ** 2:.2f} MB", "blue")
+
+            # 检查输出是否有效
+            if outputs is None:
+                raise RuntimeError("Model returned None output")
+
+            response = self.tokenizer.decode(outputs[0], skip_special_tokens=True)
+            print_colored(f"Response: {response}", "green")
+            return response
+
+        except RuntimeError as e:
+            if "CUDA out of memory" in str(e):
+                msg = "CUDA out of memory! Try smaller model or batch size"
+                print_colored(msg, "red")
+            else:
+                print_colored(f"Runtime error: {e}", "red")
+        except Exception as e:
+            print_colored(f"Unexpected error: {e}", "red")
+        finally:
+            torch.cuda.empty_cache()
 
     def vllm_inference_test(self, prompt, max_tokens=10, temperature=0.7, top_p=0.9):
         """使用vLLM框架进行推理测试"""

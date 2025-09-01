@@ -38,4 +38,12 @@ def prepare_model_for_inference(model):
         except Exception as e:
             print(f"Model compilation failed: {e}")
 
+    # 添加模型状态检查
+    if model is None:
+        raise RuntimeError("Model is None after compilation")
+
+    # 检查模型是否在GPU上
+    if next(model.parameters()).device.type != "cuda":
+        print("Warning: Model not on GPU!", "yellow")
+
     return model
