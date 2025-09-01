@@ -104,44 +104,34 @@ class QwenModelAdapter:
             for i, (input_ids, position_ids, attention_mask) in enumerate(zip(
                     input_ids_list, position_ids_list, attention_mask_list
             )):
-                current_len = input_ids.shape[1]
-                pad_len = max_len - current_len
-
                 # 填充input_ids
-                if pad_len > 0:
-                    padded_input = torch.nn.functional.pad(
-                        input_ids,
-                        (0, pad_len),
-                        value=pad_token_id
-                    )
-                else:
-                    padded_input = input_ids
+                pad_len = max_len - input_ids.shape[1]
+                padded_input = torch.nn.functional.pad(
+                    input_ids,
+                    (0, pad_len),
+                    value=pad_token_id
+                )
                 padded_input_ids.append(padded_input)
 
                 # 填充position_ids
-                if pad_len > 0:
-                    padded_pos = torch.nn.functional.pad(
-                        position_ids,
-                        (0, pad_len),
-                        value=0  # 填充位置用0
-                    )
-                else:
-                    padded_pos = position_ids
+                padded_pos = torch.nn.functional.pad(
+                    position_ids,
+                    (0, pad_len),
+                    value=0  # 填充位置用0
+                )
                 padded_position_ids.append(padded_pos)
 
-                # 填充attention_mask (仅当需要填充时)
+                # 填充attention_mask
                 if attention_mask is not None:
-                    if pad_len > 0:
-                        # 水平填充 (右侧)
-                        row_pad = torch.zeros((batch_size, current_len, pad_len), device=input_ids.device)
-                        padded_attn_h = torch.cat([attention_mask, row_pad], dim=2)
+                    # 扩展掩码到最大长度
+                    row_pad = torch.zeros((batch_size, pad_len, seq_lengths[i]), device=input_ids.device)
+                    col_pad = torch.zeros((batch_size, max_len, pad_len), device=input_ids.device)
 
-                        # 垂直填充 (底部)
-                        col_pad = torch.zeros((batch_size, pad_len, max_len), device=input_ids.device)
-                        padded_attn = torch.cat([padded_attn_h, col_pad], dim=1)
-                    else:
-                        padded_attn = attention_mask
-                    padded_attention_mask.append(padded_attn)
+                    # 水平拼接（添加右侧填充）
+                    padded_attn_h = torch.cat([attention_mask, row_pad], dim=2)
+                    # 垂直拼接（添加底部填充）
+                    padded_attn_v = torch.cat([padded_attn_h, col_pad], dim=1)
+                    padded_attention_mask.append(padded_attn_v)
                 else:
                     padded_attention_mask.append(None)
 
