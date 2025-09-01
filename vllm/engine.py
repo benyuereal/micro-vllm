@@ -176,12 +176,18 @@ class LLMEngine:
             self.response_queues[request_id] = response_queue
             response_queues.append(response_queue)
 
-            # 创建请求
+            # 创建请求并初始化所有状态
             request = Request(
                 request_id=request_id,
                 prompt=prompt,
                 sampling_params=sampling_params,
-                arrival_time=time.time()
+                arrival_time=time.time(),
+                # 初始化状态字段
+                generated_token_ids=[],
+                remaining_tokens=sampling_params.max_tokens,
+                is_completed=False,
+                start_time=time.time(),
+                last_decoded_index=0  # 初始化最后解码位置
             )
 
             # 将请求加入队列
@@ -189,13 +195,22 @@ class LLMEngine:
 
         # 等待所有响应
         for response_queue in response_queues:
-            response = response_queue.get()
-            responses.append(response)
-            # 兼容字典和对象两种类型
-            req_id = response['request_id'] if isinstance(response, dict) else response.request_id
-            if req_id in self.response_queues:
-                del self.response_queues[req_id]
+            try:
+                response = response_queue.get(timeout=30)  # 设置超时避免无限等待
+                responses.append(response)
 
+                # 兼容字典和对象两种类型
+                req_id = response['request_id'] if isinstance(response, dict) else response.request_id
+                if req_id in self.response_queues:
+                    del self.response_queues[req_id]
+            except Empty:
+                # 超时处理
+                responses.append(Response(
+                    request_id=request_id,
+                    generated_text="",
+                    success=False,
+                    error_message="Timeout waiting for response"
+                ))
 
         return responses
 

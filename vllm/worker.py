@@ -91,7 +91,7 @@ class ModelWorker:
             for req in requests:
                 seq_length = self.kv_cache.get_sequence_length(req.request_id)
                 print(f"Request {req.request_id}: "
-                      f"Prompt len={len(req.prompt_ids)}, "
+                      f"Prompt len={len(req.prompt_ids) if hasattr(req, 'prompt_ids') else 0}, "
                       f"Generated tokens={len(getattr(req, 'generated_token_ids', []))}, "
                       f"Cache length={seq_length}")
 
@@ -99,6 +99,8 @@ class ModelWorker:
             for req in requests:
                 if not hasattr(req, 'generated_token_ids'):
                     req.generated_token_ids = []  # 存储已生成的token IDs
+
+                    # 编码提示文本
                     req.prompt_ids = self.tokenizer.encode(
                         req.prompt,
                         return_tensors="pt",
@@ -106,12 +108,18 @@ class ModelWorker:
                         truncation=True,
                         max_length=self.max_seq_length
                     ).to(self.device).squeeze(0)
+
                     req.remaining_tokens = req.sampling_params.max_tokens
                     req.is_completed = False
                     req.start_time = time.time()
-                    req.last_decoded_index = 0  # 追踪最后解码位置
+                    req.last_decoded_index = 0  # 初始化最后解码位置
+
                     # 初始化KV缓存
                     self.kv_cache.add_sequence(req.request_id)
+
+                # 确保请求有last_decoded_index属性
+                if not hasattr(req, 'last_decoded_index'):
+                    req.last_decoded_index = len(req.generated_token_ids)
 
             # 准备当前步的输入
             input_ids_batch = []
@@ -141,7 +149,7 @@ class ModelWorker:
                 sampling_params_list.append(req.sampling_params)
 
             # 填充batch
-            max_len = max(len(ids) for ids in input_ids_batch)
+            max_len = max(len(ids) for ids in input_ids_batch) if input_ids_batch else 1
             padded_input_ids = torch.full((len(input_ids_batch), max_len), self.tokenizer.pad_token_id,
                                           device=self.device)
             padded_positions = torch.full((len(positions_batch), max_len), -1, device=self.device)
@@ -226,8 +234,6 @@ class ModelWorker:
                 else:
                     # 获取自上次响应后新生成的token
                     new_tokens = req.generated_token_ids[req.last_decoded_index:]
-                    # 更新最后解码位置
-                    req.last_decoded_index = len(req.generated_token_ids)
 
                     # 累积解码新token
                     new_text = self.tokenizer.decode(
@@ -235,6 +241,9 @@ class ModelWorker:
                         skip_special_tokens=True,
                         clean_up_tokenization_spaces=True
                     )
+
+                    # 更新最后解码位置
+                    req.last_decoded_index = len(req.generated_token_ids)
 
                     responses.append(Response(
                         request_id=req.request_id,
