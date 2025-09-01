@@ -10,10 +10,11 @@ if __name__ == "__main__":
     load_time = time.time() - start_time
     print(f"Model loaded in {load_time:.2f} seconds")
 
+    # 测试不同长度的提示
     prompts = [
-        "北京的旅游景点有",
-        "如何学习机器学习",
-        "Python编程有什么优势"
+        "北京",  # 短提示
+        "如何学习机器学习？",  # 中等提示
+        "Python编程语言有哪些主要优势？请详细说明。"  # 长提示
     ]
 
     print(f"Generating responses for {len(prompts)} prompts...")
@@ -27,12 +28,12 @@ if __name__ == "__main__":
         if seq_id in results:
             print(f"Prompt {i + 1}: {prompt}")
             print(f"Response: {results[seq_id]}")
-            print(f"Length: {len(results[seq_id].split())} tokens")
+            print(f"Length: {len(results[seq_id])} characters")
             print("-" * 80)
         else:
             print(f"Prompt {i + 1}: {prompt} - No response generated")
 
-    tokens_generated = sum(len(response.split()) for response in results.values())
+    tokens_generated = sum(len(response) for response in results.values())
     tokens_per_sec = tokens_generated / gen_time if gen_time > 0 else 0
 
     print(f"\nGenerated {tokens_generated} tokens in {gen_time:.2f} seconds")

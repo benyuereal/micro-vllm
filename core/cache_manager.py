@@ -5,7 +5,7 @@ class KVCache:
     def allocate(self, seq_id):
         self.cache[seq_id] = {
             'past_key_values': None,
-            'length': 0  # 新增序列长度跟踪
+            'length': 0  # 序列长度
         }
 
     def update(self, seq_id, past_key_values, length):

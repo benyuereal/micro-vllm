@@ -1,6 +1,6 @@
 import torch
 from transformers import PreTrainedModel
-from typing import Dict, Optional, Tuple
+from typing import Dict, Optional, Tuple, List
 
 
 class QwenModelAdapter:
@@ -9,7 +9,7 @@ class QwenModelAdapter:
             model: PreTrainedModel,
             input_ids: torch.Tensor,
             past_key_values: Optional[Tuple] = None,
-            sequence_length: Optional[int] = None
+            sequence_lengths: Optional[List[int]] = None
     ) -> Dict:
         """
         为Qwen模型准备输入格式
@@ -19,16 +19,19 @@ class QwenModelAdapter:
         if past_key_values is None:
             # 首次推理（prefill）
             position_ids = torch.arange(0, seq_length, dtype=torch.long, device=input_ids.device)
-            position_ids = position_ids.unsqueeze(0)
+            position_ids = position_ids.unsqueeze(0).repeat(batch_size, 1)
             attention_mask = torch.ones((batch_size, seq_length), device=input_ids.device)
         else:
             # 增量推理（decode）
-            # 使用序列长度而不是输入长度创建位置ID
-            if sequence_length is None:
-                raise ValueError("sequence_length must be provided for decoding")
+            if sequence_lengths is None:
+                raise ValueError("sequence_lengths must be provided for decoding")
 
-            position_ids = torch.tensor([[sequence_length - 1]], dtype=torch.long, device=input_ids.device)
-            position_ids = position_ids.expand(batch_size, 1)
+            # 创建位置ID：每个序列的当前位置
+            position_ids = torch.tensor(
+                [[length - 1] for length in sequence_lengths],
+                dtype=torch.long,
+                device=input_ids.device
+            )
             attention_mask = None
 
         return {

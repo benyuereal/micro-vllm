@@ -1,7 +1,6 @@
 import torch
 from typing import Dict, List, Tuple
 from .cache_manager import KVCache
-from .scheduler import Scheduler
 from .model_loader import load_model
 from models.qwen_adapter import QwenModelAdapter
 
@@ -18,14 +17,14 @@ class InferenceEngine:
         outputs = self.model(**inputs)
         return self.adapter.process_outputs(outputs, input_ids.size(1))
 
-    def decode_step(self, input_ids: torch.Tensor, past_key_values: Tuple, sequence_length: int) -> Tuple[
+    def decode_step(self, input_ids: torch.Tensor, past_key_values: Tuple, sequence_lengths: List[int]) -> Tuple[
         torch.Tensor, Tuple]:
         """单步解码（decode阶段）"""
         inputs = self.adapter.prepare_inputs(
             self.model,
             input_ids,
             past_key_values,
-            sequence_length
+            sequence_lengths
         )
         outputs = self.model(**inputs)
         return self.adapter.process_outputs(outputs, input_ids.size(1))
@@ -82,22 +81,23 @@ class InferenceEngine:
                 break
 
             # 执行批处理解码
-            input_tensor = torch.tensor([input_batch], device="cuda")
+            input_tensor = torch.tensor([input_batch], device="cuda").T  # 转置为 [batch_size, 1]
             logits, new_kv = self.decode_step(
                 input_tensor,
                 cache_entries,
-                sequence_lengths[0]  # 使用第一个序列的长度，因为Qwen所有序列需要相同长度
+                sequence_lengths
             )
 
             # 更新缓存和结果
-            next_tokens = logits[0, -1, :].argmax(dim=-1).tolist()
+            next_tokens = logits[:, -1, :].argmax(dim=-1).tolist()
             for i, seq_id in enumerate(prompt_ids):
                 token_id = next_tokens[i]
                 results[seq_id].append(token_id)
 
                 # 更新序列长度
-                self.cache.update(seq_id, new_kv[i], sequence_info[seq_id]["length"])
-                sequence_info[seq_id]["length"] += 1
+                new_length = sequence_info[seq_id]["length"] + 1
+                self.cache.update(seq_id, new_kv[i], new_length)
+                sequence_info[seq_id]["length"] = new_length
 
                 # 检查是否生成了结束符
                 if token_id == self.tokenizer.eos_token_id:
