@@ -203,24 +203,19 @@ class PagedKVCache:
             # 更新序列长度
             self.sequence_lengths[seq_id] = current_length + seq_len
 
-    def get_cache(self,
-                  sequence_ids: List[int],
-                  past_seq_lengths: List[int]) -> Optional[List[Tuple[torch.Tensor, torch.Tensor]]]:
-        """获取KV缓存，返回格式为每层一个元组(k_tensor, v_tensor)"""
-        # 检查是否有有效的缓存
+    def get_cache(
+            self,
+            sequence_ids: List[int],
+            past_seq_lengths: List[int],
+    ) -> Optional[List[Tuple[torch.Tensor, torch.Tensor]]]:
         if not sequence_ids or max(past_seq_lengths) == 0:
             return None
 
         batch_size = len(sequence_ids)
         max_actual_length = max(past_seq_lengths)
-
-        # 确保不超过最大序列长度
         max_length = min(max_actual_length, self.max_seq_length)
-
-        # 初始化past_key_values结构
         past_key_values = []
 
-        # 对于每层缓存，创建空列表
         for layer_idx in range(self.num_layers):
             k_list = []
             v_list = []
@@ -230,22 +225,19 @@ class PagedKVCache:
                 seq_length = min(past_seq_lengths[i], self.max_seq_length)
 
                 if seq_id not in self.sequence_table or seq_length == 0:
-                    # 创建兼容形状的全零张量 [batch_size, num_heads, max_length, head_size]
                     k_tensor = torch.zeros(
-                        batch_size, self.num_key_value_heads, max_length, self.head_size,
+                        self.num_key_value_heads, max_length, self.head_size,
                         device=self.device
                     )
                     v_tensor = torch.zeros(
-                        batch_size, self.num_key_value_heads, max_length, self.head_size,
+                        self.num_key_value_heads, max_length, self.head_size,
                         device=self.device
                     )
                 else:
-                    # 获取序列的所有页面
                     pages = self.sequence_table[seq_id]
                     k_slices = []
                     v_slices = []
 
-                    # 计算需要的页面范围
                     start_page = 0
                     end_page = (seq_length - 1) // self.page_size + 1
 
@@ -253,65 +245,48 @@ class PagedKVCache:
                         page_id = pages[page_idx]
                         page = self.page_pool[page_id]
 
-                        # 计算页面内的槽位
                         start_slot = 0
                         end_slot = self.page_size
-                        if page_idx == end_page - 1:  # 最后一页
+                        if page_idx == end_page - 1:
                             end_slot = seq_length % self.page_size
                             if end_slot == 0:
                                 end_slot = self.page_size
 
-                        # 获取数据 [page_slots, num_heads, head_size]
                         k_slice, v_slice = page.get_entries(start_slot, end_slot)
-
                         k_slices.append(k_slice)
                         v_slices.append(v_slice)
 
-                    # 拼接所有切片 [total_slots, num_heads, head_size]
                     if k_slices:
-                        k_tensor = torch.cat(k_slices, dim=0)  # [seq_length, num_heads, head_size]
+                        k_tensor = torch.cat(k_slices, dim=0)  # [seq_len, num_heads, head_size]
                         v_tensor = torch.cat(v_slices, dim=0)
 
-                        # 如果实际长度小于当前批次最大长度，填充零
-                        if k_tensor.size(0) < max_length:
-                            padding_size = max_length - k_tensor.size(0)
-                            k_tensor = torch.cat([
-                                k_tensor,
-                                torch.zeros(padding_size, self.num_key_value_heads, self.head_size, device=self.device)
-                            ], dim=0)
-                            v_tensor = torch.cat([
-                                v_tensor,
-                                torch.zeros(padding_size, self.num_key_value_heads, self.head_size, device=self.device)
-                            ], dim=0)
+                        # 关键修复：调整维度顺序
+                        k_tensor = k_tensor.permute(1, 0, 2)  # [num_heads, seq_len, head_size]
+                        v_tensor = v_tensor.permute(1, 0, 2)
+
+                        if k_tensor.size(1) < max_length:
+                            padding_size = max_length - k_tensor.size(1)
+                            padding = torch.zeros(
+                                self.num_key_value_heads, padding_size, self.head_size,
+                                device=self.device
+                            )
+                            k_tensor = torch.cat([k_tensor, padding], dim=1)
+                            v_tensor = torch.cat([v_tensor, padding], dim=1)
                     else:
-                        # 没有有效页面时创建全零张量
                         k_tensor = torch.zeros(
-                            max_length, self.num_key_value_heads, self.head_size,
+                            self.num_key_value_heads, max_length, self.head_size,
                             device=self.device
                         )
                         v_tensor = torch.zeros(
-                            max_length, self.num_key_value_heads, self.head_size,
+                            self.num_key_value_heads, max_length, self.head_size,
                             device=self.device
                         )
 
-                    # 调整维度为 [1, num_heads, seq_len, head_size]
-                    k_tensor = k_tensor.permute(1, 0, 2).unsqueeze(0)  # [1, num_heads, seq_len, head_size]
-                    v_tensor = v_tensor.permute(1, 0, 2).unsqueeze(0)
+                k_list.append(k_tensor.unsqueeze(0))  # [1, num_heads, seq_len, head_size]
+                v_list.append(v_tensor.unsqueeze(0))
 
-                k_list.append(k_tensor)
-                v_list.append(v_tensor)
-
-            # 将列表转换为批次张量 [batch_size, num_heads, seq_len, head_size]
-            k_batch = torch.cat(k_list, dim=0)
+            k_batch = torch.cat(k_list, dim=0)  # [batch_size, num_heads, seq_len, head_size]
             v_batch = torch.cat(v_list, dim=0)
-
-            # 确保维度正确
-            if k_batch.dim() != 4:
-                k_batch = k_batch.unsqueeze(0)
-            if v_batch.dim() != 4:
-                v_batch = v_batch.unsqueeze(0)
-
-            # 将当前层的缓存添加到结果中
             past_key_values.append((k_batch, v_batch))
 
         return past_key_values

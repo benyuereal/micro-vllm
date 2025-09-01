@@ -78,6 +78,9 @@ class ModelWorker:
         # 运行状态
         self.is_running = True
 
+        assert self.model.config.num_attention_heads == num_key_value_heads, \
+            "头数不匹配！请检查模型配置"
+
         print(f"ModelWorker initialized with model: {model_name}")
 
     def process_batch(self, requests: List[Any]) -> List[Any]:
@@ -396,6 +399,11 @@ class ModelWorker:
         # 打印输出形状
         print(f"Logits shape: {logits.shape}")
         print(f"Hidden states shape: {hidden_states.shape}")
+
+        # 在ModelWorker._forward_pass中添加
+        if past_key_values:
+            print(f"层0 k形状: {past_key_values[0][0].shape}")
+            print(f"层0 v形状: {past_key_values[0][1].shape}")
 
         return {
             "logits": logits,
