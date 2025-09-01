@@ -28,9 +28,6 @@ def main():
     prompts = [
         "hello, how are you?",
         "Hello, my name is",
-        "The future of AI is",
-        "Once upon a time",
-        "In a galaxy far far away"
     ]
 
     print("开始生成...")

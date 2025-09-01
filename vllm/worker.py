@@ -92,16 +92,24 @@ class ModelWorker:
                 seq_length = self.kv_cache.get_sequence_length(req.request_id)
                 print(f"Request {req.request_id}: "
                       f"Prompt len={len(req.prompt_ids)}, "
-                      f"Generated tokens={len(req.generated_token_ids)}, "
+                      f"Generated tokens={len(getattr(req, 'generated_token_ids', []))}, "
                       f"Cache length={seq_length}")
+
             # 维护每个请求的生成状态
             for req in requests:
                 if not hasattr(req, 'generated_token_ids'):
                     req.generated_token_ids = []  # 存储已生成的token IDs
-                    req.prompt_ids = self.tokenizer.encode(req.prompt, return_tensors="pt").to(self.device).squeeze(0)
+                    req.prompt_ids = self.tokenizer.encode(
+                        req.prompt,
+                        return_tensors="pt",
+                        padding=False,
+                        truncation=True,
+                        max_length=self.max_seq_length
+                    ).to(self.device).squeeze(0)
                     req.remaining_tokens = req.sampling_params.max_tokens
                     req.is_completed = False
                     req.start_time = time.time()
+                    req.last_decoded_index = 0  # 追踪最后解码位置
                     # 初始化KV缓存
                     self.kv_cache.add_sequence(req.request_id)
 
@@ -140,7 +148,8 @@ class ModelWorker:
 
             for i, (ids, pos) in enumerate(zip(input_ids_batch, positions_batch)):
                 padded_input_ids[i, :len(ids)] = ids
-                padded_positions[i, :len(pos)] = pos
+                if len(pos) > 0:  # 确保位置张量非空
+                    padded_positions[i, :len(pos)] = pos
 
             # 准备输入数据
             input_data = {
@@ -179,21 +188,18 @@ class ModelWorker:
                         time.time() - req.start_time > 30):  # 超时保护
                     req.is_completed = True
 
-            # 更新KV缓存（仅使用新生成的token）
+            # 更新KV缓存
             if output_data["hidden_states"] is not None:
-                # 改为：使用整个输出隐藏状态更新缓存
-                self.kv_cache.update_cache(
-                    output_data["hidden_states"],  # 使用全部隐藏状态
-                    sequence_ids,
-                    padded_positions
-                )
-
-            # 在更新缓存后添加调试信息
-            if output_data["hidden_states"] is not None:
-                print(f"Updated cache for sequences: {sequence_ids}")
-                for seq_id in sequence_ids:
-                    new_length = self.kv_cache.get_sequence_length(seq_id)
-                    print(f"Sequence {seq_id} new length: {new_length}")
+                # 确保形状兼容
+                hidden_states = output_data["hidden_states"]
+                if hidden_states.dim() == 3:  # [batch, seq, dim]
+                    self.kv_cache.update_cache(
+                        hidden_states,  # 使用全部隐藏状态
+                        sequence_ids,
+                        padded_positions
+                    )
+                else:
+                    print(f"Warning: Unexpected hidden states shape {hidden_states.shape}")
 
             # 准备响应
             responses = []
@@ -206,26 +212,30 @@ class ModelWorker:
                     ])
                     generated_text = self.tokenizer.decode(
                         full_ids[len(req.prompt_ids):],
-                        skip_special_tokens=True
+                        skip_special_tokens=True,
+                        clean_up_tokenization_spaces=True
                     )
-
                     responses.append(Response(
                         request_id=req.request_id,
                         generated_text=generated_text,
                         success=True,
                         error_message=None
                     ))
-
                     # 清理缓存
                     self.kv_cache.remove_sequence(req.request_id)
                 else:
-                    # 返回中间结果（当前生成的token）
-                    # 改为：累积解码所有生成的token
-                    full_tokens = torch.cat([req.prompt_ids, torch.tensor(req.generated_token_ids, device=self.device)])
+                    # 获取自上次响应后新生成的token
+                    new_tokens = req.generated_token_ids[req.last_decoded_index:]
+                    # 更新最后解码位置
+                    req.last_decoded_index = len(req.generated_token_ids)
+
+                    # 累积解码新token
                     new_text = self.tokenizer.decode(
-                        full_tokens[len(req.prompt_ids):],
-                        skip_special_tokens=True
+                        new_tokens,
+                        skip_special_tokens=True,
+                        clean_up_tokenization_spaces=True
                     )
+
                     responses.append(Response(
                         request_id=req.request_id,
                         generated_text=new_text,

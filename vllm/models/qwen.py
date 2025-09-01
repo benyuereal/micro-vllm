@@ -92,11 +92,10 @@ class QwenModel:
             "hidden_states": hidden_states
         }
 
-    # qwen.py 中的 _prepare_attention_mask 方法
-    # qwen.py 中的 _prepare_attention_mask 方法
     def _prepare_attention_mask(self,
                                 input_ids: torch.Tensor,
                                 past_key_values: Optional[Tuple] = None) -> torch.Tensor:
+        """准备符合Qwen要求的注意力掩码"""
         batch_size, seq_length = input_ids.shape
         device = input_ids.device
 
@@ -109,11 +108,17 @@ class QwenModel:
         if past_key_values and past_key_values[0][0] is not None:
             past_length = past_key_values[0][0].size(2)
 
-        # 创建因果掩码 (布尔类型)
+        # 创建扩展掩码
         total_length = past_length + seq_length
+        attention_mask = torch.ones(batch_size, total_length, dtype=torch.long, device=device)
+
+        # 创建因果掩码（下三角矩阵）
         causal_mask = torch.tril(
             torch.ones(total_length, total_length, dtype=torch.bool, device=device)
         )
 
+        # 应用因果掩码
+        attention_mask = attention_mask.unsqueeze(1) & causal_mask
+
         # 提取当前序列的掩码部分
-        return causal_mask[past_length:, :].unsqueeze(0)  # [1, current_len, total_len]
+        return attention_mask[:, :, -seq_length:].squeeze(1)
