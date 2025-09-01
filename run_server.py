@@ -23,7 +23,7 @@ if __name__ == "__main__":
 
     # 测试不同长度的提示
     prompts = [
-        "北京",  # 短提示
+        "请介绍北京这座城市：",  # 短提示
         "如何学习机器学习？",  # 中等提示
         "Python编程语言有哪些主要优势？请详细说明。"  # 长提示
     ]
@@ -35,7 +35,7 @@ if __name__ == "__main__":
         # 使用更高质量的生成参数
         results = engine.generate(
             prompts,
-            max_tokens=1024,
+            max_tokens=200,
             temperature=0.7,  # 控制随机性
             top_p=0.9  # 使用top-p（核采样）
         )
