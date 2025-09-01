@@ -1,7 +1,6 @@
-# models/qwen_adapter.py
 import torch
 from transformers import PreTrainedModel
-from typing import Tuple, Optional
+from typing import Tuple, Optional, Dict
 
 
 class QwenModelAdapter:
@@ -10,11 +9,10 @@ class QwenModelAdapter:
             model: PreTrainedModel,
             input_ids: torch.Tensor,
             past_key_values: Optional[Tuple] = None
-    ) -> dict:
+    ) -> Dict:
         """
         为Qwen模型准备输入格式
         """
-        # Qwen需要position_ids和attention_mask
         batch_size, seq_length = input_ids.shape
 
         if past_key_values is None:
@@ -25,7 +23,7 @@ class QwenModelAdapter:
         else:
             # 增量推理（decode）
             position_ids = torch.tensor([[seq_length - 1]], dtype=torch.long, device=input_ids.device)
-            attention_mask = None  # Qwen在decode时不需要完整的attention_mask
+            attention_mask = None
 
         return {
             "input_ids": input_ids,

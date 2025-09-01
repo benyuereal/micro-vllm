@@ -1,20 +1,17 @@
 class KVCache:
-    def __init__(self, block_size=16, max_blocks=1024):
-        self.block_size = block_size
+    def __init__(self):
         self.cache = {}
 
     def allocate(self, seq_id):
         self.cache[seq_id] = {
-            'k_blocks': [],
-            'v_blocks': [],
+            'past_key_values': None,
             'length': 0
         }
 
-    def update(self, seq_id, new_k, new_v):
+    def update(self, seq_id, past_key_values):
         entry = self.cache[seq_id]
-        entry['k_blocks'].append(new_k)
-        entry['v_blocks'].append(new_v)
-        entry['length'] += new_k.size(2)
+        entry['past_key_values'] = past_key_values
+        entry['length'] += 1
 
     def get(self, seq_id):
         return self.cache.get(seq_id)
