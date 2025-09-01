@@ -81,8 +81,8 @@ class QwenModelAdapter:
             "use_cache": True
         }
 
+    @staticmethod
     def process_batch_outputs(
-            self,
             outputs: Tuple
     ) -> Tuple[torch.Tensor, Tuple]:
         """
@@ -91,8 +91,12 @@ class QwenModelAdapter:
         logits = outputs.logits
         past_key_values = outputs.past_key_values
 
-        # 对于decode步骤，我们只需要最后一个token的logits
-        if logits.size(1) > 1:
-            logits = logits[:, -1:, :]
-
-        return logits, past_key_values
+        # 对于预填充，我们返回整个序列的logits
+        # 对于解码，只返回最后一个token的logits
+        # 通过检查序列长度决定行为
+        if logits.dim() == 3 and logits.size(1) > 1:
+            # 预填充阶段 - 返回完整logits
+            return logits, past_key_values
+        else:
+            # 解码阶段 - 直接返回
+            return logits, past_key_values
