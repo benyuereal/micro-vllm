@@ -77,38 +77,70 @@ class InferenceEngine:
 
     def prepare_batch_inputs(self, batch: List[Request]) -> Tuple[
         torch.Tensor, torch.Tensor, torch.Tensor, List[List[int]]]:
-        """准备批次输入数据"""
-        # 这里需要根据实际模型结构实现
-        # 简化实现：仅返回占位符
-        input_ids = torch.zeros((len(batch), 1), dtype=torch.long, device=Config.DEVICE)
-        attention_mask = torch.zeros((len(batch), 1), dtype=torch.long, device=Config.DEVICE)
-        position_ids = torch.zeros((len(batch), 1), dtype=torch.long, device=Config.DEVICE)
+        """正确准备批次输入数据"""
+        # 收集所有token ID
+        input_ids = []
+        attention_masks = []
+        position_ids_list = []
+
+        for request in batch:
+            # 分词并添加到批次
+            encoded = self.tokenizer(
+                request.prompt,
+                return_tensors="pt",
+                padding=False,
+                return_attention_mask=True
+            )
+            input_ids.append(encoded["input_ids"][0])
+            attention_masks.append(encoded["attention_mask"][0])
+
+            # 创建位置ID
+            positions = torch.arange(0, encoded["input_ids"].size(1), dtype=torch.long)
+            position_ids_list.append(positions)
+
+        # 填充批次
+        padded_ids = torch.nn.utils.rnn.pad_sequence(
+            input_ids, batch_first=True, padding_value=self.tokenizer.pad_token_id
+        )
+        padded_masks = torch.nn.utils.rnn.pad_sequence(
+            attention_masks, batch_first=True, padding_value=0
+        )
+        padded_positions = torch.nn.utils.rnn.pad_sequence(
+            position_ids_list, batch_first=True, padding_value=0
+        )
+
+        # 移动到GPU
+        device = next(self.model.parameters()).device
+        padded_ids = padded_ids.to(device)
+        padded_masks = padded_masks.to(device)
+        padded_positions = padded_positions.to(device)
+
         block_tables = [req.block_ids for req in batch]
 
-        return input_ids, attention_mask, position_ids, block_tables
+        return padded_ids, padded_masks, padded_positions, block_tables
 
     def sample_next_tokens(self, logits: torch.Tensor, batch: List[Request]) -> List[int]:
-        """采样下一个token"""
+        """修复采样逻辑"""
         next_tokens = []
         for i, request in enumerate(batch):
             # 应用温度调节
-            logits_i = logits[i] / request.temperature
+            logits_i = logits[i] / max(request.temperature, 1e-5)  # 防止除零
 
             # 应用top-p筛选
             if request.top_p < 1.0:
                 sorted_logits, sorted_indices = torch.sort(logits_i, descending=True)
-                cumulative_probs = torch.cumsum(torch.softmax(sorted_logits, dim=-1), dim=-1)
+                cumulative_probs = torch.cumsum(torch.nn.functional.softmax(sorted_logits, dim=-1), dim=-1)
 
                 # 移除累积概率高于top_p的token
                 sorted_indices_to_remove = cumulative_probs > request.top_p
-                sorted_indices_to_remove[..., 1:] = sorted_indices_to_remove[..., :-1].clone()
-                sorted_indices_to_remove[..., 0] = 0
+                sorted_indices_to_remove[..., 1:] = sorted_indices_to_remove[..., :-1]
+                sorted_indices_to_remove[..., 0] = False
 
                 indices_to_remove = sorted_indices[sorted_indices_to_remove]
                 logits_i[indices_to_remove] = float('-inf')
 
-            # 采样
-            probs = torch.softmax(logits_i, dim=-1)
+            # 采样 - 确保使用正确的概率分布
+            probs = torch.nn.functional.softmax(logits_i, dim=-1)
             next_token = torch.multinomial(probs, num_samples=1).item()
             next_tokens.append(next_token)
 

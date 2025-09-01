@@ -69,50 +69,48 @@ class ModelTester:
         self.setup_completed = True
 
     def direct_inference_test(self, prompt, max_tokens=10):
-        """直接使用transformers进行推理测试（作为基准）"""
-        if not self.setup_completed:
-            self.setup()
-
-        print_colored("\n[Direct Inference Test]", "yellow")
-        print_colored(f"Prompt: {prompt}", "blue")
-
+        """修复后的直接推理测试"""
         try:
-            inputs = self.tokenizer(prompt, return_tensors="pt").to(Config.DEVICE)
+            # 正确的输入处理
+            inputs = self.tokenizer(
+                prompt,
+                return_tensors="pt",
+                padding=True,  # 确保填充
+                return_attention_mask=True
+            )
 
-            # 添加显存监控
-            torch.cuda.empty_cache()
-            start_mem = torch.cuda.memory_allocated()
+            # 移动到GPU
+            inputs = {k: v.to(Config.DEVICE) for k, v in inputs.items()}
+
+            # 调试打印
+            print(f"Input IDs shape: {inputs['input_ids'].shape}")
+            print(f"Attention Mask shape: {inputs['attention_mask'].shape}")
 
             with torch.no_grad():
+                print(f"Model device: {next(self.model.parameters()).device}")
+                print(f"Input device: {inputs['input_ids'].device}")
+                print(f"Input example: {inputs['input_ids'][0][:5]}")
                 outputs = self.model.generate(
                     **inputs,
                     max_new_tokens=max_tokens,
                     do_sample=True,
                     temperature=0.7,
-                    top_p=0.9
+                    top_p=0.9,
+                    pad_token_id=self.tokenizer.pad_token_id  # 必须设置
                 )
 
-            end_mem = torch.cuda.memory_allocated()
-            print_colored(f"Memory used: {(end_mem - start_mem) / 1024 ** 2:.2f} MB", "blue")
-
-            # 检查输出是否有效
-            if outputs is None:
-                raise RuntimeError("Model returned None output")
+            # 检查输出
+            if outputs is None or outputs.numel() == 0:
+                raise RuntimeError("模型返回空输出")
 
             response = self.tokenizer.decode(outputs[0], skip_special_tokens=True)
             print_colored(f"Response: {response}", "green")
             return response
 
-        except RuntimeError as e:
-            if "CUDA out of memory" in str(e):
-                msg = "CUDA out of memory! Try smaller model or batch size"
-                print_colored(msg, "red")
-            else:
-                print_colored(f"Runtime error: {e}", "red")
         except Exception as e:
-            print_colored(f"Unexpected error: {e}", "red")
-        finally:
-            torch.cuda.empty_cache()
+            print_colored(f"推理错误: {e}", "red")
+            import traceback
+            traceback.print_exc()
 
     def vllm_inference_test(self, prompt, max_tokens=10, temperature=0.7, top_p=0.9):
         """使用vLLM框架进行推理测试"""

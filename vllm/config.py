@@ -16,6 +16,8 @@ class Config:
     MAX_BLOCKS = 1024
     GPU_MEMORY_UTILIZATION = 0.9
 
+    # 新增编译选项
+    ENABLE_COMPILE = False  # 暂时禁用编译
     # 服务器配置
     HOST = "0.0.0.0"
     PORT = 8000
