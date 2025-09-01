@@ -1,6 +1,6 @@
 import torch
 import time
-from typing import List, Dict, Any, Tuple
+from typing import List, Dict, Any
 from transformers import AutoTokenizer
 from .cache import PagedKVCache
 from .sampling.sampler import Sampler
@@ -77,9 +77,7 @@ class ModelWorker:
 
         # 运行状态
         self.is_running = True
-        self.sequence_kv_cache = {}  # 新增：序列缓存字典
-        self.num_key_value_heads = num_key_value_heads
-        self.head_size = self.model.config.hidden_size // self.model.config.num_attention_heads
+
         print(f"ModelWorker initialized with model: {model_name}")
 
     def process_batch(self, requests: List[Any]) -> List[Any]:
@@ -93,11 +91,6 @@ class ModelWorker:
             # 执行模型前向传播
             output_data = self._forward_pass(input_data)
 
-            # 更新KV缓存（关键修复）
-            self._update_kv_cache(
-                output_data["past_key_values"],
-                input_data["sequence_ids"]
-            )
             # 获取最后一个token的logits [batch_size, vocab_size]
             last_logits = output_data["logits"][:, -1, :]
             print(f"Last token logits shape: {last_logits.shape}")  # 调试日志
@@ -144,16 +137,6 @@ class ModelWorker:
                 for req in requests
             ]
 
-    def _update_kv_cache(self,
-                         new_past_key_values: List[Tuple],
-                         sequence_ids: List[int]):
-        """更新序列KV缓存"""
-        for i, seq_id in enumerate(sequence_ids):
-            # 只存储该序列对应的缓存
-            self.sequence_kv_cache[seq_id] = [
-                (k[i:i + 1].clone(), v[i:i + 1].clone())  # 提取该序列的缓存
-                for k, v in new_past_key_values
-            ]
     def _prepare_inputs(self, requests: List[Any]) -> Dict[str, Any]:
         """准备输入数据"""
         prompts = [req.prompt for req in requests]
@@ -178,18 +161,16 @@ class ModelWorker:
 
         # 获取历史长度（对于连续生成）
 
-        # 获取每个序列的历史缓存
-        past_key_values = []
-        for seq_id in sequence_ids:
-            # 获取该序列的缓存，没有则返回None
-            past_key_values.append(self.sequence_kv_cache.get(seq_id, None))
 
+        past_seq_lengths = torch.tensor([
+            self.kv_cache.get_sequence_length(seq_id) for seq_id in sequence_ids
+        ], device=self.device)  # 确保在GPU上
         return {
             "input_ids": input_ids,
             "positions": positions,
             "sequence_ids": sequence_ids,
             "sampling_params": sampling_params,
-            "past_key_values": past_key_values  # 直接传递缓存对象
+            "past_seq_lengths": past_seq_lengths
         }
 
     def _forward_pass(self, input_data: Dict[str, Any]) -> Dict[str, Any]:
@@ -238,33 +219,11 @@ class ModelWorker:
                     print(
                         f"First sequence k shape: {past_key_values[0][0][0].shape if hasattr(past_key_values[0][0][0], 'shape') else 'No shape'}")
 
-
-        # 直接使用传入的past_key_values
-        past_key_values = input_data["past_key_values"]
-
-        # 如果批次中缓存不一致，需要对齐
-        if past_key_values and any(past is not None for past in past_key_values):
-            # 合并批次中的缓存
-            merged_past = []
-            for layer_idx in range(len(past_key_values[0])):
-                k_list, v_list = [], []
-                for seq_cache in past_key_values:
-                    if seq_cache is not None:
-                        k, v = seq_cache[layer_idx]
-                        k_list.append(k)
-                        v_list.append(v)
-                    else:
-                        # 没有缓存的序列添加空缓存
-                        k_list.append(
-                            torch.zeros(1, self.num_key_value_heads, 0, self.head_size, device=self.device))
-                        v_list.append(
-                            torch.zeros(1, self.num_key_value_heads, 0, self.head_size, device=self.device))
-
-                merged_past.append((
-                    torch.cat(k_list, dim=0),
-                    torch.cat(v_list, dim=0)
-                ))
-            past_key_values = merged_past
+        # 确保past_key_values连续
+        if past_key_values is not None:
+            past_key_values = [
+                (k.contiguous(), v.contiguous()) for k, v in past_key_values
+            ]
         # 执行模型前向传播
         with torch.no_grad():
             outputs = self.model(
