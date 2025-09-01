@@ -41,6 +41,8 @@ class InferenceEngine:
         seq_lengths = []
 
         for seq_id, prompt in batch:
+            # 编码时添加padding_side设置
+            self.tokenizer.padding_side = "right"
             input_ids = self.tokenizer.encode(
                 prompt,
                 return_tensors="pt"
@@ -49,6 +51,7 @@ class InferenceEngine:
             inputs.append((input_ids, None))
             self.cache.allocate(seq_id)
 
+        # 使用修改后的适配器方法
         model_inputs = self.adapter.prepare_batch_inputs(self.model, inputs)
 
         with torch.no_grad():

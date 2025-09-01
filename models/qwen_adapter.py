@@ -58,60 +58,99 @@ class QwenModelAdapter:
             batch: List[Tuple[torch.Tensor, Optional[Tuple]]]
     ) -> Dict:
         """
-        为批量请求准备输入
+        为Qwen模型准备批量输入格式，支持不同长度的序列
         """
-        input_ids = []
-        position_ids = []
-        attention_masks = []
-        past_key_values = []
+        # 检查批次类型（预填充或解码）
+        is_prefill = batch[0][1] is None
+
+        input_ids_list = []
+        position_ids_list = []
+        attention_mask_list = []
+        past_key_values_list = []
         seq_lengths = []
 
+        # 第一步：处理每个序列的输入
         for input_tensor, past in batch:
-            if past is None:
-                # 预填充请求
-                seq_len = input_tensor.shape[1]
-                pos_ids = torch.arange(0, seq_len, device=input_tensor.device).unsqueeze(0)
-                attn_mask = torch.ones((1, seq_len, seq_len), device=input_tensor.device)
-                attn_mask = torch.tril(attn_mask)  # 因果注意力掩码
+            batch_size, seq_length = input_tensor.shape
+
+            if is_prefill:
+                # 预填充阶段
+                position_ids = torch.arange(0, seq_length, dtype=torch.long, device=input_tensor.device)
+                position_ids = position_ids.unsqueeze(0).repeat(batch_size, 1)
+
+                # 创建因果注意力掩码
+                attention_mask = torch.ones((batch_size, seq_length, seq_length), device=input_tensor.device)
+                attention_mask = torch.tril(attention_mask)  # 下三角矩阵（因果掩码）
             else:
-                # 解码请求
-                seq_len = past[0][0].shape[2] + 1  # 历史长度 + 当前token
-                pos_ids = torch.tensor([[seq_len - 1]], device=input_tensor.device)
-                attn_mask = None
+                # 解码阶段
+                position_ids = torch.tensor([[seq_length - 1]], dtype=torch.long, device=input_tensor.device)
+                attention_mask = None  # 解码阶段不需要全掩码
 
-            input_ids.append(input_tensor)
-            position_ids.append(pos_ids)
-            attention_masks.append(attn_mask)
-            past_key_values.append(past)
-            seq_lengths.append(seq_len)
+            input_ids_list.append(input_tensor)
+            position_ids_list.append(position_ids)
+            attention_mask_list.append(attention_mask)
+            past_key_values_list.append(past)
+            seq_lengths.append(seq_length)
 
-        # 填充输入使其长度一致
-        max_len = max(seq_lengths)
-        padded_inputs = []
-        padded_attentions = []
+        # 第二步：对齐不同长度的序列（仅预填充阶段需要）
+        if is_prefill:
+            max_len = max(seq_lengths)
+            padded_input_ids = []
+            padded_position_ids = []
+            padded_attention_mask = []
 
-        for i, inp in enumerate(input_ids):
-            pad_len = max_len - inp.shape[1]
-            padded = torch.nn.functional.pad(inp, (0, pad_len), value=model.config.pad_token_id)
-            padded_inputs.append(padded)
+            pad_token_id = model.config.pad_token_id if model.config.pad_token_id is not None else 0
 
-            if attention_masks[i] is not None:
-                attn_pad = torch.zeros((1, pad_len, max_len), device=inp.device)
-                padded_attn = torch.cat([
-                    attention_masks[i],
-                    torch.zeros((1, seq_lengths[i], pad_len), device=inp.device)
-                ], dim=2)
-                padded_attn = torch.cat([padded_attn, attn_pad], dim=1)
-                padded_attentions.append(padded_attn)
-            else:
-                padded_attentions.append(None)
+            for i, (input_ids, position_ids, attention_mask) in enumerate(zip(
+                    input_ids_list, position_ids_list, attention_mask_list
+            )):
+                # 填充input_ids
+                pad_len = max_len - input_ids.shape[1]
+                padded_input = torch.nn.functional.pad(
+                    input_ids,
+                    (0, pad_len),
+                    value=pad_token_id
+                )
+                padded_input_ids.append(padded_input)
+
+                # 填充position_ids
+                padded_pos = torch.nn.functional.pad(
+                    position_ids,
+                    (0, pad_len),
+                    value=0  # 填充位置用0
+                )
+                padded_position_ids.append(padded_pos)
+
+                # 填充attention_mask
+                if attention_mask is not None:
+                    # 扩展掩码到最大长度
+                    row_pad = torch.zeros((batch_size, pad_len, seq_lengths[i]), device=input_ids.device)
+                    col_pad = torch.zeros((batch_size, max_len, pad_len), device=input_ids.device)
+
+                    # 水平拼接（添加右侧填充）
+                    padded_attn_h = torch.cat([attention_mask, row_pad], dim=2)
+                    # 垂直拼接（添加底部填充）
+                    padded_attn_v = torch.cat([padded_attn_h, col_pad], dim=1)
+                    padded_attention_mask.append(padded_attn_v)
+                else:
+                    padded_attention_mask.append(None)
+
+            # 合并所有序列
+            input_ids = torch.cat(padded_input_ids, dim=0)
+            position_ids = torch.cat(padded_position_ids, dim=0)
+            attention_mask = torch.cat(padded_attention_mask, dim=0) if any(
+                m is not None for m in padded_attention_mask) else None
+        else:
+            # 解码阶段不需要填充
+            input_ids = torch.cat(input_ids_list, dim=0)
+            position_ids = torch.cat(position_ids_list, dim=0)
+            attention_mask = None
 
         return {
-            "input_ids": torch.cat(padded_inputs, dim=0),
-            "position_ids": torch.cat(position_ids, dim=0),
-            "attention_mask": torch.cat(padded_attentions, dim=0) if any(
-                m is not None for m in padded_attentions) else None,
-            "past_key_values": past_key_values,
+            "input_ids": input_ids,
+            "position_ids": position_ids,
+            "attention_mask": attention_mask,
+            "past_key_values": past_key_values_list,  # 注意：保持为列表，不是张量
             "use_cache": True
         }
 
