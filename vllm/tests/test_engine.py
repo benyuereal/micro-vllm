@@ -1,7 +1,7 @@
 import unittest
 
 
-from vllm.configs import qwen_7b as config
+from ..configs import qwen_7b as config
 from ..models.qwen  import QwenEngine
 
 class TestEngine(unittest.TestCase):

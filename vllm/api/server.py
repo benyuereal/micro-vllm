@@ -1,6 +1,6 @@
 from fastapi import FastAPI
 from ..models.qwen import QwenEngine
-from vllm.configs import qwen_7b as config
+from ..configs import qwen_7b as config
 
 app = FastAPI()
 engine = QwenEngine(config.MODEL_PATH)
