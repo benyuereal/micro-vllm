@@ -58,104 +58,60 @@ class QwenModelAdapter:
             batch: List[Tuple[torch.Tensor, Optional[Tuple]]]
     ) -> Dict:
         """
-        为Qwen模型准备批量输入格式，支持不同长度的序列
+        为批量请求准备输入
         """
-        # 检查批次类型（预填充或解码）
-        is_prefill = batch[0][1] is None
-
-        input_ids_list = []
-        position_ids_list = []
-        attention_mask_list = []
-        past_key_values_list = []
+        input_ids = []
+        position_ids = []
+        attention_masks = []
+        past_key_values = []
         seq_lengths = []
 
-        # 第一步：处理每个序列的输入
         for input_tensor, past in batch:
-            batch_size, seq_length = input_tensor.shape
-
-            if is_prefill:
-                # 预填充阶段
-                position_ids = torch.arange(0, seq_length, dtype=torch.long, device=input_tensor.device)
-                position_ids = position_ids.unsqueeze(0).repeat(batch_size, 1)
-
-                # 创建因果注意力掩码
-                attention_mask = torch.ones((batch_size, seq_length, seq_length), device=input_tensor.device)
-                attention_mask = torch.tril(attention_mask)  # 下三角矩阵（因果掩码）
+            if past is None:
+                # 预填充请求
+                seq_len = input_tensor.shape[1]
+                pos_ids = torch.arange(0, seq_len, device=input_tensor.device).unsqueeze(0)
+                attn_mask = torch.ones((1, seq_len, seq_len), device=input_tensor.device)
+                attn_mask = torch.tril(attn_mask)  # 因果注意力掩码
             else:
-                # 解码阶段
-                position_ids = torch.tensor([[seq_length - 1]], dtype=torch.long, device=input_tensor.device)
-                attention_mask = None  # 解码阶段不需要全掩码
+                # 解码请求
+                seq_len = past[0][0].shape[2] + 1  # 历史长度 + 当前token
+                pos_ids = torch.tensor([[seq_len - 1]], device=input_tensor.device)
+                attn_mask = None
 
-            input_ids_list.append(input_tensor)
-            position_ids_list.append(position_ids)
-            attention_mask_list.append(attention_mask)
-            past_key_values_list.append(past)
-            seq_lengths.append(seq_length)
+            input_ids.append(input_tensor)
+            position_ids.append(pos_ids)
+            attention_masks.append(attn_mask)
+            past_key_values.append(past)
+            seq_lengths.append(seq_len)
 
-        # 第二步：对齐不同长度的序列（仅预填充阶段需要）
-        if is_prefill:
-            max_len = max(seq_lengths)
-            padded_input_ids = []
-            padded_position_ids = []
-            padded_attention_mask = []
+        # 填充输入使其长度一致
+        max_len = max(seq_lengths)
+        padded_inputs = []
+        padded_attentions = []
 
-            pad_token_id = model.config.pad_token_id if model.config.pad_token_id is not None else 0
+        for i, inp in enumerate(input_ids):
+            pad_len = max_len - inp.shape[1]
+            padded = torch.nn.functional.pad(inp, (0, pad_len), value=model.config.pad_token_id)
+            padded_inputs.append(padded)
 
-            for i, (input_ids, position_ids, attention_mask) in enumerate(zip(
-                    input_ids_list, position_ids_list, attention_mask_list
-            )):
-                # 填充input_ids
-                pad_len = max_len - input_ids.shape[1]
-                padded_input = torch.nn.functional.pad(
-                    input_ids,
-                    (0, pad_len),
-                    value=pad_token_id
-                )
-                padded_input_ids.append(padded_input)
-
-                # 重构position_ids填充逻辑
-                # 创建目标形状的全零张量
-                padded_pos = torch.zeros(
-                    (position_ids.size(0), max_len),
-                    dtype=position_ids.dtype,
-                    device=position_ids.device
-                )
-                # 将原始数据复制到新张量
-                seq_len = position_ids.size(1)
-                padded_pos[:, :seq_len] = position_ids
-                padded_position_ids.append(padded_pos)
-
-                # 重构attention_mask填充逻辑
-                if attention_mask is not None:
-                    # 创建新的三维掩码张量
-                    padded_attn = torch.zeros(
-                        (batch_size, max_len, max_len),
-                        dtype=attention_mask.dtype,
-                        device=attention_mask.device
-                    )
-                    # 将原始掩码复制到左上角区域
-                    seq_len = seq_lengths[i]
-                    padded_attn[:, :seq_len, :seq_len] = attention_mask
-                    padded_attention_mask.append(padded_attn)
-                else:
-                    padded_attention_mask.append(None)
-
-            # 合并所有序列
-            input_ids = torch.cat(padded_input_ids, dim=0)
-            position_ids = torch.cat(padded_position_ids, dim=0)
-            attention_mask = torch.cat(padded_attention_mask, dim=0) if any(
-                m is not None for m in padded_attention_mask) else None
-        else:
-            # 解码阶段不需要填充
-            input_ids = torch.cat(input_ids_list, dim=0)
-            position_ids = torch.cat(position_ids_list, dim=0)
-            attention_mask = None
+            if attention_masks[i] is not None:
+                attn_pad = torch.zeros((1, pad_len, max_len), device=inp.device)
+                padded_attn = torch.cat([
+                    attention_masks[i],
+                    torch.zeros((1, seq_lengths[i], pad_len), device=inp.device)
+                ], dim=2)
+                padded_attn = torch.cat([padded_attn, attn_pad], dim=1)
+                padded_attentions.append(padded_attn)
+            else:
+                padded_attentions.append(None)
 
         return {
-            "input_ids": input_ids,
-            "position_ids": position_ids,
-            "attention_mask": attention_mask,
-            "past_key_values": past_key_values_list,  # 注意：保持为列表，不是张量
+            "input_ids": torch.cat(padded_inputs, dim=0),
+            "position_ids": torch.cat(position_ids, dim=0),
+            "attention_mask": torch.cat(padded_attentions, dim=0) if any(
+                m is not None for m in padded_attentions) else None,
+            "past_key_values": past_key_values,
             "use_cache": True
         }
 
