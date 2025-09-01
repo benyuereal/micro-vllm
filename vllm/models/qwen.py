@@ -110,26 +110,27 @@ class QwenModel:
         batch_size, seq_length = input_ids.shape
         device = input_ids.device
 
+        # 没有历史缓存时创建简单掩码
         if past_key_values is None:
-            print("No past key values - creating 1D attention mask")
-            # 创建一维序列长度指示器 [batch_size, seq_length]
-            attention_mask = torch.ones(
-                batch_size, seq_length,
-                dtype=torch.long, device=device
-            )
-            return attention_mask.contiguous()
+            return torch.ones(batch_size, seq_length, dtype=torch.long, device=device)
 
-        print("Using past key values - creating extended mask")
         # 获取历史长度
-        first_layer_k = past_key_values[0][0]
-        past_lengths = first_layer_k.size(2)  # [batch, heads, seq_len, head_dim]
-        total_length = past_lengths + seq_length
+        past_length = 0
+        if past_key_values is not None and len(past_key_values) > 0:
+            first_layer_k = past_key_values[0][0]
+            if first_layer_k is not None:
+                # 张量形状: [batch, num_heads, seq_len, head_dim]
+                past_length = first_layer_k.size(2)
 
         # 创建扩展掩码 [batch_size, total_length]
-        attention_mask = torch.cat([
-            torch.ones(batch_size, past_lengths, device=device),
-            torch.ones(batch_size, seq_length, device=device)
-        ], dim=1)
+        total_length = past_length + seq_length
+        attention_mask = torch.ones(batch_size, total_length, dtype=torch.long, device=device)
 
-        print(f"Extended mask shape: {attention_mask.shape}")
+        # 创建因果掩码（下三角矩阵）
+        causal_mask = torch.tril(torch.ones(total_length, total_length, device=device)).unsqueeze(0)
+        attention_mask = attention_mask.unsqueeze(1) & causal_mask
+
+        # 压缩维度: [batch_size, 1, total_length, total_length] -> [batch_size, total_length]
+        attention_mask = attention_mask[:, 0, 0]  # 取第一个token的掩码作为代表
+
         return attention_mask.contiguous()

@@ -207,12 +207,12 @@ class PagedKVCache:
                   sequence_ids: List[int],
                   past_seq_lengths: List[int]) -> Optional[List[Tuple[torch.Tensor, torch.Tensor]]]:
         """获取KV缓存，返回格式为每层一个元组(k_tensor, v_tensor)"""
-        batch_size = len(sequence_ids)
-
-        # 获取当前批次的最大序列长度
-        max_actual_length = max(past_seq_lengths) if batch_size > 0 else 0
-        if max_actual_length == 0:  # 没有历史缓存
+        # 检查是否有有效的缓存
+        if not sequence_ids or max(past_seq_lengths) == 0:
             return None
+
+        batch_size = len(sequence_ids)
+        max_actual_length = max(past_seq_lengths)
 
         # 确保不超过最大序列长度
         max_length = min(max_actual_length, self.max_seq_length)
@@ -230,7 +230,7 @@ class PagedKVCache:
                 seq_length = min(past_seq_lengths[i], self.max_seq_length)
 
                 if seq_id not in self.sequence_table or seq_length == 0:
-                    # 创建兼容形状的全零张量 [num_heads, seq_len, head_size]
+                    # 创建兼容形状的全零张量 [num_heads, max_length, head_size]
                     k_tensor = torch.zeros(
                         self.num_key_value_heads, max_length, self.head_size,
                         device=self.device
@@ -242,11 +242,13 @@ class PagedKVCache:
                 else:
                     # 获取序列的所有页面
                     pages = self.sequence_table[seq_id]
+                    k_slices = []
+                    v_slices = []
+
+                    # 计算需要的页面范围
                     start_page = 0
                     end_page = (seq_length - 1) // self.page_size + 1
 
-                    k_slices = []
-                    v_slices = []
                     for page_idx in range(start_page, end_page):
                         page_id = pages[page_idx]
                         page = self.page_pool[page_id]
@@ -255,7 +257,9 @@ class PagedKVCache:
                         start_slot = 0
                         end_slot = self.page_size
                         if page_idx == end_page - 1:  # 最后一页
-                            end_slot = seq_length % self.page_size or self.page_size
+                            end_slot = seq_length % self.page_size
+                            if end_slot == 0:
+                                end_slot = self.page_size
 
                         # 获取数据 [page_slots, num_heads, head_size]
                         k_slice, v_slice = page.get_entries(start_slot, end_slot)
@@ -271,7 +275,14 @@ class PagedKVCache:
                     if k_slices:
                         k_tensor = torch.cat(k_slices, dim=1)
                         v_tensor = torch.cat(v_slices, dim=1)
+
+                        # 如果实际长度小于当前批次最大长度，填充零
+                        if k_tensor.size(1) < max_length:
+                            padding_size = max_length - k_tensor.size(1)
+                            k_tensor = F.pad(k_tensor, (0, 0, 0, padding_size))
+                            v_tensor = F.pad(v_tensor, (0, 0, 0, padding_size))
                     else:
+                        # 没有有效页面时创建全零张量
                         k_tensor = torch.zeros(
                             self.num_key_value_heads, max_length, self.head_size,
                             device=self.device
@@ -280,12 +291,6 @@ class PagedKVCache:
                             self.num_key_value_heads, max_length, self.head_size,
                             device=self.device
                         )
-
-                    # 如果实际长度小于当前批次最大长度，填充零
-                    if k_tensor.size(1) < max_length:
-                        padding_size = max_length - k_tensor.size(1)
-                        k_tensor = F.pad(k_tensor, (0, 0, 0, padding_size))
-                        v_tensor = F.pad(v_tensor, (0, 0, 0, padding_size))
 
                 k_list.append(k_tensor)
                 v_list.append(v_tensor)

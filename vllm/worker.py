@@ -86,6 +86,14 @@ class ModelWorker:
             return []
 
         try:
+            # 调试信息：显示当前序列状态
+            print("Current batch sequence states:")
+            for req in requests:
+                seq_length = self.kv_cache.get_sequence_length(req.request_id)
+                print(f"Request {req.request_id}: "
+                      f"Prompt len={len(req.prompt_ids)}, "
+                      f"Generated tokens={len(req.generated_token_ids)}, "
+                      f"Cache length={seq_length}")
             # 维护每个请求的生成状态
             for req in requests:
                 if not hasattr(req, 'generated_token_ids'):
@@ -179,6 +187,13 @@ class ModelWorker:
                     padded_positions[:, -1].unsqueeze(1)  # 只取最后一个位置
                 )
 
+            # 在更新缓存后添加调试信息
+            if output_data["hidden_states"] is not None:
+                print(f"Updated cache for sequences: {sequence_ids}")
+                for seq_id in sequence_ids:
+                    new_length = self.kv_cache.get_sequence_length(seq_id)
+                    print(f"Sequence {seq_id} new length: {new_length}")
+
             # 准备响应
             responses = []
             for req in requests:
@@ -268,113 +283,93 @@ class ModelWorker:
         }
 
     def _forward_pass(self, input_data: Dict[str, Any]) -> Dict[str, Any]:
-        # 设备检查 ↓↓↓
-        print(f"Model device: {next(self.model.model.parameters()).device}")
-        print(f"Input IDs device: {input_data['input_ids'].device}")
-        print(f"Positions device: {input_data['positions'].device}")
+        """执行模型前向传播（完整修复版）"""
         # 打印调试信息
         print(f"Input IDs shape: {input_data['input_ids'].shape}")
         print(f"Positions shape: {input_data['positions'].shape}")
 
-        # 添加连续性检查
-        print(f"Input IDs contiguous: {input_data['input_ids'].is_contiguous()}")
-        print(f"Positions contiguous: {input_data['positions'].is_contiguous()}")
+        # 确保张量连续
+        input_ids = input_data["input_ids"].contiguous()
+        positions = input_data["positions"].contiguous()
 
-        """执行模型前向传播"""
         # 获取历史KV缓存
-        # 获取历史KV缓存（可能为None）
         past_key_values = None
-        if input_data["past_seq_lengths"].sum().item() > 0:  # 只有存在历史缓存时才获取
-            past_key_values = self.kv_cache.get_cache(
-                input_data["sequence_ids"],
-                input_data["past_seq_lengths"]
-            )
+        if input_data["past_seq_lengths"].sum().item() > 0:
+            try:
+                # 转换past_seq_lengths为列表
+                past_lengths_list = input_data["past_seq_lengths"].cpu().tolist()
+                past_key_values = self.kv_cache.get_cache(
+                    input_data["sequence_ids"],
+                    past_lengths_list
+                )
 
-        # 检查past_key_values的连续性
-        if past_key_values:
-            for i, (k, v) in enumerate(past_key_values):
-                print(f"Layer {i} k contiguous: {k.is_contiguous()}")
-                print(f"Layer {i} v contiguous: {v.is_contiguous()}")
-        if past_key_values is not None:
-            print(f"Past KV length: {len(past_key_values)}")
-            print(f"First layer k shape: {past_key_values[0][0].shape}")
-            print(f"First layer v shape: {past_key_values[0][1].shape}")
-        # 打印调试信息
+                # 确保缓存张量连续
+                if past_key_values:
+                    past_key_values = [
+                        (k.contiguous(), v.contiguous())
+                        for k, v in past_key_values
+                    ]
+            except Exception as e:
+                print(f"Error getting KV cache: {e}")
+                past_key_values = None
+
+        # 打印缓存信息
         print(f"Past KV is None: {past_key_values is None}")
-        print(f"Past KV type: {type(past_key_values)}")
-        if past_key_values and len(past_key_values) > 0:
-            first_tensor = past_key_values[0][0]
-            print(f"First KV tensor device: {first_tensor.device}")
-            print(f"First layer type: {type(past_key_values[0])}")
-            if len(past_key_values[0]) > 0:
-                print(f"First layer k type: {type(past_key_values[0][0])}")
-                if len(past_key_values[0][0]) > 0:
-                    print(f"First sequence k type: {type(past_key_values[0][0][0])}")
-                    print(
-                        f"First sequence k shape: {past_key_values[0][0][0].shape if hasattr(past_key_values[0][0][0], 'shape') else 'No shape'}")
+        if past_key_values:
+            print(f"Past KV length: {len(past_key_values)}")
+            if len(past_key_values) > 0:
+                first_layer = past_key_values[0]
+                if first_layer and len(first_layer) > 0:
+                    k, v = first_layer
+                    print(f"First layer k shape: {k.shape}")
+                    print(f"First layer v shape: {v.shape}")
 
-        # 确保past_key_values连续
-        if past_key_values is not None:
-            past_key_values = [
-                (k.contiguous(), v.contiguous()) for k, v in past_key_values
-            ]
         # 执行模型前向传播
         with torch.no_grad():
-            outputs = self.model(
-                input_ids=input_data["input_ids"].contiguous(),
-                positions=input_data["positions"].contiguous(),
-                past_key_values=past_key_values,
-                use_cache=True
-            )
+            try:
+                outputs = self.model(
+                    input_ids=input_ids,
+                    positions=positions,
+                    past_key_values=past_key_values,
+                    use_cache=True
+                )
+            except Exception as e:
+                print(f"Model forward error: {e}")
+                # 尝试不使用缓存再次运行
+                outputs = self.model(
+                    input_ids=input_ids,
+                    positions=positions,
+                    past_key_values=None,
+                    use_cache=False
+                )
+                past_key_values = None
 
-        # ======== 修复点：使用字典键访问而不是属性访问 ========
+        # 统一处理输出格式
         if isinstance(outputs, dict):
-            # 使用字典键访问
             logits = outputs["logits"]
             past_key_values = outputs.get("past_key_values", None)
-
-            # 获取隐藏状态
             hidden_states = outputs.get("hidden_states", logits)
-
-            # 如果hidden_states是元组（包含所有层），则取最后一层
-            if isinstance(hidden_states, tuple):
-                hidden_states = hidden_states[-1]
         else:
             # 处理其他输出类型（如元组）
-            print(f"Unexpected output type: {type(outputs)}")
-            # 尝试获取logits和past_key_values
             if hasattr(outputs, 'logits'):
                 logits = outputs.logits
             else:
-                # 如果连logits属性都没有，则尝试第一个元素
                 if isinstance(outputs, tuple) and len(outputs) > 0:
                     logits = outputs[0]
                 else:
                     raise ValueError("Cannot get logits from model outputs")
 
             past_key_values = outputs.past_key_values if hasattr(outputs, "past_key_values") else None
+            hidden_states = outputs.hidden_states if hasattr(outputs, "hidden_states") else logits
 
-            # 尝试获取隐藏状态
-            if hasattr(outputs, 'hidden_states'):
-                hidden_states = outputs.hidden_states
-            elif hasattr(outputs, 'last_hidden_state'):
-                hidden_states = outputs.last_hidden_state
-            else:
-                print("Warning: Using logits as fallback for hidden_states")
-                hidden_states = logits
-
-            # 如果hidden_states是元组，取最后一层
-            if isinstance(hidden_states, tuple):
-                hidden_states = hidden_states[-1]
-
-        # 确保hidden_states是张量（重要！）
+        # 确保hidden_states是张量
         if not isinstance(hidden_states, torch.Tensor):
-            hidden_states = logits  # 回退使用logits
-        # 打印确认形状
+            hidden_states = logits
+
+        # 打印输出形状
         print(f"Logits shape: {logits.shape}")
         print(f"Hidden states shape: {hidden_states.shape}")
 
-        # 确保返回三个关键值
         return {
             "logits": logits,
             "past_key_values": past_key_values,

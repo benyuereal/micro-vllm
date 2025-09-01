@@ -75,29 +75,70 @@ class LLMEngine:
         print(f"LLMEngine initialized with model: {model}")
 
     def _worker_loop(self):
-        """工作线程主循环"""
-        while True:
-            try:
-                # 获取一批请求
-                batch_requests = self._get_batch_requests()
+        """工作线程主循环（修复版：支持连续批处理）"""
+        # 活动请求池
+        active_requests = {}
 
+        while self.worker.is_running:
+            try:
+                # 添加新请求到活动池
+                while not self.request_queue.empty():
+                    req = self.request_queue.get_nowait()
+                    req_id = req.request_id
+
+                    # 初始化生成状态
+                    if not hasattr(req, 'generated_token_ids'):
+                        req.generated_token_ids = []
+                        req.prompt_ids = self.worker.tokenizer.encode(
+                            req.prompt, return_tensors="pt"
+                        ).to(self.worker.device).squeeze(0)
+                        req.remaining_tokens = req.sampling_params.max_tokens
+                        req.is_completed = False
+                        req.start_time = time.time()
+
+                    # 添加到活动请求池
+                    active_requests[req_id] = (req, self.response_queues[req_id])
+
+                # 如果没有活动请求，短暂休眠
+                if not active_requests:
+                    time.sleep(0.01)
+                    continue
+
+                # 准备批次（最多max_num_seqs个请求）
+                batch_requests = []
+                for req, queue in active_requests.values():
+                    if not req.is_completed:
+                        batch_requests.append(req)
+                        if len(batch_requests) >= self.max_num_seqs:
+                            break
+
+                # 处理批次
                 if batch_requests:
-                    # 处理请求
                     responses = self.worker.process_batch(batch_requests)
 
-                    # 将响应放入对应的队列
+                    # 处理响应并更新活动池
                     for response in responses:
-                        # 统一处理字典和对象响应
-                        req_id = response["request_id"] if isinstance(response, dict) else response.request_id
-                        if req_id in self.response_queues:
-                            self.response_queues[req_id].put(response)
+                        req_id = response.request_id
+                        if req_id in active_requests:
+                            req, queue = active_requests[req_id]
+
+                            # 发送响应
+                            queue.put(response)
+
+                            # 如果请求完成，从活动池移除
+                            if response.success:
+                                del active_requests[req_id]
+                                if req_id in self.response_queues:
+                                    del self.response_queues[req_id]
 
                 # 短暂休眠以避免过度占用CPU
                 time.sleep(0.001)
 
             except Exception as e:
                 print(f"Error in worker loop: {e}")
-                time.sleep(0.1)  # 发生错误时短暂休眠
+                import traceback
+                traceback.print_exc()
+                time.sleep(0.1)
 
     def _get_batch_requests(self) -> List[Request]:
         """从队列中获取一批请求，实现Continuous Batching"""
