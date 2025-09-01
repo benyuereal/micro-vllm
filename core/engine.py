@@ -111,50 +111,43 @@ class InferenceEngine:
     # core/engine.py (修改部分)
     # core/engine.py (修改 sample_next_tokens 方法)
 
+    # core/engine.py (完整的采样方法重写)
+
     def sample_next_tokens(self, logits_dict: Dict[int, torch.Tensor],
                            temperature: float = 0.7, top_p: float = 0.9) -> Dict[int, int]:
-        """批量采样下一个token"""
+        """批量采样下一个token - 彻底重构版"""
         next_tokens = {}
 
         for seq_id, logits in logits_dict.items():
-            # 确保logits是2维：[batch_size, vocab_size]
-            original_shape = logits.shape
+            # 1. 统一logits形状
             if logits.dim() == 3:
-                # 如果是预填充阶段返回的logits (batch_size, seq_len, vocab_size)
-                # 只取最后一个token的logits
-                logits = logits[:, -1, :]  # 形状变为 (batch_size, vocab_size)
+                logits = logits[:, -1, :]  # 取最后一个token的logits
+            logits = logits.squeeze(0) if logits.dim() == 2 else logits
 
-            # 现在logits应该是2维: (1, vocab_size) 或 (N, vocab_size)
-            if logits.dim() != 2:
-                # 如果仍然不是2维，调整为2维
-                logits = logits.view(1, -1)
-
-            # 应用温度
+            # 2. 应用温度
             logits = logits / temperature
 
-            # 应用top-p（核采样）
-            sorted_logits, sorted_indices = torch.sort(logits, descending=True)
-            cumulative_probs = torch.cumsum(F.softmax(sorted_logits, dim=-1), dim=-1)
-
-            # 移除累积概率低于top_p的token
-            sorted_indices_to_remove = cumulative_probs > top_p
-            sorted_indices_to_remove[..., 1:] = sorted_indices_to_remove[..., :-1].clone()
-            sorted_indices_to_remove[..., 0] = 0
-
-            # 关键修复：确保indices_to_remove与logits维度匹配
-            # 获取需要移除的索引
-            removal_indices = sorted_indices[sorted_indices_to_remove]
-
-            # 创建与logits形状相同的索引掩码
-            indices_to_remove = torch.full_like(logits, fill_value=-1, dtype=torch.long)
-            indices_to_remove[sorted_indices_to_remove] = removal_indices
-
-            # 安全移除
-            logits = logits.scatter(-1, indices_to_remove, float('-inf'))
-
-            # 从剩余token中采样
+            # 3. 创建概率分布
             probs = F.softmax(logits, dim=-1)
-            next_token = torch.multinomial(probs, num_samples=1).item()
+
+            # 4. top-p采样 - 安全实现
+            sorted_probs, sorted_indices = torch.sort(probs, descending=True)
+            cumulative_probs = torch.cumsum(sorted_probs, dim=-1)
+
+            # 找到需要保留的概率部分
+            sorted_indices_to_keep = cumulative_probs <= top_p
+            sorted_indices_to_keep[:, 1:] = sorted_indices_to_keep[:, :-1].clone()
+            sorted_indices_to_keep[:, 0] = True
+
+            # 创建新的概率分布
+            new_probs = torch.zeros_like(probs)
+            new_probs.scatter_(1, sorted_indices, sorted_probs * sorted_indices_to_keep)
+
+            # 重新归一化
+            new_probs = new_probs / new_probs.sum(dim=-1, keepdim=True)
+
+            # 5. 采样
+            next_token = torch.multinomial(new_probs, num_samples=1).item()
             next_tokens[seq_id] = next_token
 
         return next_tokens
