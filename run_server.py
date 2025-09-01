@@ -11,6 +11,11 @@ if __name__ == "__main__":
         engine = InferenceEngine(MODEL_PATH)
         load_time = time.time() - start_time
         print(f"Model loaded in {load_time:.2f} seconds")
+
+        # 检查模型状态
+        print(f"Model device: {engine.device}")
+        print(f"Model dtype: {next(engine.model.parameters()).dtype}")
+
     except Exception as e:
         print(f"Failed to load model: {str(e)}")
         traceback.print_exc()
@@ -30,9 +35,9 @@ if __name__ == "__main__":
         # 使用更高质量的生成参数
         results = engine.generate(
             prompts,
-            max_tokens=100,
+            max_tokens=200,
             temperature=0.7,  # 控制随机性
-            top_k=50  # 仅从top-k token中采样
+            top_p=0.9  # 使用top-p（核采样）
         )
         gen_time = time.time() - start_time
     except Exception as e:
