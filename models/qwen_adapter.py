@@ -156,33 +156,13 @@ class QwenModelAdapter:
             position_ids = torch.cat(position_ids_list, dim=0)
             attention_mask = None
 
-        # 关键修复：确保past_key_values格式正确
-        if is_prefill:
-            # 预填充阶段不需要past_key_values
-            past_key_values = None
-        else:
-            # 解码阶段需要传递正确的past_key_values结构
-            # 确保每个序列的past_key_values是元组格式
-            past_key_values = []
-            for past in past_key_values_list:
-                if past is not None:
-                    past_key_values.append(past)
-                else:
-                    # 对于没有缓存的情况，创建一个空元组占位
-                    past_key_values.append(())
-
-            # 如果所有序列都没有缓存，则设为None
-            if all(len(p) == 0 for p in past_key_values):
-                past_key_values = None
-
         return {
             "input_ids": input_ids,
             "position_ids": position_ids,
             "attention_mask": attention_mask,
-            "past_key_values": past_key_values,
+            "past_key_values": past_key_values_list,  # 注意：保持为列表，不是张量
             "use_cache": True
         }
-
 
     @staticmethod
     def process_batch_outputs(
