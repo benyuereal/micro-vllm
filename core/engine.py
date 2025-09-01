@@ -57,19 +57,15 @@ class InferenceEngine:
         # 处理输出并分配缓存
         logits, past_key_values = self.adapter.process_batch_outputs(outputs)
 
-        # 打印 logits 形状用于调试
-        print(f"Prefill logits shape: {logits.shape}")  # 调试用
-
         results = {}
         for i, seq in enumerate(batch_sequences):
-            # 适配器已返回每个序列最后一个token的logits
-            # logits 形状为 (batch_size, 1, vocab_size)
-            seq_logits = logits[i:i + 1, 0, :]  # 取序列中唯一的那个logits
+            # 修改这里：直接取最后一个token的logits，确保形状为 (1, vocab_size)
+            last_token_idx = input_lengths[i] - 1
+            seq_logits = logits[i:i + 1, last_token_idx, :]  # 形状 (1, V)
 
             results[seq.seq_id] = seq_logits
             self.cache.allocate(seq.seq_id, tuple(pk[i:i + 1] for pk in past_key_values))
             seq.prefill_done = True
-            seq.last_logits = seq_logits  # 存储最后logits用于调试
 
         return results
 
