@@ -48,6 +48,7 @@ class InferenceEngine:
                 return_tensors="pt"
             ).to(self.device)
             seq_lengths.append(input_ids.shape[1])
+            # 关键修改：预填充阶段past_key_values设置为None
             inputs.append((input_ids, None))
             self.cache.allocate(seq_id)
 
@@ -62,6 +63,7 @@ class InferenceEngine:
         output_dict = {}
         for i, (seq_id, _) in enumerate(batch):
             logits, kv_cache = results[i]
+            # 关键修改：使用实际的序列长度而不是缓存位置
             self.cache.update(seq_id, kv_cache, seq_lengths[i])
             output_dict[seq_id] = logits
             self.scheduler.move_to_decode(seq_id)
