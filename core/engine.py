@@ -115,43 +115,39 @@ class InferenceEngine:
 
     # core/engine.py (修改 sample_next_tokens 方法)
 
-    # core/engine.py (完整的采样方法重写)
-
     def sample_next_tokens(self, logits_dict: Dict[int, torch.Tensor],
                            temperature: float = 0.7, top_p: float = 0.9) -> Dict[int, int]:
-        """批量采样下一个token - 彻底重构版"""
+        """批量采样下一个token - 简化安全版"""
         next_tokens = {}
 
         for seq_id, logits in logits_dict.items():
-            # 1. 统一logits形状
+            # 确保logits是2维：[batch_size, vocab_size]
             if logits.dim() == 3:
-                logits = logits[:, -1, :]  # 取最后一个token的logits
-            logits = logits.squeeze(0) if logits.dim() == 2 else logits
+                # 取最后一个token的logits
+                logits = logits[:, -1, :]
+            elif logits.dim() == 1:
+                logits = logits.unsqueeze(0)
 
-            # 2. 应用温度
+            # 应用温度
             logits = logits / temperature
 
-            # 3. 创建概率分布
-            probs = F.softmax(logits, dim=-1)
+            # 直接使用Hugging Face的top-p采样实现
+            from transformers import TopPLogitsWarper
+            warper = TopPLogitsWarper(top_p=top_p)
 
-            # 4. top-p采样 - 安全实现
-            sorted_probs, sorted_indices = torch.sort(probs, descending=True)
-            cumulative_probs = torch.cumsum(sorted_probs, dim=-1)
+            # 应用top-p过滤
+            filtered_logits = warper(None, logits)
 
-            # 找到需要保留的概率部分
-            sorted_indices_to_keep = cumulative_probs <= top_p
-            sorted_indices_to_keep[:, 1:] = sorted_indices_to_keep[:, :-1].clone()
-            sorted_indices_to_keep[:, 0] = True
+            # 计算概率分布
+            probs = F.softmax(filtered_logits, dim=-1)
 
-            # 创建新的概率分布
-            new_probs = torch.zeros_like(probs)
-            new_probs.scatter_(1, sorted_indices, sorted_probs * sorted_indices_to_keep)
+            # 确保概率分布有效
+            if torch.isnan(probs).any() or torch.isinf(probs).any():
+                # 回退到简单采样
+                probs = F.softmax(logits, dim=-1)
 
-            # 重新归一化
-            new_probs = new_probs / new_probs.sum(dim=-1, keepdim=True)
-
-            # 5. 采样
-            next_token = torch.multinomial(new_probs, num_samples=1).item()
+            # 采样下一个token
+            next_token = torch.multinomial(probs, num_samples=1).item()
             next_tokens[seq_id] = next_token
 
         return next_tokens
