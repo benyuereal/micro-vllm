@@ -117,6 +117,9 @@ class ModelWorker:
             # 获取最大生成步数（所有请求的最大token数）
             max_steps = max(req.sampling_params.max_tokens for req in requests)
 
+            # 使用模型返回的past_key_values，而不是分页缓存
+            past_key_values = None
+
             # 循环生成token直到所有请求完成或达到最大步数
             for step in range(max_steps):
                 # 检查是否所有请求都已完成
@@ -128,7 +131,6 @@ class ModelWorker:
                 input_ids_batch = []
                 positions_batch = []
                 sequence_ids = []
-                past_seq_lengths = []
                 active_indices = []  # 活跃请求的索引
 
                 for i, req in enumerate(requests):
@@ -150,7 +152,6 @@ class ModelWorker:
                     input_ids_batch.append(input_ids)
                     positions_batch.append(positions)
                     sequence_ids.append(req.request_id)
-                    past_seq_lengths.append(self.kv_cache.get_sequence_length(req.request_id))
 
                 # 如果没有活跃请求，跳过本次迭代
                 if not active_indices:
@@ -167,16 +168,19 @@ class ModelWorker:
                     if len(pos) > 0:  # 确保位置张量非空
                         padded_positions[i, :len(pos)] = pos
 
-                # 准备输入数据
+                # 准备输入数据 - 使用模型返回的past_key_values
                 input_data = {
                     "input_ids": padded_input_ids,
                     "positions": padded_positions,
                     "sequence_ids": sequence_ids,
-                    "past_seq_lengths": torch.tensor(past_seq_lengths, device=self.device)
+                    "past_key_values": past_key_values  # 使用模型返回的缓存
                 }
 
                 # 执行前向传播
                 output_data = self._forward_pass(input_data)
+
+                # 更新past_key_values为模型返回的最新值
+                past_key_values = output_data.get("past_key_values", None)
 
                 # 获取最后一个token的logits
                 last_logits = output_data["logits"][:, -1, :]
@@ -200,28 +204,19 @@ class ModelWorker:
                             time.time() - req.start_time > 30):  # 超时保护
                         req.is_completed = True
 
-                # 更新KV缓存
-                if output_data["hidden_states"] is not None:
-                    hidden_states = output_data["hidden_states"]
-                    if hidden_states.dim() == 3:  # [batch, seq, dim]
-                        # 只更新最后一个token的隐藏状态
-                        self.kv_cache.update_cache(
-                            hidden_states[:, -1:, :],  # 只取最后一个token
-                            sequence_ids,
-                            padded_positions[:, -1:]  # 只取最后一个位置
-                        )
-                    else:
-                        print(f"Warning: Unexpected hidden states shape {hidden_states.shape}")
-
             # 准备响应
             responses = []
             for req in requests:
                 if req.is_completed:
                     # 完整解码生成的文本
+                    # 确保prompt_ids在CPU上进行连接
+                    prompt_cpu = req.prompt_ids.cpu() if req.prompt_ids.device.type == 'cuda' else req.prompt_ids
                     full_ids = torch.cat([
-                        req.prompt_ids.cpu(),
+                        prompt_cpu,
                         torch.tensor(req.generated_token_ids)
                     ])
+
+                    # 解码完整文本
                     generated_text = self.tokenizer.decode(
                         full_ids[len(req.prompt_ids):],
                         skip_special_tokens=True,
@@ -233,8 +228,6 @@ class ModelWorker:
                         success=True,
                         error_message=None
                     ))
-                    # 清理缓存
-                    self.kv_cache.remove_sequence(req.request_id)
                 else:
                     # 获取自上次响应后新生成的token
                     new_tokens = req.generated_token_ids[req.last_decoded_index:]
@@ -256,6 +249,9 @@ class ModelWorker:
                         error_message="Generation not completed"
                     ))
 
+                # 清理缓存
+                self.kv_cache.remove_sequence(req.request_id)
+
             completed_count = sum(1 for r in responses if r.success)
             print(f"Batch processed successfully. Completed requests: {completed_count}/{len(requests)}")
             return responses
@@ -263,6 +259,10 @@ class ModelWorker:
         except Exception as e:
             import traceback
             print(f"Error processing batch: {e}\n{traceback.format_exc()}")
+            # 清理所有请求的缓存
+            for req in requests:
+                self.kv_cache.remove_sequence(req.request_id)
+
             return [
                 Response(
                     request_id=req.request_id,
