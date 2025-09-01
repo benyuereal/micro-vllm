@@ -1,6 +1,8 @@
 import torch
 import torch.nn.functional as F
 from typing import Dict, List, Tuple
+
+from .scheduler import Scheduler
 from .cache_manager import KVCache
 from .model_loader import load_model
 from models.qwen_adapter import QwenModelAdapter
@@ -13,6 +15,120 @@ class InferenceEngine:
         self.cache = KVCache()
         self.adapter = QwenModelAdapter
         self.device = next(self.model.parameters()).device
+        self.scheduler = Scheduler(max_batch_size=8)
+
+    def _prepare_batch_inputs(
+            self,
+            prefill_seqs: List[Dict],
+            decode_seqs: List[Dict]
+    ) -> Tuple[torch.Tensor, List]:
+        """准备混合批次输入张量"""
+        all_inputs, seq_metas = [], []
+
+        # 新请求处理
+        for req in prefill_seqs:
+            input_ids = self.tokenizer.encode(req["prompt"], return_tensors="pt").to(self.device)
+            all_inputs.append(input_ids)
+            seq_metas.append({
+                "seq_id": req["seq_id"],
+                "is_prefill": True,
+                "position_offset": 0
+            })
+            self.cache.allocate(req["seq_id"])
+            self.scheduler.update_sequence_state(req["seq_id"], status="prefill")
+
+        # 解码中请求处理
+        for req in decode_seqs:
+            last_token = req["last_token"]
+            input_ids = torch.tensor([[last_token]], device=self.device)
+            all_inputs.append(input_ids)
+            seq_metas.append({
+                "seq_id": req["seq_id"],
+                "is_prefill": False,
+                "position_offset": req["generated_length"] - 1
+            })
+
+        # 动态填充对齐
+        padded_inputs = torch.nn.utils.rnn.pad_sequence(
+            [x[0] for x in all_inputs],
+            batch_first=True,
+            padding_value=self.tokenizer.pad_token_id
+        )
+        return padded_inputs, seq_metas
+
+    def _process_batch_outputs(self, outputs, seq_metas):
+        """处理批次输出并更新状态"""
+        next_tokens = []
+        for i, meta in enumerate(seq_metas):
+            logits = outputs.logits[i]
+            past_key_values = tuple(
+                (k[i:i + 1], v[i:i + 1]) for k, v in outputs.past_key_values
+            ) if outputs.past_key_values else None
+
+            if meta["is_prefill"]:
+                # 首字生成
+                next_token = self.sample_next_token(logits[0, -1, :])
+                self.cache.update(meta["seq_id"], past_key_values)
+                self.scheduler.update_sequence_state(
+                    meta["seq_id"],
+                    status="decoding",
+                    generated_length=1
+                )
+            else:
+                # 续生成
+                next_token = self.sample_next_token(logits[0, -1, :])
+                self.cache.update(meta["seq_id"], past_key_values)
+                self.scheduler.sequence_states[meta["seq_id"]]["generated_length"] += 1
+
+            next_tokens.append(next_token)
+            if next_token == self.tokenizer.eos_token_id:
+                self.scheduler.update_sequence_state(meta["seq_id"], status="finished")
+
+        return next_tokens
+
+    def continuous_generate(self, max_steps=100):
+        """连续批处理主循环"""
+        results = {}
+        for step in range(max_steps):
+            prefill_batch, decode_batch = self.scheduler.get_batch()
+            if not prefill_batch and not decode_batch:
+                break
+
+            inputs, seq_metas = self._prepare_batch_inputs(prefill_batch, decode_batch)
+            model_inputs = self.adapter.prepare_batch_inputs(
+                self.model, inputs, seq_metas, self.cache
+            )
+
+            with torch.no_grad():
+                outputs = self.model(**model_inputs)
+
+            next_tokens = self._process_batch_outputs(outputs, seq_metas)
+
+            # 更新结果
+            for meta, token in zip(seq_metas, next_tokens):
+                if meta["seq_id"] not in results:
+                    results[meta["seq_id"]] = []
+                results[meta["seq_id"]].append(token)
+
+        return self._decode_results(results)
+
+    # 在 InferenceEngine 类中添加
+    def _decode_results(self, results: Dict[int, List[int]]) -> Dict[int, str]:
+        """将生成的token ID序列解码为文本结果"""
+        decoded_results = {}
+        for seq_id, token_ids in results.items():
+            try:
+                # 直接解码整个序列
+                decoded_text = self.tokenizer.decode(
+                    token_ids,
+                    skip_special_tokens=True,
+                    clean_up_tokenization_spaces=True
+                )
+                decoded_results[seq_id] = decoded_text
+            except Exception as e:
+                print(f"Error decoding sequence {seq_id}: {str(e)}")
+                decoded_results[seq_id] = f"[Decoding error] Token IDs: {token_ids}"
+        return decoded_results
 
     def prefill(self, input_ids: torch.Tensor) -> Tuple[torch.Tensor, Tuple]:
         """处理初始提示（prefill阶段）"""
