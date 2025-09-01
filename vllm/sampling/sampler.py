@@ -22,44 +22,30 @@ class Sampler:
         pass
 
     def sample(self, logits: torch.Tensor, sampling_params: SamplingParams) -> torch.Tensor:
-        """从logits中采样"""
-        # 修复点：显式处理不同维度的输入
+        # 统一处理不同维度输入
         if logits.dim() == 1:
-            # 处理一维输入 (vocab_size)
-            logits = logits.unsqueeze(0).unsqueeze(0)  # [1, 1, vocab_size]
-        elif logits.dim() == 2:
-            # 处理二维输入 (batch_size, vocab_size)
-            logits = logits.unsqueeze(1)  # [batch_size, 1, vocab_size]
-
-        # 现在logits总是三维
-        batch_size, seq_len, vocab_size = logits.shape
-        last_logits = logits[:, -1, :]  # 获取最后一个token的logits [batch_size, vocab_size]
+            logits = logits.unsqueeze(0)  # [1, vocab_size]
 
         # 应用温度调节
         if sampling_params.temperature > 0:
-            last_logits = last_logits / sampling_params.temperature
+            scaled_logits = logits / sampling_params.temperature
         else:
-            # 温度=0时使用贪婪采样
-            last_logits = last_logits * 1e10
-
-        # 应用重复惩罚
-        if sampling_params.repetition_penalty != 1.0:
-            self._apply_repetition_penalty(last_logits, sampling_params.repetition_penalty)
-
-        # 应用top-k过滤
-        if sampling_params.top_k > 0:
-            self._apply_top_k(last_logits, sampling_params.top_k)
+            scaled_logits = logits * 1e10  # 贪婪采样
 
         # 应用top-p过滤
         if sampling_params.top_p < 1.0:
-            self._apply_top_p(last_logits, sampling_params.top_p)
-
-        # 计算概率分布
-        probs = F.softmax(last_logits, dim=-1)
+            sorted_logits, sorted_indices = torch.sort(scaled_logits, descending=True)
+            cumulative_probs = torch.cumsum(torch.softmax(sorted_logits, dim=-1), dim=-1)
+            sorted_indices_to_remove = cumulative_probs > sampling_params.top_p
+            sorted_indices_to_remove[..., 1:] = sorted_indices_to_remove[..., :-1].clone()
+            sorted_indices_to_remove[..., 0] = 0
+            indices_to_remove = sorted_indices_to_remove.scatter(-1, sorted_indices, sorted_indices_to_remove)
+            scaled_logits = scaled_logits.masked_fill(indices_to_remove, float('-inf'))
 
         # 采样
-        next_tokens = torch.multinomial(probs, num_samples=1).squeeze(-1)
-        return next_tokens
+        probs = torch.softmax(scaled_logits, dim=-1)
+        next_tokens = torch.multinomial(probs, num_samples=1)
+        return next_tokens.squeeze(-1)
 
     def _apply_repetition_penalty(self, logits: torch.Tensor, penalty: float):
         """应用重复惩罚"""

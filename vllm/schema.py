@@ -10,6 +10,7 @@ class Request:
     sampling_params: SamplingParams
     arrival_time: float
     priority: int = 0
+    continuation: bool = False  # 新增：是否继续生成
 
 @dataclass
 class Response:

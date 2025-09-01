@@ -6,7 +6,7 @@ from .cache import PagedKVCache
 from .sampling.sampler import Sampler
 from .models.model_registry import get_model
 from .utils.tensor_parallel import TensorParallelManager
-from .schema import Response  # 从schema导入
+from .schema import Response, Request  # 从schema导入
 
 
 class ModelWorker:
@@ -80,7 +80,7 @@ class ModelWorker:
 
         print(f"ModelWorker initialized with model: {model_name}")
 
-    def process_batch(self, requests: List[Any]) -> List[Any]:
+    def process_batch(self, requests: List[Request]) -> List[Any]:
         print(f"Processing batch of {len(requests)} requests")
         if not self.is_running or not requests:
             return []
@@ -137,40 +137,40 @@ class ModelWorker:
                 for req in requests
             ]
 
-    def _prepare_inputs(self, requests: List[Any]) -> Dict[str, Any]:
-        """准备输入数据"""
-        prompts = [req.prompt for req in requests]
-        sampling_params = [req.sampling_params for req in requests]
-        sequence_ids = [req.request_id for req in requests]
+    def _prepare_inputs(self, requests: List[Request]) -> Dict[str, Any]:
+        input_ids_list = []
+        positions_list = []
 
-        # 分词
-        input_ids = self.tokenizer(
-            prompts,
-            return_tensors="pt",
+        for req in requests:
+            if req.continuation:
+                # 继续生成：使用上次生成的最后一个token
+                last_token = self.tokenizer.encode(req.prompt, add_special_tokens=False)[-1]
+                input_ids_list.append([last_token])
+                positions_list.append([self.kv_cache.get_sequence_length(req.request_id)])
+            else:
+                # 新请求：处理完整提示
+                tokens = self.tokenizer.encode(req.prompt, add_special_tokens=False)
+                input_ids_list.append(tokens)
+                positions_list.append(list(range(len(tokens))))
+
+        # 填充批次
+        input_ids = self.tokenizer.pad(
+            {'input_ids': input_ids_list},
             padding=True,
-            truncation=True,
-            max_length=self.max_seq_length
+            return_tensors="pt"
         ).input_ids.to(self.device)
 
-        # 获取位置信息
-        positions = torch.arange(
-            input_ids.size(1),
-            device=self.device
-        ).unsqueeze(0).expand(input_ids.size(0), -1)
-        positions = positions.to(self.device).contiguous()
+        positions = torch.nn.utils.rnn.pad_sequence(
+            [torch.tensor(p, device=self.device) for p in positions_list],
+            batch_first=True,
+            padding_value=0
+        )
 
-        # 获取历史长度（对于连续生成）
-
-
-        past_seq_lengths = torch.tensor([
-            self.kv_cache.get_sequence_length(seq_id) for seq_id in sequence_ids
-        ], device=self.device)  # 确保在GPU上
         return {
             "input_ids": input_ids,
             "positions": positions,
-            "sequence_ids": sequence_ids,
-            "sampling_params": sampling_params,
-            "past_seq_lengths": past_seq_lengths
+            "sequence_ids": [req.request_id for req in requests],
+            "sampling_params": [req.sampling_params for req in requests]
         }
 
     def _forward_pass(self, input_data: Dict[str, Any]) -> Dict[str, Any]:

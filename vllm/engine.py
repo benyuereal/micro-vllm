@@ -121,40 +121,91 @@ class LLMEngine:
     def generate(self,
                  prompts: List[str],
                  sampling_params: SamplingParams) -> List[Response]:
-        """生成文本"""
         responses = []
-        response_queues = []
-
-        # 为每个提示创建请求
+        # 存储每个请求的状态
+        request_states = []
         for prompt in prompts:
             self.request_counter += 1
             request_id = self.request_counter
-
-            # 创建响应队列
             response_queue = Queue()
             self.response_queues[request_id] = response_queue
-            response_queues.append(response_queue)
 
-            # 创建请求
+            # 初始化请求状态
+            state = {
+                'request_id': request_id,
+                'prompt': prompt,
+                'generated_tokens': [],
+                'finished': False,
+                'queue': response_queue
+            }
+            request_states.append(state)
+
+            # 创建初始请求
             request = Request(
                 request_id=request_id,
                 prompt=prompt,
                 sampling_params=sampling_params,
                 arrival_time=time.time()
             )
-
-            # 将请求加入队列
             self.request_queue.put(request)
 
-        # 等待所有响应
-        for response_queue in response_queues:
-            response = response_queue.get()
-            responses.append(response)
-            # 兼容字典和对象两种类型
-            req_id = response['request_id'] if isinstance(response, dict) else response.request_id
+        # 持续生成直到所有请求完成
+        while any(not state['finished'] for state in request_states):
+            for state in request_states:
+                if state['finished']:
+                    continue
+
+                try:
+                    # 获取响应（非阻塞）
+                    response = state['queue'].get_nowait()
+                    # 处理响应
+                    if isinstance(response, dict):
+                        token = response.get('generated_text', '')
+                        success = response.get('success', False)
+                    else:
+                        token = response.generated_text
+                        success = response.success
+
+                    if success and token:
+                        state['generated_tokens'].append(token)
+
+                        # 检查是否达到停止条件
+                        max_tokens = state.get('sampling_params', sampling_params).max_tokens
+                        if len(state['generated_tokens']) >= max_tokens:
+                            state['finished'] = True
+                            responses.append(Response(
+                                request_id=state['request_id'],
+                                generated_text=''.join(state['generated_tokens']),
+                                success=True
+                            ))
+                        else:
+                            # 创建下一个token的请求
+                            next_request = Request(
+                                request_id=state['request_id'],
+                                prompt='',  # 使用空提示继续生成
+                                sampling_params=sampling_params,
+                                arrival_time=time.time(),
+                                continuation=True  # 标记为继续生成
+                            )
+                            self.request_queue.put(next_request)
+                    else:
+                        state['finished'] = True
+                        responses.append(Response(
+                            request_id=state['request_id'],
+                            generated_text=''.join(state['generated_tokens']),
+                            success=False,
+                            error_message=response.get('error_message', '') if isinstance(response,
+                                                                                          dict) else response.error_message
+                        ))
+
+                except Empty:
+                    continue  # 无新响应，继续等待
+
+        # 清理响应队列
+        for state in request_states:
+            req_id = state['request_id']
             if req_id in self.response_queues:
                 del self.response_queues[req_id]
-
 
         return responses
 
