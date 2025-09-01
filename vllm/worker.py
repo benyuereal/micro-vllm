@@ -89,6 +89,16 @@ class ModelWorker:
             # 调试信息：显示当前序列状态
             print("Current batch sequence states:")
             for req in requests:
+                # 确保 prompt_ids 存在且有效
+                if not hasattr(req, 'prompt_ids') or req.prompt_ids is None:
+                    # 初始化 prompt_ids
+                    req.prompt_ids = self.tokenizer.encode(
+                        req.prompt,
+                        return_tensors="pt",
+                        padding=False,
+                        truncation=True,
+                        max_length=self.max_seq_length
+                    ).to(self.device).squeeze(0)
                 seq_length = self.kv_cache.get_sequence_length(req.request_id)
                 print(f"Request {req.request_id}: "
                       f"Prompt len={len(req.prompt_ids) if hasattr(req, 'prompt_ids') else 0}, "
