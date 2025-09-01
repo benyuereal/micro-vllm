@@ -1,3 +1,4 @@
+# run_server.py
 from core.engine import InferenceEngine
 import time
 import traceback
@@ -8,7 +9,7 @@ if __name__ == "__main__":
     print("Loading Qwen-7B model...")
     start_time = time.time()
     try:
-        engine = InferenceEngine(MODEL_PATH)
+        engine = InferenceEngine(MODEL_PATH, max_batch_size=4)
         load_time = time.time() - start_time
         print(f"Model loaded in {load_time:.2f} seconds")
 
