@@ -109,39 +109,45 @@ class InferenceEngine:
         return {seq.seq_id: logits[i:i + 1, -1, :] for i, seq in enumerate(sequences)}
 
     # core/engine.py (修改部分)
-    # core/engine.py (修改 sample_next_tokens 方法)
-
-    # core/engine.py (完整的采样方法重写)
-
-    # core/engine.py (修改 sample_next_tokens 方法)
-
-    # core/engine.py (完整的采样方法重写)
-
     def sample_next_tokens(self, logits_dict: Dict[int, torch.Tensor],
                            temperature: float = 0.7, top_p: float = 0.9) -> Dict[int, int]:
-        """批量采样下一个token - 彻底重构版"""
+        """批量采样下一个token - 修复维度错误"""
         next_tokens = {}
 
         for seq_id, logits in logits_dict.items():
-            # 1. 统一logits形状
+            # 确保logits是2维：[batch_size, vocab_size]
             if logits.dim() == 3:
                 logits = logits[:, -1, :]  # 取最后一个token的logits
-            logits = logits.squeeze(0) if logits.dim() == 2 else logits
+            if logits.dim() == 1:
+                logits = logits.unsqueeze(0)  # 添加batch维度
 
-            # 2. 应用温度
+            # 应用温度
             logits = logits / temperature
 
-            # 3. 创建概率分布
+            # 创建概率分布
             probs = F.softmax(logits, dim=-1)
 
-            # 4. top-p采样 - 安全实现
+            # 获取概率分布的维度信息
+            batch_size, vocab_size = probs.shape
+
+            # top-p采样 - 安全实现
             sorted_probs, sorted_indices = torch.sort(probs, descending=True)
             cumulative_probs = torch.cumsum(sorted_probs, dim=-1)
 
             # 找到需要保留的概率部分
             sorted_indices_to_keep = cumulative_probs <= top_p
-            sorted_indices_to_keep[:, 1:] = sorted_indices_to_keep[:, :-1].clone()
-            sorted_indices_to_keep[:, 0] = True
+
+            # 修复索引维度问题
+            # 方法1：使用更安全的索引操作
+            for i in range(batch_size):
+                # 将第一个位置设为True，确保至少有一个token
+                sorted_indices_to_keep[i, 0] = True
+
+                # 处理后续位置
+                if vocab_size > 1:
+                    # 创建临时副本用于安全的索引操作
+                    temp = sorted_indices_to_keep[i, :-1].clone()
+                    sorted_indices_to_keep[i, 1:] = temp
 
             # 创建新的概率分布
             new_probs = torch.zeros_like(probs)
@@ -150,7 +156,7 @@ class InferenceEngine:
             # 重新归一化
             new_probs = new_probs / new_probs.sum(dim=-1, keepdim=True)
 
-            # 5. 采样
+            # 采样下一个token
             next_token = torch.multinomial(new_probs, num_samples=1).item()
             next_tokens[seq_id] = next_token
 
