@@ -1,3 +1,5 @@
+from typing import Tuple
+
 import torch
 from .cache_manager import KVCache
 from .model_loader import load_model
