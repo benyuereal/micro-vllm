@@ -86,58 +86,42 @@ class ModelWorker:
             return []
 
         try:
-            # 初始化响应列表
-            responses = [None] * len(requests)
+            # 准备输入数据
+            input_data = self._prepare_inputs(requests)
+            # 执行模型前向传播
+            output_data = self._forward_pass(input_data)
 
-            # 创建序列状态跟踪
-            active_sequences = {}
-            for i, req in enumerate(requests):
-                # 初始化序列状态
-                seq_id = req.request_id
-                active_sequences[seq_id] = {
-                    'prompt': req.prompt,
-                    'tokens': [],
-                    'max_tokens': req.sampling_params.max_tokens,
-                    'sampling_params': req.sampling_params,
-                    'finished': False,
-                    'position': 0
-                }
+            # 获取最后一个token的logits [batch_size, vocab_size]
+            last_logits = output_data["logits"][:, -1, :]
+            print(f"Last token logits shape: {last_logits.shape}")  # 调试日志
 
-            # 持续生成直到所有序列完成
-            while any(not seq['finished'] for seq in active_sequences.values()):
-                # 准备当前批次的输入
-                batch_input = self._prepare_active_batch(active_sequences)
-                if not batch_input:
-                    break
+            # 逐个样本采样
+            next_tokens_list = []
+            for i in range(last_logits.size(0)):
+                # 当前样本的logits [vocab_size]
+                logits_i = last_logits[i]
+                # 调试日志：显示采样前的logits维度
+                print(f"Sampling for sample {i}, logits shape: {logits_i.shape}")
 
-                # 执行模型前向传播
-                output_data = self._forward_pass(batch_input)
+                # 当前样本的采样参数
+                sampling_param_i = input_data["sampling_params"][i]
+                # 采样
+                next_token_i = self.sampler.sample(logits_i, sampling_param_i)
+                next_tokens_list.append(next_token_i)
 
-                # 处理输出并采样
-                last_logits = output_data["logits"][:, -1, :]
-                next_tokens = self._sample_next_tokens(
-                    last_logits,
-                    batch_input["sampling_params"]
-                )
+            # 合并结果 [batch_size]
+            next_tokens = torch.cat(next_tokens_list, dim=0)
 
-                # 更新序列状态
-                self._update_sequences(
-                    active_sequences,
-                    batch_input["sequence_ids"],
-                    next_tokens
-                )
+            # 更新KV缓存
+            self.kv_cache.update_cache(
+                output_data["hidden_states"],
+                input_data["sequence_ids"],
+                input_data["positions"]
+            )
 
-                # 更新KV缓存
-                self.kv_cache.update_cache(
-                    output_data["hidden_states"],
-                    batch_input["sequence_ids"],
-                    batch_input["positions"]
-                )
-
-            # 准备最终响应
-            responses = self._prepare_final_responses(active_sequences, requests)
-            print(
-                f"Batch processed successfully. Generated {sum(len(seq['tokens']) for seq in active_sequences.values())} tokens")
+            # 准备响应
+            responses = self._prepare_responses(requests, next_tokens)
+            print(f"Batch processed successfully. Response type: {type(responses[0])}")
             return responses
 
         except Exception as e:
@@ -152,95 +136,6 @@ class ModelWorker:
                 )
                 for req in requests
             ]
-
-    def _prepare_active_batch(self, active_sequences: dict) -> dict:
-        """为活跃序列准备输入"""
-        sequence_ids = []
-        input_ids_list = []
-        sampling_params = []
-        positions_list = []
-
-        for seq_id, seq_state in active_sequences.items():
-            if seq_state['finished']:
-                continue
-
-            # 获取当前token位置
-            current_token = seq_state['tokens'][-1] if seq_state['tokens'] else self.tokenizer.bos_token_id
-            input_ids = torch.tensor([[current_token]], device=self.device)
-
-            sequence_ids.append(seq_id)
-            input_ids_list.append(input_ids)
-            sampling_params.append(seq_state['sampling_params'])
-
-            # 位置 = 当前序列长度
-            position = torch.tensor([[len(seq_state['tokens'])]], device=self.device)
-            positions_list.append(position)
-
-        if not sequence_ids:
-            return {}
-
-        # 批处理输入
-        input_ids = torch.cat(input_ids_list, dim=0)
-        positions = torch.cat(positions_list, dim=0)
-
-        return {
-            "input_ids": input_ids,
-            "positions": positions,
-            "sequence_ids": sequence_ids,
-            "sampling_params": sampling_params,
-            "past_seq_lengths": [self.kv_cache.get_sequence_length(seq_id) for seq_id in sequence_ids]
-        }
-
-    def _sample_next_tokens(self, logits: torch.Tensor, sampling_params_list: list) -> torch.Tensor:
-        """批量采样下一个token"""
-        next_tokens = []
-        for i in range(logits.size(0)):
-            sampled_token = self.sampler.sample(logits[i], sampling_params_list[i])
-            next_tokens.append(sampled_token)
-        return torch.stack(next_tokens)
-
-    def _update_sequences(self, active_sequences: dict, sequence_ids: list, next_tokens: torch.Tensor):
-        """更新序列状态"""
-        for i, seq_id in enumerate(sequence_ids):
-            token = next_tokens[i].item()
-            seq_state = active_sequences[seq_id]
-
-            # 添加到生成的token
-            seq_state['tokens'].append(token)
-
-            # 检查是否完成
-            seq_state['finished'] = (
-                    len(seq_state['tokens']) >= seq_state['max_tokens'] or
-                    token == self.tokenizer.eos_token_id
-            )
-
-    def _prepare_final_responses(self, active_sequences: dict, requests: list) -> list:
-        """准备最终响应"""
-        responses = []
-        for req in requests:
-            seq_state = active_sequences[req.request_id]
-            try:
-                generated_text = self.tokenizer.decode(
-                    seq_state['tokens'],
-                    skip_special_tokens=True
-                )
-                responses.append(Response(
-                    request_id=req.request_id,
-                    generated_text=generated_text,
-                    success=True
-                ))
-            except Exception as e:
-                responses.append(Response(
-                    request_id=req.request_id,
-                    generated_text="",
-                    success=False,
-                    error_message=f"Decoding error: {str(e)}"
-                ))
-
-            # 清理序列缓存
-            self.kv_cache.remove_sequence(req.request_id)
-
-        return responses
 
     def _prepare_inputs(self, requests: List[Any]) -> Dict[str, Any]:
         """准备输入数据"""
