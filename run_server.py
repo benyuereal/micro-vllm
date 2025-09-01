@@ -27,7 +27,13 @@ if __name__ == "__main__":
     start_time = time.time()
 
     try:
-        results = engine.generate(prompts, max_tokens=50)
+        # 使用更高质量的生成参数
+        results = engine.generate(
+            prompts,
+            max_tokens=100,
+            temperature=0.7,  # 控制随机性
+            top_k=50  # 仅从top-k token中采样
+        )
         gen_time = time.time() - start_time
     except Exception as e:
         print(f"Generation failed: {str(e)}")

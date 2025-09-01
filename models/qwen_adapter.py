@@ -22,7 +22,12 @@ class QwenModelAdapter:
             attention_mask = torch.ones((batch_size, seq_length), device=input_ids.device)
         else:
             # 增量推理（decode）
-            position_ids = torch.tensor([[seq_length - 1]], dtype=torch.long, device=input_ids.device)
+            # 计算当前序列长度（past_key_values的长度 + 1）
+            past_length = past_key_values[0][0].size(-2)
+            current_length = past_length + 1
+
+            # 创建位置ID
+            position_ids = torch.tensor([[current_length - 1]], dtype=torch.long, device=input_ids.device)
             attention_mask = None
 
         return {

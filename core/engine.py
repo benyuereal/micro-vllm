@@ -1,4 +1,5 @@
 import torch
+import torch.nn.functional as F
 from typing import Dict, List, Tuple
 from .cache_manager import KVCache
 from .model_loader import load_model
@@ -11,6 +12,7 @@ class InferenceEngine:
         self.model.eval()  # 设置为评估模式
         self.cache = KVCache()
         self.adapter = QwenModelAdapter
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     def prefill(self, input_ids: torch.Tensor) -> Tuple[torch.Tensor, Tuple]:
         """处理初始提示（prefill阶段）"""
@@ -30,14 +32,27 @@ class InferenceEngine:
             outputs = self.model(**inputs)
         return self.adapter.process_outputs(outputs, input_ids.size(1))
 
-    def generate(self, prompts: list, max_tokens: int = 128) -> dict:
+    def sample_next_token(self, logits: torch.Tensor, temperature: float = 0.7, top_k: int = 50) -> int:
+        """使用温度采样和top-k过滤选择下一个token"""
+        # 应用温度
+        logits = logits / temperature
+
+        # 应用top-k过滤
+        top_k_values, top_k_indices = torch.topk(logits, top_k)
+        probs = F.softmax(top_k_values, dim=-1)
+
+        # 从top-k token中采样
+        next_token_index = torch.multinomial(probs, 1).item()
+        return top_k_indices[next_token_index].item()
+
+    def generate(self, prompts: list, max_tokens: int = 128, temperature: float = 0.7, top_k: int = 50) -> dict:
         """生成文本"""
         results = {}
 
         # 预热阶段：处理初始提示
         for prompt in prompts:
             seq_id = id(prompt)
-            input_ids = self.tokenizer.encode(prompt, return_tensors="pt").cuda()
+            input_ids = self.tokenizer.encode(prompt, return_tensors="pt").to(self.device)
             logits, kv_cache = self.prefill(input_ids)
 
             # 分配缓存并存储初始KV
@@ -45,10 +60,10 @@ class InferenceEngine:
             self.cache.update(seq_id, kv_cache)
 
             # 获取最后一个token的预测
-            next_token = logits[0, -1, :].argmax().item()
+            next_token = self.sample_next_token(logits[0, -1, :], temperature, top_k)
             results[seq_id] = input_ids[0].tolist() + [next_token]
 
-        # 解码循环 - 逐个序列处理，避免批处理问题
+        # 解码循环 - 逐个序列处理
         for step in range(max_tokens - 1):
             any_active = False
 
@@ -72,7 +87,7 @@ class InferenceEngine:
                     continue
 
                 # 执行单序列解码
-                input_tensor = torch.tensor([[last_token]], device="cuda")
+                input_tensor = torch.tensor([[last_token]], device=self.device)
                 try:
                     logits, new_kv = self.decode_step(
                         input_tensor,
@@ -80,7 +95,7 @@ class InferenceEngine:
                     )
 
                     # 获取下一个token
-                    next_token = logits[0, -1, :].argmax().item()
+                    next_token = self.sample_next_token(logits[0, -1, :], temperature, top_k)
                     results[seq_id].append(next_token)
 
                     # 更新缓存
