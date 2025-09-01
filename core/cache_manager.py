@@ -1,4 +1,3 @@
-# core/cache_manager.py
 class KVCache:
     def __init__(self):
         self.cache = {}
@@ -14,8 +13,3 @@ class KVCache:
 
     def get(self, seq_id):
         return self.cache.get(seq_id)
-
-    def remove(self, seq_id):
-        """移除序列的缓存"""
-        if seq_id in self.cache:
-            del self.cache[seq_id]
