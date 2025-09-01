@@ -16,6 +16,13 @@ class QwenModelAdapter:
         """
         batch_size, seq_length = input_ids.shape
 
+        # 验证past_key_values结构
+        if past_key_values is not None:
+            assert isinstance(past_key_values, tuple), "past_key_values must be a tuple"
+            for layer_kv in past_key_values:
+                assert isinstance(layer_kv, tuple) and len(
+                    layer_kv) == 2, "Each layer should be a tuple of (key, value)"
+
         if past_key_values is None:
             # 首次推理（prefill）
             position_ids = torch.arange(0, seq_length, dtype=torch.long, device=input_ids.device)
@@ -28,7 +35,7 @@ class QwenModelAdapter:
 
             # 创建位置ID：每个序列的当前位置
             position_ids = torch.tensor(
-                [[length - 1] for length in sequence_lengths],
+                [[length] for length in sequence_lengths],  # 使用完整序列长度
                 dtype=torch.long,
                 device=input_ids.device
             )
@@ -52,6 +59,11 @@ class QwenModelAdapter:
         """
         logits = outputs.logits
         past_key_values = outputs.past_key_values
+
+        # 验证past_key_values结构
+        assert isinstance(past_key_values, tuple), "past_key_values must be a tuple"
+        for i, layer_kv in enumerate(past_key_values):
+            assert isinstance(layer_kv, tuple) and len(layer_kv) == 2, f"Layer {i} should be a tuple of (key, value)"
 
         # 对于decode步骤，我们只需要最后一个token的logits
         if input_length > 1:

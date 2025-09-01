@@ -1,14 +1,20 @@
 from core.engine import InferenceEngine
 import time
+import traceback
 
 MODEL_PATH = "/data/model/qwen/Qwen-7B-Chat"
 
 if __name__ == "__main__":
     print("Loading Qwen-7B model...")
     start_time = time.time()
-    engine = InferenceEngine(MODEL_PATH)
-    load_time = time.time() - start_time
-    print(f"Model loaded in {load_time:.2f} seconds")
+    try:
+        engine = InferenceEngine(MODEL_PATH)
+        load_time = time.time() - start_time
+        print(f"Model loaded in {load_time:.2f} seconds")
+    except Exception as e:
+        print(f"Failed to load model: {str(e)}")
+        traceback.print_exc()
+        exit(1)
 
     # 测试不同长度的提示
     prompts = [
@@ -19,8 +25,14 @@ if __name__ == "__main__":
 
     print(f"Generating responses for {len(prompts)} prompts...")
     start_time = time.time()
-    results = engine.generate(prompts, max_tokens=50)
-    gen_time = time.time() - start_time
+
+    try:
+        results = engine.generate(prompts, max_tokens=50)
+        gen_time = time.time() - start_time
+    except Exception as e:
+        print(f"Generation failed: {str(e)}")
+        traceback.print_exc()
+        exit(1)
 
     print("\nResults:")
     for i, prompt in enumerate(prompts):

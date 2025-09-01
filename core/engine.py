@@ -8,13 +8,15 @@ from models.qwen_adapter import QwenModelAdapter
 class InferenceEngine:
     def __init__(self, model_path: str):
         self.model, self.tokenizer = load_model(model_path)
+        self.model.eval()  # 设置为评估模式
         self.cache = KVCache()
         self.adapter = QwenModelAdapter
 
     def prefill(self, input_ids: torch.Tensor) -> Tuple[torch.Tensor, Tuple]:
         """处理初始提示（prefill阶段）"""
         inputs = self.adapter.prepare_inputs(self.model, input_ids)
-        outputs = self.model(**inputs)
+        with torch.no_grad():  # 禁用梯度计算
+            outputs = self.model(**inputs)
         return self.adapter.process_outputs(outputs, input_ids.size(1))
 
     def decode_step(self, input_ids: torch.Tensor, past_key_values: Tuple, sequence_lengths: List[int]) -> Tuple[
@@ -26,7 +28,8 @@ class InferenceEngine:
             past_key_values,
             sequence_lengths
         )
-        outputs = self.model(**inputs)
+        with torch.no_grad():  # 禁用梯度计算
+            outputs = self.model(**inputs)
         return self.adapter.process_outputs(outputs, input_ids.size(1))
 
     def generate(self, prompts: list, max_tokens: int = 128) -> dict:
@@ -73,35 +76,54 @@ class InferenceEngine:
 
                 # 获取缓存
                 cache_entry = self.cache.get(seq_id)
-                cache_entries.append(cache_entry['past_key_values'])
-                sequence_lengths.append(cache_entry['length'])
-                prompt_ids.append(seq_id)
+                # 验证缓存结构
+                if cache_entry and 'past_key_values' in cache_entry:
+                    cache_entries.append(cache_entry['past_key_values'])
+                    sequence_lengths.append(cache_entry['length'])
+                    prompt_ids.append(seq_id)
+                else:
+                    print(f"Warning: Missing cache for sequence {seq_id}")
+                    sequence_info[seq_id]["done"] = True
 
             if not input_batch:
                 break
 
-            # 执行批处理解码
-            input_tensor = torch.tensor([input_batch], device="cuda").T  # 转置为 [batch_size, 1]
-            logits, new_kv = self.decode_step(
-                input_tensor,
-                cache_entries,
-                sequence_lengths
-            )
+            try:
+                # 执行批处理解码
+                input_tensor = torch.tensor([input_batch], device="cuda").T
+                logits, new_kv = self.decode_step(
+                    input_tensor,
+                    cache_entries,
+                    sequence_lengths
+                )
 
-            # 更新缓存和结果
-            next_tokens = logits[:, -1, :].argmax(dim=-1).tolist()
-            for i, seq_id in enumerate(prompt_ids):
-                token_id = next_tokens[i]
-                results[seq_id].append(token_id)
+                # 更新缓存和结果
+                next_tokens = logits[:, -1, :].argmax(dim=-1).tolist()
+                for i, seq_id in enumerate(prompt_ids):
+                    token_id = next_tokens[i]
+                    results[seq_id].append(token_id)
 
-                # 更新序列长度
-                new_length = sequence_info[seq_id]["length"] + 1
-                self.cache.update(seq_id, new_kv[i], new_length)
-                sequence_info[seq_id]["length"] = new_length
+                    # 更新序列长度
+                    new_length = sequence_info[seq_id]["length"] + 1
+                    self.cache.update(seq_id, new_kv[i], new_length)
+                    sequence_info[seq_id]["length"] = new_length
 
-                # 检查是否生成了结束符
-                if token_id == self.tokenizer.eos_token_id:
+                    # 检查是否生成了结束符
+                    if token_id == self.tokenizer.eos_token_id:
+                        sequence_info[seq_id]["done"] = True
+            except Exception as e:
+                print(f"Error during decode step {step}: {str(e)}")
+                # 将当前批次的所有序列标记为完成
+                for seq_id in prompt_ids:
                     sequence_info[seq_id]["done"] = True
 
         # 结果转换
-        return {k: self.tokenizer.decode(v) for k, v in results.items()}
+        decoded_results = {}
+        for seq_id, token_ids in results.items():
+            try:
+                decoded_results[seq_id] = self.tokenizer.decode(token_ids, skip_special_tokens=True)
+            except Exception as e:
+                print(f"Error decoding sequence {seq_id}: {str(e)}")
+                decoded_results[seq_id] = f"[Decoding error] Token IDs: {token_ids}"
+
+        return decoded_results
