@@ -1,203 +1,135 @@
-# core/engine.py (重构)
 import torch
 import torch.nn.functional as F
-from typing import List, Dict, Tuple
-
-from . import Scheduler
+from typing import Dict, List, Tuple
 from .cache_manager import KVCache
 from .model_loader import load_model
-from .sequence import Sequence
 from models.qwen_adapter import QwenModelAdapter
 
 
 class InferenceEngine:
-    def __init__(self, model_path: str, max_batch_size=8):
+    def __init__(self, model_path: str):
         self.model, self.tokenizer = load_model(model_path)
         self.model.eval()
-        self.cache = KVCache(max_batch_size)
-        self.adapter = QwenModelAdapter()
+        self.cache = KVCache()
+        self.adapter = QwenModelAdapter
         self.device = next(self.model.parameters()).device
-        self.max_batch_size = max_batch_size
 
-    def batch_prefill(self, sequences: List[Sequence]) -> Dict[int, torch.Tensor]:
-        """批量处理初始提示"""
-        batch_inputs = []
-        batch_sequences = []
-
-        # 准备批处理输入
-        for seq in sequences:
-            input_ids = self.tokenizer.encode(seq.prompt, return_tensors="pt").to(self.device)
-            seq.input_ids = input_ids[0].tolist()
-            batch_inputs.append(input_ids)
-            batch_sequences.append(seq)
-
-        # 创建注意力掩码
-        input_lengths = [tensor.size(1) for tensor in batch_inputs]
-        max_length = max(input_lengths)
-
-        padded_inputs = torch.zeros(len(batch_inputs), max_length, dtype=torch.long, device=self.device)
-        attention_mask = torch.zeros(len(batch_inputs), max_length, dtype=torch.long, device=self.device)
-
-        for i, tensor in enumerate(batch_inputs):
-            padded_inputs[i, :input_lengths[i]] = tensor[0]
-            attention_mask[i, :input_lengths[i]] = 1
-
-        # 准备模型输入
-        inputs = self.adapter.prepare_batch_inputs(
-            self.model,
-            padded_inputs,
-            attention_mask,
-            None
-        )
-
-        # 执行推理
+    def prefill(self, input_ids: torch.Tensor) -> Tuple[torch.Tensor, Tuple]:
+        """处理初始提示（prefill阶段）"""
+        inputs = self.adapter.prepare_inputs(self.model, input_ids, None)
         with torch.no_grad():
             outputs = self.model(**inputs)
+        return self.adapter.process_outputs(outputs, input_ids.size(1))
 
-        # 处理输出并分配缓存
-        logits, past_key_values = self.adapter.process_batch_outputs(outputs)
-
-        results = {}
-        for i, seq in enumerate(batch_sequences):
-            # 修改这里：直接取最后一个token的logits，确保形状为 (1, vocab_size)
-            last_token_idx = input_lengths[i] - 1
-            seq_logits = logits[i:i + 1, last_token_idx, :]  # 形状 (1, V)
-
-            results[seq.seq_id] = seq_logits
-            self.cache.allocate(seq.seq_id, tuple(pk[i:i + 1] for pk in past_key_values))
-            seq.prefill_done = True
-
-        return results
-
-    def batch_decode(self, sequences: List[Sequence]) -> Dict[int, torch.Tensor]:
-        """批量处理解码步骤"""
-        if not sequences:
-            return {}
-
-        # 准备输入tokens
-        input_tokens = torch.tensor(
-            [seq.get_last_token() for seq in sequences],
-            device=self.device
-        ).unsqueeze(1)
-
-        # 获取批处理缓存
-        seq_ids = [seq.seq_id for seq in sequences]
-        past_key_values = self.cache.get_batch(seq_ids)
-
-        # 准备模型输入
-        inputs = self.adapter.prepare_batch_inputs(
+    def decode_step(self, input_ids: torch.Tensor, past_key_values: Tuple) -> Tuple[torch.Tensor, Tuple]:
+        """单步解码（decode阶段）"""
+        inputs = self.adapter.prepare_inputs(
             self.model,
-            input_tokens,
-            None,
+            input_ids,
             past_key_values
         )
-
-        # 执行推理
         with torch.no_grad():
             outputs = self.model(**inputs)
+        return self.adapter.process_outputs(outputs, input_ids.size(1))
 
-        # 处理输出并更新缓存
-        logits, new_past_key_values = self.adapter.process_batch_outputs(outputs)
+    def sample_next_token(self, logits: torch.Tensor, temperature: float = 0.7, top_p: float = 0.9) -> int:
+        """使用温度采样和top-p（核采样）选择下一个token"""
+        # 应用温度
+        logits = logits / temperature
 
-        # 更新缓存
-        for i, seq_id in enumerate(seq_ids):
-            self.cache.update(seq_id, tuple(pk[i:i + 1] for pk in new_past_key_values))
+        # 应用top-p（核采样）
+        sorted_logits, sorted_indices = torch.sort(logits, descending=True)
+        cumulative_probs = torch.cumsum(F.softmax(sorted_logits, dim=-1), dim=-1)
 
-        # 返回每个序列的logits
-        return {seq.seq_id: logits[i:i + 1, -1, :] for i, seq in enumerate(sequences)}
+        # 移除累积概率低于top_p的token
+        sorted_indices_to_remove = cumulative_probs > top_p
+        sorted_indices_to_remove[..., 1:] = sorted_indices_to_remove[..., :-1].clone()
+        sorted_indices_to_remove[..., 0] = 0
 
-    # core/engine.py (修改部分)
-    def sample_next_tokens(self, logits_dict: Dict[int, torch.Tensor],
-                           temperature: float = 0.7, top_p: float = 0.9) -> Dict[int, int]:
-        """批量采样下一个token"""
-        next_tokens = {}
+        indices_to_remove = sorted_indices[sorted_indices_to_remove]
+        logits[indices_to_remove] = float('-inf')
 
-        for seq_id, logits in logits_dict.items():
-            # 确保logits是2维：[batch_size, vocab_size]
-            if logits.dim() == 3:
-                logits = logits.squeeze(1)  # 从 (1, 1, V) -> (1, V)
+        # 从剩余token中采样
+        probs = F.softmax(logits, dim=-1)
+        next_token = torch.multinomial(probs, num_samples=1).item()
+        return next_token
 
-            # 应用温度
-            logits = logits / temperature
-
-            # 应用top-p（核采样）
-            sorted_logits, sorted_indices = torch.sort(logits, descending=True)
-            cumulative_probs = torch.cumsum(F.softmax(sorted_logits, dim=-1), dim=-1)
-
-            # 移除累积概率低于top_p的token
-            sorted_indices_to_remove = cumulative_probs > top_p
-            sorted_indices_to_remove[..., 1:] = sorted_indices_to_remove[..., :-1].clone()
-            sorted_indices_to_remove[..., 0] = 0
-
-            indices_to_remove = sorted_indices[sorted_indices_to_remove]
-            logits.scatter_(dim=-1, index=indices_to_remove, value=float('-inf'))
-
-            # 确保概率分布是有效的2维张量
-            probs = F.softmax(logits, dim=-1)
-            if probs.dim() == 1:
-                probs = probs.unsqueeze(0)  # 从 (V) -> (1, V)
-
-            # 从剩余token中采样
-            next_token = torch.multinomial(probs, num_samples=1).item()
-            next_tokens[seq_id] = next_token
-
-        return next_tokens
-
-    def generate(self, prompts: List[str], max_tokens: int = 128,
-                 temperature: float = 0.7, top_p: float = 0.9) -> Dict[int, str]:
-        """支持连续批处理的生成方法"""
-        scheduler = Scheduler(max_batch_size=self.max_batch_size)
+    def generate(self, prompts: list, max_tokens: int = 128, temperature: float = 0.7, top_p: float = 0.9) -> dict:
+        """生成文本"""
         results = {}
 
-        # 添加初始请求
+        # 预热阶段：处理初始提示
         for prompt in prompts:
-            seq_id = scheduler.add_request(prompt)
-            results[seq_id] = []
+            seq_id = id(prompt)
+            input_ids = self.tokenizer.encode(prompt, return_tensors="pt").to(self.device)
+            logits, kv_cache = self.prefill(input_ids)
 
-        # 主处理循环
-        for _ in range(max_tokens):
-            # 步骤1: 处理新的预填充请求
-            prefill_batch = scheduler.get_prefill_batch()
-            if prefill_batch:
-                prefill_logits = self.batch_prefill(prefill_batch)
-                next_tokens = self.sample_next_tokens(prefill_logits, temperature, top_p)
+            # 分配缓存并存储初始KV
+            self.cache.allocate(seq_id)
+            self.cache.update(seq_id, kv_cache)
 
-                for seq in prefill_batch:
-                    token = next_tokens.get(seq.seq_id, self.tokenizer.eos_token_id)
-                    seq.add_output_token(token)
-                    results[seq.seq_id].append(token)
+            # 获取最后一个token的预测
+            next_token = self.sample_next_token(logits[0, -1, :], temperature, top_p)
+            results[seq_id] = input_ids[0].tolist() + [next_token]
 
-                scheduler.move_to_running(prefill_batch)
+        # 解码循环 - 逐个序列处理
+        for step in range(max_tokens - 1):
+            any_active = False
 
-            # 步骤2: 处理正在运行的序列
-            decode_batch = scheduler.get_decode_batch()
-            if decode_batch:
-                decode_logits = self.batch_decode(decode_batch)
-                next_tokens = self.sample_next_tokens(decode_logits, temperature, top_p)
+            for prompt in prompts:
+                seq_id = id(prompt)
+                if seq_id not in results:
+                    continue
 
-                for seq in decode_batch:
-                    token = next_tokens.get(seq.seq_id, self.tokenizer.eos_token_id)
+                # 获取最后一个生成的token
+                last_token = results[seq_id][-1]
 
-                    # 检查结束条件
-                    if token == self.tokenizer.eos_token_id:
-                        scheduler.mark_finished(seq.seq_id)
-                    else:
-                        seq.add_output_token(token)
-                        results[seq.seq_id].append(token)
+                # 检查是否生成了结束符
+                if last_token == self.tokenizer.eos_token_id:
+                    continue
 
-            # 检查是否所有序列都已完成
-            if not scheduler.has_requests():
+                any_active = True
+
+                # 获取缓存
+                cache_entry = self.cache.get(seq_id)
+                if not cache_entry or cache_entry['past_key_values'] is None:
+                    continue
+
+                # 执行单序列解码
+                input_tensor = torch.tensor([[last_token]], device=self.device)
+                try:
+                    logits, new_kv = self.decode_step(
+                        input_tensor,
+                        cache_entry['past_key_values']
+                    )
+
+                    # 获取下一个token
+                    next_token = self.sample_next_token(logits[0, -1, :], temperature, top_p)
+                    results[seq_id].append(next_token)
+
+                    # 更新缓存
+                    self.cache.update(seq_id, new_kv)
+
+                except Exception as e:
+                    print(f"Error decoding sequence {seq_id}: {str(e)}")
+                    # 移除有问题的序列
+                    if seq_id in results:
+                        del results[seq_id]
+
+            if not any_active:
                 break
 
-        # 释放缓存并转换结果
-        self.cache.free_inactive()
+        # 结果转换
         decoded_results = {}
         for seq_id, token_ids in results.items():
             try:
                 decoded_text = self.tokenizer.decode(token_ids, skip_special_tokens=True)
+                # 移除可能的重复内容
+                if decoded_text.startswith(prompts[0]):  # 简单去重逻辑
+                    decoded_text = decoded_text[len(prompts[0]):]
                 decoded_results[seq_id] = decoded_text
             except Exception as e:
                 print(f"Error decoding sequence {seq_id}: {str(e)}")
-                decoded_results[seq_id] = f"[Decoding error]"
+                decoded_results[seq_id] = f"[Decoding error] Token IDs: {token_ids}"
 
         return decoded_results
