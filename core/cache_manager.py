@@ -49,7 +49,7 @@ class KVCache:
         # ✅ 现在可以安全打印
         print(f"Batching {len(seq_ids)} sequences, num_layers={num_layers}")
         for i, seq_kv in enumerate(all_seq_kv):
-            print(f"  seq {seq_ids[i]}: {len(seq_kv)} layers, first key shape: {seq_kv[0][0].shape}")
+            print(f"  seq {seq_ids[i]}: {len(seq_kv)} layers, first key shape: {seq_kv[0].shape}")
 
         for layer_idx in range(num_layers):
             keys = []
