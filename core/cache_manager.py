@@ -71,7 +71,8 @@ class KVCache:
                 将 batch 的 past_key_values 拆分回每个序列
                 """
         if batch_kv is None:
-            return {seq_id: None for seq_id in seq_ids}
+            print("[ERROR] batch_kv is None in unbatch_kv")
+            raise RuntimeError("batch_kv is None in unbatch_kv")
 
         kv_dict = {}
         batch_size = len(seq_ids)

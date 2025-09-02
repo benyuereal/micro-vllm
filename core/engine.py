@@ -101,6 +101,10 @@ class InferenceEngine:
             for i, seq in enumerate(batch):
                 next_token = self.sample_next_token(logits[i, -1, :], seq.temperature, seq.top_p)
                 seq.update_state(next_token, new_kv_dict[seq.seq_id])
+                new_kv = new_kv_dict[seq.seq_id]
+                if new_kv is None:
+                    print(f"[ERROR] seq {seq.seq_id} got None past_key_values from unbatch_kv")
+                    raise RuntimeError(f"seq {seq.seq_id} got None past_key_values")
                 if not seq.is_finished():
                     self.cache.allocate(seq.seq_id, seq.past_key_values)
                 else:
@@ -130,6 +134,8 @@ class InferenceEngine:
         inputs = self.adapter.prepare_inputs(self.model, input_ids, past_key_values)
         outputs = self.model(**inputs)
         logits, new_past_key_values = self.adapter.process_outputs(outputs, input_ids.size(1))
+        if new_past_key_values is None:
+            raise RuntimeError("Model returned None for past_key_values")
         return logits, new_past_key_values
 
     def _pad_batch(self, sequences: List[List[int]], pad_token_id: int):

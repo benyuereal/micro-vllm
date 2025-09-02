@@ -45,6 +45,9 @@ class QwenModelAdapter:
         """
         logits = outputs.logits
         past_key_values = outputs.past_key_values
+        if past_key_values is None:
+            # 模型没有返回 past_key_values，可能是 use_cache=False 或 bug
+            raise RuntimeError("Model did not return past_key_values. Check use_cache=True and model config.")
 
         # 对于decode步骤，我们只需要最后一个token的logits
         if input_length > 1:
