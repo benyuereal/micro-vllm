@@ -1,19 +1,41 @@
-# core/sequence.py (新增)
+# core/sequence.py
+from typing import Tuple
+
+
 class Sequence:
-    def __init__(self, seq_id: int, prompt: str):
+    def __init__(self, seq_id: int, prompt: str, tokenizer, max_tokens: int = 128):
         self.seq_id = seq_id
         self.prompt = prompt
-        self.input_ids = []
+        self.tokenizer = tokenizer
+        self.max_tokens = max_tokens
+        self.input_ids = tokenizer.encode(prompt, add_special_tokens=True)
         self.output_ids = []
-        self.ended = False
-        self.prefill_done = False
-        self.next_token = None
+        self.full_ids = self.input_ids[:]  # 用于拼接输入
+        self.state = "prefill"  # prefill / decode / finished
+        self.past_key_values = None
+        self.current_position = len(self.input_ids)  # 当前解码位置
+        self.temperature = 0.7
+        self.top_p = 0.9
+        self.eos_token_id = tokenizer.eos_token_id
+        self.priority = 0  # 用于抢占
 
-    def add_output_token(self, token_id: int):
-        self.output_ids.append(token_id)
+    def is_finished(self):
+        return (len(self.output_ids) >= self.max_tokens or
+                (self.output_ids and self.output_ids[-1] == self.eos_token_id))
 
-    def get_last_token(self):
-        return self.output_ids[-1] if self.output_ids else None
+    def get_next_input_ids(self):
+        if self.state == "prefill":
+            return self.input_ids
+        elif self.state == "decode":
+            return [self.output_ids[-1]]  # 单个 token
+        return None
 
-    def get_full_input(self):
-        return self.input_ids + self.output_ids
+    def update_state(self, next_token: int, new_past_key_values: Tuple):
+        self.output_ids.append(next_token)
+        self.full_ids.append(next_token)
+        self.past_key_values = new_past_key_values
+        self.current_position += 1
+        if self.is_finished():
+            self.state = "finished"
+        elif self.state == "prefill":
+            self.state = "decode"
