@@ -33,9 +33,10 @@ class Sequence:
     def update_state(self, next_token: int, new_past_key_values: Tuple):
         self.output_ids.append(next_token)
         self.full_ids.append(next_token)
-        self.past_key_values = new_past_key_values
+        self.past_key_values = new_past_key_values  # ✅ 确保是 tuple
         self.current_position += 1
         if self.is_finished():
             self.state = "finished"
         elif self.state == "prefill":
             self.state = "decode"
+

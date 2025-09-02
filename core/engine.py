@@ -46,14 +46,21 @@ class InferenceEngine:
             # 更新每个序列
             for i, seq in enumerate(batch):
                 next_token = self.sample_next_token(logits[i, -1, :], seq.temperature, seq.top_p)
-                seq.update_state(next_token, [layer[i:i+1] for layer in past_key_values])
-                if not seq.is_finished():
-                    self.cache.allocate(seq.seq_id, seq.past_key_values)
+                # 在 _prefill_batch 后
+                new_kv_for_seq = tuple(layer[i:i + 1] for layer in past_key_values)  # ✅ tuple
+                seq.update_state(next_token, new_kv_for_seq)
+                self.cache.allocate(seq.seq_id, new_kv_for_seq)  # ✅ 存 tuple
+
 
         elif batch_type == "decode":
             # 获取输入和 past_key_values
             input_ids = [seq.get_next_input_ids() for seq in batch]
             input_tensor = torch.tensor(input_ids, device=self.device).unsqueeze(-1)
+
+            # 确保所有序列都有 past_key_values
+            for seq in batch:
+                if seq.past_key_values is None:
+                    raise RuntimeError(f"Sequence {seq.seq_id} has no past_key_values")
 
             # 获取 batch past_key_values
             batch_past_kv = self.cache.batch_kv(seq_ids)
