@@ -1,92 +1,79 @@
 # core/cache_manager.py
-from typing import Dict, List, Tuple
+from typing import Dict, List, Tuple, Optional
 import torch
+from transformers import DynamicCache, DynamicLayer
+
 
 class KVCache:
     def __init__(self):
-        self.seq_kv_cache: Dict[int, Tuple] = {}  # seq_id -> past_key_values
-        self.max_batch_size = 8
+        self.seq_kv_cache = {}  # seq_id -> DynamicCache
 
-    def allocate(self, seq_id: int, kv: Tuple):
-        self.seq_kv_cache[seq_id] = kv
+    def allocate(self, seq_id: int, past_key_values: "DynamicCache"):
+        self.seq_kv_cache[seq_id] = past_key_values
 
-    def get(self, seq_id: int):
+    def get(self, seq_id: int) -> Optional["DynamicCache"]:
         return self.seq_kv_cache.get(seq_id)
 
-    def delete(self, seq_id: int):
-        if seq_id in self.seq_kv_cache:
-            del self.seq_kv_cache[seq_id]
+    def batch_kv(self, seq_ids: List[int]) -> "DynamicCache":
+        batch_cache = DynamicCache()
 
-    # core/cache_manager.py
-    def batch_kv(self, seq_ids: List[int]) -> Tuple[torch.Tensor, ...]:
-        """
-        将多个序列的 past_key_values 按 layer 拼接成 batch
-        输入: seq_ids = [id1, id2, ...]
-        输出: tuple of (batch_k, batch_v) for each layer
-        """
-        # 获取每个序列的 past_key_values
-        all_seq_kv = [self.get(seq_id) for seq_id in seq_ids]  # [((k0,v0), (k1,v1), ...), ...]
+        for seq_id in seq_ids:
+            seq_cache = self.get(seq_id)
+            if seq_cache is None:
+                raise RuntimeError(f"seq_id {seq_id} not found in cache")
 
-        # 检查是否为空
-        if not all_seq_kv or all_seq_kv[0] is None:
-            return None
+            # ✅ 用 .layers + .keys / .values（v4.56.0）
+            for layer_idx in range(len(seq_cache.layers)):
+                layer = seq_cache.layers[layer_idx]
+                key = layer.keys  # [1, num_heads, seq_len, head_dim]
+                value = layer.values
 
-        # 检查是否有 None 或空
-        for i, seq_kv in enumerate(all_seq_kv):
-            if seq_kv is None:
-                print(f"[ERROR] seq {seq_ids[i]} has None past_key_values")
-                raise RuntimeError(f"Sequence {seq_ids[i]} has no past_key_values")
-            if len(seq_kv) == 0:
-                print(f"[ERROR] seq {seq_ids[i]} has empty past_key_values")
-                raise RuntimeError(f"Sequence {seq_ids[i]} has empty past_key_values")
-        # 按 layer 分组：将第 i 层的 (k, v) 收集起来
-        num_layers = len(all_seq_kv[0])
-        batch_kv = []
-        for seq_kv in all_seq_kv:
-            if len(seq_kv) != num_layers:
-                raise RuntimeError(f"Inconsistent number of layers: {len(seq_kv)} vs {num_layers}")
+                if layer_idx >= len(batch_cache.layers):
+                    # 第一次添加该 layer
+                    new_layer = DynamicLayer()
+                    new_layer.keys = key
+                    new_layer.values = value
+                    batch_cache.layers.append(new_layer)
+                else:
+                    # 后续合并：在 batch 维度拼接
+                    batch_layer = batch_cache.layers[layer_idx]
+                    batch_layer.keys = torch.cat([batch_layer.keys, key], dim=0)
+                    batch_layer.values = torch.cat([batch_layer.values, value], dim=0)
 
-            # 调试打印（安全）
-        print(f"Batching {len(seq_ids)} sequences, num_layers={num_layers}")
-        for i, seq_kv in enumerate(all_seq_kv):
-            print(f"  seq {seq_ids[i]}: {len(seq_kv)} layers, first key shape: {seq_kv}")
+        # ✅ 更新 cumulative_length
+        if hasattr(seq_cache, "cumulative_length"):
+            batch_cache.cumulative_length = seq_cache.cumulative_length
+        return batch_cache
 
-
-        for layer_idx in range(num_layers):
-            keys = []
-            values = []
-            for seq_kv in all_seq_kv:
-                k, v = seq_kv[layer_idx]  # ✅ 正确解包每个序列的第 layer_idx 层
-                keys.append(k)
-                values.append(v)
-            # 拼接 batch
-            batch_k = torch.cat(keys, dim=0)  # [batch_size, ...]
-            batch_v = torch.cat(values, dim=0)
-            batch_kv.append((batch_k, batch_v))
-
-        return tuple(batch_kv)  # ((k0_batch, v0_batch), (k1_batch, v1_batch), ...)
-
-    def unbatch_kv(self, seq_ids: List[int], batch_kv: Tuple) -> Dict[int, Tuple]:
-        """
-                将 batch 的 past_key_values 拆分回每个序列
-                """
-        if batch_kv is None:
-            print("[ERROR] batch_kv is None in unbatch_kv")
-            raise RuntimeError("batch_kv is None in unbatch_kv")
-
+    def unbatch_kv(self, seq_ids: List[int], batch_cache: "DynamicCache") -> Dict[int, "DynamicCache"]:
         kv_dict = {}
         batch_size = len(seq_ids)
 
         for i, seq_id in enumerate(seq_ids):
-            kv_per_seq = []
-            for layer_idx, (batch_k, batch_v) in enumerate(batch_kv):
-                if i >= batch_k.shape[0]:
-                    raise RuntimeError(f"Batch size mismatch: {batch_k.shape[0]} < {i + 1}")
-                k_i = batch_k[i:i + 1]
-                v_i = batch_v[i:i + 1]
-                kv_per_seq.append((k_i, v_i))
-            kv_dict[seq_id] = tuple(kv_per_seq)
+            seq_cache = DynamicCache()
+
+            for layer_idx in range(len(batch_cache.layers)):
+                layer = batch_cache.layers[layer_idx]
+                key = layer.keys[i:i + 1]  # [1, num_heads, seq_len, head_dim]
+                value = layer.values[i:i + 1]
+
+                # 创建新的 DynamicLayer
+                new_layer = DynamicLayer()
+                new_layer.keys = key
+                new_layer.values = value
+                seq_cache.layers.append(new_layer)
+
+            # ✅ 更新 cumulative_length
+            if hasattr(batch_cache, "cumulative_length"):
+                seq_cache.cumulative_length = batch_cache.cumulative_length
+            kv_dict[seq_id] = seq_cache
 
         return kv_dict
+
+
+
+
+
+
 
 

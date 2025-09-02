@@ -1,30 +1,27 @@
 import torch
-from transformers import PreTrainedModel
+from transformers import PreTrainedModel, DynamicCache
 from typing import Dict, Optional, Tuple
 
 
 class QwenModelAdapter:
+
     @staticmethod
     def prepare_inputs(
             model: PreTrainedModel,
             input_ids: torch.Tensor,
-            past_key_values: Optional[Tuple] = None
+            past_key_values: Optional["DynamicCache"] = None
     ) -> Dict:
-        """
-        为Qwen模型准备输入格式
-        """
         batch_size, seq_length = input_ids.shape
 
-        # 处理位置编码
         if past_key_values is None:
-            # 首次推理（prefill）
+            # Prefill
             position_ids = torch.arange(0, seq_length, dtype=torch.long, device=input_ids.device)
             position_ids = position_ids.unsqueeze(0).repeat(batch_size, 1)
             attention_mask = torch.ones((batch_size, seq_length), device=input_ids.device)
         else:
-            # 增量推理（decode）
-            # 对于解码，我们只需要当前位置
-            position_ids = torch.tensor([[seq_length - 1]], dtype=torch.long, device=input_ids.device)
+            # Decode: 用 DynamicCache.get_seq_length()
+            current_seq_len = past_key_values.get_seq_length()  # ✅ 正确获取长度
+            position_ids = torch.full((batch_size, 1), current_seq_len, dtype=torch.long, device=input_ids.device)
             attention_mask = None
 
         return {

@@ -6,8 +6,11 @@ from .cache_manager import KVCache
 from .sequence import Sequence
 from .model_loader import load_model
 from models.qwen_adapter import QwenModelAdapter
+from transformers import DynamicCache
+
 
 class InferenceEngine:
+
     def __init__(self, model_path: str, max_batch_size: int = 8, max_prefill_tokens: int = 2048):
         self.model, self.tokenizer = load_model(model_path)
         self.model.eval()
@@ -50,16 +53,28 @@ class InferenceEngine:
 
             # 执行 prefill
             logits, past_key_values = self._prefill_batch(input_tensor)
+            print(f"past_key_values len: {len(past_key_values)}")
+            print(f"layer 0 key shape: {past_key_values[0][0].shape}")  # [4, num_heads, seq_len, head_dim]
+            print(f"layer 0 value shape: {past_key_values[0][1].shape}")
 
             # 更新每个序列
             for i, seq in enumerate(batch):
                 next_token = self.sample_next_token(logits[i, -1, :], seq.temperature, seq.top_p)
                 # 在 _prefill_batch 后
-                new_kv_for_seq = tuple(layer[i:i + 1] for layer in past_key_values)  # ✅ tuple
+                # ✅ 正确提取：对每个 layer 的 key 和 value 分别切片
+                new_kv_for_seq = tuple(
+                    (layer[0][i:i + 1], layer[1][i:i + 1])  # key: [i:i+1], value: [i:i+1]
+                    for layer in past_key_values
+                )
+
+                # ✅ 检查是否提取成功（非空）
+                if not new_kv_for_seq or len(new_kv_for_seq) == 0:
+                    raise RuntimeError(f"Failed to extract kv for seq {seq.seq_id}, i={i}")
                 seq.update_state(next_token, new_kv_for_seq)
-                # ✅ 即使完成也要存（至少存一次）
+                # ✅ 用 DynamicCache 包装
                 if seq.seq_id not in self.cache.seq_kv_cache:
-                    self.cache.allocate(seq.seq_id, seq.past_key_values)
+                    cache = DynamicCache.from_legacy_cache(seq.past_key_values)  # tuple → DynamicCache
+                    self.cache.allocate(seq.seq_id, cache)  # 存入 DynamicCache
                 if seq.is_finished():
                     self.scheduler.mark_finished(seq)
 
@@ -67,7 +82,7 @@ class InferenceEngine:
         elif batch_type == "decode":
             # 获取输入和 past_key_values
             input_ids = [seq.get_next_input_ids() for seq in batch]
-            input_tensor = torch.tensor(input_ids, device=self.device).unsqueeze(-1)
+            input_tensor = torch.tensor(input_ids, device=self.device)
 
             # 防御性检查：确保所有序列都是 decode 状态
             for seq in batch:
@@ -106,7 +121,8 @@ class InferenceEngine:
                     print(f"[ERROR] seq {seq.seq_id} got None past_key_values from unbatch_kv")
                     raise RuntimeError(f"seq {seq.seq_id} got None past_key_values")
                 if not seq.is_finished():
-                    self.cache.allocate(seq.seq_id, seq.past_key_values)
+                    cache = DynamicCache.from_legacy_cache(seq.past_key_values)
+                    self.cache.allocate(seq.seq_id, cache)
                 else:
                     self.cache.delete(seq.seq_id)
 
@@ -128,14 +144,17 @@ class InferenceEngine:
         inputs = self.adapter.prepare_inputs(self.model, input_ids, None)
         outputs = self.model(**inputs)
         logits, past_key_values = self.adapter.process_outputs(outputs, input_ids.size(1))
-        return logits, past_key_values
 
-    def _decode_batch(self, input_ids: torch.Tensor, past_key_values: Tuple):
-        inputs = self.adapter.prepare_inputs(self.model, input_ids, past_key_values)
+        # ✅ 用 DynamicCache 包装 tuple
+        cache = DynamicCache.from_legacy_cache(past_key_values)  # tuple → DynamicCache
+        return logits, cache  # 返回 cache 对象
+
+    def _decode_batch(self, input_ids: torch.Tensor, past_key_values: "DynamicCache"):
+        inputs = self.adapter.prepare_inputs(self.model, input_ids, past_key_values)  # 传入 cache 对象
         outputs = self.model(**inputs)
         logits, new_past_key_values = self.adapter.process_outputs(outputs, input_ids.size(1))
-        if new_past_key_values is None:
-            raise RuntimeError("Model returned None for past_key_values")
+
+        # ✅ new_past_key_values 已经是 DynamicCache 对象
         return logits, new_past_key_values
 
     def _pad_batch(self, sequences: List[List[int]], pad_token_id: int):

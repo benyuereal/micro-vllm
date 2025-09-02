@@ -4,7 +4,7 @@ import torch
 def load_model(model_path):
     model = AutoModelForCausalLM.from_pretrained(
         model_path,
-        device_map="auto",
+        device_map="cpu",  # 强制使用 CPU
         torch_dtype=torch.bfloat16,
         trust_remote_code=True
     )
