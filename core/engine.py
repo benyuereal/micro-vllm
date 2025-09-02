@@ -18,6 +18,7 @@ class InferenceEngine:
         self.cache = KVCache()
         self.adapter = QwenModelAdapter
         self.device = next(self.model.parameters()).device
+        self.eos_token_id = self.tokenizer.eos_token_id  # ✅ 确保设置 eos_token_id
 
     def add_request(self, prompt: str, max_tokens: int = 128, temperature: float = 0.7, top_p: float = 0.9):
         seq_id = hash(prompt) % (2**32)
@@ -42,6 +43,7 @@ class InferenceEngine:
         for seq in batch:
             kv = self.cache.get(seq.seq_id)
             print(f"seq {seq.seq_id}: state={seq.state}, kv={kv is not None}, output_len={len(seq.output_ids)}")
+            print(f"seq {seq.seq_id}: output_ids={seq.output_ids}, is_finished={seq.is_finished()}")
 
         seq_ids = [seq.seq_id for seq in batch]
 
@@ -67,16 +69,16 @@ class InferenceEngine:
                     for layer in past_key_values
                 )
 
-                # ✅ 检查是否提取成功（非空）
-                if not new_kv_for_seq or len(new_kv_for_seq) == 0:
-                    raise RuntimeError(f"Failed to extract kv for seq {seq.seq_id}, i={i}")
                 seq.update_state(next_token, new_kv_for_seq)
-                # ✅ 用 DynamicCache 包装
-                if seq.seq_id not in self.cache.seq_kv_cache:
-                    cache = DynamicCache.from_legacy_cache(seq.past_key_values)  # tuple → DynamicCache
-                    self.cache.allocate(seq.seq_id, cache)  # 存入 DynamicCache
+
+                # ✅ 立即检查 is_finished（prefill 后可能直接完成）
                 if seq.is_finished():
                     self.scheduler.mark_finished(seq)
+
+                # 缓存管理
+                if seq.seq_id not in self.cache.seq_kv_cache:
+                    cache = DynamicCache.from_legacy_cache(seq.past_key_values)
+                    self.cache.allocate(seq.seq_id, cache)
 
 
         elif batch_type == "decode":
@@ -84,27 +86,8 @@ class InferenceEngine:
             input_ids = [seq.get_next_input_ids() for seq in batch]
             input_tensor = torch.tensor(input_ids, device=self.device)
 
-            # 防御性检查：确保所有序列都是 decode 状态
-            for seq in batch:
-                if seq.state != "decode":
-                    print(f"[ERROR] seq {seq.seq_id} is in {seq.state} state, expected decode")
-                    raise RuntimeError(f"Invalid state in decode batch: {seq.state}")
-
-            # 确保所有序列都有 past_key_values
-            # 过滤掉没有 past_key_values 的序列
-            valid_batch = []
-            for seq in batch:
-                kv = self.cache.get(seq.seq_id)
-                if kv is None or len(kv) == 0:
-                    print(f"[WARN] Skipping seq {seq.seq_id}: no past_key_values")
-                    if seq.is_finished():
-                        self.scheduler.mark_finished(seq)
-                else:
-                    valid_batch.append(seq)
-
-            if not valid_batch:
+            if not batch:
                 return []
-            batch = valid_batch
             # 获取 batch past_key_values
             batch_past_kv = self.cache.batch_kv(seq_ids)
 
@@ -115,16 +98,15 @@ class InferenceEngine:
             new_kv_dict = self.cache.unbatch_kv(seq_ids, new_batch_kv)
             for i, seq in enumerate(batch):
                 next_token = self.sample_next_token(logits[i, -1, :], seq.temperature, seq.top_p)
-                seq.update_state(next_token, new_kv_dict[seq.seq_id])
-                new_kv = new_kv_dict[seq.seq_id]
-                if new_kv is None:
-                    print(f"[ERROR] seq {seq.seq_id} got None past_key_values from unbatch_kv")
-                    raise RuntimeError(f"seq {seq.seq_id} got None past_key_values")
-                if not seq.is_finished():
+                seq.update_state(next_token, new_kv_dict[seq.seq_id])  # ✅ update_state 后立即检查 is_finished
+
+                # ✅ 立即检查 is_finished（decode 后可能完成）
+                if seq.is_finished():
+                    self.cache.delete(seq.seq_id)
+                    self.scheduler.mark_finished(seq)
+                else:
                     cache = DynamicCache.from_legacy_cache(seq.past_key_values)
                     self.cache.allocate(seq.seq_id, cache)
-                else:
-                    self.cache.delete(seq.seq_id)
 
         elif batch_type == "mixed":
             # 先 prefill，再 decode（复杂，建议先分开）
@@ -132,10 +114,14 @@ class InferenceEngine:
             raise NotImplementedError("Mixed batch not implemented yet")
 
         # 检查完成的序列
+            # ✅ 最后收集 finished（确保所有 seq 都被检查）
         finished = []
         for seq in batch:
             if seq.is_finished():
-                self.scheduler.mark_finished(seq)
+                print(f"seq {seq.seq_id} running finished")
+                # 如果之前没标记 finished（prefill 阶段）
+                if seq not in self.scheduler.finished_sequences:
+                    self.scheduler.mark_finished(seq)
                 finished.append((seq.seq_id, seq.output_ids))
 
         return finished
@@ -188,7 +174,17 @@ class InferenceEngine:
                 except:
                     results[seq_id] = f"[Error] {output_ids}"
 
+            # ✅ 关键：处理 finished_sequences 中的序列
+            finished_from_scheduler = self.scheduler.get_finished_results()
+            for seq_id, output_ids in finished_from_scheduler:
+                try:
+                    text = self.tokenizer.decode(output_ids, skip_special_tokens=True)
+                    results[seq_id] = text
+                except:
+                    results[seq_id] = f"[Error] {output_ids}"
+
             if not self.scheduler.running_sequences and not self.scheduler.waiting_queue:
                 break
 
         return results
+

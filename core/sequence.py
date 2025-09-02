@@ -31,6 +31,7 @@ class Sequence:
         return None
 
     def update_state(self, next_token: int, new_past_key_values: Tuple):
+        # 在 seq.update_state 中
         self.output_ids.append(next_token)
         self.full_ids.append(next_token)
         self.past_key_values = new_past_key_values  # ✅ 确保是 tuple
@@ -39,4 +40,6 @@ class Sequence:
             self.state = "finished"
         elif self.state == "prefill":
             self.state = "decode"
+        print(f"seq {self.seq_id}: updated output_ids={self.output_ids}, full_ids={self.full_ids}")
+
 
