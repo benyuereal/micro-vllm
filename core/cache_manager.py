@@ -31,7 +31,7 @@ class KVCache:
         if not all_seq_kv or all_seq_kv[0] is None:
             return None
 
-            # 🚨 先检查 None 和空
+        # 检查是否有 None 或空
         for i, seq_kv in enumerate(all_seq_kv):
             if seq_kv is None:
                 print(f"[ERROR] seq {seq_ids[i]} has None past_key_values")
@@ -39,17 +39,18 @@ class KVCache:
             if len(seq_kv) == 0:
                 print(f"[ERROR] seq {seq_ids[i]} has empty past_key_values")
                 raise RuntimeError(f"Sequence {seq_ids[i]} has empty past_key_values")
-
-            # 🚨 再检查层数一致性
+        # 按 layer 分组：将第 i 层的 (k, v) 收集起来
         num_layers = len(all_seq_kv[0])
+        batch_kv = []
         for seq_kv in all_seq_kv:
             if len(seq_kv) != num_layers:
                 raise RuntimeError(f"Inconsistent number of layers: {len(seq_kv)} vs {num_layers}")
 
-        # ✅ 现在可以安全打印
+            # 调试打印（安全）
         print(f"Batching {len(seq_ids)} sequences, num_layers={num_layers}")
         for i, seq_kv in enumerate(all_seq_kv):
-            print(f"  seq {seq_ids[i]}: {len(seq_kv)} layers, first key shape: {seq_kv[0].shape}")
+            print(f"  seq {seq_ids[i]}: {len(seq_kv)} layers, first key shape: {seq_kv}")
+
 
         for layer_idx in range(num_layers):
             keys = []
