@@ -69,6 +69,12 @@ class InferenceEngine:
             input_ids = [seq.get_next_input_ids() for seq in batch]
             input_tensor = torch.tensor(input_ids, device=self.device).unsqueeze(-1)
 
+            # 防御性检查：确保所有序列都是 decode 状态
+            for seq in batch:
+                if seq.state != "decode":
+                    print(f"[ERROR] seq {seq.seq_id} is in {seq.state} state, expected decode")
+                    raise RuntimeError(f"Invalid state in decode batch: {seq.state}")
+
             # 确保所有序列都有 past_key_values
             # 过滤掉没有 past_key_values 的序列
             valid_batch = []
@@ -83,6 +89,7 @@ class InferenceEngine:
 
             if not valid_batch:
                 return []
+            batch = valid_batch
             # 获取 batch past_key_values
             batch_past_kv = self.cache.batch_kv(seq_ids)
 
