@@ -32,6 +32,14 @@ class InferenceEngine:
         if not batch:
             return []
 
+        # 在 step() 开始
+        print(f"Step: {len(self.scheduler.running_sequences)} running, {len(self.scheduler.waiting_queue)} waiting")
+
+        # 在 decode 前
+        for seq in batch:
+            kv = self.cache.get(seq.seq_id)
+            print(f"seq {seq.seq_id}: state={seq.state}, kv={kv is not None}, output_len={len(seq.output_ids)}")
+
         seq_ids = [seq.seq_id for seq in batch]
 
         if batch_type == "prefill":
@@ -49,7 +57,11 @@ class InferenceEngine:
                 # 在 _prefill_batch 后
                 new_kv_for_seq = tuple(layer[i:i + 1] for layer in past_key_values)  # ✅ tuple
                 seq.update_state(next_token, new_kv_for_seq)
-                self.cache.allocate(seq.seq_id, new_kv_for_seq)  # ✅ 存 tuple
+                # ✅ 即使完成也要存（至少存一次）
+                if seq.seq_id not in self.cache.seq_kv_cache:
+                    self.cache.allocate(seq.seq_id, seq.past_key_values)
+                if seq.is_finished():
+                    self.scheduler.mark_finished(seq)
 
 
         elif batch_type == "decode":
@@ -58,10 +70,19 @@ class InferenceEngine:
             input_tensor = torch.tensor(input_ids, device=self.device).unsqueeze(-1)
 
             # 确保所有序列都有 past_key_values
+            # 过滤掉没有 past_key_values 的序列
+            valid_batch = []
             for seq in batch:
-                if seq.past_key_values is None:
-                    raise RuntimeError(f"Sequence {seq.seq_id} has no past_key_values")
+                kv = self.cache.get(seq.seq_id)
+                if kv is None or len(kv) == 0:
+                    print(f"[WARN] Skipping seq {seq.seq_id}: no past_key_values")
+                    if seq.is_finished():
+                        self.scheduler.mark_finished(seq)
+                else:
+                    valid_batch.append(seq)
 
+            if not valid_batch:
+                return []
             # 获取 batch past_key_values
             batch_past_kv = self.cache.batch_kv(seq_ids)
 

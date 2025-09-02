@@ -31,12 +31,23 @@ class KVCache:
         if not all_seq_kv or all_seq_kv[0] is None:
             return None
 
+        # 检查是否有 None 或空
+        for i, seq_kv in enumerate(all_seq_kv):
+            if seq_kv is None:
+                print(f"[ERROR] seq {seq_ids[i]} has None past_key_values")
+                raise RuntimeError(f"Sequence {seq_ids[i]} has no past_key_values")
+            if len(seq_kv) == 0:
+                print(f"[ERROR] seq {seq_ids[i]} has empty past_key_values")
+                raise RuntimeError(f"Sequence {seq_ids[i]} has empty past_key_values")
         # 按 layer 分组：将第 i 层的 (k, v) 收集起来
         num_layers = len(all_seq_kv[0])
         batch_kv = []
+        for seq_kv in all_seq_kv:
+            if len(seq_kv) != num_layers:
+                raise RuntimeError(f"Inconsistent number of layers: {len(seq_kv)} vs {num_layers}")
 
-        # 在 batch_kv 中
-        print(f"Batching {len(seq_ids)} sequences, num_layers={len(all_seq_kv[0])}")
+            # 调试打印（安全）
+        print(f"Batching {len(seq_ids)} sequences, num_layers={num_layers}")
         for i, seq_kv in enumerate(all_seq_kv):
             print(f"  seq {seq_ids[i]}: {len(seq_kv)} layers, first key shape: {seq_kv[0][0].shape}")
 
@@ -57,20 +68,24 @@ class KVCache:
 
     def unbatch_kv(self, seq_ids: List[int], batch_kv: Tuple) -> Dict[int, Tuple]:
         """
-        将 batch 的 past_key_values 拆分回每个序列
-        """
+                将 batch 的 past_key_values 拆分回每个序列
+                """
+        if batch_kv is None:
+            return {seq_id: None for seq_id in seq_ids}
+
         kv_dict = {}
         batch_size = len(seq_ids)
 
         for i, seq_id in enumerate(seq_ids):
             kv_per_seq = []
-            for layer_kv in batch_kv:
-                k, v = layer_kv
-                # 取第 i 个序列的 k 和 v
-                k_i = k[i:i + 1]  # 保持 batch dim
-                v_i = v[i:i + 1]
+            for layer_idx, (batch_k, batch_v) in enumerate(batch_kv):
+                if i >= batch_k.shape[0]:
+                    raise RuntimeError(f"Batch size mismatch: {batch_k.shape[0]} < {i + 1}")
+                k_i = batch_k[i:i + 1]
+                v_i = batch_v[i:i + 1]
                 kv_per_seq.append((k_i, v_i))
             kv_dict[seq_id] = tuple(kv_per_seq)
 
         return kv_dict
+
 
