@@ -68,12 +68,26 @@ class KVCache:
         kv_dict = {}
         batch_size = len(seq_ids)
 
+        # 兼容元组和 DynamicCache
+        if isinstance(batch_cache, tuple):
+            # 假设格式为 (key_0, value_0, key_1, value_1, ...)
+            num_layers = len(batch_cache) // 2
+            layers = []
+            for i in range(num_layers):
+                key = batch_cache[i * 2]
+                value = batch_cache[i * 2 + 1]
+                layer = DynamicLayer()
+                layer.keys = key
+                layer.values = value
+                layers.append(layer)
+        else:
+            layers = batch_cache.layers  # 直接使用 DynamicCache
+
         for i, seq_id in enumerate(seq_ids):
             seq_cache = DynamicCache()
-
-            for layer_idx in range(len(batch_cache.layers)):
-                layer = batch_cache.layers[layer_idx]
-                key = layer.keys[i:i + 1]  # [1, num_heads, seq_len, head_dim]
+            for layer_idx in range(len(layers)):
+                layer = layers[layer_idx]
+                key = layer.keys[i:i + 1]
                 value = layer.values[i:i + 1]
 
                 # 创建新的 DynamicLayer
@@ -90,6 +104,7 @@ class KVCache:
             kv_dict[seq_id] = seq_cache
 
         return kv_dict
+
 
 
 
