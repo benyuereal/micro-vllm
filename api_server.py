@@ -9,7 +9,7 @@ import json
 from core.engine import InferenceEngine
 import asyncio
 from queue import Queue
-import config.Config as Config
+import config.config as Config
 # 全局引擎实例
 engine = None
 app = FastAPI(title="vLLM API Server", version="0.1.0")

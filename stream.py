@@ -3,7 +3,7 @@ from core.engine import InferenceEngine
 import time
 import threading
 from queue import Queue
-import config.Config as Config
+import config.config as Config
 
 class StreamTester:
     def __init__(self, model_path=Config.ModelConfig.MODEL_PATH):
