@@ -2,7 +2,7 @@ from core.engine import InferenceEngine
 import time
 import traceback
 
-MODEL_PATH = "/data/model/qwen/Qwen-7B-Chat"
+MODEL_PATH = "/Users/Zhuanz/.cache/modelscope/hub/models/Qwen/Qwen2-0.5B"
 
 if __name__ == "__main__":
     print("Loading Qwen-7B model...")
@@ -36,7 +36,7 @@ if __name__ == "__main__":
         # 使用更高质量的生成参数
         results = engine.generate(
             prompts,
-            max_steps=200
+            max_steps=1024
         )
         gen_time = time.time() - start_time
     except Exception as e:

@@ -38,12 +38,6 @@ class InferenceEngine:
         if not batch:
             return []
 
-        # 在 decode 前
-        for seq in batch:
-            kv = self.cache.get(seq.seq_id)
-            print(f"seq {seq.seq_id}: state={seq.state}, kv={kv is not None}, output_len={len(seq.output_ids)}")
-
-
         seq_ids = [seq.seq_id for seq in batch]
 
         if batch_type == "prefill":
@@ -147,7 +141,7 @@ class InferenceEngine:
 
     def generate(self, prompts: List[str], max_steps: int = 100):
         for prompt in prompts:
-            self.add_request(prompt)
+            self.add_request(prompt, max_steps)
 
         results = {}
         for step in range(max_steps):
