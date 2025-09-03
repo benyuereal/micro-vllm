@@ -83,7 +83,6 @@ class InferenceEngine:
             # 执行 decode
             logits, new_batch_kv = self._decode_batch(input_tensor, batch_past_kv)
 
-            print(f"new_batch_kv type: {type(new_batch_kv)}")
             # 拆分并更新
             new_kv_dict = self.cache.unbatch_kv(seq_ids, new_batch_kv)
             for i, seq in enumerate(batch):
