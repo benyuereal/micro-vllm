@@ -14,15 +14,18 @@ class QwenModelAdapter:
         batch_size, seq_length = input_ids.shape
 
         if past_key_values is None:
-            # Prefill
-            position_ids = torch.arange(0, seq_length, dtype=torch.long, device=input_ids.device)
-            position_ids = position_ids.unsqueeze(0).repeat(batch_size, 1)
+            position_ids = torch.arange(0, seq_length, device=input_ids.device).unsqueeze(0)
             attention_mask = torch.ones((batch_size, seq_length), device=input_ids.device)
         else:
-            # Decode: 用 DynamicCache.get_seq_length()
-            current_seq_len = past_key_values.get_seq_length()  # ✅ 正确获取长度
-            position_ids = torch.full((batch_size, 1), current_seq_len, dtype=torch.long, device=input_ids.device)
-            attention_mask = None
+            # 动态生成位置ID和注意力掩码
+            past_length = past_key_values.get_seq_length()
+            position_ids = torch.arange(past_length, past_length + seq_length, device=input_ids.device).unsqueeze(0)
+
+            # 创建因果注意力掩码
+            attention_mask = torch.ones((batch_size, past_length + seq_length), device=input_ids.device)
+            for i in range(batch_size):
+                attention_mask[i, :past_length] = 1  # 历史token
+                attention_mask[i, past_length:] = torch.tril(torch.ones(seq_length, seq_length))[0]
 
         return {
             "input_ids": input_ids,

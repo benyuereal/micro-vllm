@@ -68,7 +68,7 @@ class InferenceEngine:
                 if seq.is_finished():
                     self.scheduler.mark_finished(seq)
                 else:
-                    self.cache.allocate(seq.seq_id, seq.past_key_values)
+                    self.cache.allocate(seq.seq_id, seq.past_key_values, seq.current_position)
 
         elif batch_type == "decode":
             # 获取输入和 past_key_values
@@ -94,7 +94,7 @@ class InferenceEngine:
                     self.cache.delete(seq.seq_id)
                     self.scheduler.mark_finished(seq)
                 else:
-                    self.cache.allocate(seq.seq_id, seq.past_key_values)
+                    self.cache.allocate(seq.seq_id, seq.past_key_values, seq.current_position)
 
         elif batch_type == "mixed":
             # 先 prefill，再 decode（复杂，建议先分开）
