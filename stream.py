@@ -4,7 +4,7 @@ import time
 import threading
 from queue import Queue
 
-MODEL_PATH = "/Users/Zhuanz/.cache/modelscope/hub/models/Qwen/Qwen2-0.5B"
+MODEL_PATH = "/data/model/qwen/Qwen-7B-Chat"
 
 class StreamTester:
     def __init__(self, model_path=MODEL_PATH):
