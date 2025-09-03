@@ -36,18 +36,14 @@ class QwenModelAdapter:
     def process_outputs(
             outputs: Tuple,
             input_length: int
-    ) -> Tuple[torch.Tensor, Tuple]:
-        """
-        处理Qwen模型的输出
-        """
+    ) -> Tuple[torch.Tensor, DynamicCache]:  # 修改返回类型
         logits = outputs.logits
         past_key_values = outputs.past_key_values
-        if past_key_values is None:
-            # 模型没有返回 past_key_values，可能是 use_cache=False 或 bug
-            raise RuntimeError("Model did not return past_key_values. Check use_cache=True and model config.")
 
-        # 对于decode步骤，我们只需要最后一个token的logits
+        # 将元组格式转换为DynamicCache
+        cache = DynamicCache.from_legacy_cache(past_key_values)
+
         if input_length > 1:
             logits = logits[:, -1:, :]
 
-        return logits, past_key_values
+        return logits, cache  # 返回DynamicCache

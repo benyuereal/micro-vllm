@@ -52,30 +52,22 @@ class InferenceEngine:
             input_tensor = self._pad_batch(input_ids, self.tokenizer.pad_token_id)
             input_tensor = input_tensor.to(self.device)
 
-            # 执行 prefill
+            # 执行prefill - 返回logits和DynamicCache
             logits, past_key_values = self._prefill_batch(input_tensor)
             print(f"past_key_values len: {len(past_key_values)}")
             print(f"layer 0 key shape: {past_key_values[0][0].shape}")  # [4, num_heads, seq_len, head_dim]
             print(f"layer 0 value shape: {past_key_values[0][1].shape}")
 
-            # 更新每个序列
+            # 拆分缓存
+            new_kv_dict = self.cache.unbatch_kv(seq_ids, past_key_values)
+
             for i, seq in enumerate(batch):
                 next_token = self.sample_next_token(logits[i, -1, :], seq.temperature, seq.top_p)
-                # 在 _prefill_batch 后
-                # ✅ 正确提取：对每个 layer 的 key 和 value 分别切片
-                new_kv_for_seq = tuple(
-                    (layer[0][i:i + 1], layer[1][i:i + 1])  # key: [i:i+1], value: [i:i+1]
-                    for layer in past_key_values
-                )
+                seq.update_state(next_token, new_kv_dict[seq.seq_id])
 
-                seq.update_state(next_token, new_kv_for_seq)
-
-                # ✅ 立即检查 is_finished（prefill 后可能直接完成）
                 if seq.is_finished():
                     self.scheduler.mark_finished(seq)
-
-                # 缓存管理
-                if seq.seq_id not in self.cache.seq_kv_cache:
+                else:
                     self.cache.allocate(seq.seq_id, seq.past_key_values)
 
         elif batch_type == "decode":
@@ -116,19 +108,16 @@ class InferenceEngine:
     def _prefill_batch(self, input_ids: torch.Tensor):
         inputs = self.adapter.prepare_inputs(self.model, input_ids, None)
         outputs = self.model(**inputs)
-        logits, past_key_values = self.adapter.process_outputs(outputs, input_ids.size(1))
+        # 直接返回adapter处理后的DynamicCache
+        return self.adapter.process_outputs(outputs, input_ids.size(1))
 
-        # ✅ 用 DynamicCache 包装 tuple
-        cache = DynamicCache.from_legacy_cache(past_key_values)  # tuple → DynamicCache
-        return logits, cache  # 返回 cache 对象
 
-    def _decode_batch(self, input_ids: torch.Tensor, past_key_values: "DynamicCache"):
-        inputs = self.adapter.prepare_inputs(self.model, input_ids, past_key_values)  # 传入 cache 对象
+    def _decode_batch(self, input_ids: torch.Tensor, past_key_values: DynamicCache):
+        inputs = self.adapter.prepare_inputs(self.model, input_ids, past_key_values)
         outputs = self.model(**inputs)
-        logits, new_past_key_values = self.adapter.process_outputs(outputs, input_ids.size(1))
+        # 直接返回adapter处理后的DynamicCache
+        return self.adapter.process_outputs(outputs, input_ids.size(1))
 
-        # ✅ new_past_key_values 已经是 DynamicCache 对象
-        return logits, new_past_key_values
 
     def _pad_batch(self, sequences: List[List[int]], pad_token_id: int):
         max_len = max(len(seq) for seq in sequences)

@@ -32,15 +32,12 @@ class Sequence:
             return [self.output_ids[-1]]  # 单个 token
         return None
 
-    def update_state(self, next_token: int, new_past_key_values: Union[Tuple, DynamicCache]):
+    def update_state(self, next_token: int, new_past_key_values: DynamicCache):  # 类型指定为DynamicCache
         self.output_ids.append(next_token)
         self.full_ids.append(next_token)
 
-        # 统一转换为DynamicCache格式
-        if isinstance(new_past_key_values, tuple):
-            self.past_key_values = DynamicCache.from_legacy_cache(new_past_key_values)
-        else:
-            self.past_key_values = new_past_key_values
+        # 直接赋值DynamicCache
+        self.past_key_values = new_past_key_values
 
         self.current_position += 1
         if self.is_finished():
