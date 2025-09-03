@@ -37,27 +37,31 @@ class KVCache:
             if seq_cache is None:
                 raise RuntimeError(f"seq_id {seq_id} not found in cache")
 
-            # ✅ 用 .layers + .keys / .values（v4.56.0）
             for layer_idx in range(len(seq_cache.layers)):
                 layer = seq_cache.layers[layer_idx]
                 key = layer.keys  # [1, num_heads, seq_len, head_dim]
                 value = layer.values
 
                 if layer_idx >= len(batch_cache.layers):
-                    # 第一次添加该 layer
+                    # 第一次添加该层
                     new_layer = DynamicLayer()
                     new_layer.keys = key
                     new_layer.values = value
                     batch_cache.layers.append(new_layer)
                 else:
-                    # 后续合并：在 batch 维度拼接
+                    # 获取已存在的层
                     batch_layer = batch_cache.layers[layer_idx]
-                    batch_layer.keys = torch.cat([batch_layer.keys, key], dim=0)
-                    batch_layer.values = torch.cat([batch_layer.values, value], dim=0)
 
-        # ✅ 更新 cumulative_length
-        if hasattr(seq_cache, "cumulative_length"):
-            batch_cache.cumulative_length = seq_cache.cumulative_length
+                    # 修复点：检查是否为首次添加值
+                    if batch_layer.keys is None:
+                        # 首次添加直接赋值
+                        batch_layer.keys = key
+                        batch_layer.values = value
+                    else:
+                        # 后续添加进行拼接
+                        batch_layer.keys = torch.cat([batch_layer.keys, key], dim=0)
+                        batch_layer.values = torch.cat([batch_layer.values, value], dim=0)
+
         return batch_cache
 
     def unbatch_kv(self, seq_ids: List[int], batch_cache: "DynamicCache") -> Dict[int, "DynamicCache"]:
