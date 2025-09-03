@@ -2,7 +2,7 @@ from core.engine import InferenceEngine
 import time
 import traceback
 
-MODEL_PATH = "/Users/Zhuanz/.cache/modelscope/hub/models/Qwen/Qwen2-0.5B"
+MODEL_PATH = "/data/model/qwen/Qwen-7B-Chat"
 
 if __name__ == "__main__":
     print("Loading Qwen-7B model...")
