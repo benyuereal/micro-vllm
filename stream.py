@@ -3,11 +3,10 @@ from core.engine import InferenceEngine
 import time
 import threading
 from queue import Queue
-
-MODEL_PATH = "/data/model/qwen/Qwen-7B-Chat"
+import config.Config as Config
 
 class StreamTester:
-    def __init__(self, model_path=MODEL_PATH):
+    def __init__(self, model_path=Config.ModelConfig.MODEL_PATH):
         print("Loading model for stream testing...")
         self.engine = InferenceEngine(model_path)
         print(f"Model loaded on device: {self.engine.device}")
@@ -140,7 +139,7 @@ if __name__ == "__main__":
     tester = StreamTester()
 
     # 测试单个流式输出
-    prompt = "帮我写一段文件分片上传的代码"
+    prompt = "帮我写一段java版本的文件分片上传的代码"
     result1 = tester.test_single_stream(prompt)
     #
     # # 测试回调函数方式
