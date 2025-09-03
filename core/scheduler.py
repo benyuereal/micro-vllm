@@ -40,12 +40,10 @@ class Scheduler:
             batch.append(seq)
             has_decode = True
 
-        # 3. ✅ 关键：把 batch 中的序列从 running_sequences 中移除（如果是 decode）
-        for seq in batch:
-            if seq in self.running_sequences:
-                self.running_sequences.remove(seq)
+        # 3. 不再从 running_sequences 中移除序列（错误逻辑）
+        # 直接进入步骤4和5
 
-        # 4. 把 prefill 序列加入 running_sequences（decode 序列已经不在 running 中了）
+        # 4. 把 prefill 序列加入 running_sequences
         for seq in batch:
             if seq.state == "prefill":
                 self.running_sequences.append(seq)
@@ -68,6 +66,7 @@ class Scheduler:
         self.finished_sequences.append(seq)
 
     def get_finished_results(self):
-        results = [(seq.seq_id, seq.output_ids) for seq in self.finished_sequences]
+        # 返回完整的生成序列（包含输入）
+        results = [(seq, seq.full_ids) for seq in self.finished_sequences]  # 关键修改
         self.finished_sequences.clear()
         return results

@@ -11,6 +11,21 @@ class KVCache:
     def allocate(self, seq_id: int, past_key_values: "DynamicCache"):
         self.seq_kv_cache[seq_id] = past_key_values
 
+    def delete(self, seq_id: int):
+        """删除指定序列的缓存"""
+        print(f"seq {seq_id}: delete")
+        if seq_id in self.seq_kv_cache:
+            # 释放显存（如果有GPU内存占用）
+            cache = self.seq_kv_cache[seq_id]
+            for layer in cache.layers:
+                if isinstance(layer.keys, torch.Tensor):
+                    layer.keys = layer.keys.cpu()
+                if isinstance(layer.values, torch.Tensor):
+                    layer.values = layer.values.cpu()
+
+            # 从缓存中移除
+            del self.seq_kv_cache[seq_id]
+
     def get(self, seq_id: int) -> Optional["DynamicCache"]:
         return self.seq_kv_cache.get(seq_id)
 
@@ -63,9 +78,11 @@ class KVCache:
                 new_layer.values = value
                 seq_cache.layers.append(new_layer)
 
-            # ✅ 更新 cumulative_length
+            # ✅ 修复：正确设置cumulative_length
             if hasattr(batch_cache, "cumulative_length"):
-                seq_cache.cumulative_length = batch_cache.cumulative_length
+                # 复制原始累计长度
+                seq_cache.cumulative_length = batch_cache.cumulative_length.copy()
+
             kv_dict[seq_id] = seq_cache
 
         return kv_dict

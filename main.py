@@ -45,15 +45,15 @@ if __name__ == "__main__":
         exit(1)
 
     print("\nResults:")
-    for i, prompt in enumerate(prompts):
-        seq_id = id(prompt)
-        if seq_id in results:
-            print(f"Prompt {i + 1}: {prompt}")
-            print(f"Response: {results[seq_id]}")
-            print(f"Length: {len(results[seq_id])} characters")
-            print("-" * 80)
-        else:
-            print(f"Prompt {i + 1}: {prompt} - No response generated")
+    # ✅ 方法 1：直接遍历 key 和 value
+    for seq,  text in results.items():
+        print(f"seq_id: {seq.seq_id}, prompt: {seq.prompt}")
+        seq_id = seq.seq_id
+        print(f"Prompt : {seq.prompt}")
+        print(f"Response: {text}")
+        print(f"Length: {len(text)} characters")
+        print("-" * 80)
+
 
     tokens_generated = sum(len(response) for response in results.values())
     tokens_per_sec = tokens_generated / gen_time if gen_time > 0 else 0

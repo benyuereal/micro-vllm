@@ -7,6 +7,8 @@ from .sequence import Sequence
 from .model_loader import load_model
 from models.qwen_adapter import QwenModelAdapter
 from transformers import DynamicCache
+import torch.nn.functional as F
+
 
 
 class InferenceEngine:
@@ -36,14 +38,11 @@ class InferenceEngine:
         if not batch:
             return []
 
-        # 在 step() 开始
-        print(f"Step: {len(self.scheduler.running_sequences)} running, {len(self.scheduler.waiting_queue)} waiting")
-
         # 在 decode 前
         for seq in batch:
             kv = self.cache.get(seq.seq_id)
             print(f"seq {seq.seq_id}: state={seq.state}, kv={kv is not None}, output_len={len(seq.output_ids)}")
-            print(f"seq {seq.seq_id}: output_ids={seq.output_ids}, is_finished={seq.is_finished()}")
+
 
         seq_ids = [seq.seq_id for seq in batch]
 
@@ -77,9 +76,7 @@ class InferenceEngine:
 
                 # 缓存管理
                 if seq.seq_id not in self.cache.seq_kv_cache:
-                    cache = DynamicCache.from_legacy_cache(seq.past_key_values)
-                    self.cache.allocate(seq.seq_id, cache)
-
+                    self.cache.allocate(seq.seq_id, seq.past_key_values)
 
         elif batch_type == "decode":
             # 获取输入和 past_key_values
@@ -105,26 +102,15 @@ class InferenceEngine:
                     self.cache.delete(seq.seq_id)
                     self.scheduler.mark_finished(seq)
                 else:
-                    cache = DynamicCache.from_legacy_cache(seq.past_key_values)
-                    self.cache.allocate(seq.seq_id, cache)
+                    self.cache.allocate(seq.seq_id, seq.past_key_values)
 
         elif batch_type == "mixed":
             # 先 prefill，再 decode（复杂，建议先分开）
             # 这里可以进一步优化：使用 vLLM 的 PagedAttention 或 FlashInfer
             raise NotImplementedError("Mixed batch not implemented yet")
 
-        # 检查完成的序列
-            # ✅ 最后收集 finished（确保所有 seq 都被检查）
-        finished = []
-        for seq in batch:
-            if seq.is_finished():
-                print(f"seq {seq.seq_id} running finished")
-                # 如果之前没标记 finished（prefill 阶段）
-                if seq not in self.scheduler.finished_sequences:
-                    self.scheduler.mark_finished(seq)
-                finished.append((seq.seq_id, seq.output_ids))
-
-        return finished
+        # 返回空列表，因为完成序列已在mark_finished时处理
+        return []
 
     def _prefill_batch(self, input_ids: torch.Tensor):
         inputs = self.adapter.prepare_inputs(self.model, input_ids, None)
@@ -148,17 +134,27 @@ class InferenceEngine:
         padded = [seq + [pad_token_id] * (max_len - len(seq)) for seq in sequences]
         return torch.tensor(padded, dtype=torch.long)
 
-    def sample_next_token(self, logits: torch.Tensor, temperature: float, top_p: float):
+    def sample_next_token(self, logits: torch.Tensor, temperature: float = 0.7, top_p: float = 0.9) -> int:
+        """使用温度采样和top-p（核采样）选择下一个token"""
+        # 应用温度
         logits = logits / temperature
+
+        # 应用top-p（核采样）
         sorted_logits, sorted_indices = torch.sort(logits, descending=True)
-        cumulative_probs = torch.cumsum(torch.softmax(sorted_logits, dim=-1), dim=-1)
+        cumulative_probs = torch.cumsum(F.softmax(sorted_logits, dim=-1), dim=-1)
+
+        # 移除累积概率低于top_p的token
         sorted_indices_to_remove = cumulative_probs > top_p
         sorted_indices_to_remove[..., 1:] = sorted_indices_to_remove[..., :-1].clone()
         sorted_indices_to_remove[..., 0] = 0
+
         indices_to_remove = sorted_indices[sorted_indices_to_remove]
         logits[indices_to_remove] = float('-inf')
-        probs = torch.softmax(logits, dim=-1)
-        return torch.multinomial(probs, num_samples=1).item()
+
+        # 从剩余token中采样
+        probs = F.softmax(logits, dim=-1)
+        next_token = torch.multinomial(probs, num_samples=1).item()
+        return next_token
 
     def generate(self, prompts: List[str], max_steps: int = 100):
         for prompt in prompts:
@@ -166,25 +162,20 @@ class InferenceEngine:
 
         results = {}
         for step in range(max_steps):
-            finished = self.step()
-            for seq_id, output_ids in finished:
-                try:
-                    text = self.tokenizer.decode(output_ids, skip_special_tokens=True)
-                    results[seq_id] = text
-                except:
-                    results[seq_id] = f"[Error] {output_ids}"
-
-            # ✅ 关键：处理 finished_sequences 中的序列
-            finished_from_scheduler = self.scheduler.get_finished_results()
-            for seq_id, output_ids in finished_from_scheduler:
-                try:
-                    text = self.tokenizer.decode(output_ids, skip_special_tokens=True)
-                    results[seq_id] = text
-                except:
-                    results[seq_id] = f"[Error] {output_ids}"
-
+            self.step()
             if not self.scheduler.running_sequences and not self.scheduler.waiting_queue:
                 break
+
+        # ✅ 关键：处理 finished_sequences 中的序列
+        finished_from_scheduler = self.scheduler.get_finished_results()
+        for seq, output_ids in finished_from_scheduler:
+            try:
+                text = self.tokenizer.decode(output_ids, skip_special_tokens=True)
+                results[seq] = text
+            except:
+                results[seq] = f"[Error] {output_ids}"
+
+
 
         return results
 
