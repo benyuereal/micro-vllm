@@ -31,15 +31,28 @@ class KVCache:
 
     def batch_kv(self, seq_ids: List[int]) -> "DynamicCache":
         batch_cache = DynamicCache()
-
         for seq_id in seq_ids:
             seq_cache = self.get(seq_id)
             if seq_cache is None:
                 raise RuntimeError(f"seq_id {seq_id} not found in cache")
 
-            for layer_idx in range(len(seq_cache.layers)):
-                layer = seq_cache.layers[layer_idx]
-                key = layer.keys  # [1, num_heads, seq_len, head_dim]
+            # 兼容元组和 DynamicCache
+            if isinstance(seq_cache, tuple):
+                num_layers = len(seq_cache) // 2
+                seq_layers = []
+                for i in range(num_layers):
+                    key = seq_cache[i * 2]
+                    value = seq_cache[i * 2 + 1]
+                    layer = DynamicLayer()
+                    layer.keys = key
+                    layer.values = value
+                    seq_layers.append(layer)
+            else:
+                seq_layers = seq_cache.layers
+
+            for layer_idx in range(len(seq_layers)):
+                layer = seq_layers[layer_idx]
+                key = layer.keys
                 value = layer.values
 
                 if layer_idx >= len(batch_cache.layers):
@@ -49,18 +62,9 @@ class KVCache:
                     new_layer.values = value
                     batch_cache.layers.append(new_layer)
                 else:
-                    # 获取已存在的层
                     batch_layer = batch_cache.layers[layer_idx]
-
-                    # 修复点：检查是否为首次添加值
-                    if batch_layer.keys is None:
-                        # 首次添加直接赋值
-                        batch_layer.keys = key
-                        batch_layer.values = value
-                    else:
-                        # 后续添加进行拼接
-                        batch_layer.keys = torch.cat([batch_layer.keys, key], dim=0)
-                        batch_layer.values = torch.cat([batch_layer.values, value], dim=0)
+                    batch_layer.keys = torch.cat([batch_layer.keys, key], dim=0)
+                    batch_layer.values = torch.cat([batch_layer.values, value], dim=0)
 
         return batch_cache
 
