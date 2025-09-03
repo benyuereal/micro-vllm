@@ -1,7 +1,6 @@
-# core/cache_manager.py
 from typing import Dict, List, Tuple, Optional
 import torch
-from transformers import DynamicCache, DynamicLayer
+from transformers.cache_utils import DynamicCache, DynamicLayer  # 推荐导入方式
 
 
 class KVCache:
@@ -15,15 +14,13 @@ class KVCache:
         """删除指定序列的缓存"""
         print(f"seq {seq_id}: delete")
         if seq_id in self.seq_kv_cache:
-            # 释放显存（如果有GPU内存占用）
             cache = self.seq_kv_cache[seq_id]
-            for layer in cache.layers:
-                if isinstance(layer.keys, torch.Tensor):
-                    layer.keys = layer.keys.cpu()
-                if isinstance(layer.values, torch.Tensor):
-                    layer.values = layer.values.cpu()
-
-            # 从缓存中移除
+            if hasattr(cache, "layers"):
+                for layer in cache.layers:
+                    if isinstance(layer.keys, torch.Tensor):
+                        layer.keys = layer.keys.cpu()
+                    if isinstance(layer.values, torch.Tensor):
+                        layer.values = layer.values.cpu()
             del self.seq_kv_cache[seq_id]
 
     def get(self, seq_id: int) -> Optional["DynamicCache"]:
@@ -38,11 +35,17 @@ class KVCache:
 
             # 兼容元组和 DynamicCache
             if isinstance(seq_cache, tuple):
+                # 假设格式为 (key_0, value_0, key_1, value_1, ...)
                 num_layers = len(seq_cache) // 2
                 seq_layers = []
                 for i in range(num_layers):
                     key = seq_cache[i * 2]
                     value = seq_cache[i * 2 + 1]
+                    # 解包元组（如果 key/value 是元组）
+                    if isinstance(key, tuple):
+                        key = key[0]
+                    if isinstance(value, tuple):
+                        value = value[0]
                     layer = DynamicLayer()
                     layer.keys = key
                     layer.values = value
@@ -55,16 +58,25 @@ class KVCache:
                 key = layer.keys
                 value = layer.values
 
+                # 确保 key/value 是张量（解包元组）
+                if isinstance(key, tuple):
+                    key = key[0]
+                if isinstance(value, tuple):
+                    value = value[0]
+
                 if layer_idx >= len(batch_cache.layers):
-                    # 第一次添加该层
                     new_layer = DynamicLayer()
                     new_layer.keys = key
                     new_layer.values = value
                     batch_cache.layers.append(new_layer)
                 else:
                     batch_layer = batch_cache.layers[layer_idx]
-                    print(f"batch_layer type: {type(batch_layer)}")
-
+                    # 确保 batch_layer.keys/values 是张量
+                    if isinstance(batch_layer.keys, tuple):
+                        batch_layer.keys = batch_layer.keys[0]
+                    if isinstance(batch_layer.values, tuple):
+                        batch_layer.values = batch_layer.values[0]
+                    # 现在可以安全调用 torch.cat
                     batch_layer.keys = torch.cat([batch_layer.keys, key], dim=0)
                     batch_layer.values = torch.cat([batch_layer.values, value], dim=0)
 
@@ -76,46 +88,47 @@ class KVCache:
 
         # 兼容元组和 DynamicCache
         if isinstance(batch_cache, tuple):
-            # 假设格式为 (key_0, value_0, key_1, value_1, ...)
             num_layers = len(batch_cache) // 2
             layers = []
             for i in range(num_layers):
                 key = batch_cache[i * 2]
                 value = batch_cache[i * 2 + 1]
+                # 解包元组
+                if isinstance(key, tuple):
+                    key = key[0]
+                if isinstance(value, tuple):
+                    value = value[0]
                 layer = DynamicLayer()
                 layer.keys = key
                 layer.values = value
                 layers.append(layer)
         else:
-            layers = batch_cache.layers  # 直接使用 DynamicCache
+            layers = batch_cache.layers
 
         for i, seq_id in enumerate(seq_ids):
             seq_cache = DynamicCache()
             for layer_idx in range(len(layers)):
                 layer = layers[layer_idx]
-                key = layer.keys[i:i + 1]
-                value = layer.values[i:i + 1]
+                key = layer.keys
+                value = layer.values
+                # 解包元组
+                if isinstance(key, tuple):
+                    key = key[0]
+                if isinstance(value, tuple):
+                    value = value[0]
+                # 切片
+                key = key[i:i + 1]
+                value = value[i:i + 1]
 
-                # 创建新的 DynamicLayer
                 new_layer = DynamicLayer()
                 new_layer.keys = key
                 new_layer.values = value
                 seq_cache.layers.append(new_layer)
 
-            # ✅ 修复：正确设置cumulative_length
+            # 复制 cumulative_length
             if hasattr(batch_cache, "cumulative_length"):
-                # 复制原始累计长度
                 seq_cache.cumulative_length = batch_cache.cumulative_length.copy()
 
             kv_dict[seq_id] = seq_cache
 
         return kv_dict
-
-
-
-
-
-
-
-
-
