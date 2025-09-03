@@ -36,7 +36,7 @@ if __name__ == "__main__":
         # 使用更高质量的生成参数
         results = engine.generate(
             prompts,
-            max_steps=1024
+            max_tokens=1024
         )
         gen_time = time.time() - start_time
     except Exception as e:

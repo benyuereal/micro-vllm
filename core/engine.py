@@ -1,4 +1,4 @@
-# core/engine.py
+# core/engine.py (完整更新)
 import torch
 from typing import List, Tuple, Dict
 from .scheduler import Scheduler
@@ -8,7 +8,6 @@ from .model_loader import load_model
 from models.qwen_adapter import QwenModelAdapter
 from transformers import DynamicCache
 import torch.nn.functional as F
-
 
 
 class InferenceEngine:
@@ -21,13 +20,32 @@ class InferenceEngine:
         self.adapter = QwenModelAdapter
         self.device = next(self.model.parameters()).device
         self.eos_token_id = self.tokenizer.eos_token_id  # ✅ 确保设置 eos_token_id
+        self.stream_callbacks = {}  # 新增：存储流式输出回调函数
 
     def add_request(self, prompt: str, max_tokens: int = 128, temperature: float = 0.7, top_p: float = 0.9):
-        seq_id = hash(prompt) % (2**32)
+        seq_id = hash(prompt) % (2 ** 32)
         seq = Sequence(seq_id, prompt, self.tokenizer, max_tokens)
         seq.temperature = temperature
         seq.top_p = top_p
         self.scheduler.add_request(seq)
+        return seq_id  # 返回序列ID以便注册回调
+
+    def register_stream_callback(self, seq_id: int, callback):
+        """注册流式输出回调函数"""
+        self.stream_callbacks[seq_id] = callback
+
+    def unregister_stream_callback(self, seq_id: int):
+        """取消注册流式输出回调函数"""
+        if seq_id in self.stream_callbacks:
+            del self.stream_callbacks[seq_id]
+
+    def _invoke_stream_callback(self, seq_id: int, token: int, text: str):
+        """调用流式输出回调函数"""
+        if seq_id in self.stream_callbacks:
+            try:
+                self.stream_callbacks[seq_id](token, text)
+            except Exception as e:
+                print(f"Error in stream callback for seq {seq_id}: {e}")
 
     @torch.no_grad()
     def step(self) -> List[Tuple[int, List[int]]]:
@@ -59,6 +77,10 @@ class InferenceEngine:
                 next_token = self.sample_next_token(logits[i, -1, :], seq.temperature, seq.top_p)
                 seq.update_state(next_token, new_kv_dict[seq.seq_id])
 
+                # 新增：流式输出回调
+                token_text = self.tokenizer.decode([next_token], skip_special_tokens=True)
+                self._invoke_stream_callback(seq.seq_id, next_token, token_text)
+
                 if seq.is_finished():
                     self.scheduler.mark_finished(seq)
                 else:
@@ -81,7 +103,11 @@ class InferenceEngine:
             new_kv_dict = self.cache.unbatch_kv(seq_ids, new_batch_kv)
             for i, seq in enumerate(batch):
                 next_token = self.sample_next_token(logits[i, -1, :], seq.temperature, seq.top_p)
-                seq.update_state(next_token, new_kv_dict[seq.seq_id])  # ✅ update_state 后立即检查 is_finished
+                seq.update_state(next_token, new_kv_dict[seq.seq_id])
+
+                # 新增：流式输出回调
+                token_text = self.tokenizer.decode([next_token], skip_special_tokens=True)
+                self._invoke_stream_callback(seq.seq_id, next_token, token_text)
 
                 # ✅ 立即检查 is_finished（decode 后可能完成）
                 if seq.is_finished():
@@ -104,13 +130,11 @@ class InferenceEngine:
         # 直接返回adapter处理后的DynamicCache
         return self.adapter.process_outputs(outputs, input_ids.size(1))
 
-
     def _decode_batch(self, input_ids: torch.Tensor, past_key_values: DynamicCache):
         inputs = self.adapter.prepare_inputs(self.model, input_ids, past_key_values)
         outputs = self.model(**inputs)
         # 直接返回adapter处理后的DynamicCache
         return self.adapter.process_outputs(outputs, input_ids.size(1))
-
 
     def _pad_batch(self, sequences: List[List[int]], pad_token_id: int):
         max_len = max(len(seq) for seq in sequences)
@@ -139,12 +163,56 @@ class InferenceEngine:
         next_token = torch.multinomial(probs, num_samples=1).item()
         return next_token
 
-    def generate(self, prompts: List[str], max_steps: int = 100):
+    def stream_generate(self, prompt: str, max_tokens: int = 128, temperature: float = 0.7, top_p: float = 0.9):
+        """流式生成方法，返回生成器"""
+        seq_id = self.add_request(prompt, max_tokens, temperature, top_p)
+
+        # 使用队列存储生成的token
+        from queue import Queue
+        token_queue = Queue()
+
+        # 定义回调函数
+        def callback(token, text):
+            token_queue.put((token, text))
+
+        # 注册回调
+        self.register_stream_callback(seq_id, callback)
+
+        try:
+            # 流式返回token
+            generated_count = 0
+            while generated_count < max_tokens:
+                # 执行一步推理
+                self.step()
+
+                # 检查是否有新token
+                while not token_queue.empty():
+                    token, text = token_queue.get()
+                    yield token, text
+                    generated_count += 1
+
+                    # 如果遇到结束标记，停止生成
+                    if token == self.eos_token_id:
+                        return
+
+                # 短暂休眠避免忙等待
+                import time
+                time.sleep(0.001)
+
+                # 检查序列是否已完成
+                running_seqs = [seq for seq in self.scheduler.running_sequences if seq.seq_id == seq_id]
+                if not running_seqs:
+                    break
+        finally:
+            # 清理回调
+            self.unregister_stream_callback(seq_id)
+
+    def generate(self, prompts: List[str], max_tokens: int = 100):
         for prompt in prompts:
-            self.add_request(prompt, max_steps)
+            self.add_request(prompt, max_tokens)
 
         results = {}
-        for step in range(max_steps):
+        for step in range(max_tokens):
             self.step()
             if not self.scheduler.running_sequences and not self.scheduler.waiting_queue:
                 break
@@ -158,7 +226,4 @@ class InferenceEngine:
             except:
                 results[seq] = f"[Error] {output_ids}"
 
-
-
         return results
-
