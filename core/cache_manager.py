@@ -63,6 +63,8 @@ class KVCache:
                     batch_cache.layers.append(new_layer)
                 else:
                     batch_layer = batch_cache.layers[layer_idx]
+                    print(f"batch_layer type: {type(batch_layer)}")
+
                     batch_layer.keys = torch.cat([batch_layer.keys, key], dim=0)
                     batch_layer.values = torch.cat([batch_layer.values, value], dim=0)
 
