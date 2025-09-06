@@ -141,24 +141,25 @@ async def batch_generate_text(request: BatchGenerateRequest):
         raise HTTPException(status_code=500, detail=f"Batch generation failed: {str(e)}")
 
 
-# 流式生成端点
+# 在 generate_stream 函数中添加统计
 @app.post("/generate_stream")
 async def generate_stream(request: GenerateRequest):
     if engine is None:
         raise HTTPException(status_code=503, detail="Model not loaded")
 
     if not request.stream:
-        # 如果不要求流式，返回普通响应
         response = await generate_text(request)
         return response
 
-    # 流式响应
+    # 添加统计变量
+    start_time = time.time()
+    token_count = 0
+
     async def event_generator():
-        # 创建队列用于接收token
+        nonlocal token_count
         token_queue = Queue()
         full_text = ""
 
-        # 添加请求并获取序列ID
         seq_id = engine.add_request(
             request.prompt,
             max_tokens=request.max_tokens,
@@ -166,25 +167,21 @@ async def generate_stream(request: GenerateRequest):
             top_p=request.top_p
         )
 
-        # 定义回调函数
         def callback(token, text):
+            nonlocal token_count
+            token_count += 1
             token_queue.put((token, text))
 
-        # 注册回调
         engine.register_stream_callback(seq_id, callback)
 
         try:
-            # 流式返回token
             while True:
-                # 执行一步推理
                 engine.step()
 
-                # 检查是否有新token
                 while not token_queue.empty():
                     token, text = token_queue.get()
                     full_text += text
 
-                    # 构建SSE格式的数据
                     data = {
                         "token": token,
                         "text": text,
@@ -193,20 +190,20 @@ async def generate_stream(request: GenerateRequest):
                     }
 
                     yield f"data: {json.dumps(data, ensure_ascii=False)}\n\n"
-
-                    # 如果遇到结束标记，停止生成
-                    if token == engine.eos_token_id:
-                        return
-
-                # 检查序列是否已完成
                 running_seqs = [seq for seq in engine.scheduler.running_sequences if seq.seq_id == seq_id]
                 if not running_seqs:
+                    print("[Done]")
+                    # 流式结束时打印统计信息
+                    end_time = time.time()
+                    gen_time = end_time - start_time
+                    tokens_per_sec = token_count / gen_time if gen_time > 0 else 0
+
+                    print(f"\nStream generated {token_count} tokens in {gen_time:.2f} seconds")
+                    print(f"Throughput: {tokens_per_sec:.2f} tokens/sec")
                     break
 
-                # 短暂休眠避免忙等待
                 await asyncio.sleep(0.01)
         finally:
-            # 清理回调
             engine.unregister_stream_callback(seq_id)
 
     return StreamingResponse(event_generator(), media_type="text/event-stream")
