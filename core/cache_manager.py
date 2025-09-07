@@ -14,13 +14,6 @@ class KVCache:
         """删除指定序列的缓存"""
         print(f"seq {seq_id}: delete")
         if seq_id in self.seq_kv_cache:
-            cache = self.seq_kv_cache[seq_id]
-            if hasattr(cache, "layers"):
-                for layer in cache.layers:
-                    if isinstance(layer.keys, torch.Tensor):
-                        layer.keys = layer.keys.cpu()
-                    if isinstance(layer.values, torch.Tensor):
-                        layer.values = layer.values.cpu()
             del self.seq_kv_cache[seq_id]
 
     def get(self, seq_id: int) -> Optional["DynamicCache"]:

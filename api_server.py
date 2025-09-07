@@ -192,7 +192,7 @@ async def generate_stream(request: GenerateRequest):
                     yield f"data: {json.dumps(data, ensure_ascii=False)}\n\n"
                 running_seqs = [seq for seq in engine.scheduler.running_sequences if seq.seq_id == seq_id]
                 if not running_seqs:
-                    print("[Done]")
+                    print("[DONE]")
                     # 流式结束时打印统计信息
                     end_time = time.time()
                     gen_time = end_time - start_time
