@@ -6,6 +6,7 @@ import time
 
 from transformers import DynamicCache
 
+from .memory_manager import MemoryPool
 from .scheduler import Scheduler
 from .cache_manager import KVCache
 from .sequence import Sequence
@@ -17,8 +18,26 @@ class InferenceEngine:
     def __init__(self, model_path: str, max_batch_size: int = 8, max_prefill_tokens: int = 2048):
         self.model, self.tokenizer = load_model(model_path)
         self.model.eval()
+
+        # 初始化内存池和KV缓存
+        num_layers = self.model.config.num_hidden_layers
+        num_heads = self.model.config.num_attention_heads
+        head_size = self.model.config.hidden_size // num_heads
+        num_key_value_heads = self.model.config.num_key_value_heads
+        # 获取模型的数据类型
+        model_dtype = next(self.model.parameters()).dtype
+
+        self.memory_pool = MemoryPool(
+            block_size=1024,
+            max_blocks=32,
+            num_layers=num_layers,
+            head_size=head_size,
+            num_heads=num_key_value_heads,
+            dtype=model_dtype  # 使用模型的数据类型
+        )
+
         self.scheduler = Scheduler(max_batch_size, max_prefill_tokens)
-        self.cache = KVCache()
+        self.cache = KVCache(self.memory_pool)
         self.adapter = QwenModelAdapter
         self.device = next(self.model.parameters()).device
         self.eos_token_id = self.tokenizer.eos_token_id
@@ -62,7 +81,6 @@ class InferenceEngine:
         return True
 
     def _process_prefill_batch(self, batch: List[Sequence], seq_ids: List[int]):
-        """处理预填充批次"""
         input_ids = [seq.get_next_input_ids() for seq in batch]
         input_tensor = self._pad_batch(input_ids, self.tokenizer.pad_token_id).to(self.device)
 
@@ -74,7 +92,6 @@ class InferenceEngine:
             self._update_sequence(seq, next_token, new_kv_dict[seq.seq_id])
 
     def _process_decode_batch(self, batch: List[Sequence], seq_ids: List[int]):
-        """处理解码批次"""
         input_ids = torch.tensor([seq.get_next_input_ids() for seq in batch], device=self.device)
         batch_past_kv = self.cache.batch_kv(seq_ids)
 

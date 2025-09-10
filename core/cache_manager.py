@@ -1,76 +1,114 @@
 from typing import Dict, List, Tuple, Optional
 import torch
-from transformers.cache_utils import DynamicCache, DynamicLayer  # 推荐导入方式
+
+from .memory_manager import MemoryPool
 
 
 class KVCache:
-    def __init__(self):
-        self.seq_kv_cache = {}  # seq_id -> (DynamicCache, seq_length)
+    def __init__(self, memory_pool: MemoryPool):
+        self.memory_pool = memory_pool
+        self.seq_lengths: Dict[int, int] = {}  # seq_id -> current_length
 
-    def allocate(self, seq_id: int, past_key_values: "DynamicCache", seq_length: int):
-        self.seq_kv_cache[seq_id] = (past_key_values, seq_length)
+    def allocate(self, seq_id: int, past_key_values: List[Tuple[torch.Tensor, torch.Tensor]], seq_length: int):
+        seq_length = seq_length - 1
+        if not self.memory_pool.allocate_for_sequence(seq_id, seq_length):
+            raise RuntimeError(f"Failed to allocate memory for sequence {seq_id}")
+
+        allocations = self.memory_pool.seq_allocations[seq_id]
+        # 按块起始位置排序确保序列顺序
+        allocations = sorted(allocations, key=lambda x: x[1])  # 按start排序
+
+        # 逐层处理
+        for layer_idx, (k, v) in enumerate(past_key_values):
+            current_pos = 0  # 当前写入位置
+            for block_idx, start, end in allocations:
+                chunk_length = end - start  # 当前块的可用长度
+                # 切片: [num_heads, chunk_length, head_size]
+                k_chunk = k[:, current_pos:current_pos + chunk_length, :]
+                v_chunk = v[:, current_pos:current_pos + chunk_length, :]
+
+                block = self.memory_pool.blocks[block_idx]
+                # 写入块缓存 (注意维度匹配)
+                block.key_cache[layer_idx, :, start:end] = k_chunk
+                block.value_cache[layer_idx, :, start:end] = v_chunk
+
+                current_pos += chunk_length  # 更新序列位置
+
+        self.seq_lengths[seq_id] = seq_length
 
     def delete(self, seq_id: int):
-        """删除指定序列的缓存"""
-        print(f"seq {seq_id}: delete")
-        if seq_id in self.seq_kv_cache:
-            del self.seq_kv_cache[seq_id]
+        """删除序列缓存"""
+        self.memory_pool.free_sequence(seq_id)
+        if seq_id in self.seq_lengths:
+            del self.seq_lengths[seq_id]
 
-    def get(self, seq_id: int) -> Optional["DynamicCache"]:
-        return self.seq_kv_cache.get(seq_id)
+    def get(self, seq_id: int) -> Optional[List[Tuple[torch.Tensor, torch.Tensor]]]:
+        """获取序列的KV缓存"""
+        if seq_id not in self.memory_pool.seq_allocations:
+            return None
 
-    def batch_kv(self, seq_ids: List[int]) -> "DynamicCache":
-        batch_cache = DynamicCache()
-        seq_caches, seq_lengths = [], []
+        allocations = self.memory_pool.seq_allocations[seq_id]
+        num_layers = self.memory_pool.num_layers
+        kv_cache = []
 
-        for seq_id in seq_ids:
-            cache, length = self.get(seq_id)
-            if cache is None:
-                raise RuntimeError(f"seq_id {seq_id} not found in cache")
-            seq_caches.append(cache)
-            seq_lengths.append(length)
+        for layer_idx in range(num_layers):
+            ## 形状(num_layers, num_heads, block_size, head_size)
+            keys, values = [], []
+            for block_idx, start, end in allocations:
+                block = self.memory_pool.blocks[block_idx]
+                # 按头直接读取连续内存
+                keys.append(block.key_cache[layer_idx, :, start:end])  # 形状: (num_heads, chunk_size, head_size)
+                values.append(block.value_cache[layer_idx, :, start:end])
 
-        # 按序列长度排序（长序列在前）
-        sorted_indices = sorted(range(len(seq_lengths)), key=lambda i: -seq_lengths[i])
-        seq_caches = [seq_caches[i] for i in sorted_indices]
-        seq_lengths = [seq_lengths[i] for i in sorted_indices]
+            # 沿序列维度拼接
+            k = torch.cat(keys, dim=1)  # dim=1拼接seq_len -> (num_heads, total_seq_len, head_size)
+            v = torch.cat(values, dim=1)
+            kv_cache.append((k, v))
 
-        # 逐层拼接
-        max_layers = max(len(cache.layers) for cache in seq_caches)
-        for layer_idx in range(max_layers):
-            all_keys, all_values = [], []
+        return kv_cache
 
-            for cache in seq_caches:
-                if layer_idx < len(cache.layers):
-                    layer = cache.layers[layer_idx]
-                    all_keys.append(layer.keys)
-                    all_values.append(layer.values)
-                else:
-                    # 补零对齐
-                    dummy_shape = (1, layer.keys.shape[1], 0, layer.keys.shape[3])
-                    all_keys.append(torch.zeros(dummy_shape, device=layer.keys.device))
-                    all_values.append(torch.zeros(dummy_shape, device=layer.values.device))
+    def batch_kv(self, seq_ids: List[int]) -> List[Tuple[torch.Tensor, torch.Tensor]]:
+        """批量获取KV缓存"""
+        batch_kv = []
+        max_len = max(self.seq_lengths.get(seq_id, 0) for seq_id in seq_ids)
+        num_layers = self.memory_pool.num_layers
 
-            batch_layer = DynamicLayer()
-            batch_layer.keys = torch.cat(all_keys, dim=0)
-            batch_layer.values = torch.cat(all_values, dim=0)
-            batch_cache.layers.append(batch_layer)
+        for layer_idx in range(num_layers):
+            keys, values = [], []
+            for seq_id in seq_ids:
+                k, v = self.get(seq_id)[layer_idx]  # k/v: (num_heads, seq_len, head_size)
+                keys.append(k)
+                values.append(v)
 
-        return batch_cache
+            # 计算当前层的最大序列长度
+            max_len = max(k.size(1) for k in keys)  # 注意：dim=1是seq_len
 
-    def unbatch_kv(self, seq_ids: List[int], batch_cache: "DynamicCache") -> Dict[int, "DynamicCache"]:
+            padded_keys, padded_values = [], []
+            for k, v in zip(keys, values):
+                # 创建填充张量 (num_heads, max_len, head_size)
+                pad_k = torch.zeros(k.size(0), max_len, k.size(2), device=k.device, dtype=k.dtype)
+                pad_k[:, :k.size(1), :] = k  # 复制有效数据
+                padded_keys.append(pad_k)
+
+                pad_v = torch.zeros_like(pad_k)
+                pad_v[:, :v.size(1), :] = v
+                padded_values.append(pad_v)
+
+            batch_k = torch.stack(padded_keys)  # 形状: (batch, num_heads, max_len, head_size)
+            batch_v = torch.stack(padded_values)
+            batch_kv.append((batch_k, batch_v))
+
+        return batch_kv
+
+    def unbatch_kv(self, seq_ids: List[int], batch_kv: List[Tuple[torch.Tensor, torch.Tensor]]) -> Dict[
+        int, List[Tuple[torch.Tensor, torch.Tensor]]]:
+        """拆分批量KV缓存"""
         kv_dict = {}
-        batch_size = len(seq_ids)
-
         for i, seq_id in enumerate(seq_ids):
-            seq_cache = DynamicCache()
-            for layer in batch_cache.layers:
-                new_layer = DynamicLayer()
-                # 精确提取对应序列的缓存
-                new_layer.keys = layer.keys[i:i + 1]
-                new_layer.values = layer.values[i:i + 1]
-                seq_cache.layers.append(new_layer)
-
-            kv_dict[seq_id] = seq_cache
-
+            seq_kv = []
+            for k, v in batch_kv:
+                seq_k = k[i:i + 1].squeeze(0)
+                seq_v = v[i:i + 1].squeeze(0)
+                seq_kv.append((seq_k, seq_v))
+            kv_dict[seq_id] = seq_kv
         return kv_dict
