@@ -30,7 +30,8 @@ class InferenceEngine:
             device = 'mps'
             block_size = 16
             max_blocks = 512
-            dtype = torch.float16
+            dtype = torch.float32
+            self.model = self.model.to(torch.float32)
         elif torch.cuda.is_available():
             device = 'cuda'
             block_size = 64
@@ -59,8 +60,9 @@ class InferenceEngine:
 
         # 初始化PageAttention模块
         self.paged_attention = PagedAttention(
-            num_heads=num_key_value_heads,
+            num_heads=num_heads,
             head_size=head_size,
+            kv_head_size=num_key_value_heads,
             device=device
         )
 
@@ -186,7 +188,7 @@ class InferenceEngine:
             query = query.view(query.size(0), self.paged_attention.num_heads, -1)
 
             # 执行PageAttention
-            attn_output = self.paged_attention(
+            attn_output = self.paged_attention.forward(
                 query=query,
                 cache_manager=self.cache,
                 seq_ids=seq_ids,

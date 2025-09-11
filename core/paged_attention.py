@@ -6,10 +6,11 @@ import numpy as np
 
 
 class PagedAttention(nn.Module):
-    def __init__(self, num_heads: int, head_size: int, device: str = "auto"):
+    def __init__(self, num_heads: int, head_size: int, kv_head_size:int, device: str = "auto"):
         super().__init__()
         self.num_heads = num_heads
         self.head_size = head_size
+        self.kv_head_size = kv_head_size
         self.scale = 1.0 / (head_size ** 0.5)
 
         # 自动检测设备
@@ -104,52 +105,62 @@ class PagedAttention(nn.Module):
 
     def _mps_forward(
             self,
-            query: torch.Tensor,
+            query: torch.Tensor,  # [2, 14, 64] ← Q 头
             cache_manager: 'KVCache',
             seq_ids: List[int],
             context_lens: List[int],
             token_positions: List[List[int]]
     ) -> torch.Tensor:
-        """MPS/CPU回退实现"""
         batch_size = query.size(0)
-        output = torch.zeros_like(query)
+        output = torch.zeros_like(query)  # [2, 14, 64]
 
         for i in range(batch_size):
             seq_id = seq_ids[i]
             tokens = cache_manager.get_sequence_tokens(seq_id)
             seq_len = context_lens[i]
 
-            # 收集序列的所有KV
+            # 收集 KV（注意：每个 token 的 k/v 是 [layers, kv_heads, head_size]）
             keys = []
             values = []
-
             for token_id, position in tokens[:seq_len]:
                 k, v = cache_manager.get_token_kv(token_id, position)
-                keys.append(k)  # [layers, heads, head_size]
+                keys.append(k)  # [layers, kv_heads, head_size]
                 values.append(v)
 
-            # 拼接序列的KV
-            K = torch.stack(keys, dim=2)  # [layers, heads, seq_len, head_size]
-            V = torch.stack(values, dim=2)
+            # 拼接：K = [layers, kv_heads, seq_len, head_size]
+            K = torch.stack(keys, dim=2)  # [24, 2, 5, 64] ✅ 正确（GQA）
+            V = torch.stack(values, dim=2)  # [24, 2, 5, 64]
 
-            # 注意力计算
-            q = query[i].unsqueeze(0)  # [1, num_heads, head_size]
+            # 当前 query：[1, 14, 64]
+            q = query[i].unsqueeze(0)  # [1, 14, 64]
+
             for layer_idx in range(K.size(0)):
-                layer_k = K[layer_idx]  # [heads, seq_len, head_size]
+                layer_k = K[layer_idx]  # [2, 5, 64]
                 layer_v = V[layer_idx]
 
-                # 计算注意力分数
-                scores = torch.einsum("hd,sd->hs", q[0], layer_k) * self.scale
-                attn = F.softmax(scores, dim=-1)
+                # ✅ GQA 修复：将 K/V 头从 2 扩展到 14
+                layer_k = layer_k.repeat_interleave(self.num_heads // layer_k.size(0), dim=0)  # [14, 5, 64]
+                layer_v = layer_v.repeat_interleave(self.num_heads  // layer_v.size(0), dim=0)  # [14, 5, 64]
 
-                # 计算加权和
-                layer_output = torch.einsum("hs,hsd->hd", attn, layer_v)
+                # 现在可以计算注意力
+                # q: [1, 14, 64] → q[0]: [14, 64]
+                # layer_k: [14, 5, 64]
+                scores = torch.einsum("hd,hsd->hs", q[0], layer_k) * self.scale  # [14, 5]
+                # ✅ 正确：h=14, d=64, s=5 → hs=14x5
+
+                attn = F.softmax(scores, dim=-1)  # [14, 5]
+
+                # 加权和：[14, 5] @ [14, 5, 64] → [14, 64]
+                layer_output = torch.einsum("hs,hsd->hd", attn, layer_v)  # [14, 64]
 
                 # 更新输出
                 output[i] += layer_output
 
-                # 为下一层调整query
-                # (简化实现，实际模型中应包含线性变换)
-                q = layer_output.unsqueeze(0)
+                # ✅ 为下一层准备 query（必须加线性变换！）
+                # 现在 layer_output 是 [14,64]，但下一层需要 [1,14,64] 且经过 q_proj
+                # 所以不能直接赋值！应该由主模型控制
+                # 这里只能简化：假设 q = layer_output（仅用于 debug）
+                q = layer_output.unsqueeze(0)  # [1,14,64] ← 仅用于本层循环
 
         return output
+
