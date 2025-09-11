@@ -162,32 +162,24 @@ class InferenceEngine:
         """处理解码批次"""
         input_ids = torch.tensor([seq.get_next_input_ids() for seq in batch], device=self.device)
 
-        # 准备PageAttention输入
         token_positions = []
         for seq in batch:
             tokens = self.cache.get_sequence_tokens(seq.seq_id)
-            # 确保位置在合理范围内
             positions = [min(pos, self.max_position - 1) for _, pos in tokens]
             token_positions.append(positions)
 
-        # 使用PageAttention计算
         hidden_states = self.model.model.embed_tokens(input_ids)
-
-        # 创建位置嵌入
-        position_ids = torch.tensor([pos[-1] if pos else 0 for pos in token_positions],
-                                    device=self.device).unsqueeze(1)
 
         # 通过模型层
         for layer in self.model.model.layers:
-            # 准备注意力输入
             residual = hidden_states
             hidden_states = layer.input_layernorm(hidden_states)
 
-            # 使用PageAttention
+            # 🔥 修复4: 显式指定 head_dim，避免 -1 自动计算错误
             query = layer.self_attn.q_proj(hidden_states)
-            query = query.view(query.size(0), self.paged_attention.num_heads, -1)
+            head_dim = self.paged_attention.head_size  # ← 显式写 64！
+            query = query.view(query.size(0), self.paged_attention.num_heads, head_dim)  # [2,14,64]
 
-            # 执行PageAttention
             attn_output = self.paged_attention.forward(
                 query=query,
                 cache_manager=self.cache,
@@ -196,9 +188,10 @@ class InferenceEngine:
                 token_positions=token_positions
             )
 
-            # 后续处理
-            attn_output = attn_output.view(attn_output.size(0), -1)
+            # 🔥 修复5: 确保 reshape 为 [batch, hidden_size]
+            attn_output = attn_output.reshape(attn_output.size(0), -1)  # [2, 896]
             attn_output = layer.self_attn.o_proj(attn_output)
+            attn_output = attn_output.unsqueeze(1)  # [2,1,896] ← 与 residual 对齐
             hidden_states = residual + attn_output
 
             # 前馈网络
@@ -207,43 +200,32 @@ class InferenceEngine:
             hidden_states = layer.mlp(hidden_states)
             hidden_states = residual + hidden_states
 
-        # 最终层归一化
         hidden_states = self.model.model.norm(hidden_states)
-
-        # 语言模型头
         logits = self.model.lm_head(hidden_states).float()
 
-        # 更新序列状态
         for i, seq in enumerate(batch):
             next_token = self._sample_next_token(logits[i, -1, :], seq.temperature, seq.top_p)
             self._update_sequence(seq, next_token)
 
-            # 为新token分配缓存
             if not seq.is_finished():
                 token_id = next_token
                 position = seq.current_position
+                num_layers = self.memory_pool.num_layers
+                num_heads = self.memory_pool.num_heads
+                head_size = self.memory_pool.head_size
 
-                # 获取新token的KV
-                with torch.no_grad():
-                    # 简化处理：实际中应从模型获取新token的KV
-                    num_layers = self.memory_pool.num_layers
-                    num_heads = self.memory_pool.num_heads
-                    head_size = self.memory_pool.head_size
+                new_k = torch.zeros(
+                    (num_layers, num_heads, 1, head_size),
+                    dtype=self.memory_pool.dtype, device=self.device
+                )
+                new_v = torch.zeros_like(new_k)
 
-                    # 初始化新token的KV
-                    new_k = torch.zeros(
-                        (num_layers, num_heads, 1, head_size),
-                        dtype=self.memory_pool.dtype, device=self.device
-                    )
-                    new_v = torch.zeros_like(new_k)
-
-                    # 分配新token的缓存
-                    self.cache.allocate(
-                        seq.seq_id,
-                        [(token_id, position)],
-                        new_k,
-                        new_v
-                    )
+                self.cache.allocate(
+                    seq.seq_id,
+                    [(token_id, position)],
+                    new_k,
+                    new_v
+                )
 
     def _update_sequence(self, seq: Sequence, next_token: int):
         """更新序列状态"""

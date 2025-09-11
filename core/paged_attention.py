@@ -128,39 +128,36 @@ class PagedAttention(nn.Module):
                 values.append(v)
 
             # 拼接：K = [layers, kv_heads, seq_len, head_size]
-            K = torch.stack(keys, dim=2)  # [24, 2, 5, 64] ✅ 正确（GQA）
-            V = torch.stack(values, dim=2)  # [24, 2, 5, 64]
+            K = torch.stack(keys, dim=2)  # [24, 2, 5, 64]
+            V = torch.stack(values, dim=2)
 
             # 当前 query：[1, 14, 64]
             q = query[i].unsqueeze(0)  # [1, 14, 64]
 
+            # 🔥 修复1: 每层输出是独立的，不要累加！
+            layer_output = None
             for layer_idx in range(K.size(0)):
                 layer_k = K[layer_idx]  # [2, 5, 64]
                 layer_v = V[layer_idx]
 
-                # ✅ GQA 修复：将 K/V 头从 2 扩展到 14
-                layer_k = layer_k.repeat_interleave(self.num_heads // layer_k.size(0), dim=0)  # [14, 5, 64]
-                layer_v = layer_v.repeat_interleave(self.num_heads  // layer_v.size(0), dim=0)  # [14, 5, 64]
+                # GQA 修复：将 K/V 头从 2 扩展到 14
+                repeat_times = self.num_heads // layer_k.size(0)
+                layer_k = layer_k.repeat_interleave(repeat_times, dim=0)  # [14, 5, 64]
+                layer_v = layer_v.repeat_interleave(repeat_times, dim=0)
 
-                # 现在可以计算注意力
-                # q: [1, 14, 64] → q[0]: [14, 64]
-                # layer_k: [14, 5, 64]
+                # 注意力计算
                 scores = torch.einsum("hd,hsd->hs", q[0], layer_k) * self.scale  # [14, 5]
-                # ✅ 正确：h=14, d=64, s=5 → hs=14x5
-
-                attn = F.softmax(scores, dim=-1)  # [14, 5]
-
-                # 加权和：[14, 5] @ [14, 5, 64] → [14, 64]
+                attn = F.softmax(scores, dim=-1)
                 layer_output = torch.einsum("hs,hsd->hd", attn, layer_v)  # [14, 64]
 
-                # 更新输出
-                output[i] += layer_output
+                # 🔥 修复2: q = layer_output 仅用于本层循环（模拟下一层）
+                # 但注意：下一层 q 应该由 o_proj 后重新投影，这里简化
+                q = layer_output.unsqueeze(0)  # [1,14,64]
 
-                # ✅ 为下一层准备 query（必须加线性变换！）
-                # 现在 layer_output 是 [14,64]，但下一层需要 [1,14,64] 且经过 q_proj
-                # 所以不能直接赋值！应该由主模型控制
-                # 这里只能简化：假设 q = layer_output（仅用于 debug）
-                q = layer_output.unsqueeze(0)  # [1,14,64] ← 仅用于本层循环
+            # 🔥 修复3: 只取最后一层的输出（或所有层平均，但不要累加！）
+            output[i] = layer_output  # ← 赋值，不是 +=！
 
-        return output
+        return output  # [2, 14, 64]
+
+
 
