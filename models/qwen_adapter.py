@@ -1,6 +1,8 @@
 import torch
-from transformers import PreTrainedModel, DynamicCache
+from transformers import PreTrainedModel
 from typing import Dict, Optional, List, Tuple
+
+from core import KVCache
 
 
 class QwenModelAdapter:
@@ -8,45 +10,39 @@ class QwenModelAdapter:
     def prepare_inputs(
             model: PreTrainedModel,
             input_ids: torch.Tensor,
-            past_key_values: Optional[List[Tuple[torch.Tensor, torch.Tensor]]] = None
+            cache_manager: Optional[KVCache] = None,
+            seq_ids: Optional[List[int]] = None
     ) -> Dict:
         batch_size, seq_length = input_ids.shape
-        cache = past_key_values
-        if past_key_values is None:
-            # Prefill
-            position_ids = torch.arange(0, seq_length, dtype=torch.long, device=input_ids.device)
+        device = input_ids.device
+
+        if cache_manager is None or seq_ids is None:
+            # Prefill阶段
+            position_ids = torch.arange(0, seq_length, dtype=torch.long, device=device)
             position_ids = position_ids.unsqueeze(0).repeat(batch_size, 1)
-            attention_mask = torch.ones((batch_size, seq_length), device=input_ids.device)
+            attention_mask = torch.ones((batch_size, seq_length), device=device)
+            return {
+                "input_ids": input_ids,
+                "position_ids": position_ids,
+                "attention_mask": attention_mask,
+                "use_cache": True
+            }
         else:
-            # Decode
-            current_seq_len = past_key_values[0][0].size(1)  # 从第一个层的key获取长度
-            position_ids = torch.full((batch_size, 1), current_seq_len, dtype=torch.long, device=input_ids.device)
-            attention_mask = None
-            # 将普通列表转换为 DynamicCache
-            cache = DynamicCache()
+            # Decode阶段（使用PageAttention）
+            # 获取序列的token位置
+            token_positions = []
+            for seq_id in seq_ids:
+                tokens = cache_manager.get_sequence_tokens(seq_id)
+                positions = [pos for _, pos in tokens]
+                token_positions.append(positions)
 
-            # 逐层处理
-            for layer_idx, layer_kv in enumerate(past_key_values):
-                # 每层是一个元组 (key_states, value_states)
-                key_states, value_states = layer_kv
-
-                # 调用update方法更新缓存
-                # 注意：这里不需要传递cache_kwargs，除非有特殊需求
-                cache.update(
-                    key_states=key_states,
-                    value_states=value_states,
-                    layer_idx=layer_idx,
-                    cache_kwargs=None  # 通常可以为None
-                )
-
-
-        return {
-            "input_ids": input_ids,
-            "position_ids": position_ids,
-            "attention_mask": attention_mask,
-            "past_key_values": cache,
-            "use_cache": True
-        }
+            return {
+                "input_ids": input_ids,
+                "cache_manager": cache_manager,
+                "seq_ids": seq_ids,
+                "token_positions": token_positions,
+                "use_cache": True
+            }
 
     @staticmethod
     def process_outputs(
@@ -54,17 +50,24 @@ class QwenModelAdapter:
             input_length: int
     ) -> Tuple[torch.Tensor, List[Tuple[torch.Tensor, torch.Tensor]]]:
         logits = outputs.logits
-        past_key_values = outputs.past_key_values  # 已经是元组形式
-
-        # 转换为层级的KV缓存列表
-        kv_cache = []
-        for layer_past in past_key_values:
-            k, v = layer_past
-            kv_cache.append((k, v))
+        past_key_values = outputs.past_key_values
 
         if input_length > 1:
             logits = logits[:, -1:, :]
 
-        return logits, kv_cache
+        return logits, past_key_values
 
+    @staticmethod
+    def extract_kv_for_token(
+            past_key_values: List[Tuple[torch.Tensor, torch.Tensor]],
+            token_idx: int
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """从KV缓存中提取特定token的KV数据"""
+        layer_k = []
+        layer_v = []
 
+        for layer_idx, (k, v) in enumerate(past_key_values):
+            layer_k.append(k[:, :, token_idx:token_idx + 1, :])
+            layer_v.append(v[:, :, token_idx:token_idx + 1, :])
+
+        return torch.cat(layer_k, dim=0), torch.cat(layer_v, dim=0)

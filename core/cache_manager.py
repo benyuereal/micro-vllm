@@ -1,114 +1,103 @@
+from collections import defaultdict
 from typing import Dict, List, Tuple, Optional
 import torch
-
 from .memory_manager import MemoryPool
 
 
 class KVCache:
     def __init__(self, memory_pool: MemoryPool):
         self.memory_pool = memory_pool
-        self.seq_lengths: Dict[int, int] = {}  # seq_id -> current_length
+        self.sequence_blocks: Dict[int, List[Tuple[int, int]]] = {}  # seq_id -> [token_key...]
+        self.token_to_sequence: Dict[Tuple[int, int], int] = {}  # token_key -> seq_id
 
-    def allocate(self, seq_id: int, past_key_values: List[Tuple[torch.Tensor, torch.Tensor]], seq_length: int):
-        seq_length = seq_length - 1
-        if not self.memory_pool.allocate_for_sequence(seq_id, seq_length):
-            raise RuntimeError(f"Failed to allocate memory for sequence {seq_id}")
+    def allocate(self, seq_id: int, tokens: List[Tuple[int, int]], k: torch.Tensor, v: torch.Tensor):
+        """
+        为序列中的token分配缓存
+        tokens: [(token_id, position)] 列表
+        k, v: 形状 [num_layers, num_heads, len(tokens), head_size]
+        """
+        allocated = []
 
-        allocations = self.memory_pool.seq_allocations[seq_id]
-        # 按块起始位置排序确保序列顺序
-        allocations = sorted(allocations, key=lambda x: x[1])  # 按start排序
+        for i, (token_id, position) in enumerate(tokens):
+            # 尝试查找或分配槽位
+            allocation = self.memory_pool.find_token(token_id, position)
+            if allocation is None:
+                allocation = self.memory_pool.allocate_token(token_id, position)
 
-        # 逐层处理
-        for layer_idx, (k, v) in enumerate(past_key_values):
-            current_pos = 0  # 当前写入位置
-            for block_idx, start, end in allocations:
-                chunk_length = end - start  # 当前块的可用长度
-                # 切片: [num_heads, chunk_length, head_size]
-                k_chunk = k[:, current_pos:current_pos + chunk_length, :]
-                v_chunk = v[:, current_pos:current_pos + chunk_length, :]
+            block_id, slot_id = allocation
+            block = self.memory_pool.get_block(block_id)
 
-                block = self.memory_pool.blocks[block_idx]
-                # 写入块缓存 (注意维度匹配)
-                block.key_cache[layer_idx, :, start:end] = k_chunk
-                block.value_cache[layer_idx, :, start:end] = v_chunk
+            # 更新KV数据
+            layer_k = k[:, :, i, :]  # [num_layers, num_heads, head_size]
+            layer_v = v[:, :, i, :]
+            block.update_slot(slot_id, layer_k, layer_v)
 
-                current_pos += chunk_length  # 更新序列位置
+            allocated.append((token_id, position))
+            self.token_to_sequence[(token_id, position)] = seq_id
 
-        self.seq_lengths[seq_id] = seq_length
+        self.sequence_blocks[seq_id] = allocated
+        return allocated
+
+    def get_token_kv(self, token_id: int, position: int) -> Tuple[torch.Tensor, torch.Tensor]:
+        """获取特定token的KV数据"""
+        allocation = self.memory_pool.find_token(token_id, position)
+        if allocation is None:
+            raise ValueError(f"Token {(token_id, position)} not found in cache")
+
+        block_id, slot_id = allocation
+        block = self.memory_pool.get_block(block_id)
+        return block.get_slot(slot_id)
+
+    def get_sequence_kv(self, seq_id: int) -> Tuple[torch.Tensor, torch.Tensor]:
+        """获取序列的所有KV数据"""
+        if seq_id not in self.sequence_blocks:
+            return None, None
+
+        tokens = self.sequence_blocks[seq_id]
+        num_tokens = len(tokens)
+        num_layers = self.memory_pool.num_layers
+        num_heads = self.memory_pool.num_heads
+        head_size = self.memory_pool.head_size
+
+        k = torch.zeros((num_layers, num_heads, num_tokens, head_size),
+                        dtype=self.memory_pool.dtype, device=self.memory_pool.blocks[0].device)
+        v = torch.zeros_like(k)
+
+        for i, (token_id, position) in enumerate(tokens):
+            token_k, token_v = self.get_token_kv(token_id, position)
+            k[:, :, i, :] = token_k
+            v[:, :, i, :] = token_v
+
+        return k, v
 
     def delete(self, seq_id: int):
         """删除序列缓存"""
-        self.memory_pool.free_sequence(seq_id)
-        if seq_id in self.seq_lengths:
-            del self.seq_lengths[seq_id]
+        if seq_id not in self.sequence_blocks:
+            return
 
-    def get(self, seq_id: int) -> Optional[List[Tuple[torch.Tensor, torch.Tensor]]]:
-        """获取序列的KV缓存"""
-        if seq_id not in self.memory_pool.seq_allocations:
-            return None
+        for token_key in self.sequence_blocks[seq_id]:
+            token_id, position = token_key
+            self.memory_pool.free_token(token_id, position)
+            if token_key in self.token_to_sequence:
+                del self.token_to_sequence[token_key]
 
-        allocations = self.memory_pool.seq_allocations[seq_id]
-        num_layers = self.memory_pool.num_layers
-        kv_cache = []
+        del self.sequence_blocks[seq_id]
 
-        for layer_idx in range(num_layers):
-            ## 形状(num_layers, num_heads, block_size, head_size)
-            keys, values = [], []
-            for block_idx, start, end in allocations:
-                block = self.memory_pool.blocks[block_idx]
-                # 按头直接读取连续内存
-                keys.append(block.key_cache[layer_idx, :, start:end])  # 形状: (num_heads, chunk_size, head_size)
-                values.append(block.value_cache[layer_idx, :, start:end])
+    def get_sequence_tokens(self, seq_id: int) -> List[Tuple[int, int]]:
+        """获取序列的所有token标识"""
+        return self.sequence_blocks.get(seq_id, [])
 
-            # 沿序列维度拼接
-            k = torch.cat(keys, dim=1)  # dim=1拼接seq_len -> (num_heads, total_seq_len, head_size)
-            v = torch.cat(values, dim=1)
-            kv_cache.append((k, v))
+    def get_all_tokens(self) -> List[Tuple[int, int]]:
+        """获取缓存中的所有token"""
+        return list(self.token_to_sequence.keys())
 
-        return kv_cache
-
-    def batch_kv(self, seq_ids: List[int]) -> List[Tuple[torch.Tensor, torch.Tensor]]:
-        """批量获取KV缓存"""
-        batch_kv = []
-        max_len = max(self.seq_lengths.get(seq_id, 0) for seq_id in seq_ids)
-        num_layers = self.memory_pool.num_layers
-
-        for layer_idx in range(num_layers):
-            keys, values = [], []
-            for seq_id in seq_ids:
-                k, v = self.get(seq_id)[layer_idx]  # k/v: (num_heads, seq_len, head_size)
-                keys.append(k)
-                values.append(v)
-
-            # 计算当前层的最大序列长度
-            max_len = max(k.size(1) for k in keys)  # 注意：dim=1是seq_len
-
-            padded_keys, padded_values = [], []
-            for k, v in zip(keys, values):
-                # 创建填充张量 (num_heads, max_len, head_size)
-                pad_k = torch.zeros(k.size(0), max_len, k.size(2), device=k.device, dtype=k.dtype)
-                pad_k[:, :k.size(1), :] = k  # 复制有效数据
-                padded_keys.append(pad_k)
-
-                pad_v = torch.zeros_like(pad_k)
-                pad_v[:, :v.size(1), :] = v
-                padded_values.append(pad_v)
-
-            batch_k = torch.stack(padded_keys)  # 形状: (batch, num_heads, max_len, head_size)
-            batch_v = torch.stack(padded_values)
-            batch_kv.append((batch_k, batch_v))
-
-        return batch_kv
-
-    def unbatch_kv(self, seq_ids: List[int], batch_kv: List[Tuple[torch.Tensor, torch.Tensor]]) -> Dict[
-        int, List[Tuple[torch.Tensor, torch.Tensor]]]:
-        """拆分批量KV缓存"""
-        kv_dict = {}
-        for i, seq_id in enumerate(seq_ids):
-            seq_kv = []
-            for k, v in batch_kv:
-                seq_k = k[i:i + 1].squeeze(0)
-                seq_v = v[i:i + 1].squeeze(0)
-                seq_kv.append((seq_k, seq_v))
-            kv_dict[seq_id] = seq_kv
-        return kv_dict
+    def get_block_table(self) -> Dict[int, List[Tuple[int, int]]]:
+        """获取块表信息"""
+        block_table = defaultdict(list)
+        for token_key in self.token_to_sequence:
+            token_id, position = token_key
+            allocation = self.memory_pool.find_token(token_id, position)
+            if allocation:
+                block_id, slot_id = allocation
+                block_table[block_id].append((token_id, position, slot_id))
+        return dict(block_table)
