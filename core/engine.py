@@ -171,7 +171,7 @@ class InferenceEngine:
         hidden_states = self.model.model.embed_tokens(input_ids)
 
         # 通过模型层
-        for layer in self.model.model.layers:
+        for layer_idx, layer in  enumerate(self.model.model.layers):
             residual = hidden_states
             hidden_states = layer.input_layernorm(hidden_states)
 
@@ -185,7 +185,8 @@ class InferenceEngine:
                 cache_manager=self.cache,
                 seq_ids=seq_ids,
                 context_lens=context_lens,
-                token_positions=token_positions
+                token_positions=token_positions,
+                layer_idx=layer_idx  # 传递层索引
             )
 
             # 🔥 修复5: 确保 reshape 为 [batch, hidden_size]

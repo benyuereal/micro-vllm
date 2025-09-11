@@ -35,15 +35,16 @@ class PagedAttention(nn.Module):
             cache_manager: 'KVCache',
             seq_ids: List[int],
             context_lens: List[int],
-            token_positions: List[List[int]]
+            token_positions: List[List[int]],
+            layer_idx: int  # 添加层索引参数
     ) -> torch.Tensor:
         batch_size = query.size(0)
         output = torch.zeros_like(query)
 
         if self.use_cuda_kernel:
-            return self._cuda_forward(query, cache_manager, seq_ids, context_lens, token_positions)
+            return self._cuda_forward(query, cache_manager, seq_ids, context_lens, token_positions, layer_idx)
         else:
-            return self._mps_forward(query, cache_manager, seq_ids, context_lens, token_positions)
+            return self._mps_forward(query, cache_manager, seq_ids, context_lens, token_positions, layer_idx)
 
     def _cuda_forward(
             self,
@@ -51,7 +52,8 @@ class PagedAttention(nn.Module):
             cache_manager: 'KVCache',
             seq_ids: List[int],
             context_lens: List[int],
-            token_positions: List[List[int]]
+            token_positions: List[List[int]],
+            layer_idx: int
     ) -> torch.Tensor:
         """CUDA优化实现"""
         # 实现vLLM的块表格式
@@ -109,7 +111,8 @@ class PagedAttention(nn.Module):
             cache_manager: 'KVCache',
             seq_ids: List[int],
             context_lens: List[int],
-            token_positions: List[List[int]]
+            token_positions: List[List[int]],
+            layer_idx: int  # 当前层索引
     ) -> torch.Tensor:
         batch_size = query.size(0)
         output = torch.zeros_like(query)  # [2, 14, 64]
@@ -124,40 +127,38 @@ class PagedAttention(nn.Module):
             values = []
             for token_id, position in tokens[:seq_len]:
                 k, v = cache_manager.get_token_kv(token_id, position)
-                keys.append(k)  # [layers, kv_heads, head_size]
+                # 只取当前层的KV数据
+                k = k[layer_idx]  # [kv_heads, head_size]
+                v = v[layer_idx]
+                keys.append(k)
                 values.append(v)
 
-            # 拼接：K = [layers, kv_heads, seq_len, head_size]
-            K = torch.stack(keys, dim=2)  # [24, 2, 5, 64]
-            V = torch.stack(values, dim=2)
+            if not keys:
+                # 如果没有token，输出零向量
+                output[i] = 0
+                continue
 
-            # 当前 query：[1, 14, 64]
-            q = query[i].unsqueeze(0)  # [1, 14, 64]
+            # 拼接KV数据: [kv_heads, seq_len, head_size]
+            K = torch.stack(keys, dim=1)  # [kv_heads, seq_len, head_size]
+            V = torch.stack(values, dim=1)
 
-            # 🔥 修复1: 每层输出是独立的，不要累加！
-            layer_output = None
-            for layer_idx in range(K.size(0)):
-                layer_k = K[layer_idx]  # [2, 5, 64]
-                layer_v = V[layer_idx]
+            # 当前查询向量: [num_heads, head_size]
+            q = query[i]  # [num_heads, head_size]
 
-                # GQA 修复：将 K/V 头从 2 扩展到 14
-                repeat_times = self.num_heads // layer_k.size(0)
-                layer_k = layer_k.repeat_interleave(repeat_times, dim=0)  # [14, 5, 64]
-                layer_v = layer_v.repeat_interleave(repeat_times, dim=0)
+            # GQA处理: 如果键值头数少于查询头数，重复键值头
+            if K.size(0) != self.num_heads:
+                repeat_times = self.num_heads // K.size(0)
+                K = K.repeat_interleave(repeat_times, dim=0)  # [num_heads, seq_len, head_size]
+                V = V.repeat_interleave(repeat_times, dim=0)
 
-                # 注意力计算
-                scores = torch.einsum("hd,hsd->hs", q[0], layer_k) * self.scale  # [14, 5]
-                attn = F.softmax(scores, dim=-1)
-                layer_output = torch.einsum("hs,hsd->hd", attn, layer_v)  # [14, 64]
+            # 注意力计算
+            scores = torch.einsum("hd,hsd->hs", q, K) * self.scale  # [num_heads, seq_len]
+            attn = F.softmax(scores, dim=-1)
+            layer_output = torch.einsum("hs,hsd->hd", attn, V)  # [num_heads, head_size]
 
-                # 🔥 修复2: q = layer_output 仅用于本层循环（模拟下一层）
-                # 但注意：下一层 q 应该由 o_proj 后重新投影，这里简化
-                q = layer_output.unsqueeze(0)  # [1,14,64]
+            output[i] = layer_output
 
-            # 🔥 修复3: 只取最后一层的输出（或所有层平均，但不要累加！）
-            output[i] = layer_output  # ← 赋值，不是 +=！
-
-        return output  # [2, 14, 64]
+        return output
 
 
 
