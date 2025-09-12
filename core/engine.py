@@ -62,7 +62,7 @@ class InferenceEngine:
         self.paged_attention = PagedAttention(
             num_heads=num_heads,
             head_size=head_size,
-            kv_head_size=num_key_value_heads,
+            kv_num_heads=num_key_value_heads,
             device=device
         )
 
