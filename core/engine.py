@@ -144,14 +144,14 @@ class InferenceEngine:
             )
             v_cache = torch.zeros_like(k_cache)
 
-            # 填充KV缓存
+            # 填充KV缓存 past_key_values.layers= 24 x [batch_size,num_heads, seq_length,head_size]
             for layer_idx in range(num_layers):
                 layer_k = past_key_values[layer_idx][0][i:i + 1]  # [batch=1, num_heads, seq_len, head_size]
                 layer_v = past_key_values[layer_idx][1][i:i + 1]
                 k_cache[layer_idx] = layer_k.squeeze(0)
                 v_cache[layer_idx] = layer_v.squeeze(0)
 
-            # 为序列分配缓存
+            # 为序列分配缓存 [num_layers,num_heads, seq_length,head_size]
             self.cache.allocate(seq.seq_id, token_positions, k_cache, v_cache)
 
             # 采样下一个token
@@ -185,14 +185,15 @@ class InferenceEngine:
             value = layer.self_attn.v_proj(hidden_states)
 
             # 获取头数和头尺寸
-            head_dim = self.paged_attention.head_size
+            head_size = self.paged_attention.head_size
             num_heads = self.paged_attention.num_heads
             kv_num_heads = self.paged_attention.kv_num_heads
 
             # 重塑Query、Key、Value
-            query = query.view(query.size(0), num_heads, head_dim)
-            key = key.view(key.size(0), kv_num_heads, head_dim)
-            value = value.view(value.size(0), kv_num_heads, head_dim)
+            query = query.view(query.size(0), num_heads, head_size)
+            # [batch_size,kv_num_heads,head_size]
+            key = key.view(key.size(0), kv_num_heads, head_size)
+            value = value.view(value.size(0), kv_num_heads, head_size)
 
             # 保存Key和Value用于后续缓存
             new_ks.append(key)

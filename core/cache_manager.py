@@ -16,7 +16,10 @@ class KVCache:
         tokens: [(token_id, position)] 列表
         k, v: 形状 [num_layers, num_heads, len(tokens), head_size]
         """
-        allocated = []
+        allocated =  []
+        if seq_id in self.sequence_blocks:
+            ## 如果已经分配过，那么就使用现有的
+            allocated = self.sequence_blocks[seq_id]
 
         for i, (token_id, position) in enumerate(tokens):
             # 尝试查找或分配槽位
