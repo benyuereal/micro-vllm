@@ -87,12 +87,19 @@ class PagedAttention(nn.Module):
             seq_ids: List[int],
             context_lens: List[int],
             token_positions: List[List[int]],
-            layer_idx: int
+            layer_idx: int,
+            current_k: Optional[torch.Tensor] = None,  # 当前token的K [batch_size, kv_num_heads, head_size]
+            current_v: Optional[torch.Tensor] = None,  # 当前token的V [batch_size, kv_num_heads, head_size]
+            current_positions: Optional[List[int]] = None  # 当前token的位置列表
     ) -> torch.Tensor:
         if self.use_cuda_kernel:
+            # 注意：CUDA内核可能需要额外修改以支持当前token的KV，这里暂不处理
             return self._cuda_forward(query, cache_manager, seq_ids, context_lens, token_positions, layer_idx)
         else:
-            return self._mps_forward(query, cache_manager, seq_ids, context_lens, token_positions, layer_idx)
+            return self._mps_forward(
+                query, cache_manager, seq_ids, context_lens, token_positions, layer_idx,
+                current_k, current_v, current_positions
+            )
 
     def _cuda_forward(
             self,
@@ -160,7 +167,10 @@ class PagedAttention(nn.Module):
             seq_ids: List[int],
             context_lens: List[int],
             token_positions: List[List[int]],
-            layer_idx: int
+            layer_idx: int,
+            current_k: Optional[torch.Tensor] = None,  # [batch_size, kv_num_heads, head_size]
+            current_v: Optional[torch.Tensor] = None,  # [batch_size, kv_num_heads, head_size]
+            current_positions: Optional[List[int]] = None  # [batch_size]
     ) -> torch.Tensor:
         batch_size = query.size(0)
         output = torch.zeros_like(query)  # [batch_size, num_heads, head_size]
@@ -175,35 +185,39 @@ class PagedAttention(nn.Module):
                 output[i] = 0
                 continue
 
-            # 收集 KV（注意：每个 token 的 k/v 是 [layers, kv_heads, head_size]）
+            # 收集 KV（从缓存中获取历史token的KV）
             keys = []
             values = []
+            positions_list = token_positions[i][:seq_len]  # 历史token的位置
+
             for token_id, position in tokens[:seq_len]:
                 k, v = cache_manager.get_token_kv(token_id, position)
-                # 只取当前层的KV数据
-                k = k[layer_idx]  # [kv_heads, head_size]
+                k = k[layer_idx]  # [kv_num_heads, head_size]
                 v = v[layer_idx]
                 keys.append(k)
                 values.append(v)
+
+            # 包括当前token的KV和位置
+            if current_k is not None and current_v is not None and current_positions is not None:
+                keys.append(current_k[i])  # [kv_num_heads, head_size]
+                values.append(current_v[i])
+                positions_list.append(current_positions[i])  # 添加当前token的位置
+                seq_len += 1  # 更新序列长度以包括当前token
 
             if not keys:
                 # 如果没有token，输出零向量
                 output[i] = 0
                 continue
 
-            # 拼接KV数据: [kv_heads, seq_len, head_size]
-            K = torch.stack(keys, dim=1)  # [kv_heads, seq_len, head_size]
+            # 拼接KV数据: [kv_num_heads, seq_len, head_size]
+            K = torch.stack(keys, dim=1)
             V = torch.stack(values, dim=1)
 
             # 当前查询向量: [num_heads, head_size]
             q = query[i]  # [num_heads, head_size]
 
-            # 获取位置信息（确保位置索引是LongTensor类型）
-            positions = torch.tensor(
-                token_positions[i][:seq_len],
-                dtype=torch.long,
-                device=self.device
-            )
+            # 准备位置张量
+            positions = torch.tensor(positions_list, dtype=torch.long, device=self.device)
 
             # 应用旋转位置编码
             # 准备查询向量 [1, num_heads, 1, head_size]

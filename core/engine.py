@@ -199,13 +199,20 @@ class InferenceEngine:
             new_ks.append(key)
             new_vs.append(value)
 
+            # 获取当前token的位置（每个序列的当前位置）
+            current_positions = [seq.current_position - 1 for seq in batch]  # 当前输入token的位置
+
+            # 调用PagedAttention，传入当前token的KV和位置
             attn_output = self.paged_attention.forward(
                 query=query,
                 cache_manager=self.cache,
                 seq_ids=seq_ids,
                 context_lens=context_lens,
                 token_positions=token_positions,
-                layer_idx=layer_idx
+                layer_idx=layer_idx,
+                current_k=key,  # 当前token的K [batch_size, kv_num_heads, head_size]
+                current_v=value,  # 当前token的V [batch_size, kv_num_heads, head_size]
+                current_positions=current_positions  # 当前token的位置列表
             )
 
             attn_output = attn_output.reshape(attn_output.size(0), -1)
