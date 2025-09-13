@@ -103,19 +103,21 @@ class PagedAttention(nn.Module):
 
     def _cuda_forward(
             self,
-            query: torch.Tensor,
+            query: torch.Tensor,  # [batch_size, num_heads, head_size]
             cache_manager: 'KVCache',
             seq_ids: List[int],
             context_lens: List[int],
             token_positions: List[List[int]],
             layer_idx: int
     ) -> torch.Tensor:
-        """CUDA优化实现"""
-        # 实现vLLM的块表格式
-        max_blocks_per_seq = 0
-        block_tables = []
+        """优化后的CUDA实现"""
+        batch_size = query.size(0)
 
-        for seq_id in seq_ids:
+        # 构建块表 - 这是vLLM内核需要的
+        block_tables = []
+        max_blocks_per_seq = 0
+
+        for i, seq_id in enumerate(seq_ids):
             tokens = cache_manager.get_sequence_tokens(seq_id)
             block_table = []
 
@@ -123,42 +125,53 @@ class PagedAttention(nn.Module):
                 allocation = cache_manager.memory_pool.find_token(token_id, position)
                 if allocation:
                     block_id, slot_id = allocation
-                    block_table.append(block_id * cache_manager.memory_pool.block_size + slot_id)
+                    # vLLM使用线性化的槽位ID
+                    linear_id = block_id * cache_manager.memory_pool.block_size + slot_id
+                    block_table.append(linear_id)
 
             block_tables.append(block_table)
             max_blocks_per_seq = max(max_blocks_per_seq, len(block_table))
 
         # 创建块表张量
         block_tables_tensor = torch.full(
-            (len(seq_ids), max_blocks_per_seq),
+            (batch_size, max_blocks_per_seq),
             -1,
-            dtype=torch.int, device=self.device
+            dtype=torch.int32,
+            device=query.device
         )
 
         for i, table in enumerate(block_tables):
             if table:
-                block_tables_tensor[i, :len(table)] = torch.tensor(table, device=self.device)
+                block_tables_tensor[i, :len(table)] = torch.tensor(
+                    table, device=query.device, dtype=torch.int32
+                )
 
-        # 获取所有KV块
-        all_k = []
-        all_v = []
-        blocks = cache_manager.memory_pool.get_all_blocks()
-        for block in blocks:
-            all_k.append(block.key_cache)
-            all_v.append(block.value_cache)
+        # 获取所有KV缓存数据
+        all_blocks = cache_manager.memory_pool.get_all_blocks()
 
-        # 拼接所有块 (vLLM要求连续内存)
-        all_k = torch.cat(all_k, dim=2)  # [layers, kv_heads, total_slots, head_size]
-        all_v = torch.cat(all_v, dim=2)
+        # 将所有块的KV缓存拼接成连续内存
+        # 这是vLLM内核要求的格式
+        k_cache = torch.cat([block.key_cache for block in all_blocks], dim=2)
+        v_cache = torch.cat([block.value_cache for block in all_blocks], dim=2)
 
-        # 调用vLLM内核
-        return self.cuda_paged_attention(
-            query,
-            all_k, all_v,
+        # 选择当前层的KV缓存
+        layer_k = k_cache[layer_idx:layer_idx + 1]  # [1, num_heads, total_slots, head_size]
+        layer_v = v_cache[layer_idx:layer_idx + 1]
+
+        # 调整query形状以匹配vLLM期望的格式 [batch_size, num_heads, head_size] -> [batch_size, num_heads, 1, head_size]
+        query = query.unsqueeze(2)
+
+        # 调用vLLM的PagedAttention内核
+        output = self.cuda_paged_attention(
+            query,  # [batch_size, num_heads, 1, head_size]
+            layer_k,  # [1, num_heads, total_slots, head_size]
+            layer_v,  # [1, num_heads, total_slots, head_size]
             block_tables_tensor,
-            torch.tensor(context_lens, device=self.device),
+            torch.tensor(context_lens, device=query.device, dtype=torch.int32),
             self.scale
         )
+
+        return output.squeeze(2)  # [batch_size, num_heads, head_size]
 
     def _mps_forward(
             self,
