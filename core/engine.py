@@ -106,7 +106,7 @@ class InferenceEngine:
             return False
 
         seq_ids = [seq.seq_id for seq in batch]
-        context_lens = [seq.current_position for seq in batch]
+        context_lens = [seq.current_position - 1 for seq in batch]
 
         if batch_type == "prefill":
             self._process_prefill_batch(batch, seq_ids, context_lens)
