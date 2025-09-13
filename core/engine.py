@@ -153,8 +153,6 @@ class InferenceEngine:
             for layer_idx in range(num_layers):
                 layer_k = past_key_values[layer_idx][0][i:i + 1]  # [batch=1, num_heads, seq_len, head_size]
                 layer_v = past_key_values[layer_idx][1][i:i + 1]
-                print("shape:",layer_v.shape, layer_k.shape, layer_k.dtype, layer_k.device, k_cache[layer_idx].shape)
-
 
                 k_cache[layer_idx] = layer_k.squeeze(0).permute(1, 0, 2)
                 v_cache[layer_idx] = layer_v.squeeze(0).permute(1, 0, 2)
