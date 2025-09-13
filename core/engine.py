@@ -176,21 +176,22 @@ class InferenceEngine:
             positions = [min(pos, self.max_position - 1) for _, pos in tokens]
             token_positions.append(positions)
 
-        hidden_states = self.model.model.embed_tokens(input_ids)
+        # 修改这里：直接使用 self.model.transformer.wte 而不是 self.model.model.embed_tokens
+        hidden_states = self.model.transformer.wte(input_ids)
         batch_size = len(input_ids)
         # 初始化列表以存储每层的Key和Value
         new_ks = []  # 每个元素形状: [batch_size, kv_num_heads, head_size]
         new_vs = []  # 每个元素形状: [batch_size, kv_num_heads, head_size]
 
         # 通过模型层
-        for layer_idx, layer in enumerate(self.model.model.layers):
+        for layer_idx, layer in enumerate(self.model.transformer.h):  # 注意这里也改为 transformer.h
             residual = hidden_states
-            hidden_states = layer.input_layernorm(hidden_states)
+            hidden_states = layer.ln_1(hidden_states)  # Qwen 使用 ln_1 而不是 input_layernorm
 
             # 计算Query、Key、Value
-            query = layer.self_attn.q_proj(hidden_states)
-            key = layer.self_attn.k_proj(hidden_states)
-            value = layer.self_attn.v_proj(hidden_states)
+            query = layer.attn.c_attn(hidden_states)
+            # Qwen 的 c_attn 是 q,k,v 的合并投影，需要拆分
+            query, key, value = query.split(self.model.config.hidden_size, dim=2)
 
             # 获取头数和头尺寸
             head_size = self.paged_attention.head_size
@@ -199,7 +200,6 @@ class InferenceEngine:
 
             # 重塑Query、Key、Value
             query = query.view(batch_size, num_heads, head_size)
-            # [batch_size,kv_num_heads,head_size]
             key = key.view(batch_size, kv_num_heads, head_size)
             value = value.view(batch_size, kv_num_heads, head_size)
 
@@ -208,9 +208,9 @@ class InferenceEngine:
             new_vs.append(value)
 
             # 获取当前token的位置（每个序列的当前位置）
-            current_positions = [seq.current_position - 1 for seq in batch]  # 当前输入token的位置
+            current_positions = [seq.current_position - 1 for seq in batch]
 
-            # 调用PagedAttention，传入当前token的KV和位置
+            # 调用PagedAttention
             attn_output = self.paged_attention.forward(
                 query=query,
                 cache_manager=self.cache,
@@ -218,23 +218,23 @@ class InferenceEngine:
                 context_lens=context_lens,
                 token_positions=token_positions,
                 layer_idx=layer_idx,
-                current_k=key,  # 当前token的K [batch_size, kv_num_heads, head_size]
-                current_v=value,  # 当前token的V [batch_size, kv_num_heads, head_size]
-                current_positions=current_positions  # 当前token的位置列表
+                current_k=key,
+                current_v=value,
+                current_positions=current_positions
             )
 
             attn_output = attn_output.reshape(attn_output.size(0), -1)
-            attn_output = layer.self_attn.o_proj(attn_output)
+            attn_output = layer.attn.c_proj(attn_output)  # Qwen 使用 c_proj 而不是 o_proj
             attn_output = attn_output.unsqueeze(1)
             hidden_states = residual + attn_output
 
             # 前馈网络
             residual = hidden_states
-            hidden_states = layer.post_attention_layernorm(hidden_states)
+            hidden_states = layer.ln_2(hidden_states)  # Qwen 使用 ln_2
             hidden_states = layer.mlp(hidden_states)
             hidden_states = residual + hidden_states
 
-        hidden_states = self.model.model.norm(hidden_states)
+        hidden_states = self.model.transformer.ln_f(hidden_states)  # Qwen 使用 ln_f
         logits = self.model.lm_head(hidden_states).float()
 
         # 采样下一个token
@@ -246,13 +246,11 @@ class InferenceEngine:
 
         # 存储当前输入token的KV到缓存中
         for i, seq in enumerate(batch):
-            # 当前输入token的ID和位置
             input_token_id = input_ids[i].item()
-            input_token_position = seq.current_position - 1  # 当前序列的current_position指向下一个位置，因此输入token的位置是current_position - 1
+            input_token_position = seq.current_position - 1
 
-            # 准备KV缓存张量
             num_layers = self.memory_pool.num_layers
-            num_heads = self.memory_pool.num_heads  # 这是KV头的数量
+            num_heads = self.memory_pool.num_heads
             head_size = self.memory_pool.head_size
 
             k_cache = torch.zeros((num_layers, num_heads, 1, head_size), dtype=self.memory_pool.dtype,
@@ -260,15 +258,11 @@ class InferenceEngine:
             v_cache = torch.zeros_like(k_cache)
 
             for layer_idx in range(num_layers):
-                # 从new_ks和new_vs中获取当前层和当前序列的KV
-                k = new_ks[layer_idx][i]  # 形状: [kv_num_heads, head_size]
-                v = new_vs[layer_idx][i]  # 形状: [kv_num_heads, head_size]
-
-                # 如果num_heads不等于kv_num_heads，可能需要重复头，但通常num_heads就是kv_num_heads
+                k = new_ks[layer_idx][i]
+                v = new_vs[layer_idx][i]
                 k_cache[layer_idx] = k.view(1, num_heads, 1, head_size)
                 v_cache[layer_idx] = v.view(1, num_heads, 1, head_size)
 
-            # 将KV缓存分配给输入token
             self.cache.allocate(
                 seq.seq_id,
                 [(input_token_id, input_token_position)],
@@ -276,7 +270,6 @@ class InferenceEngine:
                 v_cache
             )
 
-            # 更新序列状态
             self._update_sequence(seq, next_tokens[i])
 
 
