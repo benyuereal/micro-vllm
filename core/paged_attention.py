@@ -1,3 +1,5 @@
+import math
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -19,13 +21,13 @@ class RotaryEmbedding(nn.Module):
         t = torch.arange(self.max_seq_len, device=self.device, dtype=self.inv_freq.dtype)
         freqs = torch.einsum("i,j->ij", t, self.inv_freq)
         emb = torch.cat((freqs, freqs), dim=-1)
-        self.cos_cache = emb.cos()[None, None, :, :]
-        self.sin_cache = emb.sin()[None, None, :, :]
+        self.cos_cache = emb.cos()[None, None, :, :]  # [1, 1, seq_len, dim]
+        self.sin_cache = emb.sin()[None, None, :, :]  # [1, 1, seq_len, dim]
 
     def forward(self, x, positions):
         """
         x: [batch_size, num_heads, seq_len, head_size]
-        positions: [seq_len] 位置索引
+        positions: [batch_size, seq_len] 位置索引
         """
         # 确保位置索引在正确的设备上
         positions = positions.to(self.device)
@@ -36,17 +38,64 @@ class RotaryEmbedding(nn.Module):
             self._update_cos_sin_cache(max_pos)
 
         # 获取对应的cos/sin值
-        cos = self.cos_cache[:, :, positions]
-        sin = self.sin_cache[:, :, positions]
+        batch_size, num_heads, seq_len, head_size = x.shape
+
+        # 展平位置索引并获取对应的cos/sin值
+        positions_flat = positions.view(-1)  # [batch_size * seq_len]
+        cos = self.cos_cache[:, :, positions_flat]  # [1, 1, batch_size * seq_len, dim]
+        sin = self.sin_cache[:, :, positions_flat]  # [1, 1, batch_size * seq_len, dim]
+
+        # 重塑为原始形状
+        cos = cos.view(1, 1, batch_size, seq_len, head_size).permute(2, 1, 3, 0, 4).squeeze(
+            3)  # [batch_size, num_heads, seq_len, head_size]
+        sin = sin.view(1, 1, batch_size, seq_len, head_size).permute(2, 1, 3, 0, 4).squeeze(
+            3)  # [batch_size, num_heads, seq_len, head_size]
 
         # 应用旋转位置编码
-        # 将x分成两部分
         x1 = x[..., :self.dim // 2]
         x2 = x[..., self.dim // 2:]
 
         # 应用旋转公式
         rotated = torch.cat((-x2, x1), dim=-1)
         return (x * cos) + (rotated * sin)
+
+
+class FlashAttention(nn.Module):
+    """Flash Attention实现，支持MPS和CPU后端"""
+
+    def __init__(self, head_size, dropout=0.0):
+        super().__init__()
+        self.head_size = head_size
+        self.dropout = dropout
+        self.scale = 1.0 / math.sqrt(head_size)
+
+    def forward(self, q, k, v, mask=None):
+        """
+        简化的Flash Attention实现
+        q: [batch_size, num_heads, seq_len, head_size]
+        k: [batch_size, num_heads, seq_len, head_size]
+        v: [batch_size, num_heads, seq_len, head_size]
+        mask: [batch_size, seq_len] 可选
+        """
+        # 计算注意力分数
+        attn_scores = torch.matmul(q, k.transpose(-2, -1)) * self.scale
+
+        # 应用mask（如果有）
+        if mask is not None:
+            mask = mask.unsqueeze(1).unsqueeze(2)  # [batch_size, 1, 1, seq_len]
+            attn_scores = attn_scores.masked_fill(mask == 0, -1e9)
+
+        # 应用softmax
+        attn_weights = F.softmax(attn_scores, dim=-1)
+
+        # 应用dropout
+        if self.dropout > 0:
+            attn_weights = F.dropout(attn_weights, p=self.dropout, training=self.training)
+
+        # 计算输出
+        output = torch.matmul(attn_weights, v)
+
+        return output
 
 
 class PagedAttention(nn.Module):
@@ -59,7 +108,7 @@ class PagedAttention(nn.Module):
 
         # 自动检测设备
         if device == "auto":
-            self.device = 'mps' if torch.backends.mps.is_available() else 'cuda'
+            self.device = 'mps' if torch.backends.mps.is_available() else 'cuda' if torch.cuda.is_available() else 'cpu'
         else:
             self.device = device
 
@@ -70,16 +119,9 @@ class PagedAttention(nn.Module):
             device=self.device
         )
 
-        # 针对CUDA使用优化内核
-        self.use_cuda_kernel = (self.device == 'cuda') and torch.cuda.is_available()
-        print("device 、 flag:", self.device, torch.cuda.is_available())
-        if self.use_cuda_kernel:
-            # 或者（如果上述方式不可用）
-            try:
-                from vllm._C import ops as paged_attention
-            except ImportError:
-                print("vllm not available, using fallback implementation")
-                self.use_cuda_kernel = False
+        # 初始化Flash Attention
+        self.flash_attn = FlashAttention(head_size)
+        self.use_cuda_kernel = True
 
 
     def forward(
@@ -95,16 +137,17 @@ class PagedAttention(nn.Module):
             current_positions: Optional[List[int]] = None  # 当前token的位置列表
     ) -> torch.Tensor:
         if self.use_cuda_kernel:
-
-             return self._cuda_forward(query, cache_manager, seq_ids, context_lens, token_positions, layer_idx,
+            return self._flash_forward(query, cache_manager, seq_ids, context_lens, token_positions, layer_idx,
                                       current_k, current_v, current_positions)
         else:
-            return self._mps_forward(
+            return self._flash_forward(
                 query, cache_manager, seq_ids, context_lens, token_positions, layer_idx,
                 current_k, current_v, current_positions
             )
 
-    def _cuda_forward(
+
+
+    def _flash_forward(
             self,
             query: torch.Tensor,  # [batch_size, num_heads, head_size]
             cache_manager: 'KVCache',
@@ -116,96 +159,76 @@ class PagedAttention(nn.Module):
             current_v: Optional[torch.Tensor] = None,  # [batch_size, kv_num_heads, head_size]
             current_positions: Optional[List[int]] = None  # [batch_size]
     ) -> torch.Tensor:
-        """优化后的CUDA实现，包含当前token的KV缓存"""
+        """使用Flash Attention的实现，支持批量处理"""
         batch_size = query.size(0)
+        max_seq_len = max(context_lens) + 1 if current_k is not None else max(context_lens)
 
-        # 首先将当前token的KV存储到缓存中
-        if current_k is not None and current_v is not None and current_positions is not None:
-            for i in range(batch_size):
-                seq_id = seq_ids[i]
-                token_id = token_positions[i][-1] if token_positions[i] else 0  # 获取当前token ID
-                position = current_positions[i]
+        # 准备批量KV缓存
+        all_keys = torch.zeros(batch_size, self.kv_num_heads, max_seq_len, self.head_size,
+                               device=self.device, dtype=query.dtype)
+        all_values = torch.zeros_like(all_keys)
 
-                # 准备当前token的KV缓存张量
-                num_layers = cache_manager.memory_pool.num_layers
-                num_heads = cache_manager.memory_pool.num_heads
-                head_size = cache_manager.memory_pool.head_size
+        # 准备位置编码
+        all_positions = torch.zeros(batch_size, max_seq_len, dtype=torch.long, device=self.device)
 
-                k_cache = torch.zeros((num_layers, num_heads, 1, head_size),
-                                      dtype=cache_manager.memory_pool.dtype, device=self.device)
-                v_cache = torch.zeros_like(k_cache)
-
-                # 填充当前层的KV
-                k_cache[layer_idx] = current_k[i].unsqueeze(0).unsqueeze(2)  # [1, kv_num_heads, 1, head_size]
-                v_cache[layer_idx] = current_v[i].unsqueeze(0).unsqueeze(2)
-
-                # 将当前token的KV分配到缓存中
-                cache_manager.allocate(
-                    seq_id,
-                    [(token_id, position)],
-                    k_cache,
-                    v_cache
-                )
-
-        # 构建块表 - 这是vLLM内核需要的
-        block_tables = []
-        max_blocks_per_seq = 0
-
-        # 更新context_lens以包括当前token
-        updated_context_lens = [clen + 1 for clen in context_lens] if current_k is not None else context_lens
-
-        for i, seq_id in enumerate(seq_ids):
+        # 填充KV缓存和位置信息
+        for i in range(batch_size):
+            seq_id = seq_ids[i]
             tokens = cache_manager.get_sequence_tokens(seq_id)
-            block_table = []
+            seq_len = context_lens[i]
 
-            for token_id, position in tokens:
-                allocation = cache_manager.memory_pool.find_token(token_id, position)
-                if allocation:
-                    block_id, slot_id = allocation
-                    # vLLM使用线性化的槽位ID
-                    linear_id = block_id * cache_manager.memory_pool.block_size + slot_id
-                    block_table.append(linear_id)
+            # 获取历史KV
+            keys = []
+            values = []
+            positions_list = []
 
-            block_tables.append(block_table)
-            max_blocks_per_seq = max(max_blocks_per_seq, len(block_table))
+            for token_id, position in tokens[:seq_len]:
+                k, v = cache_manager.get_token_kv(token_id, position)
+                k = k[layer_idx]  # [kv_num_heads, head_size]
+                v = v[layer_idx]
+                keys.append(k)
+                values.append(v)
+                positions_list.append(position)
 
-        # 创建块表张量
-        block_tables_tensor = torch.full(
-            (batch_size, max_blocks_per_seq),
-            -1,
-            dtype=torch.int32,
-            device=query.device
-        )
+            # 包括当前token
+            if current_k is not None and current_v is not None and current_positions is not None:
+                keys.append(current_k[i])  # [kv_num_heads, head_size]
+                values.append(current_v[i])
+                positions_list.append(current_positions[i])
+                seq_len += 1
 
-        for i, table in enumerate(block_tables):
-            if table:
-                block_tables_tensor[i, :len(table)] = torch.tensor(
-                    table, device=query.device, dtype=torch.int32
-                )
+            if keys:
+                # 填充到批量张量中
+                K = torch.stack(keys, dim=1)  # [kv_num_heads, seq_len, head_size]
+                V = torch.stack(values, dim=1)
 
-        # 获取所有KV缓存数据
-        all_blocks = cache_manager.memory_pool.get_all_blocks()
+                all_keys[i, :, :seq_len, :] = K
+                all_values[i, :, :seq_len, :] = V
+                all_positions[i, :seq_len] = torch.tensor(positions_list, device=self.device)
 
-        # 将所有块的KV缓存拼接成连续内存
-        # 这是vLLM内核要求的格式
-        k_cache = torch.cat([block.key_cache for block in all_blocks], dim=2)
-        v_cache = torch.cat([block.value_cache for block in all_blocks], dim=2)
+        # 应用旋转位置编码
+        # 调整query形状: [batch_size, num_heads, 1, head_size]
+        q_rot = query.unsqueeze(2)
 
-        # 选择当前层的KV缓存
-        layer_k = k_cache[layer_idx:layer_idx + 1]  # [1, num_heads, total_slots, head_size]
-        layer_v = v_cache[layer_idx:layer_idx + 1]
+        # 应用RoPE到查询
+        q_positions = all_positions[:, -1:] if current_k is not None else all_positions[:, -1:]
+        q_rotated = self.rotary_emb(q_rot, q_positions)
 
-        # 调整query形状以匹配vLLM期望的格式 [batch_size, num_heads, head_size] -> [batch_size, num_heads, 1, head_size]
-        query = query.unsqueeze(2)
+        # 应用RoPE到键
+        k_rotated = self.rotary_emb(all_keys, all_positions)
 
-        # 调用vLLM的PagedAttention内核
-        output = self.cuda_paged_attention(
-            query,  # [batch_size, num_heads, 1, head_size]
-            layer_k,  # [1, num_heads, total_slots, head_size]
-            layer_v,  # [1, num_heads, total_slots, head_size]
-            block_tables_tensor,
-            torch.tensor(updated_context_lens, device=query.device, dtype=torch.bfloat16),
-            self.scale
+        # GQA处理: 如果键值头数少于查询头数，重复键值头
+        if self.kv_num_heads != self.num_heads:
+            repeat_times = self.num_heads // self.kv_num_heads
+            k_rotated = k_rotated.repeat_interleave(repeat_times, dim=1)
+            all_values = all_values.repeat_interleave(repeat_times, dim=1)
+
+        # 使用Flash Attention
+        # 调整形状: [batch_size, num_heads, seq_len, head_size]
+        output = self.flash_attn(
+            q_rotated,  # [batch_size, num_heads, 1, head_size]
+            k_rotated,  # [batch_size, num_heads, max_seq_len, head_size]
+            all_values,  # [batch_size, num_heads, max_seq_len, head_size]
         )
 
         return output.squeeze(2)  # [batch_size, num_heads, head_size]
