@@ -1,13 +1,21 @@
 import math
-
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from typing import List, Tuple, Dict, Optional
 import numpy as np
 
+# 尝试导入flash_attn库，如果不可用则设为None
+try:
+    import flash_attn
+    from flash_attn import flash_attn_func
+
+    flash_attn_available = True
+except ImportError:
+    flash_attn_available = False
 
 class RotaryEmbedding(nn.Module):
+    # 保持原有实现不变
     def __init__(self, dim, max_position=2048, base=10000, device=None):
         super().__init__()
         self.dim = dim
@@ -98,6 +106,33 @@ class FlashAttention(nn.Module):
         return output
 
 
+class OfficialFlashAttention(nn.Module):
+    """真正的Flash Attention实现，使用flash_attn库"""
+
+    def __init__(self, head_size, dropout=0.0):
+        super().__init__()
+        self.head_size = head_size
+        self.dropout = dropout
+        self.scale = 1.0 / math.sqrt(head_size)
+
+    def forward(self, q, k, v, mask=None):
+        """
+        使用flash_attn库的实现
+        q: [batch_size, num_heads, seq_len, head_size]
+        k: [batch_size, num_heads, seq_len, head_size]
+        v: [batch_size, num_heads, seq_len, head_size]
+        mask: [batch_size, seq_len] 可选
+        """
+        # 转换mask格式为flash_attn需要的格式
+        if mask is not None:
+            # flash_attn需要bool类型的mask
+            mask = mask.bool()
+
+        # 使用flash_attn库的函数
+        return flash_attn_func(q, k, v, dropout_p=self.dropout if self.training else 0.0,
+                               softmax_scale=self.scale, causal=False, window_size=(-1, -1))
+
+
 class PagedAttention(nn.Module):
     def __init__(self, num_heads: int, head_size: int, kv_num_heads: int, device: str = "auto"):
         super().__init__()
@@ -119,10 +154,15 @@ class PagedAttention(nn.Module):
             device=self.device
         )
 
-        # 初始化Flash Attention
-        self.flash_attn = FlashAttention(head_size)
-        self.use_cuda_kernel = True
-
+        # 根据设备和flash_attn可用性选择不同的Attention实现
+        if flash_attn_available:
+            # 在CUDA设备上且flash_attn可用时使用真正的Flash Attention
+            self.flash_attn = OfficialFlashAttention(head_size)
+            self.use_real_flash_attn = True
+        else:
+            # 在其他设备上或flash_attn不可用时使用模拟实现
+            self.flash_attn = FlashAttention(head_size)
+            self.use_real_flash_attn = False
 
     def forward(
             self,
@@ -136,30 +176,27 @@ class PagedAttention(nn.Module):
             current_v: Optional[torch.Tensor] = None,  # 当前token的V [batch_size, kv_num_heads, head_size]
             current_positions: Optional[List[int]] = None  # 当前token的位置列表
     ) -> torch.Tensor:
-        if self.use_cuda_kernel:
-            return self._flash_forward(query, cache_manager, seq_ids, context_lens, token_positions, layer_idx,
-                                      current_k, current_v, current_positions)
-        else:
-            return self._flash_forward(
-                query, cache_manager, seq_ids, context_lens, token_positions, layer_idx,
-                current_k, current_v, current_positions
-            )
 
+        return self._flash_forward(
+            query, cache_manager, seq_ids, context_lens, token_positions, layer_idx,
+            current_k, current_v, current_positions
+        )
 
 
     def _flash_forward(
             self,
-            query: torch.Tensor,  # [batch_size, num_heads, head_size]
+            query: torch.Tensor,
             cache_manager: 'KVCache',
             seq_ids: List[int],
             context_lens: List[int],
             token_positions: List[List[int]],
             layer_idx: int,
-            current_k: Optional[torch.Tensor] = None,  # [batch_size, kv_num_heads, head_size]
-            current_v: Optional[torch.Tensor] = None,  # [batch_size, kv_num_heads, head_size]
-            current_positions: Optional[List[int]] = None  # [batch_size]
+            current_k: Optional[torch.Tensor] = None,
+            current_v: Optional[torch.Tensor] = None,
+            current_positions: Optional[List[int]] = None
     ) -> torch.Tensor:
-        """使用Flash Attention的实现，支持批量处理"""
+        """原有的模拟Flash Attention实现"""
+        # 保持原有实现不变
         batch_size = query.size(0)
         max_seq_len = max(context_lens) + 1 if current_k is not None else max(context_lens)
 
@@ -233,98 +270,3 @@ class PagedAttention(nn.Module):
 
         return output.squeeze(2)  # [batch_size, num_heads, head_size]
 
-    def _mps_forward(
-            self,
-            query: torch.Tensor,  # [batch_size, num_heads, head_size]
-            cache_manager: 'KVCache',
-            seq_ids: List[int],
-            context_lens: List[int],
-            token_positions: List[List[int]],
-            layer_idx: int,
-            current_k: Optional[torch.Tensor] = None,  # [batch_size, kv_num_heads, head_size]
-            current_v: Optional[torch.Tensor] = None,  # [batch_size, kv_num_heads, head_size]
-            current_positions: Optional[List[int]] = None  # [batch_size]
-    ) -> torch.Tensor:
-        batch_size = query.size(0)
-        output = torch.zeros_like(query)  # [batch_size, num_heads, head_size]
-
-        for i in range(batch_size):
-            seq_id = seq_ids[i]
-            tokens = cache_manager.get_sequence_tokens(seq_id)
-            seq_len = context_lens[i]
-
-            if seq_len == 0:
-                # 如果序列长度为0，输出零向量
-                output[i] = 0
-                continue
-
-            # 收集 KV（从缓存中获取历史token的KV）
-            keys = []
-            values = []
-            positions_list = token_positions[i][:seq_len]  # 历史token的位置
-
-            for token_id, position in tokens[:seq_len]:
-                k, v = cache_manager.get_token_kv(token_id, position)
-                k = k[layer_idx]  # [kv_num_heads, head_size]
-                v = v[layer_idx]
-                keys.append(k)
-                values.append(v)
-
-            # 包括当前token的KV和位置
-            if current_k is not None and current_v is not None and current_positions is not None:
-                keys.append(current_k[i])  # [kv_num_heads, head_size]
-                values.append(current_v[i])
-                positions_list.append(current_positions[i])  # 添加当前token的位置
-                seq_len += 1  # 更新序列长度以包括当前token
-
-            if not keys:
-                # 如果没有token，输出零向量
-                output[i] = 0
-                continue
-
-            # 拼接KV数据: [kv_num_heads, seq_len, head_size]
-            K = torch.stack(keys, dim=1)
-            V = torch.stack(values, dim=1)
-
-            # 当前查询向量: [num_heads, head_size]
-            q = query[i]  # [num_heads, head_size]
-
-            # 准备位置张量
-            positions = torch.tensor(positions_list, dtype=torch.long, device=self.device)
-
-            # 应用旋转位置编码
-            # 准备查询向量 [1, num_heads, 1, head_size]
-            q_rot = q.unsqueeze(0).unsqueeze(2)
-            # 准备键向量 [1, kv_heads, seq_len, head_size]
-            k_rot = K.unsqueeze(0)
-
-            # 应用RoPE
-            q_rot = self.rotary_emb(q_rot, positions[-1:])
-            k_rot = self.rotary_emb(k_rot, positions)
-
-            # 更新查询和键
-            q = q_rot.squeeze(0).squeeze(1)  # [num_heads, head_size]
-            K = k_rot.squeeze(0)  # [kv_heads, seq_len, head_size]
-
-            # GQA处理: 如果键值头数少于查询头数，重复键值头
-            if K.size(0) != self.num_heads:
-                # 计算重复次数
-                repeat_times = self.num_heads // K.size(0)
-                K = K.repeat_interleave(repeat_times, dim=0)  # [num_heads, seq_len, head_size]
-                V = V.repeat_interleave(repeat_times, dim=0)
-
-            # 注意力计算
-            # q: [num_heads, head_size]
-            # K: [num_heads, seq_len, head_size]
-            # 计算点积: [num_heads, seq_len]
-            scores = torch.einsum("hd,hsd->hs", q, K) * self.scale
-
-            # 应用softmax
-            attn = F.softmax(scores, dim=-1)
-
-            # 加权值向量: [num_heads, head_size]
-            layer_output = torch.einsum("hs,hsd->hd", attn, V)
-
-            output[i] = layer_output
-
-        return output
