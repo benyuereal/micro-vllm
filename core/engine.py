@@ -23,6 +23,7 @@ class InferenceEngine:
         num_layers = self.model.config.num_hidden_layers
         num_heads = self.model.config.num_attention_heads
         head_size = self.model.config.hidden_size // num_heads
+        print("load model config:", self.model.config)
         num_key_value_heads = self.model.config.num_key_value_heads or num_heads
 
         # 自动检测设备并优化配置
