@@ -153,15 +153,11 @@ class InferenceEngine:
             for layer_idx in range(num_layers):
                 layer_k = past_key_values[layer_idx][0][i:i + 1]  # [batch=1, num_heads, seq_len, head_size]
                 layer_v = past_key_values[layer_idx][1][i:i + 1]
-                print("shape:",layer_v.shape, layer_k.shape, layer_k.dtype, layer_k.device)
-                # 如果维度顺序不正确，进行转置
-                if layer_k.size(0) != num_heads:
-                    layer_k = layer_k.permute(1, 0,
-                                              2)  # 从 [seq_len, num_heads, head_size] 到 [num_heads, seq_len, head_size]
-                    layer_v = layer_v.permute(1, 0, 2)
+                print("shape:",layer_v.shape, layer_k.shape, layer_k.dtype, layer_k.device, k_cache[layer_idx].shape)
 
-                k_cache[layer_idx] = layer_k.squeeze(0)
-                v_cache[layer_idx] = layer_v.squeeze(0)
+
+                k_cache[layer_idx] = layer_k.squeeze(0).permute(1, 0, 2)
+                v_cache[layer_idx] = layer_v.squeeze(0).permute(1, 0, 2)
 
             # 为序列分配缓存 [num_layers,num_heads, seq_length,head_size]
             self.cache.allocate(seq.seq_id, token_positions, k_cache, v_cache)
