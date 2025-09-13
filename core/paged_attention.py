@@ -72,6 +72,7 @@ class PagedAttention(nn.Module):
 
         # 针对CUDA使用优化内核
         self.use_cuda_kernel = (self.device == 'cuda') and torch.cuda.is_available()
+        print("device 、 flag:", self.device, torch.cuda.is_available())
         if self.use_cuda_kernel:
             try:
                 from vllm import paged_attention
