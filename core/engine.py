@@ -24,7 +24,11 @@ class InferenceEngine:
         num_heads = self.model.config.num_attention_heads
         head_size = self.model.config.hidden_size // num_heads
         print("load model config:", self.model.config)
-        num_key_value_heads = self.model.config.num_key_value_heads or num_heads
+        # 检查是否有num_key_value_heads属性，如果没有则使用num_heads
+        if hasattr(self.model.config, 'num_key_value_heads'):
+            num_key_value_heads = self.model.config.num_key_value_heads
+        else:
+            num_key_value_heads = num_heads
 
         # 自动检测设备并优化配置
         if torch.backends.mps.is_available():
