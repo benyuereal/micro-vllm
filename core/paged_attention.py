@@ -74,12 +74,13 @@ class PagedAttention(nn.Module):
         self.use_cuda_kernel = (self.device == 'cuda') and torch.cuda.is_available()
         print("device 、 flag:", self.device, torch.cuda.is_available())
         if self.use_cuda_kernel:
+            # 或者（如果上述方式不可用）
             try:
-                from vllm import paged_attention
-                self.cuda_paged_attention = paged_attention
+                from vllm._C import ops as paged_attention
             except ImportError:
                 print("vllm not available, using fallback implementation")
                 self.use_cuda_kernel = False
+
 
     def forward(
             self,
