@@ -93,8 +93,9 @@ class PagedAttention(nn.Module):
             current_positions: Optional[List[int]] = None  # 当前token的位置列表
     ) -> torch.Tensor:
         if self.use_cuda_kernel:
-            # 注意：CUDA内核可能需要额外修改以支持当前token的KV，这里暂不处理
-            return self._cuda_forward(query, cache_manager, seq_ids, context_lens, token_positions, layer_idx)
+
+             return self._cuda_forward(query, cache_manager, seq_ids, context_lens, token_positions, layer_idx,
+                                      current_k, current_v, current_positions)
         else:
             return self._mps_forward(
                 query, cache_manager, seq_ids, context_lens, token_positions, layer_idx,
@@ -108,14 +109,48 @@ class PagedAttention(nn.Module):
             seq_ids: List[int],
             context_lens: List[int],
             token_positions: List[List[int]],
-            layer_idx: int
+            layer_idx: int,
+            current_k: Optional[torch.Tensor] = None,  # [batch_size, kv_num_heads, head_size]
+            current_v: Optional[torch.Tensor] = None,  # [batch_size, kv_num_heads, head_size]
+            current_positions: Optional[List[int]] = None  # [batch_size]
     ) -> torch.Tensor:
-        """优化后的CUDA实现"""
+        """优化后的CUDA实现，包含当前token的KV缓存"""
         batch_size = query.size(0)
+
+        # 首先将当前token的KV存储到缓存中
+        if current_k is not None and current_v is not None and current_positions is not None:
+            for i in range(batch_size):
+                seq_id = seq_ids[i]
+                token_id = token_positions[i][-1] if token_positions[i] else 0  # 获取当前token ID
+                position = current_positions[i]
+
+                # 准备当前token的KV缓存张量
+                num_layers = cache_manager.memory_pool.num_layers
+                num_heads = cache_manager.memory_pool.num_heads
+                head_size = cache_manager.memory_pool.head_size
+
+                k_cache = torch.zeros((num_layers, num_heads, 1, head_size),
+                                      dtype=cache_manager.memory_pool.dtype, device=self.device)
+                v_cache = torch.zeros_like(k_cache)
+
+                # 填充当前层的KV
+                k_cache[layer_idx] = current_k[i].unsqueeze(0).unsqueeze(2)  # [1, kv_num_heads, 1, head_size]
+                v_cache[layer_idx] = current_v[i].unsqueeze(0).unsqueeze(2)
+
+                # 将当前token的KV分配到缓存中
+                cache_manager.allocate(
+                    seq_id,
+                    [(token_id, position)],
+                    k_cache,
+                    v_cache
+                )
 
         # 构建块表 - 这是vLLM内核需要的
         block_tables = []
         max_blocks_per_seq = 0
+
+        # 更新context_lens以包括当前token
+        updated_context_lens = [clen + 1 for clen in context_lens] if current_k is not None else context_lens
 
         for i, seq_id in enumerate(seq_ids):
             tokens = cache_manager.get_sequence_tokens(seq_id)
@@ -167,7 +202,7 @@ class PagedAttention(nn.Module):
             layer_k,  # [1, num_heads, total_slots, head_size]
             layer_v,  # [1, num_heads, total_slots, head_size]
             block_tables_tensor,
-            torch.tensor(context_lens, device=query.device, dtype=torch.int32),
+            torch.tensor(updated_context_lens, device=query.device, dtype=torch.bfloat16),
             self.scale
         )
 
