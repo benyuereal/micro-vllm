@@ -30,8 +30,8 @@ class InferenceEngine:
             device = 'mps'
             block_size = 16
             max_blocks = 512
-            dtype = torch.float32
-            self.model = self.model.to(torch.float32)
+            dtype = torch.float16
+            # self.model = self.model.to(torch.float32)
         elif torch.cuda.is_available():
             device = 'cuda'
             block_size = 64
