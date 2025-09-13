@@ -51,27 +51,7 @@ class KVCache:
         block = self.memory_pool.get_block(block_id)
         return block.get_slot(slot_id)
 
-    def get_sequence_kv(self, seq_id: int) -> Tuple[torch.Tensor, torch.Tensor]:
-        """获取序列的所有KV数据"""
-        if seq_id not in self.sequence_blocks:
-            return None, None
 
-        tokens = self.sequence_blocks[seq_id]
-        num_tokens = len(tokens)
-        num_layers = self.memory_pool.num_layers
-        num_heads = self.memory_pool.num_heads
-        head_size = self.memory_pool.head_size
-
-        k = torch.zeros((num_layers, num_heads, num_tokens, head_size),
-                        dtype=self.memory_pool.dtype, device=self.memory_pool.blocks[0].device)
-        v = torch.zeros_like(k)
-
-        for i, (token_id, position) in enumerate(tokens):
-            token_k, token_v = self.get_token_kv(token_id, position)
-            k[:, :, i, :] = token_k
-            v[:, :, i, :] = token_v
-
-        return k, v
 
     def delete(self, seq_id: int):
         """删除序列缓存"""
@@ -90,9 +70,6 @@ class KVCache:
         """获取序列的所有token标识"""
         return self.sequence_blocks.get(seq_id, [])
 
-    def get_all_tokens(self) -> List[Tuple[int, int]]:
-        """获取缓存中的所有token"""
-        return list(self.token_to_sequence.keys())
 
     def get_block_table(self) -> Dict[int, List[Tuple[int, int]]]:
         """获取块表信息"""

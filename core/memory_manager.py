@@ -75,14 +75,6 @@ class MemoryBlock:
         self.key_cache[:, :, slot_id, :] = new_k
         self.value_cache[:, :, slot_id, :] = new_v
 
-    def has_token(self, token_id: int, position: int) -> bool:
-        """检查token是否存在于块中"""
-        return (token_id, position) in self.token_to_slots
-
-    def get_token_slots(self, token_id: int, position: int) -> List[int]:
-        """获取token的槽位"""
-        return list(self.token_to_slots.get((token_id, position), []))
-
     def get_free_slot_count(self) -> int:
         """获取空闲槽位数量"""
         return len(self.free_slots)

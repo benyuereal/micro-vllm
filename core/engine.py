@@ -169,7 +169,7 @@ class InferenceEngine:
             token_positions.append(positions)
 
         hidden_states = self.model.model.embed_tokens(input_ids)
-
+        batch_size = len(input_ids)
         # 初始化列表以存储每层的Key和Value
         new_ks = []  # 每个元素形状: [batch_size, kv_num_heads, head_size]
         new_vs = []  # 每个元素形状: [batch_size, kv_num_heads, head_size]
@@ -190,10 +190,10 @@ class InferenceEngine:
             kv_num_heads = self.paged_attention.kv_num_heads
 
             # 重塑Query、Key、Value
-            query = query.view(query.size(0), num_heads, head_size)
+            query = query.view(batch_size, num_heads, head_size)
             # [batch_size,kv_num_heads,head_size]
-            key = key.view(key.size(0), kv_num_heads, head_size)
-            value = value.view(value.size(0), kv_num_heads, head_size)
+            key = key.view(batch_size, kv_num_heads, head_size)
+            value = value.view(batch_size, kv_num_heads, head_size)
 
             # 保存Key和Value用于后续缓存
             new_ks.append(key)
