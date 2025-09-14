@@ -253,12 +253,6 @@ class PagedAttention(nn.Module):
         # 应用RoPE到键
         k_rotated = self.rotary_emb(all_keys, all_positions)
 
-        # 添加详细的调试信息
-        print(f"Before GQA:")
-        print(f"  q_rotated shape: {q_rotated.shape}")  # 应为 [batch_size, num_heads, 1, head_size]
-        print(f"  k_rotated shape: {k_rotated.shape}")  # 应为 [batch_size, kv_num_heads, max_seq_len, head_size]
-        print(f"  all_values shape: {all_values.shape}")  # 应为 [batch_size, kv_num_heads, max_seq_len, head_size]
-
         # GQA处理: 确保键值头数与查询头数匹配
         if self.kv_num_heads != self.num_heads:
             repeat_times = self.num_heads // self.kv_num_heads
