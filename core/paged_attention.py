@@ -271,18 +271,44 @@ class PagedAttention(nn.Module):
             k_rotated = k_rotated.repeat_interleave(repeat_times, dim=1)
             all_values = all_values.repeat_interleave(repeat_times, dim=1)
 
-        # 使用Flash Attention
-        print(f"Before FlashAttention:")
-        print(f"  q_rotated shape: {q_rotated.shape}")
-        print(f"  k_rotated shape: {k_rotated.shape}")
-        print(f"  all_values shape: {all_values.shape}")
-        # 使用Flash Attention
-        # 调整形状: [batch_size, num_heads, seq_len, head_size]
-        output = self.flash_attn(
-            q_rotated,  # [batch_size, num_heads, 1, head_size]
-            k_rotated,  # [batch_size, num_heads, max_seq_len, head_size]
-            all_values,  # [batch_size, num_heads, max_seq_len, head_size]
-        )
 
-        return output.squeeze(2)  # [batch_size, num_heads, head_size]
+        if not self.use_real_flash_attn:
+
+            # 使用Flash Attention
+            print(f"Before FlashAttention:")
+            print(f"  q_rotated shape: {q_rotated.shape}")
+            print(f"  k_rotated shape: {k_rotated.shape}")
+            print(f"  all_values shape: {all_values.shape}")
+            # 使用Flash Attention
+            # 调整形状: [batch_size, num_heads, seq_len, head_size]
+            output = self.flash_attn(
+                q_rotated,  # [batch_size, num_heads, 1, head_size]
+                k_rotated,  # [batch_size, num_heads, max_seq_len, head_size]
+                all_values,  # [batch_size, num_heads, max_seq_len, head_size]
+            )
+
+            return output.squeeze(2)  # [batch_size, num_heads, head_size]
+        else:
+            # 调整维度顺序以符合FlashAttention的输入要求
+            # 从 [batch_size, num_heads, seq_len, head_size] 变为 [batch_size, seq_len, num_heads, head_size]
+            q_rotated = q_rotated.transpose(1, 2)  # [1, 1, 32, 128]
+            k_rotated = k_rotated.transpose(1, 2)  # [1, 9, 32, 128]
+            all_values = all_values.transpose(1, 2)  # [1, 9, 32, 128]
+
+            print(f"After transpose:")
+            print(f"  q_rotated shape: {q_rotated.shape}")
+            print(f"  k_rotated shape: {k_rotated.shape}")
+            print(f"  all_values shape: {all_values.shape}")
+
+            # 使用Flash Attention
+            output = self.flash_attn(
+                q_rotated,  # [batch_size, 1, num_heads, head_size]
+                k_rotated,  # [batch_size, 9, num_heads, head_size]
+                all_values,  # [batch_size, 9, num_heads, head_size]
+            )
+
+            # 将输出转置回原始维度顺序
+            output = output.transpose(1, 2)  # [batch_size, num_heads, 1, head_size]
+
+            return output.squeeze(2)  # [batch_size, num_heads, head_size]
 
