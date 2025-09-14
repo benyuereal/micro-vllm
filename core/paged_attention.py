@@ -20,13 +20,14 @@ class RotaryEmbedding(nn.Module):
         super().__init__()
         self.dim = dim
         self.device = device if device is not None else torch.device('cpu')
-        self.inv_freq = 1.0 / (base ** (torch.arange(0, dim, 2, device=self.device).float() / dim))
+        # 使用指定数据类型创建 inv_freq
+        self.inv_freq = 1.0 / (base ** (torch.arange(0, dim, 2, device=self.device).to(torch.bfloat16) / dim))
         self.max_seq_len = max_position
         self._update_cos_sin_cache(max_position)
 
     def _update_cos_sin_cache(self, seq_len):
         self.max_seq_len = max(self.max_seq_len, seq_len)
-        t = torch.arange(self.max_seq_len, device=self.device, dtype=torch.bfloat16)
+        t = torch.arange(self.max_seq_len, device=self.device, dtype=self.inv_freq.dtype)
         freqs = torch.einsum("i,j->ij", t, self.inv_freq)
         emb = torch.cat((freqs, freqs), dim=-1)
         self.cos_cache = emb.cos()[None, None, :, :]  # [1, 1, seq_len, dim]
@@ -52,9 +53,6 @@ class RotaryEmbedding(nn.Module):
         positions_flat = positions.view(-1)  # [batch_size * seq_len]
         cos = self.cos_cache[:, :, positions_flat]  # [1, 1, batch_size * seq_len, dim]
         sin = self.sin_cache[:, :, positions_flat]  # [1, 1, batch_size * seq_len, dim]
-
-        cos = cos.to(x.dtype)
-        sin = sin.to(x.dtype)
 
         # 重塑为原始形状
         cos = cos.view(1, 1, batch_size, seq_len, head_size).permute(2, 1, 3, 0, 4).squeeze(
@@ -265,6 +263,10 @@ class PagedAttention(nn.Module):
 
         # 使用Flash Attention
         # 调整形状: [batch_size, num_heads, seq_len, head_size]
+        print(f" RoPE - q_rotated dtype: {q_rotated.dtype}")
+        print(f" RoPE - k_rotated dtype: {k_rotated.dtype}")
+        print(f" RoPE - all_values dtype: {all_values.dtype}")
+
         output = self.flash_attn(
             q_rotated,  # [batch_size, num_heads, 1, head_size]
             k_rotated,  # [batch_size, num_heads, max_seq_len, head_size]
