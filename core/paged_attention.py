@@ -183,7 +183,6 @@ class PagedAttention(nn.Module):
             current_k, current_v, current_positions
         )
 
-
     def _flash_forward(
             self,
             query: torch.Tensor,
@@ -197,7 +196,6 @@ class PagedAttention(nn.Module):
             current_positions: Optional[List[int]] = None
     ) -> torch.Tensor:
         """原有的模拟Flash Attention实现"""
-        # 保持原有实现不变
         batch_size = query.size(0)
         max_seq_len = max(context_lens) + 1 if current_k is not None else max(context_lens)
 
@@ -255,18 +253,22 @@ class PagedAttention(nn.Module):
         # 应用RoPE到键
         k_rotated = self.rotary_emb(all_keys, all_positions)
 
-        # GQA处理: 如果键值头数少于查询头数，重复键值头
+        print("kv_num_heads: ", self.kv_num_heads)
+        print("num_heads: ", self.num_heads)
+        # GQA处理: 确保键值头数与查询头数匹配
         if self.kv_num_heads != self.num_heads:
+
+            # 确保查询头数是键值头数的整数倍
+            if self.num_heads % self.kv_num_heads != 0:
+                raise ValueError(f"num_heads({self.num_heads}) must be divisible by "
+                                 f"kv_num_heads({self.kv_num_heads}) for Grouped Query Attention")
+
             repeat_times = self.num_heads // self.kv_num_heads
             k_rotated = k_rotated.repeat_interleave(repeat_times, dim=1)
             all_values = all_values.repeat_interleave(repeat_times, dim=1)
 
         # 使用Flash Attention
         # 调整形状: [batch_size, num_heads, seq_len, head_size]
-        print(f" RoPE - q_rotated dtype: {q_rotated.dtype}")
-        print(f" RoPE - k_rotated dtype: {k_rotated.dtype}")
-        print(f" RoPE - all_values dtype: {all_values.dtype}")
-
         output = self.flash_attn(
             q_rotated,  # [batch_size, num_heads, 1, head_size]
             k_rotated,  # [batch_size, num_heads, max_seq_len, head_size]
