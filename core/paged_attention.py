@@ -53,6 +53,9 @@ class RotaryEmbedding(nn.Module):
         cos = self.cos_cache[:, :, positions_flat]  # [1, 1, batch_size * seq_len, dim]
         sin = self.sin_cache[:, :, positions_flat]  # [1, 1, batch_size * seq_len, dim]
 
+        cos = cos.to(x.dtype)
+        sin = sin.to(x.dtype)
+
         # 重塑为原始形状
         cos = cos.view(1, 1, batch_size, seq_len, head_size).permute(2, 1, 3, 0, 4).squeeze(
             3)  # [batch_size, num_heads, seq_len, head_size]
