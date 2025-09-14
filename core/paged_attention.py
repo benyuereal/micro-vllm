@@ -261,12 +261,6 @@ class PagedAttention(nn.Module):
 
         # GQA处理: 确保键值头数与查询头数匹配
         if self.kv_num_heads != self.num_heads:
-
-            # 确保查询头数是键值头数的整数倍
-            if self.num_heads % self.kv_num_heads != 0:
-                raise ValueError(f"num_heads({self.num_heads}) must be divisible by "
-                                 f"kv_num_heads({self.kv_num_heads}) for Grouped Query Attention")
-
             repeat_times = self.num_heads // self.kv_num_heads
             k_rotated = k_rotated.repeat_interleave(repeat_times, dim=1)
             all_values = all_values.repeat_interleave(repeat_times, dim=1)
@@ -274,11 +268,6 @@ class PagedAttention(nn.Module):
 
         if not self.use_real_flash_attn:
 
-            # 使用Flash Attention
-            print(f"Before FlashAttention:")
-            print(f"  q_rotated shape: {q_rotated.shape}")
-            print(f"  k_rotated shape: {k_rotated.shape}")
-            print(f"  all_values shape: {all_values.shape}")
             # 使用Flash Attention
             # 调整形状: [batch_size, num_heads, seq_len, head_size]
             output = self.flash_attn(
@@ -294,11 +283,6 @@ class PagedAttention(nn.Module):
             q_rotated = q_rotated.transpose(1, 2)  # [1, 1, 32, 128]
             k_rotated = k_rotated.transpose(1, 2)  # [1, 9, 32, 128]
             all_values = all_values.transpose(1, 2)  # [1, 9, 32, 128]
-
-            print(f"After transpose:")
-            print(f"  q_rotated shape: {q_rotated.shape}")
-            print(f"  k_rotated shape: {k_rotated.shape}")
-            print(f"  all_values shape: {all_values.shape}")
 
             # 使用Flash Attention
             output = self.flash_attn(
