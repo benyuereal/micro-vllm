@@ -26,7 +26,7 @@ class RotaryEmbedding(nn.Module):
 
     def _update_cos_sin_cache(self, seq_len):
         self.max_seq_len = max(self.max_seq_len, seq_len)
-        t = torch.arange(self.max_seq_len, device=self.device, dtype=self.inv_freq.dtype)
+        t = torch.arange(self.max_seq_len, device=self.device, dtype=torch.bfloat16)
         freqs = torch.einsum("i,j->ij", t, self.inv_freq)
         emb = torch.cat((freqs, freqs), dim=-1)
         self.cos_cache = emb.cos()[None, None, :, :]  # [1, 1, seq_len, dim]
