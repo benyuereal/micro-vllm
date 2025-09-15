@@ -2,7 +2,7 @@ import torch
 from transformers import PreTrainedModel
 from typing import Dict, Optional, List, Tuple
 
-from core import KVCache
+from core import KVCacheManager
 
 
 class QwenModelAdapter:
@@ -10,7 +10,7 @@ class QwenModelAdapter:
     def prepare_inputs(
             model: PreTrainedModel,
             input_ids: torch.Tensor,
-            cache_manager: Optional[KVCache] = None,
+            cache_manager: Optional[KVCacheManager] = None,
             seq_ids: Optional[List[int]] = None
     ) -> Dict:
         batch_size, seq_length = input_ids.shape

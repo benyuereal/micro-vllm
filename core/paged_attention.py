@@ -3,16 +3,13 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from typing import List, Tuple, Dict, Optional
-import numpy as np
 
-# 尝试导入flash_attn库，如果不可用则设为None
 try:
-    import flash_attn
-    from flash_attn import flash_attn_func
-
-    flash_attn_available = True
+    from flash_attn import flash_attn_func, flash_attn_with_kvcache
 except ImportError:
-    flash_attn_available = False
+
+    print('flash_attn_with_kvcache not installed')
+
 
 class RotaryEmbedding(nn.Module):
     # 保持原有实现不变
@@ -69,71 +66,6 @@ class RotaryEmbedding(nn.Module):
         return (x * cos) + (rotated * sin)
 
 
-class FlashAttention(nn.Module):
-    """Flash Attention实现，支持MPS和CPU后端"""
-
-    def __init__(self, head_size, dropout=0.0):
-        super().__init__()
-        self.head_size = head_size
-        self.dropout = dropout
-        self.scale = 1.0 / math.sqrt(head_size)
-
-    def forward(self, q, k, v, mask=None):
-        """
-        简化的Flash Attention实现
-        q: [batch_size, num_heads, seq_len, head_size]
-        k: [batch_size, num_heads, seq_len, head_size]
-        v: [batch_size, num_heads, seq_len, head_size]
-        mask: [batch_size, seq_len] 可选
-        """
-        # 计算注意力分数
-        attn_scores = torch.matmul(q, k.transpose(-2, -1)) * self.scale
-
-        # 应用mask（如果有）
-        if mask is not None:
-            mask = mask.unsqueeze(1).unsqueeze(2)  # [batch_size, 1, 1, seq_len]
-            attn_scores = attn_scores.masked_fill(mask == 0, -1e9)
-
-        # 应用softmax
-        attn_weights = F.softmax(attn_scores, dim=-1)
-
-        # 应用dropout
-        if self.dropout > 0:
-            attn_weights = F.dropout(attn_weights, p=self.dropout, training=self.training)
-
-        # 计算输出
-        output = torch.matmul(attn_weights, v)
-
-        return output
-
-
-class OfficialFlashAttention(nn.Module):
-    """真正的Flash Attention实现，使用flash_attn库"""
-
-    def __init__(self, head_size, dropout=0.0):
-        super().__init__()
-        self.head_size = head_size
-        self.dropout = dropout
-        self.scale = 1.0 / math.sqrt(head_size)
-
-    def forward(self, q, k, v, mask=None):
-        """
-        使用flash_attn库的实现
-        q: [batch_size, num_heads, seq_len, head_size]
-        k: [batch_size, num_heads, seq_len, head_size]
-        v: [batch_size, num_heads, seq_len, head_size]
-        mask: [batch_size, seq_len] 可选
-        """
-        # 转换mask格式为flash_attn需要的格式
-        if mask is not None:
-            # flash_attn需要bool类型的mask
-            mask = mask.bool()
-
-        # 使用flash_attn库的函数
-        return flash_attn_func(q, k, v, dropout_p=self.dropout if self.training else 0.0,
-                               softmax_scale=self.scale, causal=False, window_size=(-1, -1))
-
-
 class PagedAttention(nn.Module):
     def __init__(self, num_heads: int, head_size: int, kv_num_heads: int, device: str = "auto"):
         super().__init__()
@@ -151,42 +83,23 @@ class PagedAttention(nn.Module):
         # 初始化旋转位置编码
         self.rotary_emb = RotaryEmbedding(
             dim=head_size,
-            max_position=4096,  # 与模型的最大位置一致
+            max_position=4096,
             device=self.device
         )
 
-        # 根据设备和flash_attn可用性选择不同的Attention实现
-        if flash_attn_available:
-            # 在CUDA设备上且flash_attn可用时使用真正的Flash Attention
-            self.flash_attn = OfficialFlashAttention(head_size)
-            self.use_real_flash_attn = True
-        else:
-            # 在其他设备上或flash_attn不可用时使用模拟实现
-            self.flash_attn = FlashAttention(head_size)
-            self.use_real_flash_attn = False
+        # 检查Flash Attention可用性
+        self.use_flash_attn = False
+        if self.device == 'cuda':
+            try:
+                from flash_attn import flash_attn_func, flash_attn_with_kvcache
+                self.use_flash_attn = True
+            except ImportError:
+                self.use_flash_attn = False
 
     def forward(
             self,
             query: torch.Tensor,
-            cache_manager: 'KVCache',
-            seq_ids: List[int],
-            context_lens: List[int],
-            token_positions: List[List[int]],
-            layer_idx: int,
-            current_k: Optional[torch.Tensor] = None,  # 当前token的K [batch_size, kv_num_heads, head_size]
-            current_v: Optional[torch.Tensor] = None,  # 当前token的V [batch_size, kv_num_heads, head_size]
-            current_positions: Optional[List[int]] = None  # 当前token的位置列表
-    ) -> torch.Tensor:
-
-        return self._flash_forward(
-            query, cache_manager, seq_ids, context_lens, token_positions, layer_idx,
-            current_k, current_v, current_positions
-        )
-
-    def _flash_forward(
-            self,
-            query: torch.Tensor,
-            cache_manager: 'KVCache',
+            cache_manager: 'KVCacheManager',
             seq_ids: List[int],
             context_lens: List[int],
             token_positions: List[List[int]],
@@ -195,9 +108,89 @@ class PagedAttention(nn.Module):
             current_v: Optional[torch.Tensor] = None,
             current_positions: Optional[List[int]] = None
     ) -> torch.Tensor:
-        """原有的模拟Flash Attention实现"""
+        """
+        统一的注意力计算方法，自动选择最佳实现
+        """
+        if self.use_flash_attn:
+            return self._flash_attn_forward(
+                query, cache_manager, seq_ids, context_lens, token_positions,
+                layer_idx, current_k, current_v, current_positions
+            )
+        else:
+            return self._compatible_forward(
+                query, cache_manager, seq_ids, context_lens, token_positions,
+                layer_idx, current_k, current_v, current_positions
+            )
+
+    def _flash_attn_forward(
+            self,
+            query: torch.Tensor,
+            cache_manager: 'KVCacheManager',
+            seq_ids: List[int],
+            context_lens: List[int],
+            token_positions: List[List[int]],
+            layer_idx: int,
+            current_k: Optional[torch.Tensor] = None,
+            current_v: Optional[torch.Tensor] = None,
+            current_positions: Optional[List[int]] = None
+    ) -> torch.Tensor:
+        """
+        A100 GPU上的高性能Flash Attention实现
+        """
+
+
+        # 准备块表
+        block_tables = [cache_manager.get_block_table(seq_id) for seq_id in seq_ids]
+        max_blocks = max(len(blocks) for blocks in block_tables) if block_tables else 0
+
+        # 确保块表长度一致（不足的部分填充0）
+        padded_block_tables = []
+        for blocks in block_tables:
+            padded = blocks + [0] * (max_blocks - len(blocks))
+            padded_block_tables.append(padded)
+
+        block_table_tensor = torch.tensor(padded_block_tables, dtype=torch.int32, device=self.device)
+        context_lens_tensor = torch.tensor(context_lens, dtype=torch.int32, device=self.device)
+
+        # 获取当前层的KV缓存
+        k_cache = cache_manager.get_k_cache(layer_idx)
+        v_cache = cache_manager.get_v_cache(layer_idx)
+
+        # 使用Flash Attention
+        output = flash_attn_with_kvcache(
+            query.unsqueeze(1),  # 添加序列维度 [batch_size, 1, num_heads, head_size]
+            k_cache, v_cache,
+            cache_seqlens=context_lens_tensor,
+            block_table=block_table_tensor,
+            softmax_scale=self.scale,
+            causal=True
+        )
+
+        return output.squeeze(1)  # 移除序列维度 [batch_size, num_heads, head_size]
+
+    def _compatible_forward(
+            self,
+            query: torch.Tensor,
+            cache_manager: 'KVCacheManager',
+            seq_ids: List[int],
+            context_lens: List[int],
+            token_positions: List[List[int]],
+            layer_idx: int,
+            current_k: Optional[torch.Tensor] = None,
+            current_v: Optional[torch.Tensor] = None,
+            current_positions: Optional[List[int]] = None
+    ) -> torch.Tensor:
+        """
+        macOS兼容的实现，使用标准PyTorch操作
+        """
         batch_size = query.size(0)
         max_seq_len = max(context_lens) + 1 if current_k is not None else max(context_lens)
+
+        # 获取缓存管理器参数
+        block_size = cache_manager.block_size
+        num_heads = cache_manager.num_heads
+        head_size = cache_manager.head_size
+        token_kv_size = num_heads * head_size  # 每个token在缓存中的大小
 
         # 准备批量KV缓存
         all_keys = torch.zeros(batch_size, self.kv_num_heads, max_seq_len, self.head_size,
@@ -207,50 +200,70 @@ class PagedAttention(nn.Module):
         # 准备位置编码
         all_positions = torch.zeros(batch_size, max_seq_len, dtype=torch.long, device=self.device)
 
-        # 填充KV缓存和位置信息
+        # 从缓存管理器中填充KV缓存
         for i in range(batch_size):
             seq_id = seq_ids[i]
-            tokens = cache_manager.get_sequence_tokens(seq_id)
             seq_len = context_lens[i]
+            positions = token_positions[i]
 
-            # 获取历史KV
+            # 获取该序列的slot映射
+            slot_mapping = cache_manager.get_slot_mapping(seq_id, positions[:seq_len])
+
+            # 获取当前层的KV缓存
+            k_cache = cache_manager.get_k_cache(layer_idx)
+            v_cache = cache_manager.get_v_cache(layer_idx)
+
+            # 从缓存中读取历史KV
             keys = []
             values = []
-            positions_list = []
+            for slot in slot_mapping:
+                if slot == -1:
+                    # 未找到的token，填充0
+                    keys.append(torch.zeros(self.kv_num_heads, self.head_size,
+                                            device=self.device, dtype=query.dtype))
+                    values.append(torch.zeros(self.kv_num_heads, self.head_size,
+                                              device=self.device, dtype=query.dtype))
+                else:
+                    # 关键修改：正确地从块中提取单个token的KV数据
+                    # 计算块ID和在块内的偏移量
+                    block_id = slot // block_size
+                    offset_in_block = slot % block_size
 
-            for token_id, position in tokens[:seq_len]:
-                k, v = cache_manager.get_token_kv(token_id, position)
-                k = k[layer_idx]  # [kv_num_heads, head_size]
-                v = v[layer_idx]
-                keys.append(k)
-                values.append(v)
-                positions_list.append(position)
+                    # 计算在块内的起始位置
+                    start_idx = offset_in_block * token_kv_size
+                    end_idx = start_idx + (self.kv_num_heads * self.head_size)  # 实际KV数据大小
 
-            # 包括当前token
+                    # 从块中提取对应的KV数据
+                    k_flat = k_cache[block_id, start_idx:end_idx]
+                    v_flat = v_cache[block_id, start_idx:end_idx]
+
+                    # 重塑为正确的形状
+                    k = k_flat.view(self.kv_num_heads, self.head_size)
+                    v = v_flat.view(self.kv_num_heads, self.head_size)
+
+                    keys.append(k)
+                    values.append(v)
+
+            # 包括当前token（如果有）
             if current_k is not None and current_v is not None and current_positions is not None:
-                keys.append(current_k[i])  # [kv_num_heads, head_size]
+                keys.append(current_k[i])
                 values.append(current_v[i])
-                positions_list.append(current_positions[i])
+                positions = positions + [current_positions[i]]
                 seq_len += 1
 
+            # 填充到批量张量中
             if keys:
-                # 填充到批量张量中
                 K = torch.stack(keys, dim=1)  # [kv_num_heads, seq_len, head_size]
                 V = torch.stack(values, dim=1)
 
                 all_keys[i, :, :seq_len, :] = K
                 all_values[i, :, :seq_len, :] = V
-                all_positions[i, :seq_len] = torch.tensor(positions_list, device=self.device)
+                all_positions[i, :seq_len] = torch.tensor(positions, device=self.device)
 
         # 应用旋转位置编码
-        # 调整query形状: [batch_size, num_heads, 1, head_size]
-        q_rot = query.unsqueeze(2)
-
-        # 应用RoPE到查询
+        q_rot = query.unsqueeze(2)  # [batch_size, num_heads, 1, head_size]
         q_positions = all_positions[:, -1:] if current_k is not None else all_positions[:, -1:]
         q_rotated = self.rotary_emb(q_rot, q_positions)
-
-        # 应用RoPE到键
         k_rotated = self.rotary_emb(all_keys, all_positions)
 
         # GQA处理: 确保键值头数与查询头数匹配
@@ -259,34 +272,9 @@ class PagedAttention(nn.Module):
             k_rotated = k_rotated.repeat_interleave(repeat_times, dim=1)
             all_values = all_values.repeat_interleave(repeat_times, dim=1)
 
+        # 计算注意力
+        attn_scores = torch.matmul(q_rotated, k_rotated.transpose(-2, -1)) * self.scale
+        attn_weights = F.softmax(attn_scores, dim=-1)
+        output = torch.matmul(attn_weights, all_values)
 
-        if not self.use_real_flash_attn:
-
-            # 使用Flash Attention
-            # 调整形状: [batch_size, num_heads, seq_len, head_size]
-            output = self.flash_attn(
-                q_rotated,  # [batch_size, num_heads, 1, head_size]
-                k_rotated,  # [batch_size, num_heads, max_seq_len, head_size]
-                all_values,  # [batch_size, num_heads, max_seq_len, head_size]
-            )
-
-            return output.squeeze(2)  # [batch_size, num_heads, head_size]
-        else:
-            # 调整维度顺序以符合FlashAttention的输入要求
-            # 从 [batch_size, num_heads, seq_len, head_size] 变为 [batch_size, seq_len, num_heads, head_size]
-            q_rotated = q_rotated.transpose(1, 2)  # [1, 1, 32, 128]
-            k_rotated = k_rotated.transpose(1, 2)  # [1, 9, 32, 128]
-            all_values = all_values.transpose(1, 2)  # [1, 9, 32, 128]
-
-            # 使用Flash Attention
-            output = self.flash_attn(
-                q_rotated,  # [batch_size, 1, num_heads, head_size]
-                k_rotated,  # [batch_size, 9, num_heads, head_size]
-                all_values,  # [batch_size, 9, num_heads, head_size]
-            )
-
-            # 将输出转置回原始维度顺序
-            output = output.transpose(1, 2)  # [batch_size, num_heads, 1, head_size]
-
-            return output.squeeze(2)  # [batch_size, num_heads, head_size]
-
+        return output.squeeze(2)  # [batch_size, num_heads, head_size]
