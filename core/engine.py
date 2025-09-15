@@ -187,10 +187,13 @@ class InferenceEngine:
                     v = past_key_values[layer_idx][1]
                     if self.model_type == "qwen":
                         # Qwen 7B的KV格式
+                        print(k.shape)
                         k = k.transpose(0, 1)
                         v = v.transpose(0, 1)
                         k = k[i, :, token_idx:token_idx + 1, :]
                         v = v[i, :, token_idx:token_idx + 1, :]
+                        print("after", k.shape)
+
                     else:
                         # Qwen 1.5的KV格式
                         k = k[i, :, token_idx:token_idx + 1, :]
