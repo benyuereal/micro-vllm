@@ -199,6 +199,7 @@ class MemoryPool:
 
         # 如果所有块都满了，尝试清理并重用最旧的块
         if self.blocks:
+            print("block is full")
             # 找到引用计数最少的块
             oldest_block_id = min(
                 range(len(self.blocks)),

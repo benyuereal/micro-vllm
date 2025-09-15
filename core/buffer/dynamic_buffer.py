@@ -108,6 +108,7 @@ class DynamicBuffer:
                 self.batch_buffer_size < batch_size or
                 self.kv_buffer_size < max_seq_len):
             self.allocate_buffer(batch_size, kv_num_heads, head_size, max_seq_len, dtype)
+            print(" allocate more buffer ")
             return True
         return False
 
