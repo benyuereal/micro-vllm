@@ -167,6 +167,7 @@ class InferenceEngine:
 
         logits = outputs.logits
         past_key_values = outputs.past_key_values
+        print("k shape", past_key_values[0][0].shape)
         # 存储KV到缓存
         for i, seq in enumerate(batch):
             num_tokens = len(seq.get_next_input_ids())
