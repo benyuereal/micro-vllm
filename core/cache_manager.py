@@ -98,6 +98,7 @@ def store_kvcache(key: torch.Tensor, value: torch.Tensor,
             k_cache[block_id, start_idx:end_idx] = k_flat
             v_cache[block_id, start_idx:end_idx] = v_flat
     else:
+        print("cuda key shape:", key.shape)
         # CUDA 高性能实现
         assert key.stride(-1) == 1 and value.stride(-1) == 1
         assert key.stride(1) == head_dim and value.stride(1) == head_dim

@@ -183,19 +183,23 @@ class InferenceEngine:
                 # 获取当前token在所有层的KV
                 layer_kv = []
                 for layer_idx in range(len(past_key_values)):
+                    k = past_key_values[layer_idx][0]
+                    v = past_key_values[layer_idx][1]
                     if self.model_type == "qwen":
                         # Qwen 7B的KV格式
-                        k = past_key_values[layer_idx][0][i, :, token_idx:token_idx + 1, :]
-                        v = past_key_values[layer_idx][1][i, :, token_idx:token_idx + 1, :]
-                        print("qwen 7b", k.shape)
+                        k = k.transpose(0, 1)
+                        v = v.transpose(0, 1)
+                        k = k[i, :, token_idx:token_idx + 1, :]
+                        v = v[i, :, token_idx:token_idx + 1, :]
                     else:
                         # Qwen 1.5的KV格式
-                        k = past_key_values[layer_idx][0][i, :, token_idx:token_idx + 1, :]
-                        v = past_key_values[layer_idx][1][i, :, token_idx:token_idx + 1, :]
+                        k = k[i, :, token_idx:token_idx + 1, :]
+                        v = v[i, :, token_idx:token_idx + 1, :]
                     layer_kv.append((k, v))
                 token_kv.append(layer_kv)
 
             # 存储到缓存
+            print("layer kv shape", token_kv[0][0][0].shape)
             self._store_token_kv(seq.seq_id, token_kv, slot_mapping)
 
         # 采样下一个token
