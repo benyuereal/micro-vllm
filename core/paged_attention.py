@@ -5,7 +5,7 @@ import torch.nn.functional as F
 from typing import List, Tuple, Dict, Optional
 import numpy as np
 
-from core.buffer.dynamic_buffer import DynamicBuffer
+from core.buffer.DynamicBuffer import DynamicBuffer
 
 # 尝试导入flash_attn库，如果不可用则设为None
 try:
