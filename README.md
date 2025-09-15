@@ -228,3 +228,7 @@ curl -X POST "http://localhost:8000/batch_generate" \
 > 建议：实际性能会因提示长度、温度参数和并发请求数波动，建议使用[官方基准工具](https://github.com/vllm-project/vllm/tree/main/benchmarks)验证您的环境
 
 （保留原有安装/使用/API部分）
+
+## 安装flash-attn
+
+pip install flash-attn --no-build-isolation -i https://pypi.tuna.tsinghua.edu.cn/simple
