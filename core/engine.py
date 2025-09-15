@@ -6,6 +6,7 @@ import time
 import math
 
 from models.qwen_adapter import QwenModelAdapter
+from .layer.layer import ModelLayerAdapter
 from .memory_manager import MemoryPool
 from .scheduler import Scheduler
 from .cache_manager import KVCacheManager, store_kvcache
@@ -21,15 +22,28 @@ class InferenceEngine:
         self.model.eval()
 
         # 获取模型配置
-        num_layers = self.model.config.num_hidden_layers
-        num_heads = self.model.config.num_attention_heads
-        head_size = self.model.config.hidden_size // num_heads
-        print("load model config:", self.model.config)
-        # 检查是否有num_key_value_heads属性，如果没有则使用num_heads
-        if hasattr(self.model.config, 'num_key_value_heads'):
-            num_key_value_heads = self.model.config.num_key_value_heads
+        self.model_config = self.model.config
+        self.model_type = self.model_config.model_type
+
+        # 根据模型类型设置不同的参数
+        if self.model_type == "qwen":  # Qwen 7B
+            num_layers = self.model_config.num_hidden_layers
+            num_heads = self.model_config.num_attention_heads
+            head_size = self.model_config.hidden_size // num_heads
+            num_key_value_heads = getattr(self.model_config, 'num_key_value_heads', num_heads)
+            self.embedding_layer = self.model.transformer.wte
+            self.norm_layer = self.model.transformer.ln_f
+            self.model_layers = self.model.transformer.h
+        elif self.model_type == "qwen2":  # Qwen 1.5 0.5B
+            num_layers = self.model_config.num_hidden_layers
+            num_heads = self.model_config.num_attention_heads
+            head_size = self.model_config.hidden_size // num_heads
+            num_key_value_heads = self.model_config.num_key_value_heads
+            self.embedding_layer = self.model.model.embed_tokens
+            self.norm_layer = self.model.model.norm
+            self.model_layers = self.model.model.layers
         else:
-            num_key_value_heads = num_heads
+            raise ValueError(f"Unsupported model type: {self.model_type}")
 
         # 自动检测设备并优化配置
         if torch.backends.mps.is_available():
@@ -53,13 +67,19 @@ class InferenceEngine:
         self.num_key_value_heads = num_key_value_heads
         self.head_size = head_size
 
-
         # 初始化KV缓存管理器
         self.cache_manager = KVCacheManager(
             max_blocks, block_size, num_layers, num_key_value_heads, head_size, dtype, device
         )
+
+        # 初始化模型层适配器
+        self.layer_adapter = ModelLayerAdapter(self.model_config,
+                                               device=device,
+                                               num_heads=num_heads,
+                                               kv_num_heads= num_key_value_heads,
+                                               head_size=head_size)
+
         # 初始化注意力模块
-        # 初始化PagedAttention
         self.paged_attention = PagedAttention(
             num_heads=num_heads,
             head_size=head_size,
@@ -73,7 +93,13 @@ class InferenceEngine:
         self.device = device
         self.eos_token_id = self.tokenizer.eos_token_id
         self.stream_callbacks = {}
-        self.max_position = 4096  # 最大位置嵌入
+
+        # 根据模型类型设置最大位置
+        if hasattr(self.model_config, 'max_position_embeddings'):
+            self.max_position = self.model_config.max_position_embeddings
+        else:
+            self.max_position = 4096  # 默认值
+
         # 初始化日志
         logging.basicConfig(
             level=logging.INFO,
@@ -84,7 +110,7 @@ class InferenceEngine:
             ]
         )
         self.logger = logging.getLogger("InferenceEngine")
-        self.logger.info("Initializing Inference Engine...")
+        self.logger.info(f"Initializing Inference Engine for model type: {self.model_type}")
 
     def add_request(self, prompt: str, max_tokens: int = 128,
                     temperature: float = 0.7, top_p: float = 0.9, priority: int = 0) -> int:
@@ -132,14 +158,15 @@ class InferenceEngine:
 
     @torch.no_grad()
     def _process_prefill_batch(self, batch: List[Sequence]):
-        """处理预填充批次"""
+        """处理预填充批次，适配不同模型架构"""
         input_ids_list = [seq.get_next_input_ids() for seq in batch]
         input_tensor = self._pad_batch(input_ids_list, self.tokenizer.pad_token_id).to(self.device)
 
-        # 前向传播获取KV
+        # 前向传播获取KV - 使用标准模型实现
         outputs = self.model(input_ids=input_tensor, use_cache=True)
-        logits, past_key_values = self.adapter.process_outputs(outputs, input_tensor.size(1))
 
+        logits = outputs.logits
+        past_key_values = outputs.past_key_values
         # 存储KV到缓存
         for i, seq in enumerate(batch):
             num_tokens = len(seq.get_next_input_ids())
@@ -155,8 +182,15 @@ class InferenceEngine:
                 # 获取当前token在所有层的KV
                 layer_kv = []
                 for layer_idx in range(len(past_key_values)):
-                    k = past_key_values[layer_idx][0][i, :, token_idx:token_idx + 1, :]
-                    v = past_key_values[layer_idx][1][i, :, token_idx:token_idx + 1, :]
+                    if self.model_type == "qwen":
+                        # Qwen 7B的KV格式
+                        k = past_key_values[layer_idx][0][i, :, token_idx:token_idx + 1, :]
+                        v = past_key_values[layer_idx][1][i, :, token_idx:token_idx + 1, :]
+                        print("qwen 7b", k.shape)
+                    else:
+                        # Qwen 1.5的KV格式
+                        k = past_key_values[layer_idx][0][i, :, token_idx:token_idx + 1, :]
+                        v = past_key_values[layer_idx][1][i, :, token_idx:token_idx + 1, :]
                     layer_kv.append((k, v))
                 token_kv.append(layer_kv)
 
@@ -208,7 +242,7 @@ class InferenceEngine:
 
     @torch.no_grad()
     def _process_decode_batch(self, batch: List[Sequence]):
-        """处理解码批次"""
+        """处理解码批次，适配不同模型架构"""
         self.logger.info(f"Starting decode batch with {len(batch)} sequences")
         start_time = time.perf_counter()
 
@@ -221,9 +255,9 @@ class InferenceEngine:
         prepare_time = time.perf_counter() - prepare_start
         self.logger.info(f"Data preparation time: {prepare_time * 1000:.2f}ms")
 
-        # 嵌入层
+        # 嵌入层 - 使用模型特定的嵌入层
         embed_start = time.perf_counter()
-        hidden_states = self.model.model.embed_tokens(input_ids)
+        hidden_states = self.embedding_layer(input_ids)
         embed_time = time.perf_counter() - embed_start
         self.logger.info(f"Embedding time: {embed_time * 1000:.2f}ms")
 
@@ -231,76 +265,25 @@ class InferenceEngine:
         all_layer_kvs = []
         total_layer_time = 0
 
-        for layer_idx, layer in enumerate(self.model.model.layers):
+        for layer_idx, layer in enumerate(self.model_layers):
             layer_start = time.perf_counter()
 
-            # 前向传播
-            residual = hidden_states
-            hidden_states = layer.input_layernorm(hidden_states)
-
-            # QKV投影
-            q_start = time.perf_counter()
-            query = layer.self_attn.q_proj(hidden_states)
-            q_time = time.perf_counter() - q_start
-
-            kv_start = time.perf_counter()
-            key = layer.self_attn.k_proj(hidden_states)
-            value = layer.self_attn.v_proj(hidden_states)
-            kv_time = time.perf_counter() - kv_start
-
-            # 重塑形状
-            reshape_start = time.perf_counter()
-            head_size = self.paged_attention.head_size
-            query = query.view(len(batch), self.paged_attention.num_heads, head_size)
-            key = key.view(len(batch), self.paged_attention.kv_num_heads, head_size)
-            value = value.view(len(batch), self.paged_attention.kv_num_heads, head_size)
-            reshape_time = time.perf_counter() - reshape_start
-
-            # 保存当前层的KV
-            all_layer_kvs.append((key, value))
-
-            # 注意力计算
-            attn_start = time.perf_counter()
-            current_positions = [seq.current_position - 1 for seq in batch]
-            attn_output = self.paged_attention(
-                query=query,
-                cache_manager=self.cache_manager,
-                seq_ids=seq_ids,
-                context_lens=context_lens,
-                token_positions=token_positions,
-                layer_idx=layer_idx,
-                current_k=key,
-                current_v=value,
-                current_positions=current_positions
+            # 使用模型层适配器处理不同架构的层
+            hidden_states, layer_kv = self.layer_adapter.process_layer(
+                layer, hidden_states, self.cache_manager, seq_ids,
+                context_lens, token_positions, layer_idx,
+                [seq.current_position - 1 for seq in batch]
             )
-            attn_time = time.perf_counter() - attn_start
 
-            # 后续处理
-            post_start = time.perf_counter()
-            attn_output = attn_output.reshape(attn_output.size(0), -1)
-            attn_output = layer.self_attn.o_proj(attn_output)
-            attn_output = attn_output.unsqueeze(1)
-            hidden_states = residual + attn_output
-
-            # 前馈网络
-            residual = hidden_states
-            hidden_states = layer.post_attention_layernorm(hidden_states)
-            hidden_states = layer.mlp(hidden_states)
-            hidden_states = residual + hidden_states
-            post_time = time.perf_counter() - post_start
+            all_layer_kvs.append(layer_kv)
 
             layer_time = time.perf_counter() - layer_start
             total_layer_time += layer_time
-            self.logger.info(
-                f"Layer {layer_idx} time: {layer_time * 1000:.2f}ms "
-                f"(Q: {q_time * 1000:.1f}ms, KV: {kv_time * 1000:.1f}ms, "
-                f"Reshape: {reshape_time * 1000:.1f}ms, Attn: {attn_time * 1000:.1f}ms, "
-                f"Post: {post_time * 1000:.1f}ms)"
-            )
+            self.logger.info(f"Layer {layer_idx} time: {layer_time * 1000:.2f}ms")
 
-        # 最终层归一化和输出
+        # 最终层归一化 - 使用模型特定的归一化层
         norm_start = time.perf_counter()
-        hidden_states = self.model.model.norm(hidden_states)
+        hidden_states = self.norm_layer(hidden_states)
         logits = self.model.lm_head(hidden_states).float()
         norm_time = time.perf_counter() - norm_start
         self.logger.info(f"Final norm & output time: {norm_time * 1000:.2f}ms")
@@ -320,14 +303,14 @@ class InferenceEngine:
             token_idx = seq.current_position - 1
             slot = self.cache_manager.append_token(seq.seq_id, token_idx)
             if slot >= 0:
-                token_kv = []
                 layer_kv = []
                 for layer_idx, (k, v) in enumerate(all_layer_kvs):
                     k_current = k[i:i + 1].squeeze(0).unsqueeze(1)
                     v_current = v[i:i + 1].squeeze(0).unsqueeze(1)
                     layer_kv.append((k_current, v_current))
-                token_kv.append(layer_kv)
-                self._store_token_kv(seq.seq_id, token_kv, [slot])
+
+                # 存储到缓存
+                self._store_token_kv(seq.seq_id, [layer_kv], [slot])
         kv_store_time = time.perf_counter() - kv_store_start
         self.logger.info(f"KV storage time: {kv_store_time * 1000:.2f}ms")
 
