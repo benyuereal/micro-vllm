@@ -12,6 +12,7 @@ from .cache_manager import KVCacheManager, store_kvcache
 from .sequence import Sequence
 from .model_loader import load_model
 from .paged_attention import PagedAttention
+import logging
 
 
 class InferenceEngine:
@@ -73,6 +74,17 @@ class InferenceEngine:
         self.eos_token_id = self.tokenizer.eos_token_id
         self.stream_callbacks = {}
         self.max_position = 4096  # 最大位置嵌入
+        # 初始化日志
+        logging.basicConfig(
+            level=logging.INFO,
+            format='%(asctime)s [%(levelname)s] %(message)s',
+            handlers=[
+                logging.FileHandler("inference_perf.log"),
+                logging.StreamHandler()
+            ]
+        )
+        self.logger = logging.getLogger("InferenceEngine")
+        self.logger.info("Initializing Inference Engine...")
 
     def add_request(self, prompt: str, max_tokens: int = 128,
                     temperature: float = 0.7, top_p: float = 0.9, priority: int = 0) -> int:
@@ -197,43 +209,59 @@ class InferenceEngine:
     @torch.no_grad()
     def _process_decode_batch(self, batch: List[Sequence]):
         """处理解码批次"""
-        input_ids = torch.tensor([seq.get_next_input_ids() for seq in batch], device=self.device)
+        self.logger.info(f"Starting decode batch with {len(batch)} sequences")
+        start_time = time.perf_counter()
 
-        # 准备注意力计算参数
+        # 准备输入数据
+        prepare_start = time.perf_counter()
+        input_ids = torch.tensor([seq.get_next_input_ids() for seq in batch], device=self.device)
         context_lens = [seq.current_position - 1 for seq in batch]
         token_positions = [[pos for pos in range(seq.current_position - 1)] for seq in batch]
         seq_ids = [seq.seq_id for seq in batch]
+        prepare_time = time.perf_counter() - prepare_start
+        self.logger.info(f"Data preparation time: {prepare_time * 1000:.2f}ms")
 
-        # 模型前向传播
+        # 嵌入层
+        embed_start = time.perf_counter()
         hidden_states = self.model.model.embed_tokens(input_ids)
+        embed_time = time.perf_counter() - embed_start
+        self.logger.info(f"Embedding time: {embed_time * 1000:.2f}ms")
 
-        # 收集所有层的KV（用于后续存储）
+        # 逐层处理
         all_layer_kvs = []
+        total_layer_time = 0
 
-        # 逐层计算
         for layer_idx, layer in enumerate(self.model.model.layers):
-            # 获取当前层的查询、键、值
+            layer_start = time.perf_counter()
+
+            # 前向传播
             residual = hidden_states
             hidden_states = layer.input_layernorm(hidden_states)
 
+            # QKV投影
+            q_start = time.perf_counter()
             query = layer.self_attn.q_proj(hidden_states)
+            q_time = time.perf_counter() - q_start
+
+            kv_start = time.perf_counter()
             key = layer.self_attn.k_proj(hidden_states)
             value = layer.self_attn.v_proj(hidden_states)
-
-
+            kv_time = time.perf_counter() - kv_start
 
             # 重塑形状
-            batch_size = query.size(0)
+            reshape_start = time.perf_counter()
             head_size = self.paged_attention.head_size
-            query = query.view(batch_size, self.paged_attention.num_heads, head_size)
-            key = key.view(batch_size, self.paged_attention.kv_num_heads, head_size)
-            value = value.view(batch_size, self.paged_attention.kv_num_heads, head_size)
-            # 保存当前层的KV（用于后续存储）
-            all_layer_kvs.append((key, value))
-            # 当前token的位置
-            current_positions = [seq.current_position - 1 for seq in batch]
+            query = query.view(len(batch), self.paged_attention.num_heads, head_size)
+            key = key.view(len(batch), self.paged_attention.kv_num_heads, head_size)
+            value = value.view(len(batch), self.paged_attention.kv_num_heads, head_size)
+            reshape_time = time.perf_counter() - reshape_start
 
-            # 使用PagedAttention计算注意力
+            # 保存当前层的KV
+            all_layer_kvs.append((key, value))
+
+            # 注意力计算
+            attn_start = time.perf_counter()
+            current_positions = [seq.current_position - 1 for seq in batch]
             attn_output = self.paged_attention(
                 query=query,
                 cache_manager=self.cache_manager,
@@ -245,8 +273,10 @@ class InferenceEngine:
                 current_v=value,
                 current_positions=current_positions
             )
+            attn_time = time.perf_counter() - attn_start
 
             # 后续处理
+            post_start = time.perf_counter()
             attn_output = attn_output.reshape(attn_output.size(0), -1)
             attn_output = layer.self_attn.o_proj(attn_output)
             attn_output = attn_output.unsqueeze(1)
@@ -257,41 +287,63 @@ class InferenceEngine:
             hidden_states = layer.post_attention_layernorm(hidden_states)
             hidden_states = layer.mlp(hidden_states)
             hidden_states = residual + hidden_states
+            post_time = time.perf_counter() - post_start
+
+            layer_time = time.perf_counter() - layer_start
+            total_layer_time += layer_time
+            self.logger.info(
+                f"Layer {layer_idx} time: {layer_time * 1000:.2f}ms "
+                f"(Q: {q_time * 1000:.1f}ms, KV: {kv_time * 1000:.1f}ms, "
+                f"Reshape: {reshape_time * 1000:.1f}ms, Attn: {attn_time * 1000:.1f}ms, "
+                f"Post: {post_time * 1000:.1f}ms)"
+            )
 
         # 最终层归一化和输出
+        norm_start = time.perf_counter()
         hidden_states = self.model.model.norm(hidden_states)
         logits = self.model.lm_head(hidden_states).float()
+        norm_time = time.perf_counter() - norm_start
+        self.logger.info(f"Final norm & output time: {norm_time * 1000:.2f}ms")
 
         # 采样下一个token
+        sample_start = time.perf_counter()
         next_tokens = []
         for i, seq in enumerate(batch):
             next_token = self._sample_next_token(logits[i, -1, :], seq.temperature, seq.top_p)
             next_tokens.append(next_token)
+        sample_time = time.perf_counter() - sample_start
+        self.logger.info(f"Sampling time: {sample_time * 1000:.2f}ms")
 
-            # 存储当前token的KV（所有层）
+        # KV缓存存储
+        kv_store_start = time.perf_counter()
+        for i, seq in enumerate(batch):
             token_idx = seq.current_position - 1
             slot = self.cache_manager.append_token(seq.seq_id, token_idx)
             if slot >= 0:
-                # 准备当前token在所有层的KV
                 token_kv = []
                 layer_kv = []
                 for layer_idx, (k, v) in enumerate(all_layer_kvs):
-                    # 获取当前序列在当前层的KV
-                    k_current = k[i:i + 1]  # [1, num_kv_heads, head_size]
-                    v_current = v[i:i + 1]  # [1, num_kv_heads, head_size]
-
-                    # 添加序列维度 [1, num_kv_heads, 1, head_size]
-                    # 舍弃batch_size 添加seq_len为1
-                    k_current = k_current.squeeze(0).unsqueeze(1)
-                    v_current = v_current.squeeze(0).unsqueeze(1)
+                    k_current = k[i:i + 1].squeeze(0).unsqueeze(1)
+                    v_current = v[i:i + 1].squeeze(0).unsqueeze(1)
                     layer_kv.append((k_current, v_current))
                 token_kv.append(layer_kv)
-
-                # 存储到缓存
                 self._store_token_kv(seq.seq_id, token_kv, [slot])
+        kv_store_time = time.perf_counter() - kv_store_start
+        self.logger.info(f"KV storage time: {kv_store_time * 1000:.2f}ms")
 
-            # 更新序列状态
-            self._update_sequence(seq, next_token)
+        # 序列更新
+        update_start = time.perf_counter()
+        for i, seq in enumerate(batch):
+            self._update_sequence(seq, next_tokens[i])
+        update_time = time.perf_counter() - update_start
+        self.logger.info(f"Sequence update time: {update_time * 1000:.2f}ms")
+
+        total_time = time.perf_counter() - start_time
+        self.logger.info(
+            f"DECODE BATCH COMPLETED: "
+            f"Total time: {total_time * 1000:.2f}ms ({len(batch)} seqs, "
+            f"Avg: {total_time / len(batch) * 1000:.2f}ms/seq)\n"
+        )
 
         return next_tokens
 
