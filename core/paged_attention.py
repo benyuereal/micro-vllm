@@ -5,8 +5,6 @@ import torch.nn.functional as F
 from typing import List, Tuple, Dict, Optional
 import numpy as np
 
-from core.buffer.DynamicBuffer import DynamicBuffer
-
 # 尝试导入flash_attn库，如果不可用则设为None
 try:
     import flash_attn
@@ -167,9 +165,6 @@ class PagedAttention(nn.Module):
             self.flash_attn = FlashAttention(head_size)
             self.use_real_flash_attn = False
 
-        # 初始化动态缓冲区
-        self.buffer = DynamicBuffer(device)
-
     def forward(
             self,
             query: torch.Tensor,
@@ -204,17 +199,13 @@ class PagedAttention(nn.Module):
         batch_size = query.size(0)
         max_seq_len = max(context_lens) + 1 if current_k is not None else max(context_lens)
 
-        # 检查并分配缓冲区
-        self.buffer.check_and_allocate(
-            batch_size=batch_size,
-            kv_num_heads=self.kv_num_heads,
-            head_size=self.head_size,
-            max_seq_len=max_seq_len,
-            dtype=query.dtype
-        )
+        # 准备批量KV缓存
+        all_keys = torch.zeros(batch_size, self.kv_num_heads, max_seq_len, self.head_size,
+                               device=self.device, dtype=query.dtype)
+        all_values = torch.zeros_like(all_keys)
 
-        # 使用缓冲区的切片
-        all_keys, all_values, all_positions = self.buffer.get_buffer_slice(batch_size, max_seq_len)
+        # 准备位置编码
+        all_positions = torch.zeros(batch_size, max_seq_len, dtype=torch.long, device=self.device)
 
         # 填充KV缓存和位置信息
         for i in range(batch_size):
