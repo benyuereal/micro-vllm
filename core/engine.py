@@ -168,6 +168,7 @@ class InferenceEngine:
         logits = outputs.logits
         past_key_values = outputs.past_key_values
         print("k shape", past_key_values[0][0].shape)
+
         # 存储KV到缓存
         for i, seq in enumerate(batch):
             num_tokens = len(seq.get_next_input_ids())
@@ -185,20 +186,27 @@ class InferenceEngine:
                 for layer_idx in range(len(past_key_values)):
                     k = past_key_values[layer_idx][0]
                     v = past_key_values[layer_idx][1]
+
+                    # 修改点：直接提取每个token的KV，不需要切片操作
                     if self.model_type == "qwen":
                         # Qwen 7B的KV格式
-                        print(k.shape)
-                        k = k.transpose(0, 1)
-                        v = v.transpose(0, 1)
-                        k = k[i, :, token_idx:token_idx + 1, :]
-                        v = v[i, :, token_idx:token_idx + 1, :]
-                        print("after", k.shape)
+                        # 直接提取当前token的所有头信息
+                        k_token = k[i, token_idx, :, :]  # [num_heads, head_size]
+                        v_token = v[i, token_idx, :, :]  # [num_heads, head_size]
 
+                        # 添加额外的维度以满足[32, 1, 128]的形状要求
+                        k_token = k_token.unsqueeze(1)  # [num_heads, 1, head_size]
+                        v_token = v_token.unsqueeze(1)  # [num_heads, 1, head_size]
                     else:
                         # Qwen 1.5的KV格式
-                        k = k[i, :, token_idx:token_idx + 1, :]
-                        v = v[i, :, token_idx:token_idx + 1, :]
-                    layer_kv.append((k, v))
+                        k_token = k[i, :, token_idx, :]  # [num_heads, head_size]
+                        v_token = v[i, :, token_idx, :]  # [num_heads, head_size]
+
+                        # 添加额外的维度以满足[32, 1, 128]的形状要求
+                        k_token = k_token.unsqueeze(1)  # [num_heads, 1, head_size]
+                        v_token = v_token.unsqueeze(1)  # [num_heads, 1, head_size]
+
+                    layer_kv.append((k_token, v_token))
                 token_kv.append(layer_kv)
 
             # 存储到缓存
