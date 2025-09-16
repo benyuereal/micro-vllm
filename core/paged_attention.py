@@ -124,10 +124,9 @@ class PagedAttention(nn.Module):
     ) -> torch.Tensor:
         batch_size = query.size(0)
 
-        new_positions = [l + 1 for l in context_lens]  # 新token位置
         # 应用旋转位置编码
         positions = torch.tensor(
-            new_positions, dtype=torch.int32, device=self.device
+            context_lens, dtype=torch.int32, device=self.device
         ).unsqueeze(1)
         query = self.rotary_emb(query.unsqueeze(2), positions).squeeze(2)
         key = self.rotary_emb(key.unsqueeze(2), positions).squeeze(2)
@@ -138,7 +137,6 @@ class PagedAttention(nn.Module):
             # 由于获取的是最新的位置，那么就是按照当前长度来去查询
             slot = cache_manager.get_slot(seq_id, token_idx)
             # 添加调试日志
-            print(f"Seq {seq_id} | Pos:  | Slot: {slot}")
             if slot >= 0:
                 # 确保存储新token的KV
                 k = key[i]
@@ -169,12 +167,11 @@ class PagedAttention(nn.Module):
 
         query = query.unsqueeze(1)
         # 使用flash_attn_with_kvcache
-        updated_lens = [l + 1 for l in context_lens]  # 包含新token
         output = flash_attn_with_kvcache(
             query,
             k_cache,
             v_cache,
-            cache_seqlens=torch.tensor(updated_lens, dtype=torch.int32, device=self.device),
+            cache_seqlens=torch.tensor(context_lens, dtype=torch.int32, device=self.device),
             block_table=block_table_tensor,
             softmax_scale=self.scale,
             causal=True
