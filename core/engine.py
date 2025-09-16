@@ -223,7 +223,6 @@ class InferenceEngine:
         """处理解码批次，适配不同模型架构"""
         # 准备输入数据
         input_ids = torch.tensor([seq.get_next_input_ids() for seq in batch], device=self.device)
-        context_lens = [seq.current_position - 1 for seq in batch]
         token_positions = [[pos for pos in range(seq.current_position - 1)] for seq in batch]
         seq_ids = [seq.seq_id for seq in batch]
 
@@ -232,14 +231,12 @@ class InferenceEngine:
         # 逐层处理
         all_layer_kvs = []
 
-        # KV缓存存储
-        kv_store_start = time.perf_counter()
         for i, seq in enumerate(batch):
             token_idx = seq.current_position - 1
             # 追加新的token
             self.cache_manager.append_token(seq.seq_id, token_idx)
-        kv_store_time = time.perf_counter() - kv_store_start
-        self.logger.info(f"KV storage time: {kv_store_time * 1000:.2f}ms")
+        context_lens = [seq.current_position for seq in batch]
+
 
         ## 追加新的token
         for layer_idx, layer in enumerate(self.model_layers):
