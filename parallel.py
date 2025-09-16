@@ -28,7 +28,9 @@ async def main():
         {"prompt": "如何学习深度学习？给出学习路径", "max_tokens": 1500, "temperature": 0.7, "stream": True},
         {"prompt": "比较React和Vue框架的优缺点", "max_tokens": 1500, "temperature": 0.6, "stream": True},
         {"prompt": "写一个关于太空探索的科幻故事开头", "max_tokens": 1500, "temperature": 0.9, "stream": True},
-        {"prompt": "解释区块链技术如何工作", "max_tokens": 1500, "temperature": 0.7, "stream": True}
+        {"prompt": "如何正确学习", "max_tokens": 1500, "temperature": 0.7, "stream": True},
+        {"prompt": "开发一个虚拟机", "max_tokens": 1500, "temperature": 0.7, "stream": True},
+
     ]
 
     async with aiohttp.ClientSession() as session:
