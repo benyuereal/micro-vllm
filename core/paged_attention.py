@@ -108,7 +108,7 @@ class PagedAttention(nn.Module):
             current_k: Optional[torch.Tensor] = None,
             current_v: Optional[torch.Tensor] = None
     ) -> torch.Tensor:
-        if self.use_flash_attn:
+        if True:
             return self._flash_attn_forward(
                 query, cache_manager, seq_ids, context_lens, layer_idx, current_k, current_v
             )
@@ -170,9 +170,10 @@ class PagedAttention(nn.Module):
                 v = value[i]
                 layer_kv.append((k, v))
                 # 存储到缓存
-                print(" decode layer kv shape", k.shape)
+                print(f" decode layer kv shape, slot\f{slot}", k.shape)
                 self.kv_store.store_tokens_layer_kv(layer_idx, [layer_kv], [slot])
 
+        query = query.unsqueeze(1)
         # 使用flash_attn_with_kvcache
         output = flash_attn_with_kvcache(
             query,
