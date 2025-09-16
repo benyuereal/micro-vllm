@@ -208,6 +208,9 @@ class PagedAttention(nn.Module):
             causal=True,  # 因果掩码
             # ❌ 不传rotary_cos/sin (性能最优)
             # ❌ 不传k/v (FA2自动从缓存读取)
+            num_splits=1,  # 固定为1，性能最优 (FA1默认)
+            rotary_interleaved=False,  # 更优的旋转编码 (FA1默认)
+            softcap=0.0,
         )
         return output.squeeze(1)  # [B, H, D]
 
