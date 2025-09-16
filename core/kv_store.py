@@ -27,8 +27,7 @@ class KVStore:
         :param slot_mapping: 槽位映射列表，每个元素表示token在缓存中的位置
         """
         # 获取当前层的缓存
-        k_cache = self.cache_manager.get_k_cache(layer_idx)
-        v_cache = self.cache_manager.get_v_cache(layer_idx)
+        k_cache, v_cache = self.cache_manager.get(layer_idx)
 
         # 将slot_mapping转为tensor
         slot_tensor = torch.tensor(slot_mapping, dtype=torch.int32, device=k_tensor.device)

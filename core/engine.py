@@ -171,7 +171,7 @@ class InferenceEngine:
             num_tokens = len(seq.get_next_input_ids())
 
             # 分配缓存块并获取slot映射
-            success, slot_mapping = self.cache_manager.allocate(seq.seq_id, num_tokens)
+            success, slot_mapping = self.cache_manager.alloc(seq.seq_id, num_tokens)
             if not success:
                 continue
 
@@ -232,9 +232,8 @@ class InferenceEngine:
         all_layer_kvs = []
 
         for i, seq in enumerate(batch):
-            token_idx = seq.current_position - 1
             # 追加新的token
-            self.cache_manager.append_token(seq.seq_id, token_idx)
+            self.cache_manager.append(seq.seq_id)
         context_lens = [seq.current_position for seq in batch]
 
 
@@ -279,7 +278,7 @@ class InferenceEngine:
 
         if seq.is_finished():
             self.scheduler.mark_finished(seq)
-            self.cache_manager.deallocate(seq.seq_id)
+            self.cache_manager.free(seq.seq_id)
             self.logger.info(f"FINISHED: {seq.seq_id}")
 
 

@@ -135,19 +135,19 @@ class PagedAttention(nn.Module):
         for i, token_idx in enumerate(context_lens):
             seq_id = seq_ids[i]
             # 由于获取的是最新的位置，那么就是按照当前长度来去查询
-            slot = cache_manager.get_slot(seq_id, token_idx - 1)
+            slot = cache_manager.get_slots(seq_id, [token_idx - 1])
             # 添加调试日志
-            if slot >= 0:
+            if slot[0] >= 0:
                 # 确保存储新token的KV
                 k = key[i]
                 v = value[i]
-                self.kv_store.store_tokens_layer_kv(layer_idx, [[(k, v)]], [slot])
+                self.kv_store.store_tokens_layer_kv(layer_idx, [[(k, v)]], slot)
 
         # 在存储之后准备块表，因为存储可能分配了新块
         block_tables = []
         max_blocks = 0
         for seq_id in seq_ids:
-            blocks = cache_manager.get_block_table(seq_id)
+            blocks = cache_manager.get_blocks(seq_id)
             block_tables.append(blocks)
             max_blocks = max(max_blocks, len(blocks))
 
@@ -162,8 +162,7 @@ class PagedAttention(nn.Module):
         )
 
         # 获取KV缓存
-        k_cache = cache_manager.get_k_cache(layer_idx)
-        v_cache = cache_manager.get_v_cache(layer_idx)
+        k_cache, v_cache = cache_manager.get(layer_idx)
 
         query = query.unsqueeze(1)
         # 使用flash_attn_with_kvcache
