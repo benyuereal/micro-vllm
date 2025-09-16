@@ -135,7 +135,8 @@ class PagedAttention(nn.Module):
         # 存储当前KV缓存（可能分配新块，改变块表）
         for i, token_idx in enumerate(context_lens):
             seq_id = seq_ids[i]
-            slot = cache_manager.append_token(seq_id, token_idx)
+            # 由于获取的是最新的位置，那么就是按照当前长度来去查询
+            slot = cache_manager.get_slot(seq_id, token_idx)
             # 添加调试日志
             print(f"Seq {seq_id} | Pos:  | Slot: {slot}")
             if slot >= 0:

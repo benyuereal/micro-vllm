@@ -206,6 +206,35 @@ class KVCacheManager:
             return new_block * self.block_size
         return -1
 
+    def get_slot(self, seq_id, token_position):
+        """根据序列ID和token位置获取对应的slot值
+
+        Args:
+            seq_id: 序列ID
+            token_position: token在序列中的位置
+
+        Returns:
+            slot值(int)，如果位置无效则返回-1
+        """
+        if seq_id not in self.allocated_blocks:
+            return -1
+
+        blocks = self.allocated_blocks[seq_id]
+        block_idx = token_position // self.block_size
+        pos_in_block = token_position % self.block_size
+
+        # 检查块索引是否有效
+        if block_idx >= len(blocks):
+            return -1
+
+        block_id = blocks[block_idx]
+
+        # 检查块内位置是否有效
+        if pos_in_block >= self.block_positions.get(block_id, 0):
+            return -1
+
+        return block_id * self.block_size + pos_in_block
+
     def get_block_table(self, seq_id):
         """获取序列的块表"""
         return self.allocated_blocks.get(seq_id, [])

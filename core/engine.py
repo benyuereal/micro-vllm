@@ -232,6 +232,16 @@ class InferenceEngine:
         # 逐层处理
         all_layer_kvs = []
 
+        # KV缓存存储
+        kv_store_start = time.perf_counter()
+        for i, seq in enumerate(batch):
+            token_idx = seq.current_position - 1
+            # 追加新的token
+            self.cache_manager.append_token(seq.seq_id, token_idx)
+        kv_store_time = time.perf_counter() - kv_store_start
+        self.logger.info(f"KV storage time: {kv_store_time * 1000:.2f}ms")
+
+        ## 追加新的token
         for layer_idx, layer in enumerate(self.model_layers):
 
             # 使用模型层适配器处理不同架构的层
