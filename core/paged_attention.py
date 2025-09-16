@@ -165,13 +165,11 @@ class PagedAttention(nn.Module):
             slot = cache_manager.append_token(seq_id, token_idx)
             if slot >= 0:
                 # 存储经过旋转后的 k和未经旋转的v
-                layer_kv = []
                 k = key[i]
                 v = value[i]
-                layer_kv.append((k, v))
                 # 存储到缓存
                 print(f" decode layer kv shape, slot\f{slot}", k.shape)
-                self.kv_store.store_tokens_layer_kv(layer_idx, [layer_kv], [slot])
+                self.kv_store.store_tokens_layer_kv(layer_idx, k, v, [slot])
 
         query = query.unsqueeze(1)
         print("q shape", query.shape)
