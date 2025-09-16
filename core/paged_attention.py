@@ -156,6 +156,12 @@ class PagedAttention(nn.Module):
         k_cache = cache_manager.get_k_cache(layer_idx)
         v_cache = cache_manager.get_v_cache(layer_idx)
 
+        print(f"Query shape: {query.shape}")
+        print(f"K cache shape: {k_cache.shape}")
+        print(f"V cache shape: {v_cache.shape}")
+        print(f"block_table shape: {block_table_tensor.shape}")
+        print(f"context_lens_tensor shape: {context_lens_tensor.shape}")
+
         # 使用Flash Attention
         output = flash_attn_with_kvcache(
             query.unsqueeze(1),  # 添加序列维度 [batch_size, 1, num_heads, head_size]
