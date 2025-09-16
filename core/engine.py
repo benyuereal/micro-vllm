@@ -55,7 +55,7 @@ class InferenceEngine:
         elif torch.cuda.is_available():
             device = 'cuda'
             block_size = 256
-            max_blocks = 512  # 40GB / (64 * 128 * 32 * 2 * 2) ≈ 640
+            max_blocks = 32  # 40GB / (64 * 128 * 32 * 2 * 2) ≈ 640
             dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
         else:
             device = 'cpu'
