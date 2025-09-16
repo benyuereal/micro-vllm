@@ -169,7 +169,21 @@ class KVCacheManager:
             block_id = blocks[block_idx]
             slot_mapping.append(block_id * self.block_size + pos_in_block)
 
+        self.update_block_positions(seq_id, num_tokens)
+
         return True, torch.tensor(slot_mapping, dtype=torch.int32, device=self.device)
+
+    def update_block_positions(self, seq_id, num_tokens):
+        """更新序列的块位置计数器（预填充完成后调用）"""
+        if seq_id not in self.allocated_blocks:
+            return
+
+        blocks = self.allocated_blocks[seq_id]
+        for i, block_id in enumerate(blocks):
+            start_idx = i * self.block_size
+            end_idx = min((i + 1) * self.block_size, num_tokens)
+            tokens_in_block = end_idx - start_idx
+            self.block_positions[block_id] = tokens_in_block  # 更新块内计数
 
     def append_token(self, seq_id, token_position):
         """为序列追加token并返回slot"""
