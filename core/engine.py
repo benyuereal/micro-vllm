@@ -8,7 +8,7 @@ from core.kv_store import  KVStore
 from models.qwen_adapter import QwenModelAdapter
 from .layer.layer import ModelLayerAdapter
 from .scheduler import Scheduler
-from .cache_manager import KVCacheManager
+from .cache_manager import KVCacheManager, store_kvcache
 from .sequence import Sequence
 from .model_loader import load_model
 import logging
@@ -157,58 +157,34 @@ class InferenceEngine:
     @torch.no_grad()
     def _process_prefill_batch(self, batch: List[Sequence]):
         """处理预填充批次，适配不同模型架构"""
-        input_ids_list = [seq.get_next_input_ids() for seq in batch]
-        input_tensor = self._pad_batch(input_ids_list, self.tokenizer.pad_token_id).to(self.device)
 
-        # 前向传播获取KV - 使用标准模型实现
+        """处理预填充批次 (极简版)"""
+        # 1. 准备输入
+        input_ids = [seq.get_next_input_ids() for seq in batch]
+        input_tensor = self._pad_batch(input_ids, self.tokenizer.pad_token_id).to(self.device)
+
+        # 2. 前向传播
         outputs = self.model(input_ids=input_tensor, use_cache=True)
+        logits, past_kvs = outputs.logits, outputs.past_key_values
 
-        logits = outputs.logits
-        past_key_values = outputs.past_key_values
-
-        # 存储KV到缓存
+        # 3. 存储KV (按序列处理)
         for i, seq in enumerate(batch):
-            num_tokens = len(seq.get_next_input_ids())
-
-            # 分配缓存块并获取slot映射
+            num_tokens = len(input_ids[i])
             success, slot_mapping = self.cache_manager.alloc(seq.seq_id, num_tokens)
-            if not success:
-                continue
-
-            # 存储每个token的KV
-            token_kv = []
-            for token_idx in range(num_tokens):
-                # 获取当前token在所有层的KV
-                layer_kv = []
-                for layer_idx in range(len(past_key_values)):
-                    k = past_key_values[layer_idx][0]
-                    v = past_key_values[layer_idx][1]
-
-                    # 修改点：直接提取每个token的KV，不需要切片操作
-                    if self.model_type == "qwen":
-                        # Qwen 7B的KV格式
-                        # 直接提取当前token的所有头信息
-                        k_token = k[i, token_idx, :, :]  # [num_heads, head_size]
-                        v_token = v[i, token_idx, :, :]  # [num_heads, head_size]
-
-                        # 添加额外的维度以满足[32, 1, 128]的形状要求
-                        k_token = k_token.unsqueeze(1)  # [num_heads, 1, head_size]
-                        v_token = v_token.unsqueeze(1)  # [num_heads, 1, head_size]
-                    else:
-                        # Qwen 1.5的KV格式
-                        k_token = k[i, :, token_idx, :]  # [num_heads, head_size]
-                        v_token = v[i, :, token_idx, :]  # [num_heads, head_size]
-
-                        # 添加额外的维度以满足[32, 1, 128]的形状要求
-                        k_token = k_token.unsqueeze(1)  # [num_heads, 1, head_size]
-                        v_token = v_token.unsqueeze(1)  # [num_heads, 1, head_size]
-
-                    layer_kv.append((k_token, v_token))
-                token_kv.append(layer_kv)
-
-            # 存储到缓存
-            self.kv_store.store_all_layers_kv(token_kv, slot_mapping)
-
+            if not success: continue
+            model_type = getattr(self, 'model_type', 'default')
+            for layer_idx, (k, v) in enumerate(past_kvs):
+                # 直接提取当前序列的所有token KV (避免循环)
+                if model_type == "qwen":
+                    k_tensor = k[i, :num_tokens, :, :]  # [N, H, D]
+                    v_tensor = v[i, :num_tokens, :, :]
+                else:
+                    k_tensor = k[i, :, :num_tokens, :].permute(1, 0, 2)  # [H, N, D]
+                    v_tensor = v[i, :, :num_tokens, :].permute(1, 0, 2)
+                k_cache, v_cache = self.cache_manager.get(layer_idx)
+                store_kvcache(k_tensor, v_tensor, k_cache, v_cache,
+                              torch.tensor(slot_mapping, dtype=torch.int32, device=k_tensor.device),
+                              self.block_size)
         # 采样下一个token
         next_tokens = []
         for i, seq in enumerate(batch):
