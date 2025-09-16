@@ -172,7 +172,7 @@ curl -X POST "http://localhost:8000/generate_stream" \
   -H "Content-Type: application/json" \
   -d '{
     "prompt": "写一个java版本的文件上传代码",
-    "max_tokens": 1000,
+    "max_tokens": 500,
     "temperature": 0.7,
     "stream": true
   }'
@@ -181,7 +181,7 @@ curl -X POST "http://localhost:8000/generate_stream" \
   -H "Content-Type: application/json" \
   -d '{
     "prompt": "写一个springboot+vue版本的文件上传代码",
-    "max_tokens": 1000,
+    "max_tokens": 500,
     "temperature": 0.7,
     "stream": true
   }'
