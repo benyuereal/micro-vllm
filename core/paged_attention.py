@@ -151,19 +151,23 @@ class PagedAttention(nn.Module):
             blocks + [-1] * (max_blocks - len(blocks)) for blocks in block_tables
         ], dtype=torch.int32, device=self.device)
 
-        # 3. FlashAttention-2调用 (修复k/v参数)
+        # 3. 准备新token的KV (修复形状问题)
+        if key is not None and value is not None:
+            # 修复：添加seqlen_knew维度 [B, H, D] -> [B, 1, H, D]
+            new_k = key.unsqueeze(1)  # [B, H, 1, D]
+            new_v = value.unsqueeze(1)  # [B, H, 1, D]
+        else:
+            new_k = None
+            new_v = None
+
+        # 4. FlashAttention-2调用 (修复k/v形状)
         k_cache, v_cache = cache_manager.get(layer_idx)
-
-        # 如果提供新token的KV，则传入k/v；否则传入None
-        new_k = key if key is not None else None
-        new_v = value if value is not None else None
-
         output = flash_attn_with_kvcache(
             q=query.unsqueeze(1),  # [B, 1, H, D]
             k_cache=k_cache,  # [max_blocks, block_size, H, D]
             v_cache=v_cache,
-            k=new_k,  # ✅ 修复：新token的KV
-            v=new_v,  # ✅ 修复：新token的KV
+            k=new_k,  # ✅ 修复：[B, 1, H, D]
+            v=new_v,  # ✅ 修复：[B, 1, H, D]
             cache_seqlens=torch.tensor(context_lens, dtype=torch.int32, device=self.device),
             block_table=block_table_tensor,  # [B, max_blocks]
             softmax_scale=self.scale,  # 1/sqrt(head_dim)
