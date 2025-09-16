@@ -19,12 +19,11 @@ class ModelLayerAdapter:
         self.kv_num_heads = kv_num_heads
         self.head_size = head_size
         # 初始化注意力模块
-        self.paged_attention = PagedAttention(
+        self.attention = PagedAttention(
             num_heads=num_heads,
             head_size=head_size,
             kv_num_heads=kv_num_heads,
-            device=device,
-            kv_store=kv_store
+            device=device
         )
 
     def process_layer(self, layer, hidden_states, cache_manager, seq_ids,
@@ -65,14 +64,14 @@ class ModelLayerAdapter:
         current_v = value
 
         # 注意力计算
-        attn_output = self.paged_attention(
+        attn_output = self.attention.forward(
             query=query,
             cache_manager=cache_manager,
             seq_ids=seq_ids,
             context_lens=context_lens,
             layer_idx=layer_idx,
-            current_k=current_k,
-            current_v=current_v
+            key=current_k,
+            value=current_v
         )
 
         attn_output = attn_output.reshape(attn_output.size(0), -1)
@@ -113,14 +112,14 @@ class ModelLayerAdapter:
         current_v = value
 
         # 注意力计算
-        attn_output = self.paged_attention(
+        attn_output = self.attention.forward(
             query=query,
             cache_manager=cache_manager,
             seq_ids=seq_ids,
             context_lens=context_lens,
             layer_idx=layer_idx,
-            current_k=current_k,
-            current_v=current_v
+            key=current_k,
+            value=current_v
         )
 
         attn_output = attn_output.reshape(attn_output.size(0), -1)
