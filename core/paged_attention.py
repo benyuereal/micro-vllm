@@ -30,7 +30,7 @@ from typing import List, Optional
 from core.cache_manager import KVCacheManager, store_kvcache
 
 try:
-    from flash_attn import flash_attn_with_kvcache
+    from flash_attn.flash_attn_interface import flash_attn_with_kvcache  # ✅ 正确导入
 except ImportError:
     print('flash_attn_with_kvcache not installed')
     flash_attn_with_kvcache = None
