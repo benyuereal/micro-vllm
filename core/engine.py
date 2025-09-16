@@ -304,6 +304,9 @@ class InferenceEngine:
 
         if seq.is_finished():
             self.scheduler.mark_finished(seq)
+            self.cache_manager.deallocate(seq.seq_id)
+            self.logger.info(f"FINISHED: {seq.seq_id}")
+
 
     def _pad_batch(self, sequences: List[List[int]], pad_token_id: int) -> torch.Tensor:
         """填充批次"""
