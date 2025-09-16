@@ -35,7 +35,6 @@ if not is_macos():
             block_size: tl.constexpr,
             num_heads: tl.constexpr,
             head_size: tl.constexpr,
-            BLOCK_SIZE: tl.constexpr,  # 每个线程块处理的元素数
     ):
         # 获取当前token的索引
         token_idx = tl.program_id(0)
@@ -53,36 +52,22 @@ if not is_macos():
         # 计算缓存中的起始位置（以块为单位）
         cache_base = block_id * block_size * num_heads * head_size
 
-        # 处理每个头的KV存储
-        for head_idx in range(0, num_heads, BLOCK_SIZE):
-            # 计算当前处理的头范围
-            head_range = head_idx + tl.arange(0, BLOCK_SIZE)
-            mask = head_range < num_heads
-
+        # 处理每个头
+        for head_idx in range(num_heads):
             # 计算key/value的内存偏移
-            key_offsets = token_idx * key_stride_0 + \
-                          head_range * key_stride_1 + \
-                          tl.arange(0, head_size) * key_stride_2
-
-            value_offsets = token_idx * value_stride_0 + \
-                            head_range * value_stride_1 + \
-                            tl.arange(0, head_size) * value_stride_2
+            key_offset = token_idx * key_stride_0 + head_idx * key_stride_1
+            value_offset = token_idx * value_stride_0 + head_idx * value_stride_1
 
             # 加载当前头的KV数据
-            key = tl.load(key_ptr + key_offsets, mask=mask[:, None] & (tl.arange(0, head_size)[None, :] < head_size))
-            value = tl.load(value_ptr + value_offsets,
-                            mask=mask[:, None] & (tl.arange(0, head_size)[None, :] < head_size))
+            key = tl.load(key_ptr + key_offset + tl.arange(0, head_size))
+            value = tl.load(value_ptr + value_offset + tl.arange(0, head_size))
 
             # 计算缓存中的位置
-            cache_offsets = cache_base + start_idx + \
-                            head_range * head_size + \
-                            tl.arange(0, head_size)
+            cache_offset = cache_base + start_idx + head_idx * head_size + tl.arange(0, head_size)
 
             # 存储到缓存
-            tl.store(k_cache_ptr + cache_offsets, key,
-                     mask=mask[:, None] & (tl.arange(0, head_size)[None, :] < head_size))
-            tl.store(v_cache_ptr + cache_offsets, value,
-                     mask=mask[:, None] & (tl.arange(0, head_size)[None, :] < head_size))
+            tl.store(k_cache_ptr + cache_offset, key)
+            tl.store(v_cache_ptr + cache_offset, value)
 
 
 def store_kvcache(
@@ -130,20 +115,15 @@ def store_kvcache(
             v_cache[block_id, start_idx:end_idx] = v_flat
     else:
         # CUDA高性能实现
-        assert key.is_contiguous() or key.stride(1) == head_size and key.stride(2) == 1
-        assert value.is_contiguous() or value.stride(1) == head_size and value.stride(2) == 1
-
-        # 定义每个线程块处理的头数
-        block_size_per_thread = 4  # 根据硬件调整
+        # 确保slot_mapping是正确类型的张量
 
         # 调用Triton内核
         store_kvcache_kernel[(num_tokens,)](
             key, key.stride(0), key.stride(1), key.stride(2),
             value, value.stride(0), value.stride(1), value.stride(2),
             k_cache, v_cache, slot_mapping,
-            block_size, num_heads, head_size, block_size_per_thread,
+            block_size, num_heads, head_size,
         )
-
 
 # 重构的 KV Cache 管理类
 class KVCacheManager:
