@@ -112,7 +112,6 @@ class PagedAttention(nn.Module):
             query, cache_manager, seq_ids, context_lens, layer_idx, current_k, current_v
         )
 
-
     def _flash_attn_forward(
             self,
             query: torch.Tensor,
@@ -125,7 +124,26 @@ class PagedAttention(nn.Module):
     ) -> torch.Tensor:
         batch_size = query.size(0)
 
-        # 准备块表 (batch_size, max_blocks)
+        # 应用旋转位置编码
+        positions = torch.tensor(
+            context_lens, dtype=torch.int32, device=self.device
+        ).unsqueeze(1)
+        query = self.rotary_emb(query.unsqueeze(2), positions).squeeze(2)
+        key = self.rotary_emb(key.unsqueeze(2), positions).squeeze(2)
+
+        # 存储当前KV缓存（可能分配新块，改变块表）
+        for i, token_idx in enumerate(context_lens):
+            seq_id = seq_ids[i]
+            slot = cache_manager.append_token(seq_id, token_idx)
+            if slot >= 0:
+                layer_kv = []
+                k = key[i]
+                v = value[i]
+                layer_kv.append((k, v))
+                # 存储到缓存
+                self.kv_store.store_tokens_layer_kv(layer_idx, [layer_kv], [slot])
+
+        # 在存储之后准备块表，因为存储可能分配了新块
         block_tables = []
         max_blocks = 0
         for seq_id in seq_ids:
@@ -147,29 +165,7 @@ class PagedAttention(nn.Module):
         k_cache = cache_manager.get_k_cache(layer_idx)
         v_cache = cache_manager.get_v_cache(layer_idx)
 
-        ## query、k的形状是:[batch_size, num_heads, head_size] 需要在第三个维度增加上seq_len满足旋转的参数需求
-        positions = torch.tensor(
-            context_lens, dtype=torch.int32, device=self.device
-        ).unsqueeze(1)
-        query = self.rotary_emb(query.unsqueeze(2), positions).squeeze(2)
-        key = self.rotary_emb(key.unsqueeze(2), positions).squeeze(2)
-        # 存储
-        ##  进行存储
-        for i, token_idx in enumerate(context_lens):
-            seq_id = seq_ids[i]
-            slot = cache_manager.append_token(seq_id, token_idx)
-            if slot >= 0:
-                # 存储经过旋转后的 k和未经旋转的v
-                layer_kv = []
-                k = key[i]
-                v = value[i]
-                layer_kv.append((k, v))
-                # 存储到缓存
-                print(f" decode layer kv shape, slot\f{slot}", k.shape)
-                self.kv_store.store_tokens_layer_kv(layer_idx, [layer_kv], [slot])
-
         query = query.unsqueeze(1)
-        print("q shape ",query.shape)
         # 使用flash_attn_with_kvcache
         output = flash_attn_with_kvcache(
             query,
@@ -180,7 +176,6 @@ class PagedAttention(nn.Module):
             softmax_scale=self.scale,
             causal=True
         )
-        print("output shape ",output.shape)
 
         return output.squeeze(1)  # [batch_size, num_heads, head_size]
 
