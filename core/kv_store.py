@@ -92,12 +92,8 @@ class KVStore:
         k_list = []
         v_list = []
         for token_idx in range(num_tokens):
-            k, v = token_kv[token_idx][layer_idx]
+            k, v = token_kv[0][0]
             # 确保形状正确 [num_kv_heads, head_dim]
-            if k.dim() == 3:
-                k = k.squeeze(1)
-            if v.dim() == 3:
-                v = v.squeeze(1)
             k_list.append(k)
             v_list.append(v)
 
