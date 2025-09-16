@@ -108,15 +108,10 @@ class PagedAttention(nn.Module):
             current_k: Optional[torch.Tensor] = None,
             current_v: Optional[torch.Tensor] = None
     ) -> torch.Tensor:
-        if True:
-            return self._flash_attn_forward(
-                query, cache_manager, seq_ids, context_lens, layer_idx, current_k, current_v
-            )
-        else:
-            return self._compatible_forward(
-                query, cache_manager, seq_ids, context_lens, layer_idx,
-                current_k, current_v
-            )
+        return self._flash_attn_forward(
+            query, cache_manager, seq_ids, context_lens, layer_idx, current_k, current_v
+        )
+
 
     def _flash_attn_forward(
             self,
@@ -185,88 +180,7 @@ class PagedAttention(nn.Module):
             softmax_scale=self.scale,
             causal=True
         )
+        print("output shape ",output.shape)
 
         return output.squeeze(1)  # [batch_size, num_heads, head_size]
 
-    def _compatible_forward(
-            self,
-            query: torch.Tensor,
-            cache_manager: KVCacheManager,
-            seq_ids: List[int],
-            context_lens: List[int],
-            layer_idx: int,
-            current_k: Optional[torch.Tensor] = None,
-            current_v: Optional[torch.Tensor] = None
-    ) -> torch.Tensor:
-        """
-        macOS兼容实现，专门为Qwen 0.5B模型的GQA特性优化
-        - Qwen 0.5B: 14个注意力头，2个KV头
-        - 输入query形状: [batch_size, num_heads, head_size] (解码时)
-        - 输出形状: [batch_size, num_heads, head_size]
-        """
-        batch_size = query.size(0)
-        max_seq_len = max(context_lens) + (1 if current_k is not None else 0)
-
-        # 准备KV缓存张量 [batch_size, kv_num_heads, max_seq_len, head_size]
-        all_keys = torch.zeros(
-            batch_size, self.kv_num_heads, max_seq_len, self.head_size,
-            device=self.device, dtype=query.dtype
-        )
-        all_values = torch.zeros_like(all_keys)
-
-        # 准备位置索引 [batch_size, max_seq_len]
-        all_positions = torch.zeros(batch_size, max_seq_len, dtype=torch.long, device=self.device)
-
-        # 从缓存中填充历史KV
-        for i in range(batch_size):
-            seq_id = seq_ids[i]
-            seq_len = context_lens[i]
-            positions = list(range(seq_len))
-
-            # 获取slot映射
-            slot_mapping = cache_manager.get_slot_mapping(seq_id, positions)
-
-            # 获取当前层的KV缓存
-            k_cache = cache_manager.get_k_cache(layer_idx)
-            v_cache = cache_manager.get_v_cache(layer_idx)
-
-            # 从缓存中提取KV
-            for j, slot in enumerate(slot_mapping):
-                if slot == -1:
-                    continue
-
-                block_id = slot // cache_manager.block_size
-                pos_in_block = slot % cache_manager.block_size
-
-                all_keys[i, :, j] = k_cache[block_id, pos_in_block]
-                all_values[i, :, j] = v_cache[block_id, pos_in_block]
-                all_positions[i, j] = positions[j]
-
-        # 包括当前token（如果有）
-        if current_k is not None and current_v is not None:
-            # 将当前KV添加到序列末尾
-            for i in range(batch_size):
-                all_keys[i, :, context_lens[i]] = current_k[i]
-                all_values[i, :, context_lens[i]] = current_v[i]
-                all_positions[i, context_lens[i]] = context_lens[i]  # 当前位置
-                context_lens[i] += 1
-
-
-        # 应用旋转位置编码
-        q_rot = query.unsqueeze(2)  # [batch_size, num_heads, 1, head_size]
-        q_positions = all_positions[:, -1:] if current_k is not None else all_positions[:, -1:]
-        q_rotated = self.rotary_emb(q_rot, q_positions)
-        k_rotated = self.rotary_emb(all_keys, all_positions)
-
-        # GQA处理: 确保键值头数与查询头数匹配
-        if self.kv_num_heads != self.num_heads:
-            repeat_times = self.num_heads // self.kv_num_heads
-            k_rotated = k_rotated.repeat_interleave(repeat_times, dim=1)
-            all_values = all_values.repeat_interleave(repeat_times, dim=1)
-
-        # 计算注意力
-        attn_scores = torch.matmul(q_rotated, k_rotated.transpose(-2, -1)) * self.scale
-        attn_weights = F.softmax(attn_scores, dim=-1)
-        output = torch.matmul(attn_weights, all_values)
-
-        return output.squeeze(2)  # [batch_size, num_heads, head_size]
