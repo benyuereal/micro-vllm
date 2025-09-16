@@ -240,7 +240,6 @@ class InferenceEngine:
         # 这里传的是算上当前token的长度
         context_lens = [seq.current_position for seq in batch]
         kv_store_time = time.perf_counter() - kv_store_start
-        self.logger.info(f"KV storage time: {kv_store_time * 1000:.2f}ms")
 
         ## 追加新的token
         for layer_idx, layer in enumerate(self.model_layers):
