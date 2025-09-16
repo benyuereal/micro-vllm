@@ -142,7 +142,7 @@ class PagedAttention(nn.Module):
         # 1. 旋转位置编码 (使用修复后的rotary_cos/sin)
         positions = torch.tensor(context_lens, dtype=torch.int32, device=self.device).unsqueeze(1)
         query = self.rotary_emb(query.unsqueeze(2), positions).squeeze(2)
-        rotary_cos, rotary_sin = self._get_rotary_cos_sin(context_lens)  # ✅ 修复：长度 ≥ KV缓存
+        rotary_cos, rotary_sin = self._get_rotary_cos_sin(context_lens, cache_manager)  # ✅ 修复：长度 ≥ KV缓存
 
         # 2. 准备Block Table (保持不变)
         block_tables = [cache_manager.get_blocks(seq_id) for seq_id in seq_ids]
@@ -178,13 +178,13 @@ class PagedAttention(nn.Module):
         return output.squeeze(1)  # [B, H, D]
 
     # core/paged_attention.py
-    def _get_rotary_cos_sin(self, context_lens):
+    def _get_rotary_cos_sin(self, context_lens, cache_manager):
         """计算rotary_cos/sin (长度必须 ≥ KV缓存长度)"""
         # 获取KV缓存的最大长度
         max_cache_len = max(context_lens) if context_lens else 0
         for seq_id in context_lens:
-            blocks = self.cache_manager.get_blocks(seq_id)
-            max_cache_len = max(max_cache_len, len(blocks) * self.cache_manager.block_size)
+            blocks = cache_manager.get_blocks(seq_id)
+            max_cache_len = max(max_cache_len, len(blocks) * cache_manager.block_size)
 
         # 计算最大位置
         max_pos = max(context_lens) if context_lens else 1
