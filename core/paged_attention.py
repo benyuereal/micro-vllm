@@ -135,48 +135,42 @@ class PagedAttention(nn.Module):
         self.use_flash_attn = self.device.type == 'cuda' and flash_attn_with_kvcache is not None
 
     # 仅展示关键修改部分 (其他代码保持不变)
+    # core/paged_attention.py
     def forward(self, query, cache_manager, seq_ids, context_lens, layer_idx, key=None, value=None) -> torch.Tensor:
         batch_size, num_heads, head_dim = query.shape
 
         # 1. 旋转位置编码 (手动计算rotary_cos/sin)
         positions = torch.tensor(context_lens, dtype=torch.int32, device=self.device).unsqueeze(1)
         query = self.rotary_emb(query.unsqueeze(2), positions).squeeze(2)
-
-        # 计算rotary_cos/sin (用于更新KV缓存)
         rotary_cos, rotary_sin = self._get_rotary_cos_sin(context_lens)
 
-        # 2. 存储新token KV (零拷贝)
-        if key is not None and context_lens is not None:
-            for i, (seq_id, token_idx) in enumerate(zip(seq_ids, context_lens)):
-                if token_idx > 0 and key[i].numel() > 0:
-                    slot = cache_manager.get_slots(seq_id, [token_idx - 1])[0]
-                    if slot >= 0:
-                        k_cache, v_cache = cache_manager.get(layer_idx)
-                        # 直接存储 (零拷贝)
-                        store_kvcache(key[i].unsqueeze(0), value[i].unsqueeze(0),
-                                      k_cache, v_cache, torch.tensor([slot], dtype=torch.int32, device=self.device),
-                                      cache_manager.block_size)
-
-        # 3. 准备Block Table
+        # 2. 准备Block Table
         block_tables = [cache_manager.get_blocks(seq_id) for seq_id in seq_ids]
         max_blocks = max(map(len, block_tables), default=0)
         block_table_tensor = torch.tensor([
             blocks + [-1] * (max_blocks - len(blocks)) for blocks in block_tables
         ], dtype=torch.int32, device=self.device)
 
-        # 4. FlashAttention-2调用 (新参数)
+        # 3. FlashAttention-2调用 (修复k/v参数)
         k_cache, v_cache = cache_manager.get(layer_idx)
+
+        # 如果提供新token的KV，则传入k/v；否则传入None
+        new_k = key if key is not None else None
+        new_v = value if value is not None else None
+
         output = flash_attn_with_kvcache(
             q=query.unsqueeze(1),  # [B, 1, H, D]
             k_cache=k_cache,  # [max_blocks, block_size, H, D]
             v_cache=v_cache,
+            k=new_k,  # ✅ 修复：新token的KV
+            v=new_v,  # ✅ 修复：新token的KV
             cache_seqlens=torch.tensor(context_lens, dtype=torch.int32, device=self.device),
             block_table=block_table_tensor,  # [B, max_blocks]
             softmax_scale=self.scale,  # 1/sqrt(head_dim)
-            causal=True,  # 因果掩码 (必须设置)
-            rotary_cos=rotary_cos,  # 旋转编码cos (必须设置)
-            rotary_sin=rotary_sin,  # 旋转编码sin (必须设置)
-            rotary_interleaved=False,  # 更优的旋转编码 (推荐设置)
+            causal=True,  # 因果掩码
+            rotary_cos=rotary_cos,  # 旋转编码cos
+            rotary_sin=rotary_sin,  # 旋转编码sin
+            rotary_interleaved=False,  # 更优的旋转编码
         )
         return output.squeeze(1)  # [B, H, D]
 
