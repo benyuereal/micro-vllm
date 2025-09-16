@@ -174,6 +174,7 @@ class PagedAttention(nn.Module):
                 self.kv_store.store_tokens_layer_kv(layer_idx, [layer_kv], [slot])
 
         query = query.unsqueeze(1)
+        print("q shape", query.shape)
         # 使用flash_attn_with_kvcache
         output = flash_attn_with_kvcache(
             query,
