@@ -134,73 +134,82 @@ class PagedAttention(nn.Module):
         self.rotary_emb = RotaryEmbedding(head_size, max_position=4096, device=self.device)
         self.use_flash_attn = self.device.type == 'cuda' and flash_attn_with_kvcache is not None
 
-    # 仅展示关键修改部分 (其他代码保持不变)
-    # core/paged_attention.py
-    def forward(self, query, cache_manager, seq_ids, context_lens, layer_idx, key=None, value=None) -> torch.Tensor:
+    def forward(
+            self,
+            query: torch.Tensor,  # [B, H, D] 查询张量
+            cache_manager: KVCacheManager,  # KV缓存管理器
+            seq_ids: List[int],  # [B] 序列ID列表
+            context_lens: List[int],  # [B] 每个序列的当前长度
+            layer_idx: int,  # 层索引
+            key: Optional[torch.Tensor] = None,  # [B, H, D] 新token的键 (可选)
+            value: Optional[torch.Tensor] = None  # [B, H, D] 新token的值 (可选)
+    ) -> torch.Tensor:
+        """
+        📌 **PagedAttention前向传播** (极简接口)
+
+        🔍 **参数**:
+            - query: 查询张量 [B, H, D]
+            - cache_manager: KV缓存管理器
+            - seq_ids: 序列ID列表 [B]
+            - context_lens: 每个序列的当前长度 [B]
+            - layer_idx: 层索引
+            - key/value: 新token的KV (解码阶段提供)
+
+        ✅ **返回**:
+            - output: 注意力输出 [B, H, D]
+
+        🧠 **内部逻辑**:
+            1. 应用旋转位置编码
+            2. (可选) 存储新token的KV到缓存
+            3. 准备Block Table (自动处理Block分配)
+            4. 调用FlashAttention
+        """
         batch_size, num_heads, head_dim = query.shape
 
-        # 1. 旋转位置编码 (使用修复后的rotary_cos/sin)
+        # 1. 旋转位置编码
         positions = torch.tensor(context_lens, dtype=torch.int32, device=self.device).unsqueeze(1)
         query = self.rotary_emb(query.unsqueeze(2), positions).squeeze(2)
-        rotary_cos, rotary_sin = self._get_rotary_cos_sin(context_lens, cache_manager)  # ✅ 修复：长度 ≥ KV缓存
+        key = self.rotary_emb(key.unsqueeze(2), positions).squeeze(2)
+        value = value  # value无需旋转
 
-        # 2. 准备Block Table (保持不变)
+
+        # 2. 存储新token KV (直接操作缓存，零拷贝)
+        for i, (seq_id, token_idx) in enumerate(zip(seq_ids, context_lens)):
+            if token_idx > 0:  # 确保不是第一个token
+                # 获取目标slot
+                slot = cache_manager.get_slots(seq_id, [token_idx - 1])[0]
+                if slot >= 0:
+                    # 直接存储到KV缓存 (使用cache_manager的store_kvcache)
+                    k_cache, v_cache = cache_manager.get(layer_idx)
+                    store_kvcache(
+                        key[i].unsqueeze(0), value[i].unsqueeze(0),  # [1, H, D]
+                        k_cache, v_cache,
+                        torch.tensor([slot], dtype=torch.int32, device=self.device),
+                        cache_manager.block_size
+                    )
+
+
+        # 3. 准备Block Table (自动处理动态Block分配)
         block_tables = [cache_manager.get_blocks(seq_id) for seq_id in seq_ids]
         max_blocks = max(map(len, block_tables), default=0)
         block_table_tensor = torch.tensor([
             blocks + [-1] * (max_blocks - len(blocks)) for blocks in block_tables
         ], dtype=torch.int32, device=self.device)
 
-        # 3. 准备新token的KV (保持不变)
-        if key is not None and value is not None:
-            new_k = key.unsqueeze(1)  # [B, 1, H, D]
-            new_v = value.unsqueeze(1)  # [B, 1, H, D]
-        else:
-            new_k = None
-            new_v = None
-
-        # 4. FlashAttention-2调用 (修复rotary_cos/sin长度)
+        # 4. FlashAttention (零拷贝)
         k_cache, v_cache = cache_manager.get(layer_idx)
         output = flash_attn_with_kvcache(
             q=query.unsqueeze(1),  # [B, 1, H, D]
             k_cache=k_cache,  # [max_blocks, block_size, H, D]
             v_cache=v_cache,
-            k=new_k,  # [B, 1, H, D]
-            v=new_v,  # [B, 1, H, D]
             cache_seqlens=torch.tensor(context_lens, dtype=torch.int32, device=self.device),
             block_table=block_table_tensor,  # [B, max_blocks]
             softmax_scale=self.scale,  # 1/sqrt(head_dim)
             causal=True,  # 因果掩码
-            rotary_cos=rotary_cos,  # ✅ 修复：长度 ≥ KV缓存
-            rotary_sin=rotary_sin,  # ✅ 修复：长度 ≥ KV缓存
-            rotary_interleaved=False,  # 更优的旋转编码
+            # ❌ 不传rotary_cos/sin (性能最优)
+            # ❌ 不传k/v (FA2自动从缓存读取)
         )
         return output.squeeze(1)  # [B, H, D]
-
-    # core/paged_attention.py
-    def _get_rotary_cos_sin(self, context_lens, cache_manager):
-        """计算rotary_cos/sin (长度必须 ≥ KV缓存长度)"""
-        # 获取KV缓存的最大长度
-        max_cache_len = max(context_lens) if context_lens else 0
-        for seq_id in context_lens:
-            blocks = cache_manager.get_blocks(seq_id)
-            max_cache_len = max(max_cache_len, len(blocks) * cache_manager.block_size)
-
-        # 计算最大位置
-        max_pos = max(context_lens) if context_lens else 1
-        max_pos = max(max_pos, max_cache_len + 1)  # 必须 ≥ KV缓存长度
-
-        # 预计算cos/sin (向量化)
-        t = torch.arange(max_pos, device=self.device, dtype=torch.bfloat16)
-        freqs = torch.einsum("i,j->ij", t, self.rotary_emb.inv_freq)
-        cos = freqs.cos()  # [max_pos, rotary_dim//2]
-        sin = freqs.sin()  # [max_pos, rotary_dim//2]
-
-        # 获取每个序列的cos/sin
-        positions = torch.tensor(context_lens, dtype=torch.int32, device=self.device)
-        cos = cos[positions]  # [B, rotary_dim//2]
-        sin = sin[positions]
-        return cos, sin
 
 
 # =============================================================================
