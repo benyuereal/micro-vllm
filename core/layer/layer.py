@@ -1,5 +1,7 @@
 import logging
+from typing import Optional
 
+from core.kv_store import KVStore
 from core.paged_attention import PagedAttention
 # 导入您现有的模块
 from models.qwen_adapter import QwenModelAdapter
@@ -9,7 +11,7 @@ from models.qwen_adapter import QwenModelAdapter
 class ModelLayerAdapter:
     """模型层适配器，处理不同架构的模型层计算"""
 
-    def __init__(self, model_config, device, num_heads: int, head_size: int, kv_num_heads: int):
+    def __init__(self, model_config, device, num_heads: int, head_size: int, kv_num_heads: int, kv_store: Optional[KVStore] = None):
         self.model_config = model_config
         self.device = device
         self.model_type = model_config.model_type
@@ -21,7 +23,8 @@ class ModelLayerAdapter:
             num_heads=num_heads,
             head_size=head_size,
             kv_num_heads=kv_num_heads,
-            device=device
+            device=device,
+            kv_store=kv_store
         )
 
     def process_layer(self, layer, hidden_states, cache_manager, seq_ids,

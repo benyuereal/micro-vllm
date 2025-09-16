@@ -1,10 +1,10 @@
-import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from typing import List, Tuple, Dict, Optional
+from typing import List, Optional
 
 from core import KVCacheManager
+from core.kv_store import KVStore
 
 try:
     from flash_attn import flash_attn_func, flash_attn_with_kvcache
@@ -69,7 +69,7 @@ class RotaryEmbedding(nn.Module):
 
 
 class PagedAttention(nn.Module):
-    def __init__(self, num_heads: int, head_size: int, kv_num_heads: int, device: str = "auto"):
+    def __init__(self, num_heads: int, head_size: int, kv_num_heads: int, device: str = "auto", kv_store: Optional[KVStore] = None):
         super().__init__()
         self.num_heads = num_heads
         self.kv_num_heads = kv_num_heads
@@ -88,7 +88,7 @@ class PagedAttention(nn.Module):
             max_position=4096,  # 与模型的最大位置一致
             device=self.device
         )
-
+        self.kv_store = kv_store
         # 检查Flash Attention可用性
         self.use_flash_attn = False
         if self.device == 'cuda':
@@ -108,9 +108,9 @@ class PagedAttention(nn.Module):
             current_k: Optional[torch.Tensor] = None,
             current_v: Optional[torch.Tensor] = None
     ) -> torch.Tensor:
-        if self.use_flash_attn:
+        if True:
             return self._flash_attn_forward(
-                query, cache_manager, seq_ids, context_lens, layer_idx
+                query, cache_manager, seq_ids, context_lens, layer_idx, current_k, current_v
             )
         else:
             return self._compatible_forward(
@@ -124,7 +124,9 @@ class PagedAttention(nn.Module):
             cache_manager: KVCacheManager,
             seq_ids: List[int],
             context_lens: List[int],
-            layer_idx: int
+            layer_idx: int,
+            key: Optional[torch.Tensor] = None,
+            value: Optional[torch.Tensor] = None
     ) -> torch.Tensor:
         batch_size = query.size(0)
 
@@ -150,8 +152,26 @@ class PagedAttention(nn.Module):
         k_cache = cache_manager.get_k_cache(layer_idx)
         v_cache = cache_manager.get_v_cache(layer_idx)
 
-        # 调整query维度: [batch_size, seq_len=1, num_heads, head_size]
-        query = query.unsqueeze(1)
+        ## query、k的形状是:[batch_size, num_heads, head_size] 需要在第三个维度增加上seq_len满足旋转的参数需求
+        positions = torch.tensor(
+            context_lens, dtype=torch.int32, device=self.device
+        ).unsqueeze(1)
+        query = self.rotary_emb(query.unsqueeze(2), positions).squeeze(2)
+        key = self.rotary_emb(key.unsqueeze(2), positions).squeeze(2)
+        # 存储
+        ##  进行存储
+        for i, token_idx in enumerate(context_lens):
+            seq_id = seq_ids[i]
+            slot = cache_manager.append_token(seq_id, token_idx)
+            if slot >= 0:
+                # 存储经过旋转后的 k和未经旋转的v
+                layer_kv = []
+                k = key[i]
+                v = value[i]
+                layer_kv.append((k, v))
+                # 存储到缓存
+                print(" decode layer kv shape", layer_kv[0][0].shape)
+                self.kv_store.store_tokens_layer_kv(layer_idx, [layer_kv], [slot])
 
         # 使用flash_attn_with_kvcache
         output = flash_attn_with_kvcache(

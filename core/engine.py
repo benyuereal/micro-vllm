@@ -1,18 +1,16 @@
 import torch
 import torch.nn.functional as F
-from typing import List, Tuple, Dict, Generator, Optional
+from typing import List, Tuple, Dict, Generator
 from queue import Queue
 import time
-import math
 
+from core.kv_store import  KVStore
 from models.qwen_adapter import QwenModelAdapter
 from .layer.layer import ModelLayerAdapter
-from .memory_manager import MemoryPool
 from .scheduler import Scheduler
-from .cache_manager import KVCacheManager, store_kvcache
+from .cache_manager import KVCacheManager
 from .sequence import Sequence
 from .model_loader import load_model
-from .paged_attention import PagedAttention
 import logging
 
 
@@ -72,20 +70,20 @@ class InferenceEngine:
             max_blocks, block_size, num_layers, num_key_value_heads, head_size, dtype, device
         )
 
+        # 初始化KV存储管理器
+        kv_store = KVStore(self.cache_manager, block_size)
         # 初始化模型层适配器
         self.layer_adapter = ModelLayerAdapter(self.model_config,
                                                device=device,
                                                num_heads=num_heads,
                                                kv_num_heads= num_key_value_heads,
-                                               head_size=head_size)
+                                               head_size=head_size,
+                                               kv_store=kv_store)
 
-        # 初始化注意力模块
-        self.paged_attention = PagedAttention(
-            num_heads=num_heads,
-            head_size=head_size,
-            kv_num_heads=num_key_value_heads,
-            device=device
-        )
+
+
+
+        self.kv_store = kv_store
 
         self.scheduler = Scheduler(max_batch_size, max_prefill_tokens)
         self.adapter = QwenModelAdapter()
@@ -211,7 +209,7 @@ class InferenceEngine:
 
             # 存储到缓存
             print("layer kv shape", token_kv[0][0][0].shape)
-            self._store_token_kv(seq.seq_id, token_kv, slot_mapping)
+            self.kv_store.store_all_layers_kv(token_kv, slot_mapping)
 
         # 采样下一个token
         next_tokens = []
@@ -221,40 +219,6 @@ class InferenceEngine:
             self._update_sequence(seq, next_token)
 
         return next_tokens
-
-    def _store_token_kv(self, seq_id, token_kv, slot_mapping):
-        """存储多个token的KV到缓存（按层批量存储）"""
-        num_tokens = len(token_kv)
-        if num_tokens == 0:
-            return
-
-        # 将slot_mapping转为tensor
-        slot_tensor = torch.tensor(slot_mapping, dtype=torch.int32, device=self.device)
-
-        # 按层处理
-        num_layers = len(token_kv[0])
-        for layer_idx in range(num_layers):
-            # 收集当前层的所有token的K和V
-            k_list = []
-            v_list = []
-            for token_idx in range(num_tokens):
-                k, v = token_kv[token_idx][layer_idx]
-                # 移除seq_len维度
-                k = k.squeeze(1)  # [num_kv_heads, head_dim]
-                v = v.squeeze(1)  # [num_kv_heads, head_dim]
-                k_list.append(k)
-                v_list.append(v)
-
-            # 堆叠成三维张量: [num_tokens, num_kv_heads, head_dim]
-            k_tensor = torch.stack(k_list, dim=0)  # 形状: [num_tokens, num_kv_heads, head_dim]
-            v_tensor = torch.stack(v_list, dim=0)  # 形状: [num_tokens, num_kv_heads, head_dim]
-
-            # 获取当前层的缓存
-            k_cache = self.cache_manager.get_k_cache(layer_idx)
-            v_cache = self.cache_manager.get_v_cache(layer_idx)
-
-            # 存储到缓存（现在满足三维要求）
-            store_kvcache(k_tensor, v_tensor, k_cache, v_cache, slot_tensor, self.block_size )
 
     @torch.no_grad()
     def _process_decode_batch(self, batch: List[Sequence]):
@@ -312,24 +276,6 @@ class InferenceEngine:
             next_tokens.append(next_token)
         sample_time = time.perf_counter() - sample_start
         self.logger.info(f"Sampling time: {sample_time * 1000:.2f}ms")
-
-        # KV缓存存储
-        kv_store_start = time.perf_counter()
-        for i, seq in enumerate(batch):
-            token_idx = seq.current_position - 1
-            slot = self.cache_manager.append_token(seq.seq_id, token_idx)
-            if slot >= 0:
-                layer_kv = []
-                for layer_idx, (k, v) in enumerate(all_layer_kvs):
-                    k_current = k[i:i + 1].squeeze(0).unsqueeze(1)
-                    v_current = v[i:i + 1].squeeze(0).unsqueeze(1)
-                    layer_kv.append((k_current, v_current))
-
-                # 存储到缓存
-                print(" decode layer kv shape", layer_kv[0][0].shape)
-                self._store_token_kv(seq.seq_id, [layer_kv], [slot])
-        kv_store_time = time.perf_counter() - kv_store_start
-        self.logger.info(f"KV storage time: {kv_store_time * 1000:.2f}ms")
 
         # 序列更新
         update_start = time.perf_counter()
