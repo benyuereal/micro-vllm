@@ -124,9 +124,10 @@ class PagedAttention(nn.Module):
     ) -> torch.Tensor:
         batch_size = query.size(0)
 
+        new_positions = [l + 1 for l in context_lens]  # 新token位置
         # 应用旋转位置编码
         positions = torch.tensor(
-            context_lens, dtype=torch.int32, device=self.device
+            new_positions, dtype=torch.int32, device=self.device
         ).unsqueeze(1)
         query = self.rotary_emb(query.unsqueeze(2), positions).squeeze(2)
         key = self.rotary_emb(key.unsqueeze(2), positions).squeeze(2)
@@ -135,13 +136,13 @@ class PagedAttention(nn.Module):
         for i, token_idx in enumerate(context_lens):
             seq_id = seq_ids[i]
             slot = cache_manager.append_token(seq_id, token_idx)
+            # 添加调试日志
+            print(f"Seq {seq_id} | Pos:  | Slot: {slot}")
             if slot >= 0:
-                layer_kv = []
+                # 确保存储新token的KV
                 k = key[i]
                 v = value[i]
-                layer_kv.append((k, v))
-                # 存储到缓存
-                self.kv_store.store_tokens_layer_kv(layer_idx, [layer_kv], [slot])
+                self.kv_store.store_tokens_layer_kv(layer_idx, [[(k, v)]], [slot])
 
         # 在存储之后准备块表，因为存储可能分配了新块
         block_tables = []
@@ -167,11 +168,12 @@ class PagedAttention(nn.Module):
 
         query = query.unsqueeze(1)
         # 使用flash_attn_with_kvcache
+        updated_lens = [l + 1 for l in context_lens]  # 包含新token
         output = flash_attn_with_kvcache(
             query,
             k_cache,
             v_cache,
-            cache_seqlens=torch.tensor(context_lens, dtype=torch.int32, device=self.device),
+            cache_seqlens=torch.tensor(updated_lens, dtype=torch.int32, device=self.device),
             block_table=block_table_tensor,
             softmax_scale=self.scale,
             causal=True

@@ -221,10 +221,9 @@ class InferenceEngine:
     @torch.no_grad()
     def _process_decode_batch(self, batch: List[Sequence]):
         """处理解码批次，适配不同模型架构"""
-
         # 准备输入数据
         input_ids = torch.tensor([seq.get_next_input_ids() for seq in batch], device=self.device)
-        context_lens = [seq.current_position  for seq in batch]
+        context_lens = [seq.current_position - 1 for seq in batch]
         token_positions = [[pos for pos in range(seq.current_position - 1)] for seq in batch]
         seq_ids = [seq.seq_id for seq in batch]
 
