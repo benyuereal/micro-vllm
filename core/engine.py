@@ -165,7 +165,6 @@ class InferenceEngine:
 
         logits = outputs.logits
         past_key_values = outputs.past_key_values
-        print("k shape", past_key_values[0][0].shape)
 
         # 存储KV到缓存
         for i, seq in enumerate(batch):
@@ -208,7 +207,6 @@ class InferenceEngine:
                 token_kv.append(layer_kv)
 
             # 存储到缓存
-            print("layer kv shape", token_kv[0][0][0].shape)
             self.kv_store.store_all_layers_kv(token_kv, slot_mapping)
 
         # 采样下一个token
@@ -223,30 +221,19 @@ class InferenceEngine:
     @torch.no_grad()
     def _process_decode_batch(self, batch: List[Sequence]):
         """处理解码批次，适配不同模型架构"""
-        self.logger.info(f"Starting decode batch with {len(batch)} sequences")
-        start_time = time.perf_counter()
 
         # 准备输入数据
-        prepare_start = time.perf_counter()
         input_ids = torch.tensor([seq.get_next_input_ids() for seq in batch], device=self.device)
         context_lens = [seq.current_position - 1 for seq in batch]
         token_positions = [[pos for pos in range(seq.current_position - 1)] for seq in batch]
         seq_ids = [seq.seq_id for seq in batch]
-        prepare_time = time.perf_counter() - prepare_start
-        self.logger.info(f"Data preparation time: {prepare_time * 1000:.2f}ms")
 
-        # 嵌入层 - 使用模型特定的嵌入层
-        embed_start = time.perf_counter()
         hidden_states = self.embedding_layer(input_ids)
-        embed_time = time.perf_counter() - embed_start
-        self.logger.info(f"Embedding time: {embed_time * 1000:.2f}ms")
 
         # 逐层处理
         all_layer_kvs = []
-        total_layer_time = 0
 
         for layer_idx, layer in enumerate(self.model_layers):
-            layer_start = time.perf_counter()
 
             # 使用模型层适配器处理不同架构的层
             hidden_states, layer_kv = self.layer_adapter.process_layer(
@@ -257,39 +244,21 @@ class InferenceEngine:
 
             all_layer_kvs.append(layer_kv)
 
-            layer_time = time.perf_counter() - layer_start
-            total_layer_time += layer_time
-            self.logger.info(f"Layer {layer_idx} time: {layer_time * 1000:.2f}ms")
 
         # 最终层归一化 - 使用模型特定的归一化层
-        norm_start = time.perf_counter()
         hidden_states = self.norm_layer(hidden_states)
         logits = self.model.lm_head(hidden_states).float()
-        norm_time = time.perf_counter() - norm_start
-        self.logger.info(f"Final norm & output time: {norm_time * 1000:.2f}ms")
 
         # 采样下一个token
-        sample_start = time.perf_counter()
         next_tokens = []
         for i, seq in enumerate(batch):
             next_token = self._sample_next_token(logits[i, -1, :], seq.temperature, seq.top_p)
             next_tokens.append(next_token)
-        sample_time = time.perf_counter() - sample_start
-        self.logger.info(f"Sampling time: {sample_time * 1000:.2f}ms")
 
         # 序列更新
-        update_start = time.perf_counter()
         for i, seq in enumerate(batch):
             self._update_sequence(seq, next_tokens[i])
-        update_time = time.perf_counter() - update_start
-        self.logger.info(f"Sequence update time: {update_time * 1000:.2f}ms")
 
-        total_time = time.perf_counter() - start_time
-        self.logger.info(
-            f"DECODE BATCH COMPLETED: "
-            f"Total time: {total_time * 1000:.2f}ms ({len(batch)} seqs, "
-            f"Avg: {total_time / len(batch) * 1000:.2f}ms/seq)\n"
-        )
 
         return next_tokens
 
