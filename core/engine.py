@@ -254,7 +254,7 @@ class InferenceEngine:
             v_cache = self.cache_manager.get_v_cache(layer_idx)
 
             # 存储到缓存（现在满足三维要求）
-            store_kvcache(k_tensor, v_tensor, k_cache, v_cache, slot_tensor, self.block_size, self.num_key_value_heads, self.head_size )
+            store_kvcache(k_tensor, v_tensor, k_cache, v_cache, slot_tensor, self.block_size )
 
     @torch.no_grad()
     def _process_decode_batch(self, batch: List[Sequence]):

@@ -67,11 +67,9 @@ class ModelLayerAdapter:
             cache_manager=cache_manager,
             seq_ids=seq_ids,
             context_lens=context_lens,
-            token_positions=token_positions,
             layer_idx=layer_idx,
             current_k=current_k,
-            current_v=current_v,
-            current_positions=current_positions
+            current_v=current_v
         )
 
         attn_output = attn_output.reshape(attn_output.size(0), -1)
@@ -117,11 +115,9 @@ class ModelLayerAdapter:
             cache_manager=cache_manager,
             seq_ids=seq_ids,
             context_lens=context_lens,
-            token_positions=token_positions,
             layer_idx=layer_idx,
             current_k=current_k,
-            current_v=current_v,
-            current_positions=current_positions
+            current_v=current_v
         )
 
         attn_output = attn_output.reshape(attn_output.size(0), -1)
