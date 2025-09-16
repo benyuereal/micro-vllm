@@ -326,6 +326,7 @@ class InferenceEngine:
                     layer_kv.append((k_current, v_current))
 
                 # 存储到缓存
+                print(" decode layer kv shape", layer_kv[0][0].shape)
                 self._store_token_kv(seq.seq_id, [layer_kv], [slot])
         kv_store_time = time.perf_counter() - kv_store_start
         self.logger.info(f"KV storage time: {kv_store_time * 1000:.2f}ms")
