@@ -45,27 +45,43 @@ class PrecomputedRotaryEmbedding(nn.Module):
         self.max_position = max_position
 
         # 预先计算所有位置的旋转矩阵
-        inv_freq = 1.0 / (base ** (torch.arange(0, dim, 2, device=self.device).to(torch.bfloat16) / dim))
+        inv_freq = 1.0 / (base ** (torch.arange(0, dim, 2, device=self.device, dtype=torch.bfloat16).to(torch.bfloat16) / dim))
         t = torch.arange(max_position, device=self.device, dtype=inv_freq.dtype)
         freqs = torch.einsum("i,j->ij", t, inv_freq)
         emb = torch.cat((freqs, freqs), dim=-1)
 
         # 预先计算好所有位置的cos和sin
-        self.register_buffer("cos_cache", emb.cos().unsqueeze(0).unsqueeze(0))  # [1, 1, max_position, dim]
-        self.register_buffer("sin_cache", emb.sin().unsqueeze(0).unsqueeze(0))  # [1, 1, max_position, dim]
+        cos_cache = emb.cos()
+        sin_cache = emb.sin()
+
+        # 注册为缓冲区，确保在正确设备上
+        self.register_buffer("cos_cache", cos_cache)
+        self.register_buffer("sin_cache", sin_cache)
+
+        # 预计算旋转矩阵的转置版本，以便快速应用
+        self.register_buffer("neg_mask", torch.tensor([-1.0, 1.0], device=self.device).repeat(dim // 2))
 
     def forward(self, x, positions):
         batch_size, num_heads, seq_len, head_size = x.shape
         positions = positions.to(self.device)
 
-        # 直接索引预先计算好的旋转矩阵
-        cos = self.cos_cache[:, :, positions].view(batch_size, 1, seq_len, head_size)
-        sin = self.sin_cache[:, :, positions].view(batch_size, 1, seq_len, head_size)
+        # 使用更高效的索引方式
+        flat_positions = positions.view(-1)
+
+        # 直接索引预先计算好的旋转矩阵 (使用高级索引)
+        cos = self.cos_cache[flat_positions].view(batch_size, seq_len, head_size).unsqueeze(1)
+        sin = self.sin_cache[flat_positions].view(batch_size, seq_len, head_size).unsqueeze(1)
+
+        # 扩展维度以匹配输入
+        cos = cos.expand(-1, num_heads, -1, -1)
+        sin = sin.expand(-1, num_heads, -1, -1)
+
+        # 优化旋转计算 - 使用更高效的元素级操作
+        x_rotated = x * self.neg_mask.reshape(1, 1, 1, -1)
+        x_rotated = torch.cat([x_rotated[..., head_size // 2:], x_rotated[..., :head_size // 2]], dim=-1)
 
         # 应用旋转
-        x1, x2 = x[..., :self.dim // 2], x[..., self.dim // 2:]
-        rotated = torch.cat((-x2, x1), dim=-1)
-        return x * cos + rotated * sin
+        return x * cos + x_rotated * sin
 
 class RotaryEmbedding(nn.Module):
     """
