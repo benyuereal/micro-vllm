@@ -174,7 +174,7 @@ class InferenceEngine:
         dtype = config["dtype"]
         if device == "cuda" and dtype is None:
             dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
-            if dtype == torch.bfloat16: self.model.to(torch.bfloat16)
+            # if dtype == torch.bfloat16: self.model.to(torch.bfloat16)
 
         return device, dtype, config["block_size"], config["max_blocks"]
 
