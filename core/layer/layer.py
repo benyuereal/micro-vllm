@@ -183,8 +183,9 @@ class ModelLayerAdapter:
         residual = hidden_states
         hidden_states = mlp_norm_fn(hidden_states)
         if self.cfg.get("moe", False):
-            # ✅ Qwen3 MoE: 混合专家
-            hidden_states = layer.moe(hidden_states)  # 直接调用moe模块
+            # ✅ Qwen3 MoE: 使用 mlp 模块 (包含 experts 和 gate)
+            if hasattr(layer, 'mlp') and hasattr(layer.mlp, 'experts'):
+                hidden_states = layer.mlp(hidden_states)  # 直接调用mlp模块
         else:
             # Qwen2: 普通MLP
             hidden_states = mlp_fn(hidden_states)
