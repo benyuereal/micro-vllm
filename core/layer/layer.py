@@ -93,7 +93,7 @@ class ModelLayerAdapter:
         # 预分配内存用于形状重塑
         # 根据典型batch size和序列长度预分配
         self.max_batch_size = 256
-        self.max_seq_len = 1024
+        self.max_seq_len = 4096
         self.hidden_size = self.num_heads * self.head_size
 
         # QKV缓冲区
