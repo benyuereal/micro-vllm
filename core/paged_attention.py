@@ -27,7 +27,7 @@ PagedAttention - vLLM 高性能注意力层 (FlashAttention优化版)
 import torch
 import torch.nn as nn
 from typing import List, Optional
-from core.cache_manager import KVCacheManager, store_kvcache, store_kvcache_batch
+from core.cache_manager import KVCacheManager, store_kvcache
 
 try:
     from flash_attn import flash_attn_with_kvcache  # ✅ 正确导入
