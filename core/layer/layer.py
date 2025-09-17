@@ -164,7 +164,7 @@ class ModelLayerAdapter:
         v = v.view(batch_size, seq_len, self.kv_num_heads, self.head_size).permute(0, 2, 1, 3)
 
         # 5. 注意力计算 (零拷贝)
-        attn_output = self.attention.forward(
+        attn_output = self.attention(
             query=q.squeeze(2),  # [B, H, D]
             cache_manager=cache_manager,
             seq_ids=seq_ids,
