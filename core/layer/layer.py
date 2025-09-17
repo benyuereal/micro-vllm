@@ -54,17 +54,22 @@ class ModelLayerAdapter:
 
     # 模型架构配置 (可扩展)
     MODEL_CONFIGS = {
-        "qwen": {
+        "qwen": {  # Qwen 7B
             "norm": "ln_1", "attn": "c_attn", "proj": "c_proj", "mlp_norm": "ln_2",
             "qkv_split": True, "qkv_proj": False,
             "mlp": "mlp", "residual": True,
         },
-        "qwen2": {
+        "qwen2": {  # Qwen 1.5/2.5
             "norm": "input_layernorm", "attn": None, "proj": "o_proj", "mlp_norm": "post_attention_layernorm",
             "qkv_split": False, "qkv_proj": True,
             "mlp": "mlp", "residual": True,
         },
-        # 可扩展其他模型...
+        "qwen3": {  # Qwen3 (与Qwen2相同，但支持MoE)
+            "norm": "input_layernorm", "attn": None, "proj": "o_proj", "mlp_norm": "post_attention_layernorm",
+            "qkv_split": False, "qkv_proj": True,
+            "mlp": "mlp", "residual": True,
+            "moe": True,  # ✅ 支持MoE
+        },
     }
 
     def __init__(self, model_config, device: str, num_heads: int, head_size: int, kv_num_heads: int):
@@ -174,10 +179,15 @@ class ModelLayerAdapter:
         attn_output = proj_fn(attn_output.reshape(batch_size, -1)).unsqueeze(1)  # [B, 1, D]
         hidden_states = residual + attn_output
 
-        # 7. MLP + 残差
+        # 7. MLP + 残差 (支持MoE)
         residual = hidden_states
         hidden_states = mlp_norm_fn(hidden_states)
-        hidden_states = mlp_fn(hidden_states)
+        if self.cfg.get("moe", False):
+            # ✅ Qwen3 MoE: 混合专家
+            hidden_states = layer.moe(hidden_states)  # 直接调用moe模块
+        else:
+            # Qwen2: 普通MLP
+            hidden_states = mlp_fn(hidden_states)
         hidden_states = residual + hidden_states
 
         return hidden_states, (k.squeeze(2), v.squeeze(2))  # [B, H, D]
