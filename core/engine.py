@@ -270,7 +270,6 @@ class InferenceEngine:
         hidden_states = self.embedding_layer(input_ids)
 
         # 逐层处理
-        all_layer_kvs = []
 
         for i, seq in enumerate(batch):
             # 追加新的token
@@ -288,7 +287,6 @@ class InferenceEngine:
                 [seq.current_position - 1 for seq in batch]
             )
 
-            all_layer_kvs.append(layer_kv)
 
 
         # 最终层归一化 - 使用模型特定的归一化层
