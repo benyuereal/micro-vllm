@@ -18,6 +18,13 @@ class Scheduler:
     def get_next_batch(self) -> Tuple[List[Sequence], str]:
         batch = []
         batch_type = "idle"
+        # 快速路径：单个序列时直接返回
+        if len(self.waiting_queue) == 1 and not self.running_sequences:
+            seq = self.waiting_queue.popleft()
+            self.running_sequences.append(seq)
+            return [seq], "prefill"
+        if len(self.running_sequences) == 1 and not self.waiting_queue:
+            return self.running_sequences, "decode"
 
         # 1. 预填充（保持不变）
         if self.waiting_queue:
