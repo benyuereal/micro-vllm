@@ -177,10 +177,22 @@ curl -X POST "http://localhost:8000/generate_stream" \
     "stream": true
   }'
   
+
+  
  curl -X POST "http://localhost:8000/generate_stream" \
   -H "Content-Type: application/json" \
   -d '{
     "prompt": "写一个springboot+vue版本的文件上传代码",
+    "max_tokens": 500,
+    "temperature": 0.7,
+    "stream": true
+  }'
+  
+  
+   curl -X POST "http://localhost:8000/generate_stream" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "prompt": "请介一下北京,上海，并且介绍一下两个地方的优势、区别",
     "max_tokens": 500,
     "temperature": 0.7,
     "stream": true
@@ -228,3 +240,30 @@ curl -X POST "http://localhost:8000/batch_generate" \
 > 建议：实际性能会因提示长度、温度参数和并发请求数波动，建议使用[官方基准工具](https://github.com/vllm-project/vllm/tree/main/benchmarks)验证您的环境
 
 （保留原有安装/使用/API部分）
+
+
+## 对比测试
+
+vllm
+```shell
+python -m vllm.entrypoints.openai.api_server \
+    --model /root/Qwen-7B-Chat \
+    --host 0.0.0.0 \
+    --port 8000 \
+    --trust-remote-code \
+    --served-model-name Qwen-7B-Chat
+    
+```
+
+```shell
+# 流式生成
+curl http://localhost:8000/v1/completions \
+    -H "Content-Type: application/json" \
+    -d '{
+        "model": "Qwen-7B-Chat",
+        "prompt": "你好，写一个java版本的文件上传代码",
+        "max_tokens": 1000,
+        "temperature": 0.7,
+        "stream": true
+    }'
+```
