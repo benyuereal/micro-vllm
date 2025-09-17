@@ -27,7 +27,7 @@ PagedAttention - vLLM 高性能注意力层 (FlashAttention优化版)
 import torch
 import torch.nn as nn
 from typing import List, Optional
-from core.cache_manager import KVCacheManager, store_kvcache
+from core.cache_manager import KVCacheManager, store_kvcache, store_kvcache_batch
 
 try:
     from flash_attn import flash_attn_with_kvcache  # ✅ 正确导入
@@ -35,6 +35,37 @@ except ImportError:
     print('flash_attn_with_kvcache not installed')
     flash_attn_with_kvcache = None
 
+
+# 预先计算所有可能位置的旋转矩阵
+class PrecomputedRotaryEmbedding(nn.Module):
+    def __init__(self, dim, max_position=8192, base=10000, device=None):
+        super().__init__()
+        self.dim = dim
+        self.device = device or torch.device('cpu')
+        self.max_position = max_position
+
+        # 预先计算所有位置的旋转矩阵
+        inv_freq = 1.0 / (base ** (torch.arange(0, dim, 2, device=self.device).to(torch.bfloat16) / dim))
+        t = torch.arange(max_position, device=self.device, dtype=inv_freq.dtype)
+        freqs = torch.einsum("i,j->ij", t, inv_freq)
+        emb = torch.cat((freqs, freqs), dim=-1)
+
+        # 预先计算好所有位置的cos和sin
+        self.register_buffer("cos_cache", emb.cos().unsqueeze(0).unsqueeze(0))  # [1, 1, max_position, dim]
+        self.register_buffer("sin_cache", emb.sin().unsqueeze(0).unsqueeze(0))  # [1, 1, max_position, dim]
+
+    def forward(self, x, positions):
+        batch_size, num_heads, seq_len, head_size = x.shape
+        positions = positions.to(self.device)
+
+        # 直接索引预先计算好的旋转矩阵
+        cos = self.cos_cache[:, :, positions].view(batch_size, 1, seq_len, head_size)
+        sin = self.sin_cache[:, :, positions].view(batch_size, 1, seq_len, head_size)
+
+        # 应用旋转
+        x1, x2 = x[..., :self.dim // 2], x[..., self.dim // 2:]
+        rotated = torch.cat((-x2, x1), dim=-1)
+        return x * cos + rotated * sin
 
 class RotaryEmbedding(nn.Module):
     """
@@ -131,7 +162,7 @@ class PagedAttention(nn.Module):
         if device != "auto": self.device = torch.device(device)
 
         # 初始化旋转位置编码
-        self.rotary_emb = RotaryEmbedding(head_size, max_position=4096, device=self.device)
+        self.rotary_emb = PrecomputedRotaryEmbedding(head_size, max_position=4096, device=self.device)
         self.use_flash_attn = self.device.type == 'cuda' and flash_attn_with_kvcache is not None
 
     def forward(
@@ -198,20 +229,6 @@ class PagedAttention(nn.Module):
 
         # 4. FlashAttention (零拷贝)
         k_cache, v_cache = cache_manager.get(layer_idx)
-        # output = flash_attn_with_kvcache(
-        #     q=query.unsqueeze(1),  # [B, 1, H, D]
-        #     k_cache=k_cache,  # [max_blocks, block_size, H, D]
-        #     v_cache=v_cache,
-        #     cache_seqlens=torch.tensor(context_lens, dtype=torch.int32, device=self.device),
-        #     block_table=block_table_tensor,  # [B, max_blocks]
-        #     softmax_scale=self.scale,  # 1/sqrt(head_dim)
-        #     causal=True,  # 因果掩码
-        #     # ❌ 不传rotary_cos/sin (性能最优)
-        #     # ❌ 不传k/v (FA2自动从缓存读取)
-        #     num_splits=1,  # 固定为1，性能最优 (FA1默认)
-        #     rotary_interleaved=False,  # 更优的旋转编码 (FA1默认)
-        #     softcap=0.0,
-        # )
         output = flash_attn_with_kvcache(q=query.unsqueeze(1),
                                 k_cache=k_cache,
                                 v_cache=v_cache,
