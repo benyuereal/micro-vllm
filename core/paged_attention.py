@@ -45,14 +45,14 @@ class PrecomputedRotaryEmbedding(nn.Module):
         self.max_position = max_position
 
         # 预先计算所有位置的旋转矩阵
-        inv_freq = 1.0 / (base ** (torch.arange(0, dim, 2, device=self.device, dtype=torch.bfloat16).to(torch.bfloat16) / dim))
+        inv_freq = 1.0 / (base ** (torch.arange(0, dim, 2, device=self.device).to(torch.bfloat16) / dim))
         t = torch.arange(max_position, device=self.device, dtype=inv_freq.dtype)
         freqs = torch.einsum("i,j->ij", t, inv_freq)
         emb = torch.cat((freqs, freqs), dim=-1)
 
         # 预先计算好所有位置的cos和sin
-        cos_cache = emb.cos()
-        sin_cache = emb.sin()
+        cos_cache = emb.cos().to(torch.bfloat16)
+        sin_cache = emb.sin().to(torch.bfloat16)
 
         # 注册为缓冲区，确保在正确设备上
         self.register_buffer("cos_cache", cos_cache)
@@ -277,6 +277,7 @@ class PagedAttention(nn.Module):
         # 4. FlashAttention (零拷贝)
         attn_start = get_current_time_us()
         k_cache, v_cache = cache_manager.get(layer_idx)
+        print("shape of q ,k v", query.shape, k_cache.shape, v_cache.shape)
         output = flash_attn_with_kvcache(
             q=query.unsqueeze(1),  # [B, 1, H, D]
             k_cache=k_cache,  # [max_blocks, block_size, H, D]
