@@ -28,7 +28,7 @@ import torch
 import torch.nn as nn
 from typing import List, Optional
 from core.cache_manager import KVCacheManager, store_kvcache, store_kvcache_batch
-
+import time
 try:
     from flash_attn import flash_attn_with_kvcache  # ✅ 正确导入
 except ImportError:
@@ -126,6 +126,13 @@ class RotaryEmbedding(nn.Module):
         return (x * cos) + (torch.cat((-x2, x1), dim=-1) * sin)
 
 
+
+# 添加时间测量工具函数
+def get_current_time_us():
+    """获取当前时间戳（微秒）"""
+    return time.time() * 1e6
+
+
 class PagedAttention(nn.Module):
     """
     📌 **分页注意力** - vLLM核心组件
@@ -165,6 +172,10 @@ class PagedAttention(nn.Module):
         self.rotary_emb = PrecomputedRotaryEmbedding(head_size, max_position=4096, device=self.device)
         self.use_flash_attn = self.device.type == 'cuda' and flash_attn_with_kvcache is not None
 
+        # 性能统计
+        self.total_calls = 0
+        self.total_time_us = 0
+
     def forward(
             self,
             query: torch.Tensor,  # [B, H, D] 查询张量
@@ -195,18 +206,24 @@ class PagedAttention(nn.Module):
             3. 准备Block Table (自动处理Block分配)
             4. 调用FlashAttention
         """
+        # 记录开始时间
+        start_time = get_current_time_us()
+        total_start = start_time
+
         batch_size, num_heads, head_dim = query.shape
 
         # 1. 旋转位置编码
+        rotary_start = get_current_time_us()
         positions = torch.tensor(context_lens, dtype=torch.int32, device=self.device).unsqueeze(1)
         query = self.rotary_emb(query.unsqueeze(2), positions).squeeze(2)
-        key = self.rotary_emb(key.unsqueeze(2), positions).squeeze(2)
-        value = value  # value无需旋转
-
+        if key is not None:
+            key = self.rotary_emb(key.unsqueeze(2), positions).squeeze(2)
+        rotary_end = get_current_time_us()
+        rotary_time = rotary_end - rotary_start
 
         # 2. 存储新token KV (直接操作缓存，零拷贝)
+        store_start = get_current_time_us()
         k_cache, v_cache = cache_manager.get(layer_idx)
-        # 获取所有需要存储的slot
         store_slots = []
         for i, (seq_id, token_idx) in enumerate(zip(seq_ids, context_lens)):
             if token_idx > 0:  # 确保不是第一个token
@@ -219,22 +236,30 @@ class PagedAttention(nn.Module):
         store_slots_tensor = torch.tensor(store_slots, dtype=torch.int32, device=self.device).unsqueeze(1)
 
         # 批量存储
-        store_kvcache_batch(
-            key=key.unsqueeze(1),  # [batch_size, 1, num_heads, head_size]
-            value=value.unsqueeze(1),
-            k_cache=k_cache,
-            v_cache=v_cache,
-            block_size=cache_manager.block_size,
-            slot_mapping_batch=store_slots_tensor
-        )
+        if key is not None and value is not None:
+            store_kvcache_batch(
+                key=key.unsqueeze(1),  # [batch_size, 1, num_heads, head_size]
+                value=value.unsqueeze(1),
+                k_cache=k_cache,
+                v_cache=v_cache,
+                block_size=cache_manager.block_size,
+                slot_mapping_batch=store_slots_tensor
+            )
+        store_end = get_current_time_us()
+        store_time = store_end - store_start
+
         # 3. 准备Block Table (自动处理动态Block分配)
+        block_start = get_current_time_us()
         block_tables = [cache_manager.get_blocks(seq_id) for seq_id in seq_ids]
         max_blocks = max(map(len, block_tables), default=0)
         block_table_tensor = torch.tensor([
             blocks + [-1] * (max_blocks - len(blocks)) for blocks in block_tables
         ], dtype=torch.int32, device=self.device)
+        block_end = get_current_time_us()
+        block_time = block_end - block_start
 
         # 4. FlashAttention (零拷贝)
+        attn_start = get_current_time_us()
         k_cache, v_cache = cache_manager.get(layer_idx)
         output = flash_attn_with_kvcache(
             q=query.unsqueeze(1),  # [B, 1, H, D]
@@ -250,6 +275,26 @@ class PagedAttention(nn.Module):
             rotary_interleaved=False,  # 更优的旋转编码 (FA1默认)
             softcap=0.0,
         )
+        attn_end = get_current_time_us()
+        attn_time = attn_end - attn_start
+
+        # 记录总时间
+        total_end = get_current_time_us()
+        total_time = total_end - total_start
+
+        # 更新性能统计
+        self.total_calls += 1
+        self.total_time_us += total_time
+
+        # 打印性能日志（每100次打印一次）
+        if self.total_calls % 100 == 0:
+            print(f"📊 PagedAttention 性能统计 (调用 #{self.total_calls}):")
+            print(f"   ├── 总耗时: {total_time:.2f}μs")
+            print(f"   ├── 旋转编码: {rotary_time:.2f}μs ({rotary_time / total_time * 100:.1f}%)")
+            print(f"   ├── KV存储: {store_time:.2f}μs ({store_time / total_time * 100:.1f}%)")
+            print(f"   ├── Block准备: {block_time:.2f}μs ({block_time / total_time * 100:.1f}%)")
+            print(f"   ├── FlashAttention: {attn_time:.2f}μs ({attn_time / total_time * 100:.1f}%)")
+            print(f"   └── 平均耗时: {self.total_time_us / self.total_calls:.2f}μs/call")
 
         return output.squeeze(1)  # [B, H, D]
 
