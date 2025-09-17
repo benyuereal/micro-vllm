@@ -105,9 +105,12 @@ class InferenceEngine:
         # 3. 自动配置参数
         self.num_layers = self.config.num_hidden_layers
         self.num_heads = self.config.num_attention_heads
-        self.head_size = self.config.hidden_size // self.num_heads
         self.kv_num_heads = getattr(self.config, 'num_key_value_heads', self.num_heads)
-
+        # ✅ 修复：从模型配置获取 head_size (支持Qwen3)
+        if hasattr(self.config, 'head_dim'):  # Qwen3 使用 head_dim
+            self.head_size = self.config.head_dim
+        else:  # Qwen2 使用 hidden_size // num_heads
+            self.head_size = self.config.hidden_size // self.num_heads
         # 4. 自动检测设备和精度
         self.device, self.dtype, self.block_size, self.max_blocks = self._auto_configure()
         self.logger.info(f"Using device={self.device}, dtype={self.dtype}")
