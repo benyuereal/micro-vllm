@@ -192,6 +192,67 @@ def store_kvcache(
             *cache_strides  # 展开为4个stride
         )
 
+def store_kvcache_batch(
+        key: torch.Tensor,  # [batch_size, num_tokens=1, num_heads, head_size]
+        value: torch.Tensor,  # [batch_size, num_tokens=1, num_heads, head_size]
+        k_cache: torch.Tensor,  # [num_blocks, block_size, num_heads, head_size]
+        v_cache: torch.Tensor,  # [num_blocks, block_size, num_heads, head_size]
+        slot_mapping_batch: torch.Tensor,  # [batch_size, num_tokens=1] (int32)
+        block_size: int,
+):
+    """
+    📌 **批量KV缓存存储函数**
+
+    🔍 **参数说明**:
+        - key/value: 当前批次的KV张量，形状为 [batch_size, num_tokens, num_heads, head_size]
+        - k_cache/v_cache: 全局KV缓存，形状为 [num_blocks, block_size, num_heads, head_size]
+        - slot_mapping_batch: 每个token对应的目标slot，形状为 [batch_size, num_tokens]
+        - block_size: 每个block的slot数
+
+    ⚡ **性能路径**:
+        1. CUDA + Triton: 使用核函数 (最快，~10μs/100tokens)
+        2. macOS/CPU: 使用PyTorch索引 (兼容模式，~50μs/100tokens)
+    """
+    batch_size, num_tokens, num_heads, head_size = key.shape
+
+    # 输入验证
+    assert key.dim() == 4 and value.dim() == 4
+    assert key.shape == (batch_size, num_tokens, num_heads, head_size)
+    assert value.shape == (batch_size, num_tokens, num_heads, head_size)
+    assert slot_mapping_batch.shape == (batch_size, num_tokens)
+    assert num_tokens == 1, "Only support num_tokens=1 for decoding stage"
+
+    if is_macos() or not torch.cuda.is_available():
+        # 🐢 兼容模式: 使用PyTorch索引 (适用于macOS/CPU)
+        for batch_idx in range(batch_size):
+            for token_idx in range(num_tokens):
+                slot = slot_mapping_batch[batch_idx, token_idx].item()
+                if slot != -1:  # -1表示无效slot
+                    block_id, offset_in_block = divmod(slot, block_size)
+                    k_cache[block_id, offset_in_block] = key[batch_idx, token_idx]
+                    v_cache[block_id, offset_in_block] = value[batch_idx, token_idx]
+    else:
+        # 🚀 高性能模式: 使用Triton核函数 (CUDA only)
+        # 将输入张量展平为 [batch_size * num_tokens, num_heads, head_size]
+        key_flat = key.view(-1, num_heads, head_size)
+        value_flat = value.view(-1, num_heads, head_size)
+        slot_mapping_flat = slot_mapping_batch.view(-1)
+
+        # 启动网格: (batch_size * num_tokens, num_heads) → 每个head一个线程
+        grid = (batch_size * num_tokens, num_heads)
+
+        # 获取缓存步长 (用于计算内存偏移)
+        cache_strides = k_cache.stride()  # (block_stride, block_size_stride, head_stride, dim_stride)
+
+        # 调用Triton核函数
+        store_kvcache_kernel[grid](
+            key_flat, *key_flat.stride(),
+            value_flat, *value_flat.stride(),
+            k_cache, v_cache, slot_mapping_flat,
+            block_size, num_heads, head_size,
+            *cache_strides
+        )
+
 
 # =============================================================================
 # 🧠 KVCacheManager 主类 (极简接口，极致性能)

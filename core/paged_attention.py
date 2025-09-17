@@ -27,7 +27,7 @@ PagedAttention - vLLM 高性能注意力层 (FlashAttention优化版)
 import torch
 import torch.nn as nn
 from typing import List, Optional
-from core.cache_manager import KVCacheManager, store_kvcache
+from core.cache_manager import KVCacheManager, store_kvcache, store_kvcache_batch
 
 try:
     from flash_attn import flash_attn_with_kvcache  # ✅ 正确导入
@@ -205,21 +205,28 @@ class PagedAttention(nn.Module):
 
 
         # 2. 存储新token KV (直接操作缓存，零拷贝)
+        k_cache, v_cache = cache_manager.get(layer_idx)
+        # 获取所有需要存储的slot
+        store_slots = []
         for i, (seq_id, token_idx) in enumerate(zip(seq_ids, context_lens)):
             if token_idx > 0:  # 确保不是第一个token
-                # 获取目标slot
                 slot = cache_manager.get_slots(seq_id, [token_idx - 1])[0]
-                if slot >= 0:
-                    # 直接存储到KV缓存 (使用cache_manager的store_kvcache)
-                    k_cache, v_cache = cache_manager.get(layer_idx)
-                    store_kvcache(
-                        key[i].unsqueeze(0), value[i].unsqueeze(0),  # [1, H, D]
-                        k_cache, v_cache,
-                        torch.tensor([slot], dtype=torch.int32, device=self.device),
-                        cache_manager.block_size
-                    )
+                store_slots.append(slot)
+            else:
+                store_slots.append(-1)  # 无效slot
 
+        # 转换为张量 [batch_size, 1]
+        store_slots_tensor = torch.tensor(store_slots, dtype=torch.int32, device=self.device).unsqueeze(1)
 
+        # 批量存储
+        store_kvcache_batch(
+            key=key.unsqueeze(1),  # [batch_size, 1, num_heads, head_size]
+            value=value.unsqueeze(1),
+            k_cache=k_cache,
+            v_cache=v_cache,
+            block_size=cache_manager.block_size,
+            slot_mapping_batch=store_slots_tensor
+        )
         # 3. 准备Block Table (自动处理动态Block分配)
         block_tables = [cache_manager.get_blocks(seq_id) for seq_id in seq_ids]
         max_blocks = max(map(len, block_tables), default=0)
