@@ -51,46 +51,20 @@ class PrecomputedRotaryEmbedding(nn.Module):
         emb = torch.cat((freqs, freqs), dim=-1)
 
         # 预先计算好所有位置的cos和sin
-        # 直接存储为 [max_position, dim] 而不是 [1, 1, max_position, dim]
-        cos_cache = emb.cos()
-        sin_cache = emb.sin()
-
-        # 注册为buffer，确保在正确设备上
-        self.register_buffer("cos_cache", cos_cache, persistent=False)
-        self.register_buffer("sin_cache", sin_cache, persistent=False)
-
-        # 预分配旋转后的模板，减少每次计算时的内存分配
-        self.register_buffer("rotated_template",
-                             torch.tensor([1.0, -1.0], device=self.device).repeat_interleave(dim // 2),
-                             persistent=False)
+        self.register_buffer("cos_cache", emb.cos().unsqueeze(0).unsqueeze(0))  # [1, 1, max_position, dim]
+        self.register_buffer("sin_cache", emb.sin().unsqueeze(0).unsqueeze(0))  # [1, 1, max_position, dim]
 
     def forward(self, x, positions):
         batch_size, num_heads, seq_len, head_size = x.shape
         positions = positions.to(self.device)
 
-        # 优化索引操作 - 直接使用一维索引
-        flat_positions = positions.view(-1)
+        # 直接索引预先计算好的旋转矩阵
+        cos = self.cos_cache[:, :, positions].view(batch_size, 1, seq_len, head_size)
+        sin = self.sin_cache[:, :, positions].view(batch_size, 1, seq_len, head_size)
 
-        # 使用gather而不是索引操作，减少内存访问
-        cos = torch.gather(
-            self.cos_cache,
-            0,
-            flat_positions.unsqueeze(1).expand(-1, self.dim)
-        ).view(batch_size, seq_len, 1, head_size).transpose(1, 2)
-
-        sin = torch.gather(
-            self.sin_cache,
-            0,
-            flat_positions.unsqueeze(1).expand(-1, self.dim)
-        ).view(batch_size, seq_len, 1, head_size).transpose(1, 2)
-
-        # 优化旋转计算 - 使用预计算的模板和向量化操作
-        x1 = x[..., :self.dim // 2]
-        x2 = x[..., self.dim // 2:]
-
-        # 使用预计算的旋转模板
-        rotated = torch.cat([x2 * self.rotated_template[0], x1 * self.rotated_template[1]], dim=-1)
-
+        # 应用旋转
+        x1, x2 = x[..., :self.dim // 2], x[..., self.dim // 2:]
+        rotated = torch.cat((-x2, x1), dim=-1)
         return x * cos + rotated * sin
 
 class RotaryEmbedding(nn.Module):
@@ -239,18 +213,11 @@ class PagedAttention(nn.Module):
         batch_size, num_heads, head_dim = query.shape
 
         # 1. 旋转位置编码
-        # 1. 旋转位置编码 (优化后的调用)
         rotary_start = get_current_time_us()
-        positions = torch.tensor(context_lens, dtype=torch.int32, device=self.device)
-
-        # 为query和key准备正确形状的输入
-        query_4d = query.unsqueeze(2)  # [B, H, 1, D]
-        query = self.rotary_emb(query_4d, positions).squeeze(2)
-
+        positions = torch.tensor(context_lens, dtype=torch.int32, device=self.device).unsqueeze(1)
+        query = self.rotary_emb(query.unsqueeze(2), positions).squeeze(2)
         if key is not None:
-            key_4d = key.unsqueeze(2)  # [B, H, 1, D]
-            key = self.rotary_emb(key_4d, positions).squeeze(2)
-
+            key = self.rotary_emb(key.unsqueeze(2), positions).squeeze(2)
         rotary_end = get_current_time_us()
         rotary_time = rotary_end - rotary_start
 
