@@ -212,7 +212,7 @@ class PagedAttention(nn.Module):
         #     rotary_interleaved=False,  # 更优的旋转编码 (FA1默认)
         #     softcap=0.0,
         # )
-        flash_attn_with_kvcache(q=query.unsqueeze(1),
+        output = flash_attn_with_kvcache(q=query.unsqueeze(1),
                                 k_cache=k_cache,
                                 v_cache=v_cache,
                                 cache_seqlens=torch.tensor(context_lens, dtype=torch.int32, device=self.device),
