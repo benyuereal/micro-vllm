@@ -51,37 +51,47 @@ class PrecomputedRotaryEmbedding(nn.Module):
         emb = torch.cat((freqs, freqs), dim=-1)
 
         # 预先计算好所有位置的cos和sin
-        cos_cache = emb.cos().to(torch.bfloat16)
-        sin_cache = emb.sin().to(torch.bfloat16)
+        # 直接存储为 [max_position, dim] 而不是 [1, 1, max_position, dim]
+        cos_cache = emb.cos()
+        sin_cache = emb.sin()
 
-        # 注册为缓冲区，确保在正确设备上
-        self.register_buffer("cos_cache", cos_cache)
-        self.register_buffer("sin_cache", sin_cache)
+        # 注册为buffer，确保在正确设备上
+        self.register_buffer("cos_cache", cos_cache, persistent=False)
+        self.register_buffer("sin_cache", sin_cache, persistent=False)
 
-        # 预计算旋转矩阵的转置版本，以便快速应用
-        self.register_buffer("neg_mask", torch.tensor([-1.0, 1.0], device=self.device).repeat(dim // 2))
+        # 预分配旋转后的模板，减少每次计算时的内存分配
+        self.register_buffer("rotated_template",
+                             torch.tensor([1.0, -1.0], device=self.device).repeat_interleave(dim // 2),
+                             persistent=False)
 
     def forward(self, x, positions):
         batch_size, num_heads, seq_len, head_size = x.shape
         positions = positions.to(self.device)
 
-        # 使用更高效的索引方式
+        # 优化索引操作 - 直接使用一维索引
         flat_positions = positions.view(-1)
 
-        # 直接索引预先计算好的旋转矩阵 (使用高级索引)
-        cos = self.cos_cache[flat_positions].view(batch_size, seq_len, head_size).unsqueeze(1)
-        sin = self.sin_cache[flat_positions].view(batch_size, seq_len, head_size).unsqueeze(1)
+        # 使用gather而不是索引操作，减少内存访问
+        cos = torch.gather(
+            self.cos_cache,
+            0,
+            flat_positions.unsqueeze(1).expand(-1, self.dim)
+        ).view(batch_size, seq_len, 1, head_size).transpose(1, 2)
 
-        # 扩展维度以匹配输入
-        cos = cos.expand(-1, num_heads, -1, -1)
-        sin = sin.expand(-1, num_heads, -1, -1)
+        sin = torch.gather(
+            self.sin_cache,
+            0,
+            flat_positions.unsqueeze(1).expand(-1, self.dim)
+        ).view(batch_size, seq_len, 1, head_size).transpose(1, 2)
 
-        # 优化旋转计算 - 使用更高效的元素级操作
-        x_rotated = x * self.neg_mask.reshape(1, 1, 1, -1)
-        x_rotated = torch.cat([x_rotated[..., head_size // 2:], x_rotated[..., :head_size // 2]], dim=-1)
+        # 优化旋转计算 - 使用预计算的模板和向量化操作
+        x1 = x[..., :self.dim // 2]
+        x2 = x[..., self.dim // 2:]
 
-        # 应用旋转
-        return x * cos + x_rotated * sin
+        # 使用预计算的旋转模板
+        rotated = torch.cat([x2 * self.rotated_template[0], x1 * self.rotated_template[1]], dim=-1)
+
+        return x * cos + rotated * sin
 
 class RotaryEmbedding(nn.Module):
     """
@@ -229,11 +239,18 @@ class PagedAttention(nn.Module):
         batch_size, num_heads, head_dim = query.shape
 
         # 1. 旋转位置编码
+        # 1. 旋转位置编码 (优化后的调用)
         rotary_start = get_current_time_us()
-        positions = torch.tensor(context_lens, dtype=torch.int32, device=self.device).unsqueeze(1)
-        query = self.rotary_emb(query.unsqueeze(2), positions).squeeze(2)
+        positions = torch.tensor(context_lens, dtype=torch.int32, device=self.device)
+
+        # 为query和key准备正确形状的输入
+        query_4d = query.unsqueeze(2)  # [B, H, 1, D]
+        query = self.rotary_emb(query_4d, positions).squeeze(2)
+
         if key is not None:
-            key = self.rotary_emb(key.unsqueeze(2), positions).squeeze(2)
+            key_4d = key.unsqueeze(2)  # [B, H, 1, D]
+            key = self.rotary_emb(key_4d, positions).squeeze(2)
+
         rotary_end = get_current_time_us()
         rotary_time = rotary_end - rotary_start
 
@@ -277,7 +294,6 @@ class PagedAttention(nn.Module):
         # 4. FlashAttention (零拷贝)
         attn_start = get_current_time_us()
         k_cache, v_cache = cache_manager.get(layer_idx)
-        print("shape of q ,k v", query.shape, k_cache.shape, v_cache.shape)
         output = flash_attn_with_kvcache(
             q=query.unsqueeze(1),  # [B, 1, H, D]
             k_cache=k_cache,  # [max_blocks, block_size, H, D]
