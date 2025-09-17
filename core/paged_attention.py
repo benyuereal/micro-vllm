@@ -229,12 +229,20 @@ class PagedAttention(nn.Module):
 
         # 4. FlashAttention (零拷贝)
         k_cache, v_cache = cache_manager.get(layer_idx)
-        output = flash_attn_with_kvcache(q=query.unsqueeze(1),
-                                k_cache=k_cache,
-                                v_cache=v_cache,
-                                cache_seqlens=torch.tensor(context_lens, dtype=torch.int32, device=self.device),
-                                block_table=block_table_tensor,
-                                softmax_scale=self.scale, causal=True)
+        output = flash_attn_with_kvcache(
+            q=query.unsqueeze(1),  # [B, 1, H, D]
+            k_cache=k_cache,  # [max_blocks, block_size, H, D]
+            v_cache=v_cache,
+            cache_seqlens=torch.tensor(context_lens, dtype=torch.int32, device=self.device),
+            block_table=block_table_tensor,  # [B, max_blocks]
+            softmax_scale=self.scale,  # 1/sqrt(head_dim)
+            causal=True,  # 因果掩码
+            # ❌ 不传rotary_cos/sin (性能最优)
+            # ❌ 不传k/v (FA2自动从缓存读取)
+            num_splits=1,  # 固定为1，性能最优 (FA1默认)
+            rotary_interleaved=False,  # 更优的旋转编码 (FA1默认)
+            softcap=0.0,
+        )
 
         return output.squeeze(1)  # [B, H, D]
 
