@@ -1,15 +1,28 @@
-from transformers import AutoModelForCausalLM, AutoTokenizer
+from transformers import AutoTokenizer, AutoModelForCausalLM
+import json
 import torch
 
+
 def load_model(model_path):
+    try:
+        # 先尝试直接加载
+        tokenizer = AutoTokenizer.from_pretrained(
+            model_path,
+            trust_remote_code=True,
+            use_fast=True  # 确保使用fast tokenizer
+        )
+    except Exception as e:
+        print(f"Fast tokenizer failed: {e}, trying slow tokenizer")
+        tokenizer = AutoTokenizer.from_pretrained(
+            model_path,
+            trust_remote_code=True,
+            use_fast=False  # 回退到slow tokenizer
+        )
+
     model = AutoModelForCausalLM.from_pretrained(
         model_path,
-        device_map="auto",  # 强制使用 CPU
-        torch_dtype=torch.bfloat16,
-        trust_remote_code=True
-    )
-    tokenizer = AutoTokenizer.from_pretrained(
-        model_path,
+        torch_dtype=torch.float16,
+        device_map="auto",
         trust_remote_code=True
     )
     return model, tokenizer
