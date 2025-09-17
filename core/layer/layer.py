@@ -73,16 +73,6 @@ class ModelLayerAdapter:
     }
 
     def __init__(self, model_config, device: str, num_heads: int, head_size: int, kv_num_heads: int):
-        """
-        📌 **初始化**
-
-        🔍 **参数**:
-            - model_config: 模型配置
-            - device: 设备 ("cuda", "mps", "cpu")
-            - num_heads: 注意力头数
-            - head_size: 每个头维度
-            - kv_num_heads: KV头数 (GQA支持)
-        """
         self.config = model_config
         self.device = device
         self.model_type = model_config.model_type
@@ -96,46 +86,45 @@ class ModelLayerAdapter:
             device=device
         )
 
-        # 验证模型类型
         if self.model_type not in self.MODEL_CONFIGS:
             raise ValueError(f"Unsupported model type: {self.model_type}")
         self.cfg = self.MODEL_CONFIGS[self.model_type]
 
+        # 预分配内存用于形状重塑
+        # 根据典型batch size和序列长度预分配
+        self.max_batch_size = 256
+        self.max_seq_len = 4096
+        self.hidden_size = self.num_heads * self.head_size
+
+        # QKV缓冲区
+        self.q_buffer = torch.empty(
+            self.max_batch_size, self.max_seq_len, self.num_heads, self.head_size,
+            device=self.device, dtype=torch.bfloat16
+        )
+        self.k_buffer = torch.empty(
+            self.max_batch_size, self.max_seq_len, self.kv_num_heads, self.head_size,
+            device=self.device, dtype=torch.bfloat16
+        )
+        self.v_buffer = torch.empty(
+            self.max_batch_size, self.max_seq_len, self.kv_num_heads, self.head_size,
+            device=self.device, dtype=torch.bfloat16
+        )
+
+
+
+
     def process_layer(self,
                       layer,
-                      hidden_states: torch.Tensor,  # [B, S, D]
+                      hidden_states: torch.Tensor,
                       cache_manager,
                       seq_ids: List[int],
                       context_lens: List[int],
                       token_positions: Optional[torch.Tensor] = None,
                       layer_idx: int = 0,
-                      current_positions: Optional[torch.Tensor] = None) -> Tuple[
-        torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
-        """
-        📌 **处理单层计算** (统一接口，自动适配模型架构)
+                      current_positions: Optional[torch.Tensor] = None):
 
-        🔍 **参数**:
-            - layer: 模型层 (transformer layer)
-            - hidden_states: 隐藏状态 [B, S, D]
-            - cache_manager: KVCacheManager实例
-            - seq_ids: 序列ID列表 [B]
-            - context_lens: 当前长度列表 [B]
-            - token_positions: token位置 (可选)
-            - layer_idx: 层索引
-            - current_positions: 当前位置 (可选)
+        batch_size, seq_len, hidden_dim = hidden_states.shape
 
-        ✅ **返回**:
-            - hidden_states: 更新后的隐藏状态 [B, S, D]
-            - (current_k, current_v): 当前层的KV [B, H, D]
-
-        🧠 **内部逻辑**:
-            1. 自动适配模型架构 (Qwen/Qwen2等)
-            2. 应用LayerNorm
-            3. 计算QKV (自动处理不同投影方式)
-            4. 重塑形状 [B, S, D] → [B, H, D]
-            5. 调用PagedAttention
-            6. 残差连接 + MLP
-        """
         # 1. 自动适配模型架构
         norm_fn = getattr(layer, self.cfg["norm"])
         mlp_norm_fn = getattr(layer, self.cfg["mlp_norm"])
@@ -145,50 +134,66 @@ class ModelLayerAdapter:
         residual = hidden_states
         hidden_states = norm_fn(hidden_states)
 
-        # 3. QKV计算 (自动处理不同投影方式)
+        # 3. QKV计算
         if self.cfg["qkv_split"]:
-            # Qwen 7B: 合并的c_attn投影
             qkv = layer.attn.c_attn(hidden_states)
             hidden_size = qkv.shape[-1] // 3
             q, k, v = qkv.split(hidden_size, dim=-1)
         else:
-            # Qwen 1.5: 分开的q_proj/k_proj/v_proj
             q = layer.self_attn.q_proj(hidden_states)
             k = layer.self_attn.k_proj(hidden_states)
             v = layer.self_attn.v_proj(hidden_states)
 
-        # 4. 重塑形状 [B, S, D] → [B, H, D]
-        batch_size, seq_len, _ = hidden_states.shape
-        q = q.view(batch_size, seq_len, self.num_heads, self.head_size).permute(0, 2, 1, 3)  # [B, H, S, D]
-        k = k.view(batch_size, seq_len, self.kv_num_heads, self.head_size).permute(0, 2, 1, 3)
-        v = v.view(batch_size, seq_len, self.kv_num_heads, self.head_size).permute(0, 2, 1, 3)
+        # 4. 优化后的形状重塑 (使用连续内存布局)
+        # 直接使用view而不是permute，避免内存不连续
+        q_4d = q.view(batch_size, seq_len, self.num_heads, self.head_size)
+        k_4d = k.view(batch_size, seq_len, self.kv_num_heads, self.head_size)
+        v_4d = v.view(batch_size, seq_len, self.kv_num_heads, self.head_size)
 
-        # 5. 注意力计算 (零拷贝)
+        # 使用预分配的内存缓冲区
+        if (batch_size <= self.max_batch_size and
+                seq_len <= self.max_seq_len and
+                q_4d.dtype == self.q_buffer.dtype):
+
+            # 将数据复制到预分配的缓冲区
+            self.q_buffer[:batch_size, :seq_len] = q_4d
+            self.k_buffer[:batch_size, :seq_len] = k_4d
+            self.v_buffer[:batch_size, :seq_len] = v_4d
+
+            # 使用连续的内存布局
+            q_reshaped = self.q_buffer[:batch_size, :seq_len].contiguous()
+            k_reshaped = self.k_buffer[:batch_size, :seq_len].contiguous()
+            v_reshaped = self.v_buffer[:batch_size, :seq_len].contiguous()
+        else:
+            # 回退到原始方法
+            q_reshaped = q_4d.contiguous()
+            k_reshaped = k_4d.contiguous()
+            v_reshaped = v_4d.contiguous()
+
+        # 5. 注意力计算
         attn_output = self.attention(
-            query=q.squeeze(2),  # [B, H, D]
+            query=q_reshaped.view(batch_size, self.num_heads, -1),
             cache_manager=cache_manager,
             seq_ids=seq_ids,
             context_lens=context_lens,
             layer_idx=layer_idx,
-            key=k.squeeze(2),  # [B, H, D]
-            value=v.squeeze(2)  # [B, H, D]
+            key=k_reshaped.view(batch_size, self.kv_num_heads, -1),
+            value=v_reshaped.view(batch_size, self.kv_num_heads, -1)
         )
 
         # 6. 输出投影 + 残差
         proj_fn = getattr(layer.self_attn if self.cfg["qkv_proj"] else layer.attn, self.cfg["proj"])
-        attn_output = proj_fn(attn_output.reshape(batch_size, -1)).unsqueeze(1)  # [B, 1, D]
+        attn_output = proj_fn(attn_output.view(batch_size, -1)).unsqueeze(1)
         hidden_states = residual + attn_output
 
-        # 7. MLP + 残差 (支持MoE)
+        # 7. MLP + 残差
         residual = hidden_states
         hidden_states = mlp_norm_fn(hidden_states)
         if self.cfg.get("moe", False):
-            # ✅ Qwen3 MoE: 使用 mlp 模块 (包含 experts 和 gate)
-            if hasattr(layer, 'mlp') and hasattr(layer.mlp, 'experts'):
-                hidden_states = layer.mlp(hidden_states)  # 直接调用mlp模块
+            hidden_states = layer.mlp(hidden_states)
         else:
-            # Qwen2: 普通MLP
             hidden_states = mlp_fn(hidden_states)
         hidden_states = residual + hidden_states
 
-        return hidden_states, (k.squeeze(2), v.squeeze(2))  # [B, H, D]
+        return hidden_states, (k_reshaped.view(batch_size, self.kv_num_heads, -1),
+                               v_reshaped.view(batch_size, self.kv_num_heads, -1))

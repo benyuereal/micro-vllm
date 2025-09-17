@@ -154,104 +154,148 @@ class PagedAttention(nn.Module):
         self.num_heads = num_heads
         self.kv_num_heads = kv_num_heads
         self.head_size = head_size
-        self.scale = head_size ** -0.5  # 1/sqrt(head_size)
+        self.scale = head_size ** -0.5
 
         # 自动检测设备
-        self.device = (torch.device('mps') if torch.backends.mps.is_available() else
-                       torch.device('cuda') if torch.cuda.is_available() else torch.device('cpu'))
-        if device != "auto": self.device = torch.device(device)
+        self.device = (torch.device('cuda') if torch.cuda.is_available() else
+                       torch.device('mps') if torch.backends.mps.is_available() else
+                       torch.device('cpu'))
+        if device != "auto":
+            self.device = torch.device(device)
 
-        # 初始化旋转位置编码
-        self.rotary_emb = PrecomputedRotaryEmbedding(head_size, max_position=4096, device=self.device)
+        # 初始化预计算旋转位置编码
+        self.rotary_emb = PrecomputedRotaryEmbedding(head_size, max_position=32768, device=self.device)
         self.use_flash_attn = self.device.type == 'cuda' and flash_attn_with_kvcache is not None
+
+        # 预分配Block Table内存
+        self.max_batch_size = 256  # 根据实际需求调整
+        self.max_blocks_per_seq = 512
+        self.block_table_buffer = torch.full(
+            (self.max_batch_size, self.max_blocks_per_seq),
+            -1,
+            dtype=torch.int32,
+            device=self.device
+        )
+
+        # 异步存储相关的流
+        if self.device.type == 'cuda':
+            self.store_stream = torch.cuda.Stream(device=self.device)
+        else:
+            self.store_stream = None
+
+    def _prepare_block_table_async(self, cache_manager, seq_ids):
+        """异步准备Block Table"""
+        block_tables = []
+        max_blocks = 0
+
+        for seq_id in seq_ids:
+            blocks = cache_manager.get_blocks(seq_id)
+            block_tables.append(blocks)
+            max_blocks = max(max_blocks, len(blocks))
+
+        # 使用预分配的buffer
+        block_table = self.block_table_buffer[:len(seq_ids), :max_blocks].clone()
+
+        for i, blocks in enumerate(block_tables):
+            block_table[i, :len(blocks)] = torch.tensor(blocks, dtype=torch.int32, device=self.device)
+            if len(blocks) < max_blocks:
+                block_table[i, len(blocks):] = -1
+
+        return block_table, max_blocks
 
     def forward(
             self,
-            query: torch.Tensor,  # [B, H, D] 查询张量
-            cache_manager: KVCacheManager,  # KV缓存管理器
-            seq_ids: List[int],  # [B] 序列ID列表
-            context_lens: List[int],  # [B] 每个序列的当前长度
-            layer_idx: int,  # 层索引
-            key: Optional[torch.Tensor] = None,  # [B, H, D] 新token的键 (可选)
-            value: Optional[torch.Tensor] = None  # [B, H, D] 新token的值 (可选)
+            query: torch.Tensor,
+            cache_manager: KVCacheManager,
+            seq_ids: List[int],
+            context_lens: List[int],
+            layer_idx: int,
+            key: Optional[torch.Tensor] = None,
+            value: Optional[torch.Tensor] = None
     ) -> torch.Tensor:
-        """
-        📌 **PagedAttention前向传播** (极简接口)
-
-        🔍 **参数**:
-            - query: 查询张量 [B, H, D]
-            - cache_manager: KV缓存管理器
-            - seq_ids: 序列ID列表 [B]
-            - context_lens: 每个序列的当前长度 [B]
-            - layer_idx: 层索引
-            - key/value: 新token的KV (解码阶段提供)
-
-        ✅ **返回**:
-            - output: 注意力输出 [B, H, D]
-
-        🧠 **内部逻辑**:
-            1. 应用旋转位置编码
-            2. (可选) 存储新token的KV到缓存
-            3. 准备Block Table (自动处理Block分配)
-            4. 调用FlashAttention
-        """
         batch_size, num_heads, head_dim = query.shape
 
-        # 1. 旋转位置编码
-        positions = torch.tensor(context_lens, dtype=torch.int32, device=self.device).unsqueeze(1)
-        query = self.rotary_emb(query.unsqueeze(2), positions).squeeze(2)
-        key = self.rotary_emb(key.unsqueeze(2), positions).squeeze(2)
-        value = value  # value无需旋转
+        # 1. 应用预计算的旋转位置编码 (零计算)
+        positions = torch.tensor(context_lens, dtype=torch.long, device=self.device).unsqueeze(1)
 
+        # 重塑query为4D格式用于旋转编码
+        query_4d = query.unsqueeze(2)  # [B, H, 1, D]
+        query_rotated = self.rotary_emb(query_4d, positions).squeeze(2)
 
-        # 2. 存储新token KV (直接操作缓存，零拷贝)
-        k_cache, v_cache = cache_manager.get(layer_idx)
-        # 获取所有需要存储的slot
-        store_slots = []
-        for i, (seq_id, token_idx) in enumerate(zip(seq_ids, context_lens)):
-            if token_idx > 0:  # 确保不是第一个token
-                slot = cache_manager.get_slots(seq_id, [token_idx - 1])[0]
-                store_slots.append(slot)
+        if key is not None:
+            key_4d = key.unsqueeze(2)
+            key_rotated = self.rotary_emb(key_4d, positions).squeeze(2)
+        else:
+            key_rotated = None
+
+        # 2. 异步KV存储 (与后续计算重叠)
+        if key is not None and value is not None and key_rotated is not None:
+            if self.store_stream is not None:
+                # 使用CUDA流进行异步存储
+                with torch.cuda.stream(self.store_stream):
+                    self._store_kv_async(cache_manager, layer_idx, seq_ids, context_lens, key_rotated, value)
             else:
-                store_slots.append(-1)  # 无效slot
+                # 非CUDA设备的同步版本
+                self._store_kv_sync(cache_manager, layer_idx, seq_ids, context_lens, key_rotated, value)
 
-        # 转换为张量 [batch_size, 1]
+        # 3. 异步准备Block Table (与FlashAttention计算重叠)
+        if self.store_stream is not None:
+            # 在主流中准备Block Table
+            block_table_tensor, max_blocks = self._prepare_block_table_async(cache_manager, seq_ids)
+        else:
+            # 同步版本
+            block_table_tensor, max_blocks = self._prepare_block_table_async(cache_manager, seq_ids)
+
+        # 4. FlashAttention计算
+        k_cache, v_cache = cache_manager.get(layer_idx)
+        output = flash_attn_with_kvcache(
+            q=query_rotated.unsqueeze(1),  # [B, 1, H, D]
+            k_cache=k_cache,
+            v_cache=v_cache,
+            cache_seqlens=torch.tensor(context_lens, dtype=torch.int32, device=self.device),
+            block_table=block_table_tensor,
+            softmax_scale=self.scale,
+            causal=True,
+            num_splits=1,
+            rotary_interleaved=False,
+            softcap=0.0,
+        )
+
+        # 等待异步操作完成 (如果需要)
+        if self.store_stream is not None:
+            torch.cuda.current_stream().wait_stream(self.store_stream)
+
+        return output.squeeze(1)
+
+    def _store_kv_async(self, cache_manager, layer_idx, seq_ids, context_lens, key, value):
+        """异步KV存储实现"""
+        k_cache, v_cache = cache_manager.get(layer_idx)
+        store_slots = []
+
+        for i, (seq_id, token_idx) in enumerate(zip(seq_ids, context_lens)):
+            if token_idx > 0:
+                try:
+                    slot = cache_manager.get_slots(seq_id, [token_idx - 1])[0]
+                    store_slots.append(slot)
+                except:
+                    store_slots.append(-1)
+            else:
+                store_slots.append(-1)
+
         store_slots_tensor = torch.tensor(store_slots, dtype=torch.int32, device=self.device).unsqueeze(1)
 
-        # 批量存储
         store_kvcache_batch(
-            key=key.unsqueeze(1),  # [batch_size, 1, num_heads, head_size]
+            key=key.unsqueeze(1),
             value=value.unsqueeze(1),
             k_cache=k_cache,
             v_cache=v_cache,
             block_size=cache_manager.block_size,
             slot_mapping_batch=store_slots_tensor
         )
-        # 3. 准备Block Table (自动处理动态Block分配)
-        block_tables = [cache_manager.get_blocks(seq_id) for seq_id in seq_ids]
-        max_blocks = max(map(len, block_tables), default=0)
-        block_table_tensor = torch.tensor([
-            blocks + [-1] * (max_blocks - len(blocks)) for blocks in block_tables
-        ], dtype=torch.int32, device=self.device)
 
-        # 4. FlashAttention (零拷贝)
-        k_cache, v_cache = cache_manager.get(layer_idx)
-        output = flash_attn_with_kvcache(
-            q=query.unsqueeze(1),  # [B, 1, H, D]
-            k_cache=k_cache,  # [max_blocks, block_size, H, D]
-            v_cache=v_cache,
-            cache_seqlens=torch.tensor(context_lens, dtype=torch.int32, device=self.device),
-            block_table=block_table_tensor,  # [B, max_blocks]
-            softmax_scale=self.scale,  # 1/sqrt(head_dim)
-            causal=True,  # 因果掩码
-            # ❌ 不传rotary_cos/sin (性能最优)
-            # ❌ 不传k/v (FA2自动从缓存读取)
-            num_splits=1,  # 固定为1，性能最优 (FA1默认)
-            rotary_interleaved=False,  # 更优的旋转编码 (FA1默认)
-            softcap=0.0,
-        )
-
-        return output.squeeze(1)  # [B, H, D]
+    def _store_kv_sync(self, cache_manager, layer_idx, seq_ids, context_lens, key, value):
+        """同步KV存储实现"""
+        self._store_kv_async(cache_manager, layer_idx, seq_ids, context_lens, key, value)
 
 
 # =============================================================================
