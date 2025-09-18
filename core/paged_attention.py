@@ -281,7 +281,7 @@ class PagedAttention(nn.Module):
         total_time = time.time() - start_time
         timing['total'] = total_time
 
-        if True:
+        if False:
             logger.info(f"PagedAttention Layer {layer_idx} - Total: {total_time * 1000:.2f}ms")
             for k, v in timing.items():
                 if k != 'total':
