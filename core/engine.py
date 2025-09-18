@@ -174,7 +174,6 @@ class InferenceEngine:
         dtype = config["dtype"]
         if device == "cuda" and dtype is None:
             dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
-            if dtype == torch.bfloat16: self.model.to(torch.bfloat16)
 
         return device, dtype, config["block_size"], config["max_blocks"]
 
@@ -264,7 +263,6 @@ class InferenceEngine:
         """处理解码批次，适配不同模型架构"""
         # 准备输入数据
         input_ids = torch.tensor([seq.get_next_input_ids() for seq in batch], device=self.device)
-        token_positions = [[pos for pos in range(seq.current_position - 1)] for seq in batch]
         seq_ids = [seq.seq_id for seq in batch]
 
         hidden_states = self.embedding_layer(input_ids)
@@ -284,8 +282,7 @@ class InferenceEngine:
             # 使用模型层适配器处理不同架构的层
             hidden_states, layer_kv = self.layer_adapter.process_layer(
                 layer, hidden_states, self.cache_manager, seq_ids,
-                context_lens, token_positions, layer_idx,
-                [seq.current_position - 1 for seq in batch]
+                context_lens, layer_idx
             )
 
             all_layer_kvs.append(layer_kv)
