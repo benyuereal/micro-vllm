@@ -181,6 +181,11 @@ class PagedAttention(nn.Module):
         self._sin_pool = self.rotary_emb.sin_cache[
             0, 0, :max_kv_capacity, :self.rotary_emb.dim // 2].contiguous()
 
+        self._block_table_pool = torch.full(
+            (self.max_batch_size, self.max_blocks), -1,
+            dtype=torch.int32, device=self.device
+        )
+
 
     def forward(
             self,
@@ -237,11 +242,12 @@ class PagedAttention(nn.Module):
         # 4. 构建 block_table
         t0 = time.time()
         # 3. 准备Block Table (自动处理动态Block分配)
-        block_tables = [cache_manager.get_blocks(seq_id) for seq_id in seq_ids]
-        max_blocks = max(map(len, block_tables), default=0)
-        block_table_tensor = torch.tensor([
-            blocks + [-1] * (max_blocks - len(blocks)) for blocks in block_tables
-        ], dtype=torch.int32, device=self.device)
+        # 优化block table构建
+        block_table = self._block_table_pool[:batch_size]
+        for i, seq_id in enumerate(seq_ids):
+            blocks = cache_manager.get_blocks(seq_id)
+            if blocks:
+                block_table[i, :len(blocks)] = torch.tensor(blocks, device=self.device)
 
         timing['block_table'] = time.time() - t0
 
@@ -252,7 +258,7 @@ class PagedAttention(nn.Module):
 
         # 6. FlashAttention 调用
         t0 = time.time()
-        with torch.cuda.amp.autocast(enabled=False):  # 确保精度
+        with torch.cuda.amp.autocast(enabled=True):  # 确保精度
             output = flash_attn_with_kvcache(
                 q=query.unsqueeze(1),
                 k_cache=k_cache,
@@ -262,7 +268,7 @@ class PagedAttention(nn.Module):
                 rotary_cos=rotary_cos,
                 rotary_sin=rotary_sin,
                 cache_seqlens=cache_seqlens,
-                block_table=block_table_tensor,
+                block_table=block_table,
                 softmax_scale=self.scale,
                 causal=True,
                 window_size=(-1, -1),
@@ -278,7 +284,7 @@ class PagedAttention(nn.Module):
         total_time = time.time() - start_time
         timing['total'] = total_time
 
-        if False:
+        if True:
             logger.info(f"PagedAttention Layer {layer_idx} - Total: {total_time * 1000:.2f}ms")
             for k, v in timing.items():
                 if k != 'total':
