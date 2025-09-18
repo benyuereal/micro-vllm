@@ -328,6 +328,12 @@ class KVCacheManager:
 
         # 3. 块位置计数器 (block_id → 当前已用slot数)
         self._pos = {}
+        
+        # 4. block table 
+        self._block_table = torch.full(
+            (16, self.n_blocks), -1,
+            dtype=torch.int32, device=self.device
+        )
 
     def alloc(self, seq_id: int, n_tokens: int):
         """
@@ -484,6 +490,19 @@ class KVCacheManager:
             4. 序列分片 (如模型并行)
         """
         return self._blocks.get(seq_id, [])  # 直接返回内部引用 (零拷贝)
+    
+    def update_block_table(self, seq_ids: list):
+        self._block_table = torch.full(
+            (16, self.n_blocks), -1,
+            dtype=torch.int32, device=self.device
+        )
+        for i, seq_id in enumerate(seq_ids):
+            blocks = self.get_blocks(seq_id)
+            if blocks:
+                self._block_table[i, :len(blocks)] = torch.tensor(blocks, device=self.device)
+                
+    
+      
 
     def get_slots(self, seq_id: int, token_positions: list) -> list:
         """

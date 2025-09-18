@@ -244,17 +244,7 @@ class PagedAttention(nn.Module):
         # 3. 准备Block Table (自动处理动态Block分配)
         # 优化block table构建
 
-
-        block_table = self._block_table_pool[:batch_size]
-        timing['block_table_step1'] = time.time() - t0
-
-        for i, seq_id in enumerate(seq_ids):
-            blocks = cache_manager.get_blocks(seq_id)
-            timing['block_table_step2'] = time.time() - t0
-
-            if blocks:
-                block_table[i, :len(blocks)] = torch.tensor(blocks, device=self.device)
-                timing['block_table_step3'] = time.time() - t0
+        block_table = cache_manager._block_table
 
         timing['block_table'] = time.time() - t0
 
