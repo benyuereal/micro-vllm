@@ -492,14 +492,12 @@ class KVCacheManager:
         return self._blocks.get(seq_id, [])  # 直接返回内部引用 (零拷贝)
     
     def update_block_table(self, seq_ids: list):
-        self._block_table = torch.full(
-            (16, self.n_blocks), -1,
-            dtype=torch.int32, device=self.device
-        )
-        for i, seq_id in enumerate(seq_ids):
-            blocks = self.get_blocks(seq_id)
-            if blocks:
-                self._block_table[i, :len(blocks)] = torch.tensor(blocks, device=self.device)
+        block_tables = [self.get_blocks(seq_id) for seq_id in seq_ids]
+        max_blocks = max(map(len, block_tables), default=0)
+        block_table_tensor = torch.tensor([
+            blocks + [-1] * (max_blocks - len(blocks)) for blocks in block_tables
+        ], dtype=torch.int32, device=self.device)
+        self._block_table = block_table_tensor
                 
     
       
