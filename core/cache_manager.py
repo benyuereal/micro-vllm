@@ -47,6 +47,7 @@ KVCacheManager - vLLM 高效内存管理模块 (4D Block-Slot-Tensor结构)
    - PagedAttention: https://arxiv.org/abs/2309.06180
    - FlashAttention: https://arxiv.org/abs/2205.14135
 """
+from typing import List
 
 import torch
 import collections
@@ -334,6 +335,7 @@ class KVCacheManager:
             (16, self.n_blocks), -1,
             dtype=torch.int32, device=self.device
         )
+        self.cache_seqlens = torch.tensor([1], dtype=torch.int32, device=self.device)
 
     def alloc(self, seq_id: int, n_tokens: int):
         """
@@ -490,14 +492,18 @@ class KVCacheManager:
             4. 序列分片 (如模型并行)
         """
         return self._blocks.get(seq_id, [])  # 直接返回内部引用 (零拷贝)
-    
-    def update_block_table(self, seq_ids: list):
+
+    # 准备推理的数据
+    def cache_batch_data(self, seq_ids: list, context_lens: List[int],):
         block_tables = [self.get_blocks(seq_id) for seq_id in seq_ids]
         max_blocks = max(map(len, block_tables), default=0)
         block_table_tensor = torch.tensor([
             blocks + [-1] * (max_blocks - len(blocks)) for blocks in block_tables
         ], dtype=torch.int32, device=self.device)
         self._block_table = block_table_tensor
+
+        self.cache_seqlens = torch.tensor(context_lens, dtype=torch.int32, device=self.device)
+
                 
     
       

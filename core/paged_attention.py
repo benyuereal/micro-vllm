@@ -250,7 +250,7 @@ class PagedAttention(nn.Module):
 
         # 5. 构造 cache_seqlens（预分配）
         t0 = time.time()
-        cache_seqlens = torch.tensor(context_lens, dtype=torch.int32, device=self.device)
+        cache_seqlens = cache_manager.cache_seqlens
         timing['seq_lens'] = time.time() - t0
 
         # 6. FlashAttention 调用

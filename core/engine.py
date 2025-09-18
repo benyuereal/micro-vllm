@@ -277,8 +277,8 @@ class InferenceEngine:
             self.cache_manager.append(seq.seq_id)
 
         # 预更新block table
-        self.cache_manager.update_block_table(seq_ids)
         context_lens = [seq.current_position for seq in batch]
+        self.cache_manager.cache_batch_data(seq_ids, context_lens)
 
 
         ## 追加新的token
