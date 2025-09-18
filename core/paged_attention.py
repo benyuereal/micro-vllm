@@ -181,35 +181,6 @@ class PagedAttention(nn.Module):
         self._sin_pool = self.rotary_emb.sin_cache[
             0, 0, :max_kv_capacity, :self.rotary_emb.dim // 2].contiguous()
 
-        self.register_buffer("block_table_pool",
-                             torch.full((max_batch_size, max_blocks), -1, dtype=torch.int32, device=self.device))
-        self.register_buffer("cache_seqlens_pool", torch.zeros(max_batch_size, dtype=torch.int32, device=self.device))
-
-
-    def _get_block_table(self, cache_manager: KVCacheManager, seq_ids: List[int]) -> torch.Tensor:
-        """获取 block_table，预分配 + 原地更新"""
-        batch_size = len(seq_ids)
-        if batch_size > self.max_batch_size:
-            raise ValueError(f"batch_size {batch_size} > max_batch_size {self.max_batch_size}")
-
-        # 原地更新 block_table_pool
-        self.block_table_pool.zero_()
-        for i, seq_id in enumerate(seq_ids):
-            blocks = cache_manager.get_blocks(seq_id)
-            n_blocks = len(blocks)
-            if n_blocks > self.max_blocks:
-                raise ValueError(f"seq {seq_id} has {n_blocks} blocks > max_blocks {self.max_blocks}")
-            self.block_table_pool[i, :n_blocks] = torch.tensor(blocks, dtype=torch.int32, device=self.device)
-
-        return self.block_table_pool[:batch_size, :]
-
-    def _get_cache_seqlens(self, context_lens: List[int]) -> torch.Tensor:
-        """获取 cache_seqlens，预分配 + 原地更新"""
-        batch_size = len(context_lens)
-        if batch_size > self.max_batch_size:
-            raise ValueError(f"batch_size {batch_size} > max_batch_size {self.max_batch_size}")
-        self.cache_seqlens_pool[:batch_size] = torch.tensor(context_lens, dtype=torch.int32, device=self.device)
-        return self.cache_seqlens_pool[:batch_size]
 
     def forward(
             self,
@@ -265,12 +236,18 @@ class PagedAttention(nn.Module):
 
         # 4. 构建 block_table
         t0 = time.time()
-        block_table_tensor = self._get_block_table(cache_manager, seq_ids)
+        # 3. 准备Block Table (自动处理动态Block分配)
+        block_tables = [cache_manager.get_blocks(seq_id) for seq_id in seq_ids]
+        max_blocks = max(map(len, block_tables), default=0)
+        block_table_tensor = torch.tensor([
+            blocks + [-1] * (max_blocks - len(blocks)) for blocks in block_tables
+        ], dtype=torch.int32, device=self.device)
+
         timing['block_table'] = time.time() - t0
 
         # 5. 构造 cache_seqlens（预分配）
         t0 = time.time()
-        cache_seqlens = self._get_cache_seqlens(context_lens)
+        cache_seqlens = torch.tensor(context_lens, dtype=torch.int32, device=self.device)
         timing['seq_lens'] = time.time() - t0
 
         # 6. FlashAttention 调用
@@ -301,7 +278,7 @@ class PagedAttention(nn.Module):
         total_time = time.time() - start_time
         timing['total'] = total_time
 
-        if True:
+        if layer_idx % 32 == 0:
             logger.info(f"PagedAttention Layer {layer_idx} - Total: {total_time * 1000:.2f}ms")
             for k, v in timing.items():
                 if k != 'total':
