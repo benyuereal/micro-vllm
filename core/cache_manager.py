@@ -329,6 +329,9 @@ class KVCacheManager:
         # 3. 块位置计数器 (block_id → 当前已用slot数)
         self._pos = {}
 
+        # 5.🔥 新增: seq_id到blocks向量的映射 (用于PagedAttention)
+        self._seq_blocks_map = {}  # seq_id -> torch.Tensor of block indices
+
     def alloc(self, seq_id: int, n_tokens: int):
         """
         📌 **分配缓存块** (预填充阶段调用)
@@ -369,6 +372,9 @@ class KVCacheManager:
 
         # 记录已分配块
         self._blocks[seq_id] = blocks
+
+        # 🔥 新增: 更新blocks向量映射
+        self._update_blocks_tensor(seq_id)
 
         # 生成slot_mapping (每个token的目标slot)
         # 线性映射: token_idx → block_id * block_size + offset_in_block
@@ -412,6 +418,8 @@ class KVCacheManager:
             new_block = self._free.popleft()
             blocks.append(new_block)
             self._pos[new_block] = 1  # 新块已用1个slot
+            # 🔥 新增: 更新blocks向量映射
+            self._update_blocks_tensor(seq_id)
             return new_block * self.block_size
 
         # 情况3: 无可用Block
@@ -484,6 +492,43 @@ class KVCacheManager:
             4. 序列分片 (如模型并行)
         """
         return self._blocks.get(seq_id, [])  # 直接返回内部引用 (零拷贝)
+
+    def get_blocks_tensor(self, seq_id: int) -> torch.Tensor:
+        """
+        📌 **新增: 获取序列的blocks向量** (用于PagedAttention)
+
+        🔍 **参数**:
+            - seq_id: 序列ID
+
+        ✅ **返回**:
+            - blocks_vector: torch.Tensor of block indices, shape [num_blocks]
+            - 如果序列不存在，返回空Tensor
+
+        ⚡ **性能**:
+            - O(1) 时间复杂度
+            - 零拷贝 (返回内部缓存的引用)
+        """
+        return self._seq_blocks_map.get(seq_id, torch.tensor([], dtype=torch.int32, device=self.device))
+
+    def _update_blocks_tensor(self, seq_id: int):
+        """
+        📌 **内部方法: 更新seq_id到blocks向量的映射**
+
+        🔍 **参数**:
+            - seq_id: 序列ID
+
+        🧠 **逻辑**:
+            - 将blocks列表转换为Tensor
+            - 存储在_seq_blocks_map中供PagedAttention使用
+        """
+        if seq_id in self._blocks:
+            blocks_list = self._blocks[seq_id]
+            self._seq_blocks_map[seq_id] = torch.tensor(
+                blocks_list, dtype=torch.int32, device=self.device
+            )
+        else:
+            # 如果序列不存在，从映射中移除
+            self._seq_blocks_map.pop(seq_id, None)
 
     def get_slots(self, seq_id: int, token_positions: list) -> list:
         """
@@ -559,6 +604,8 @@ class KVCacheManager:
 
             # 删除序列记录
             del self._blocks[seq_id]
+            # 🔥 新增: 更新blocks向量映射
+            self._update_blocks_tensor(seq_id)
 
     def reset(self):
         """
@@ -575,6 +622,7 @@ class KVCacheManager:
         # 重置已分配块和位置计数器
         self._blocks.clear()
         self._pos.clear()
+        self._seq_blocks_map.clear()
 
     @property
     def stats(self):
