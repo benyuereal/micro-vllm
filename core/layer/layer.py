@@ -230,7 +230,7 @@ class ModelLayerAdapter:
 
         # 记录总耗时
         total_time = time.time() - start_time
-        if layer_idx == 31:
+        if False:
             logger.info(f"Layer {layer_idx}: 总处理耗时 {total_time * 1000:.2f}ms, "
                         f"分布: LN({norm_time * 1000:.2f}ms)+QKV({qkv_time * 1000:.2f}ms)+"
                         f"Reshape({reshape_time * 1000:.2f}ms)+Attn({attn_time * 1000:.2f}ms)+"
