@@ -249,8 +249,12 @@ class PagedAttention(nn.Module):
         timing['block_table_step1'] = time.time() - t0
 
         for i, seq_id in enumerate(seq_ids):
-            blocks = cache_manager.get_blocks_tensor(seq_id)
-            block_table[i, :len(blocks)] = blocks
+            blocks = cache_manager.get_blocks(seq_id)
+            timing['block_table_step2'] = time.time() - t0
+
+            if blocks:
+                block_table[i, :len(blocks)] = torch.tensor(blocks, device=self.device)
+                timing['block_table_step3'] = time.time() - t0
 
         timing['block_table'] = time.time() - t0
 
