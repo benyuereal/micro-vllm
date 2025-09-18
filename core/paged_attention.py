@@ -135,18 +135,6 @@ class PagedAttention(nn.Module):
         2. **零拷贝设计**: 直接操作KV缓存，无中间拷贝
         3. **自动Block管理**: 动态分配Block，自动更新Block Table
         4. **生产就绪**: 支持AMP、异常处理、设备匹配
-
-    🧪 **典型用法**:
-        attn = PagedAttention(num_heads=16, head_size=128, kv_num_heads=16, device="cuda")
-        output = attn(
-            query=query,                    # [B, H, D]
-            cache_manager=cache_manager,    # KVCacheManager实例
-            seq_ids=[0, 1, 2],             # 序列ID列表
-            context_lens=[10, 20, 30],      # 每个序列的当前长度
-            layer_idx=0,                    # 层索引
-            key=new_k,                      # [B, H, D] (可选，新token)
-            value=new_v                     # [B, H, D] (可选，新token)
-        )
     """
 
     def __init__(self, num_heads: int, head_size: int, kv_num_heads: int, device: str = "auto"):
@@ -201,8 +189,6 @@ class PagedAttention(nn.Module):
         # 2. 获取 contiguous 的 rotary_cos/sin
         rotary_cos = self.rotary_emb.cos_cache[0, 0, :self.rotary_emb.max_position, :self.rotary_emb.dim // 2].contiguous()
         rotary_sin = self.rotary_emb.sin_cache[0, 0, :self.rotary_emb.max_position, :self.rotary_emb.dim // 2].contiguous()
-        assert rotary_cos.is_contiguous(), "rotary_cos must be contiguous"
-        assert rotary_sin.is_contiguous(), "rotary_sin must be contiguous"
 
         # 3. ✅ 准备当前 token 的 k 和 v（未旋转！），用于写入缓存 + 参与本次 attention
         # 注意：flash_attn_with_kvcache 会自动把 k/v 写入 k_cache/v_cache（inplace）
@@ -245,44 +231,4 @@ class PagedAttention(nn.Module):
         return output.squeeze(1)  # [B, H, D]
 
 
-# =============================================================================
-# 🧪 使用示例
-# =============================================================================
 
-if __name__ == "__main__":
-    # 初始化
-    cache_manager = KVCacheManager(n_blocks=1024, block_size=16, n_layers=32, n_heads=16, head_size=128)
-    attn = PagedAttention(num_heads=16, head_size=128, kv_num_heads=16, device="cuda")
-
-    # 模拟数据
-    batch_size = 3
-    query = torch.randn(batch_size, 16, 128, device=attn.device)
-    seq_ids = [0, 1, 2]
-    context_lens = [10, 20, 30]
-
-    # 示例1: 预填充阶段 (无新KV)
-    output = attn(
-        query=query,
-        cache_manager=cache_manager,
-        seq_ids=seq_ids,
-        context_lens=context_lens,
-        layer_idx=0
-    )
-    print(f"预填充输出: {output.shape}")  # [3, 16, 128]
-
-    # 示例2: 解码阶段 (有新KV)
-    new_k = torch.randn(batch_size, 16, 128, device=attn.device)
-    new_v = torch.randn(batch_size, 16, 128, device=attn.device)
-    output = attn(
-        query=query,
-        cache_manager=cache_manager,
-        seq_ids=seq_ids,
-        context_lens=[l + 1 for l in context_lens],  # 长度+1
-        layer_idx=0,
-        key=new_k,
-        value=new_v
-    )
-    print(f"解码输出: {output.shape}")  # [3, 16, 128]
-
-    # 示例3: 检查缓存统计
-    print(f"缓存状态: {cache_manager.stats}")
