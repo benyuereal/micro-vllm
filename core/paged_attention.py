@@ -243,11 +243,18 @@ class PagedAttention(nn.Module):
         t0 = time.time()
         # 3. 准备Block Table (自动处理动态Block分配)
         # 优化block table构建
+
+
         block_table = self._block_table_pool[:batch_size]
+        timing['block_table_step1'] = time.time() - t0
+
         for i, seq_id in enumerate(seq_ids):
             blocks = cache_manager.get_blocks(seq_id)
+            timing['block_table_step2'] = time.time() - t0
+
             if blocks:
                 block_table[i, :len(blocks)] = torch.tensor(blocks, device=self.device)
+                timing['block_table_step3'] = time.time() - t0
 
         timing['block_table'] = time.time() - t0
 
@@ -258,7 +265,7 @@ class PagedAttention(nn.Module):
 
         # 6. FlashAttention 调用
         t0 = time.time()
-        with torch.cuda.amp.autocast(enabled=True):  # 确保精度
+        with torch.cuda.amp.autocast(enabled=False):  # 确保精度
             output = flash_attn_with_kvcache(
                 q=query.unsqueeze(1),
                 k_cache=k_cache,
