@@ -190,67 +190,58 @@ class PagedAttention(nn.Module):
             - output: 注意力输出 [B, H, D]
 
         🧠 **内部逻辑**:
-            1. 应用旋转位置编码
-            2. (可选) 存储新token的KV到缓存
             3. 准备Block Table (自动处理Block分配)
             4. 调用FlashAttention
         """
+
         batch_size, num_heads, head_dim = query.shape
+        device = self.device
 
-        # 1. 旋转位置编码
-        positions = torch.tensor(context_lens, dtype=torch.int32, device=self.device).unsqueeze(1)
-        query = self.rotary_emb(query.unsqueeze(2), positions).squeeze(2)
-        key = self.rotary_emb(key.unsqueeze(2), positions).squeeze(2)
-        value = value  # value无需旋转
+        # 获取 cos/sin 缓存，shape: [1, 1, max_seqlen, rotary_dim]
+        # 2. 获取 contiguous 的 rotary_cos/sin
+        rotary_cos = self.rotary_emb.cos_cache[0, 0, :self.rotary_emb.max_position, :self.rotary_emb.dim // 2].contiguous()
+        rotary_sin = self.rotary_emb.sin_cache[0, 0, :self.rotary_emb.max_position, :self.rotary_emb.dim // 2].contiguous()
+        assert rotary_cos.is_contiguous(), "rotary_cos must be contiguous"
+        assert rotary_sin.is_contiguous(), "rotary_sin must be contiguous"
 
+        # 3. ✅ 准备当前 token 的 k 和 v（未旋转！），用于写入缓存 + 参与本次 attention
+        # 注意：flash_attn_with_kvcache 会自动把 k/v 写入 k_cache/v_cache（inplace）
+        k_new = key.unsqueeze(1)  # [B, 1, H, D]
+        v_new = value.unsqueeze(1)  # [B, 1, H, D]
 
-        # 2. 存储新token KV (直接操作缓存，零拷贝)
+        # 4. ✅ 获取缓存
         k_cache, v_cache = cache_manager.get(layer_idx)
-        # 获取所有需要存储的slot
-        store_slots = []
-        for i, (seq_id, token_idx) in enumerate(zip(seq_ids, context_lens)):
-            if token_idx > 0:  # 确保不是第一个token
-                slot = cache_manager.get_slots(seq_id, [token_idx - 1])[0]
-                store_slots.append(slot)
-            else:
-                store_slots.append(-1)  # 无效slot
 
-        # 转换为张量 [batch_size, 1]
-        store_slots_tensor = torch.tensor(store_slots, dtype=torch.int32, device=self.device).unsqueeze(1)
-
-        # 批量存储
-        store_kvcache_batch(
-            key=key.unsqueeze(1),  # [batch_size, 1, num_heads, head_size]
-            value=value.unsqueeze(1),
-            k_cache=k_cache,
-            v_cache=v_cache,
-            block_size=cache_manager.block_size,
-            slot_mapping_batch=store_slots_tensor
-        )
-        # 3. 准备Block Table (自动处理动态Block分配)
+        # 5. ✅ 准备 block_table（不变）
         block_tables = [cache_manager.get_blocks(seq_id) for seq_id in seq_ids]
         max_blocks = max(map(len, block_tables), default=0)
         block_table_tensor = torch.tensor([
             blocks + [-1] * (max_blocks - len(blocks)) for blocks in block_tables
-        ], dtype=torch.int32, device=self.device)
+        ], dtype=torch.int32, device=device)
 
-        # 4. FlashAttention (零拷贝)
-        k_cache, v_cache = cache_manager.get(layer_idx)
+        # 6. ✅ 构造 cache_seqlens（当前每个序列的总长度，即新 token 的位置）
+        cache_seqlens = torch.tensor(context_lens, dtype=torch.int32, device=device)  # [batch_size]
+
+        # 7. ✅ 调用 flash_attn_with_kvcache（自动 RoPE + 自动写入缓存）
         output = flash_attn_with_kvcache(
             q=query.unsqueeze(1),  # [B, 1, H, D]
-            k_cache=k_cache,  # [max_blocks, block_size, H, D]
+            k_cache=k_cache,  # [max_blocks, block_size, H, D] 或 [B, L, H, D]
             v_cache=v_cache,
-            cache_seqlens=torch.tensor(context_lens, dtype=torch.int32, device=self.device),
+            k=k_new,  # ✅ 必须传！用于更新缓存 + RoPE
+            v=v_new,  # ✅ 必须传！
+            rotary_cos=rotary_cos,  # ✅ 自动 RoPE
+            rotary_sin=rotary_sin,  # ✅ 自动 RoPE
+            cache_seqlens=cache_seqlens,  # 当前序列长度（即新 token 的位置）
             block_table=block_table_tensor,  # [B, max_blocks]
-            softmax_scale=self.scale,  # 1/sqrt(head_dim)
-            causal=True,  # 因果掩码
-            # ❌ 不传rotary_cos/sin (性能最优)
-            # ❌ 不传k/v (FA2自动从缓存读取)
-            num_splits=1,  # 固定为1，性能最优 (FA1默认)
-            rotary_interleaved=False,  # 更优的旋转编码 (FA1默认)
-            softcap=0.0,
+            softmax_scale=self.scale,
+            causal=True,
+            window_size=(-1, -1),
+            rotary_interleaved=False,  # 推荐 False，和你的 PrecomputedRotaryEmbedding 一致
+            alibi_slopes=None,
+            # num_splits=1,  # 可选，默认即可
         )
 
+        # 8. ✅ 输出
         return output.squeeze(1)  # [B, H, D]
 
 
