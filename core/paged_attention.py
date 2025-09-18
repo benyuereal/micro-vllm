@@ -23,12 +23,10 @@ PagedAttention - vLLM 高性能注意力层 (FlashAttention优化版)
    - FlashAttention: https://arxiv.org/abs/2205.14135
    - PagedAttention: https://arxiv.org/abs/2309.06180
 """
-import logging
-import time
 
 import torch
 import torch.nn as nn
-from typing import List, Optional, Dict
+from typing import List, Optional
 from core.cache_manager import KVCacheManager, store_kvcache, store_kvcache_batch
 
 try:
@@ -53,14 +51,8 @@ class PrecomputedRotaryEmbedding(nn.Module):
         emb = torch.cat((freqs, freqs), dim=-1)
 
         # 预先计算好所有位置的cos和sin
-        # self.register_buffer("cos_cache", emb.cos().unsqueeze(0).unsqueeze(0))  # [1, 1, max_position, dim]
-        # self.register_buffer("sin_cache", emb.sin().unsqueeze(0).unsqueeze(0))  # [1, 1, max_position, dim]
-        # 预计算 cos/sin，并确保 contiguous
-        cos = emb.cos().unsqueeze(0).unsqueeze(0)  # [1, 1, max_position, dim]
-        sin = emb.sin().unsqueeze(0).unsqueeze(0)
-        self.register_buffer("cos_cache", cos.contiguous())
-        self.register_buffer("sin_cache", sin.contiguous())
-
+        self.register_buffer("cos_cache", emb.cos().unsqueeze(0).unsqueeze(0))  # [1, 1, max_position, dim]
+        self.register_buffer("sin_cache", emb.sin().unsqueeze(0).unsqueeze(0))  # [1, 1, max_position, dim]
 
     def forward(self, x, positions):
         batch_size, num_heads, seq_len, head_size = x.shape
@@ -133,9 +125,6 @@ class RotaryEmbedding(nn.Module):
         x1, x2 = x[..., :self.dim // 2], x[..., self.dim // 2:]
         return (x * cos) + (torch.cat((-x2, x1), dim=-1) * sin)
 
-# 配置日志
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
-logger = logging.getLogger(__name__)
 
 class PagedAttention(nn.Module):
     """
@@ -148,7 +137,7 @@ class PagedAttention(nn.Module):
         4. **生产就绪**: 支持AMP、异常处理、设备匹配
     """
 
-    def __init__(self, num_heads: int, head_size: int, kv_num_heads: int, device: str = "auto", max_batch_size=16, max_blocks=32, max_position=4096):
+    def __init__(self, num_heads: int, head_size: int, kv_num_heads: int, device: str = "auto"):
         super().__init__()
         self.num_heads = num_heads
         self.kv_num_heads = kv_num_heads
@@ -161,37 +150,8 @@ class PagedAttention(nn.Module):
         if device != "auto": self.device = torch.device(device)
 
         # 初始化旋转位置编码
-        max_kv_capacity = max_blocks * 256
-
-        self.rotary_emb = PrecomputedRotaryEmbedding(head_size, max_position=max_kv_capacity, device=self.device)
+        self.rotary_emb = PrecomputedRotaryEmbedding(head_size, max_position=4096, device=self.device)
         self.use_flash_attn = self.device.type == 'cuda' and flash_attn_with_kvcache is not None
-        # ✅ 预分配缓存（关键优化）
-        self._rotary_cos_cache = None
-        self._rotary_sin_cache = None
-        self._rotary_max_pos = None
-        self.log_timing = True
-
-        # 预分配 block_table 和 cache_seqlens pool
-        self.max_batch_size = max_batch_size
-        self.max_blocks = max_blocks
-        # ✅ 修正：获取 rotary_emb 的 max_position
-        # ✅ 预分配 rotary_cos/sin（关键修复）
-        self._cos_pool = self.rotary_emb.cos_cache[
-            0, 0, :max_kv_capacity, :self.rotary_emb.dim // 2].contiguous()
-        self._sin_pool = self.rotary_emb.sin_cache[
-            0, 0, :max_kv_capacity, :self.rotary_emb.dim // 2].contiguous()
-
-
-        self.register_buffer("cache_seqlens_pool", torch.zeros(max_batch_size, dtype=torch.int32, device=self.device))
-
-
-    def _get_cache_seqlens(self, context_lens: List[int]) -> torch.Tensor:
-        """获取 cache_seqlens，预分配 + 原地更新"""
-        batch_size = len(context_lens)
-        if batch_size > self.max_batch_size:
-            raise ValueError(f"batch_size {batch_size} > max_batch_size {self.max_batch_size}")
-        self.cache_seqlens_pool[:batch_size] = torch.tensor(context_lens, dtype=torch.int32, device=self.device)
-        return self.cache_seqlens_pool[:batch_size]
 
     def forward(
             self,
@@ -223,74 +183,52 @@ class PagedAttention(nn.Module):
         """
 
         batch_size, num_heads, head_dim = query.shape
-        start_time = time.time()
         device = self.device
 
-        timing: Dict[str, float] = {}  # 耗时记录
-        k_cache, v_cache = cache_manager.get(layer_idx)
-        # 1. 获取 RoPE cos/sin
-        t0 = time.time()
-        rotary_cos = self._cos_pool
-        rotary_sin = self._sin_pool
-        timing['rope_load'] = time.time() - t0
+        # 获取 cos/sin 缓存，shape: [1, 1, max_seqlen, rotary_dim]
+        # 2. 获取 contiguous 的 rotary_cos/sin
+        rotary_cos = self.rotary_emb.cos_cache[0, 0, :self.rotary_emb.max_position, :self.rotary_emb.dim // 2].contiguous()
+        rotary_sin = self.rotary_emb.sin_cache[0, 0, :self.rotary_emb.max_position, :self.rotary_emb.dim // 2].contiguous()
 
-        # 2. 准备 k/v
-        t0 = time.time()
+        # 3. ✅ 准备当前 token 的 k 和 v（未旋转！），用于写入缓存 + 参与本次 attention
+        # 注意：flash_attn_with_kvcache 会自动把 k/v 写入 k_cache/v_cache（inplace）
         k_new = key.unsqueeze(1)  # [B, 1, H, D]
-        v_new = value.unsqueeze(1)
-        timing['kv_prep'] = time.time() - t0
+        v_new = value.unsqueeze(1)  # [B, 1, H, D]
 
-        # 3. 获取缓存
-        t0 = time.time()
+        # 4. ✅ 获取缓存
         k_cache, v_cache = cache_manager.get(layer_idx)
-        timing['cache_get'] = time.time() - t0
 
-        # 4. 构建 block_table
-        t0 = time.time()
-        block_table_tensor = cache_manager.get_block_table_batch(seq_ids, max_blocks=32)
-        timing['block_table'] = time.time() - t0
+        # 5. ✅ 准备 block_table（不变）
+        block_tables = [cache_manager.get_blocks(seq_id) for seq_id in seq_ids]
+        max_blocks = max(map(len, block_tables), default=0)
+        block_table_tensor = torch.tensor([
+            blocks + [-1] * (max_blocks - len(blocks)) for blocks in block_tables
+        ], dtype=torch.int32, device=device)
 
-        # 5. 构造 cache_seqlens（预分配）
-        t0 = time.time()
-        cache_seqlens = self._get_cache_seqlens(context_lens)
-        timing['seq_lens'] = time.time() - t0
+        # 6. ✅ 构造 cache_seqlens（当前每个序列的总长度，即新 token 的位置）
+        cache_seqlens = torch.tensor(context_lens, dtype=torch.int32, device=device)  # [batch_size]
 
-        # 6. FlashAttention 调用
-        t0 = time.time()
-        with torch.cuda.amp.autocast(enabled=False):  # 确保精度
-            output = flash_attn_with_kvcache(
-                q=query.unsqueeze(1),
-                k_cache=k_cache,
-                v_cache=v_cache,
-                k=k_new,
-                v=v_new,
-                rotary_cos=rotary_cos,
-                rotary_sin=rotary_sin,
-                cache_seqlens=cache_seqlens,
-                block_table=block_table_tensor,
-                softmax_scale=self.scale,
-                causal=True,
-                window_size=(-1, -1),
-                rotary_interleaved=False,
-                alibi_slopes=None,
-            )
-        timing['flash_attn'] = time.time() - t0
+        # 7. ✅ 调用 flash_attn_with_kvcache（自动 RoPE + 自动写入缓存）
+        output = flash_attn_with_kvcache(
+            q=query.unsqueeze(1),  # [B, 1, H, D]
+            k_cache=k_cache,  # [max_blocks, block_size, H, D] 或 [B, L, H, D]
+            v_cache=v_cache,
+            k=k_new,  # ✅ 必须传！用于更新缓存 + RoPE
+            v=v_new,  # ✅ 必须传！
+            rotary_cos=rotary_cos,  # ✅ 自动 RoPE
+            rotary_sin=rotary_sin,  # ✅ 自动 RoPE
+            cache_seqlens=cache_seqlens,  # 当前序列长度（即新 token 的位置）
+            block_table=block_table_tensor,  # [B, max_blocks]
+            softmax_scale=self.scale,
+            causal=True,
+            window_size=(-1, -1),
+            rotary_interleaved=False,  # 推荐 False，和你的 PrecomputedRotaryEmbedding 一致
+            alibi_slopes=None,
+            # num_splits=1,  # 可选，默认即可
+        )
 
-        # 7. 输出
-        output = output.squeeze(1)
-
-        # 8. 记录总耗时和分布
-        total_time = time.time() - start_time
-        timing['total'] = total_time
-
-        if True:
-            logger.info(f"PagedAttention Layer {layer_idx} - Total: {total_time * 1000:.2f}ms")
-            for k, v in timing.items():
-                if k != 'total':
-                    logger.info(f"  ├─ {k}: {v * 1000:.2f}ms ({v / total_time * 100:.1f}%)")
-            logger.info(f"  └─ flash_attn 占比: {timing['flash_attn'] / total_time * 100:.1f}%")
-
-        return output
+        # 8. ✅ 输出
+        return output.squeeze(1)  # [B, H, D]
 
 
 

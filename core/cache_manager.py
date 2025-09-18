@@ -47,7 +47,6 @@ KVCacheManager - vLLM 高效内存管理模块 (4D Block-Slot-Tensor结构)
    - PagedAttention: https://arxiv.org/abs/2309.06180
    - FlashAttention: https://arxiv.org/abs/2205.14135
 """
-from typing import List
 
 import torch
 import collections
@@ -292,8 +291,7 @@ class KVCacheManager:
                  n_heads: int,  # 注意力头数 (如16)
                  head_size: int,  # 每个头的维度 (如128)
                  dtype=torch.float16,  # 数据类型
-                 device="cuda",
-                 max_batch_size = 32,):  # 设备
+                 device="cuda"):  # 设备
         """
         📌 **初始化**:
             1. 创建KV缓存张量 (ParameterList支持AMP)
@@ -303,7 +301,6 @@ class KVCacheManager:
         # 参数保存
         self.n_blocks, self.block_size, self.n_layers = n_blocks, block_size, n_layers
         self.dtype, self.device = dtype, device
-        self.max_batch_size = max_batch_size
 
         # 创建KV缓存 (使用ParameterList支持自动混合精度AMP)
         # 形状: [n_layers, n_blocks, block_size, n_heads, head_size]
@@ -331,13 +328,6 @@ class KVCacheManager:
 
         # 3. 块位置计数器 (block_id → 当前已用slot数)
         self._pos = {}
-
-        # 4. block table pool 预分配
-        self._block_table_pool = torch.full(
-            (max_batch_size, self.n_blocks), -1,
-            dtype=torch.int32, device=self.device
-        )
-
 
     def alloc(self, seq_id: int, n_tokens: int):
         """
@@ -494,38 +484,6 @@ class KVCacheManager:
             4. 序列分片 (如模型并行)
         """
         return self._blocks.get(seq_id, [])  # 直接返回内部引用 (零拷贝)
-
-
-
-    def get_block_table_batch(self, seq_ids: List[int], max_blocks: int) -> torch.Tensor:
-        """
-        批量构建 block_table_tensor（终极优化）
-        """
-        batch_size = len(seq_ids)
-        if batch_size > self.max_batch_size:
-            raise ValueError(f"batch_size {batch_size} > {self.max_batch_size}")
-
-        # 1. 批量获取 blocks
-        all_blocks = [self._blocks.get(seq_id, []) for seq_id in seq_ids]  # [B, ?]
-
-        # 2. 批量构建 block_table（关键优化）
-        # 用列表推导式 + torch.tensor 一次性转换
-        max_n_blocks = min(max(map(len, all_blocks), default=0), max_blocks)
-        if max_n_blocks == 0:
-            return self._block_table_pool[:batch_size, :max_blocks].zero_()
-
-        # 3. 批量填充 + 截断（统一逻辑）
-        block_table_data = [
-            (blocks[:max_n_blocks] + [-1] * max_n_blocks)[:max_n_blocks]  # 截断 + 填充
-            for blocks in all_blocks
-        ]
-        block_table = torch.tensor(block_table_data, dtype=torch.int32, device=self.device)
-
-        # 4. 返回（复用预分配 pool 或返回新 tensor）
-        if batch_size <= self.max_batch_size and max_blocks <= self.n_blocks:
-            self._block_table_pool[:batch_size, :max_blocks] = block_table
-            return self._block_table_pool[:batch_size, :max_blocks]
-        return block_table
 
     def get_slots(self, seq_id: int, token_positions: list) -> list:
         """
