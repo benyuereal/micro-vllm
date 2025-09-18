@@ -22,11 +22,14 @@ ModelLayerAdapter - vLLM 多模型架构适配器 (极简设计)
    - vLLM: https://arxiv.org/abs/2309.06180
    - PagedAttention: https://arxiv.org/abs/2309.06180
 """
+import logging
+import time
 
 import torch
 from typing import Tuple, List, Optional
 from core.paged_attention import PagedAttention
-
+# 设置日志记录
+logger = logging.getLogger(__name__)
 
 class ModelLayerAdapter:
     """
@@ -136,16 +139,27 @@ class ModelLayerAdapter:
             5. 调用PagedAttention
             6. 残差连接 + MLP
         """
+        # 记录开始时间
+        start_time = time.time()
+
         # 1. 自动适配模型架构
         norm_fn = getattr(layer, self.cfg["norm"])
         mlp_norm_fn = getattr(layer, self.cfg["mlp_norm"])
         mlp_fn = getattr(layer, self.cfg["mlp"])
 
+        # 记录LayerNorm前的时间
+        norm_start = time.time()
+
         # 2. LayerNorm + 残差
         residual = hidden_states
         hidden_states = norm_fn(hidden_states)
 
+        norm_time = time.time() - norm_start
+        logger.debug(f"Layer {layer_idx}: LayerNorm耗时 {norm_time * 1000:.2f}ms")
+
         # 3. QKV计算 (自动处理不同投影方式)
+        qkv_start = time.time()
+
         if self.cfg["qkv_split"]:
             # Qwen 7B: 合并的c_attn投影
             qkv = layer.attn.c_attn(hidden_states)
@@ -157,13 +171,23 @@ class ModelLayerAdapter:
             k = layer.self_attn.k_proj(hidden_states)
             v = layer.self_attn.v_proj(hidden_states)
 
+        qkv_time = time.time() - qkv_start
+        logger.debug(f"Layer {layer_idx}: QKV投影耗时 {qkv_time * 1000:.2f}ms")
+
         # 4. 重塑形状 [B, S, D] → [B, H, D]
+        reshape_start = time.time()
+
         batch_size, seq_len, _ = hidden_states.shape
         q = q.view(batch_size, seq_len, self.num_heads, self.head_size).permute(0, 2, 1, 3)  # [B, H, S, D]
         k = k.view(batch_size, seq_len, self.kv_num_heads, self.head_size).permute(0, 2, 1, 3)
         v = v.view(batch_size, seq_len, self.kv_num_heads, self.head_size).permute(0, 2, 1, 3)
 
+        reshape_time = time.time() - reshape_start
+        logger.debug(f"Layer {layer_idx}: 形状重塑耗时 {reshape_time * 1000:.2f}ms")
+
         # 5. 注意力计算 (零拷贝)
+        attn_start = time.time()
+
         attn_output = self.attention(
             query=q.squeeze(2),  # [B, H, D]
             cache_manager=cache_manager,
@@ -174,12 +198,22 @@ class ModelLayerAdapter:
             value=v.squeeze(2)  # [B, H, D]
         )
 
+        attn_time = time.time() - attn_start
+        logger.debug(f"Layer {layer_idx}: 注意力计算耗时 {attn_time * 1000:.2f}ms")
+
         # 6. 输出投影 + 残差
+        proj_start = time.time()
+
         proj_fn = getattr(layer.self_attn if self.cfg["qkv_proj"] else layer.attn, self.cfg["proj"])
         attn_output = proj_fn(attn_output.reshape(batch_size, -1)).unsqueeze(1)  # [B, 1, D]
         hidden_states = residual + attn_output
 
+        proj_time = time.time() - proj_start
+        logger.debug(f"Layer {layer_idx}: 输出投影耗时 {proj_time * 1000:.2f}ms")
+
         # 7. MLP + 残差 (支持MoE)
+        mlp_start = time.time()
+
         residual = hidden_states
         hidden_states = mlp_norm_fn(hidden_states)
         if self.cfg.get("moe", False):
@@ -190,5 +224,15 @@ class ModelLayerAdapter:
             # Qwen2: 普通MLP
             hidden_states = mlp_fn(hidden_states)
         hidden_states = residual + hidden_states
+
+        mlp_time = time.time() - mlp_start
+        logger.debug(f"Layer {layer_idx}: MLP计算耗时 {mlp_time * 1000:.2f}ms")
+
+        # 记录总耗时
+        total_time = time.time() - start_time
+        logger.info(f"Layer {layer_idx}: 总处理耗时 {total_time * 1000:.2f}ms, "
+                    f"分布: LN({norm_time * 1000:.2f}ms)+QKV({qkv_time * 1000:.2f}ms)+"
+                    f"Reshape({reshape_time * 1000:.2f}ms)+Attn({attn_time * 1000:.2f}ms)+"
+                    f"Proj({proj_time * 1000:.2f}ms)+MLP({mlp_time * 1000:.2f}ms)")
 
         return hidden_states, (k.squeeze(2), v.squeeze(2))  # [B, H, D]
