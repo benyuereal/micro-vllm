@@ -45,6 +45,7 @@ def gemm_kernel(
         BLOCK_SIZE_M: tl.constexpr,
         BLOCK_SIZE_N: tl.constexpr,
         BLOCK_SIZE_K: tl.constexpr,
+        A_DTYPE: tl.constexpr,  # 新增：输入类型
 ):
     pid = tl.program_id(axis=0)
     num_pid_m = tl.cdiv(M, BLOCK_SIZE_M)
@@ -66,7 +67,7 @@ def gemm_kernel(
         a_ptrs += BLOCK_SIZE_K * stride_ak
         b_ptrs += BLOCK_SIZE_K * stride_bk
 
-    c = accumulator.to(a.dtype)
+    c = accumulator.to(A_DTYPE)
     offs_cm = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
     offs_cn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
     c_ptrs = c_ptr + stride_cm * offs_cm[:, None] + stride_cn * offs_cn[None, :]
@@ -138,6 +139,7 @@ class TritonQwenMLP:
                     BLOCK_SIZE_M=self.gemm_block_m,
                     BLOCK_SIZE_N=self.gemm_block_n,
                     BLOCK_SIZE_K=self.gemm_block_k,
+                    A_DTYPE=tl.bfloat16,  # 如果输入是 BF16
                 )
         return out
 
@@ -197,7 +199,7 @@ def test_kernels():
         A.stride(0), A.stride(1),
         B.stride(0), B.stride(1),
         triton_C.stride(0), triton_C.stride(1),
-        BLOCK_SIZE_M=128, BLOCK_SIZE_N=128, BLOCK_SIZE_K=64
+        BLOCK_SIZE_M=128, BLOCK_SIZE_N=128, BLOCK_SIZE_K=64,A_DTYPE=tl.bfloat16,  # 如果输入是 BF16
     )
     torch_C = torch.matmul(A, B)
     assert torch.allclose(triton_C, torch_C, atol=1e-2), "GEMM 验证失败"
