@@ -9,20 +9,23 @@ def load_model(model_path):
         tokenizer = AutoTokenizer.from_pretrained(
             model_path,
             trust_remote_code=True,
-            use_fast=True  # 确保使用fast tokenizer
+            use_fast=True,
+            local_files_only=True
         )
     except Exception as e:
         print(f"Fast tokenizer failed: {e}, trying slow tokenizer")
         tokenizer = AutoTokenizer.from_pretrained(
             model_path,
             trust_remote_code=True,
-            use_fast=False  # 回退到slow tokenizer
+            use_fast=False,
+            local_files_only=True
         )
 
     model = AutoModelForCausalLM.from_pretrained(
         model_path,
         torch_dtype=torch.bfloat16,
         device_map="auto",
-        trust_remote_code=True
+        trust_remote_code=True,
+        local_files_only=True
     )
     return model, tokenizer
