@@ -27,8 +27,6 @@ import time
 
 import torch
 from typing import Tuple, List, Optional
-
-from core.layer.fused_mlp import TritonQwenMLP
 from core.paged_attention import PagedAttention
 # 设置日志记录
 logger = logging.getLogger(__name__)
@@ -77,7 +75,7 @@ class ModelLayerAdapter:
         },
     }
 
-    def __init__(self, model_config, device: str, num_heads: int, head_size: int, kv_num_heads: int, model=None):
+    def __init__(self, model_config, device: str, num_heads: int, head_size: int, kv_num_heads: int):
         """
         📌 **初始化**
 
@@ -105,9 +103,6 @@ class ModelLayerAdapter:
         if self.model_type not in self.MODEL_CONFIGS:
             raise ValueError(f"Unsupported model type: {self.model_type}")
         self.cfg = self.MODEL_CONFIGS[self.model_type]
-        # 初始化 Triton MLP (Qwen-7B 专用)
-        self.triton_mlp = TritonQwenMLP(device=device, model=model)
-        logger.info("✅ 加载 Triton MLP 加速模块")
 
     def process_layer(self,
                       layer,
@@ -221,16 +216,13 @@ class ModelLayerAdapter:
 
         residual = hidden_states
         hidden_states = mlp_norm_fn(hidden_states)
-        if self.triton_mlp is not None and layer_idx < len(self.triton_mlp.weights):
-            # ✅ 使用 Triton 加速 MLP (Qwen-7B)
-            hidden_states = self.triton_mlp.forward(hidden_states, layer_idx=layer_idx)
+        if self.cfg.get("moe", False):
+            # ✅ Qwen3 MoE: 使用 mlp 模块 (包含 experts 和 gate)
+            if hasattr(layer, 'mlp') and hasattr(layer.mlp, 'experts'):
+                hidden_states = layer.mlp(hidden_states)  # 直接调用mlp模块
         else:
-            # 回退到原生 PyTorch MLP
-            if self.cfg.get("moe", False):
-                if hasattr(layer, 'mlp') and hasattr(layer.mlp, 'experts'):
-                    hidden_states = layer.mlp(hidden_states)
-            else:
-                hidden_states = mlp_fn(hidden_states)
+            # Qwen2: 普通MLP
+            hidden_states = mlp_fn(hidden_states)
         hidden_states = residual + hidden_states
 
         mlp_time = time.time() - mlp_start
@@ -238,7 +230,7 @@ class ModelLayerAdapter:
 
         # 记录总耗时
         total_time = time.time() - start_time
-        if layer_idx == 31:
+        if False:
             logger.info(f"Layer {layer_idx}: 总处理耗时 {total_time * 1000:.2f}ms, "
                         f"分布: LN({norm_time * 1000:.2f}ms)+QKV({qkv_time * 1000:.2f}ms)+"
                         f"Reshape({reshape_time * 1000:.2f}ms)+Attn({attn_time * 1000:.2f}ms)+"
