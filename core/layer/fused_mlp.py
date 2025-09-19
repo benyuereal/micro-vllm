@@ -30,7 +30,7 @@ def swiglu_kernel(
     # 手动实现 FP16 兼容的 Sigmoid（避免 tl.sigmoid 的 FP32 限制）
     y_fp32 = y.to(tl.float32)  # 转为 FP32 计算
     sigmoid_y = 1.0 / (1.0 + tl.exp(-y_fp32))
-    output = x * (y * sigmoid_y.to(tl.float16))  # 转回 FP16
+    output = x * (y * sigmoid_y.to(x.dtype))  # 动态匹配输入类型
 
     tl.store(output_ptr + offsets, output, mask=mask)
 
@@ -66,7 +66,7 @@ def gemm_kernel(
         a_ptrs += BLOCK_SIZE_K * stride_ak
         b_ptrs += BLOCK_SIZE_K * stride_bk
 
-    c = accumulator.to(tl.float16)
+    c = accumulator.to(a.dtype)  # 动态匹配输入类型
     offs_cm = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
     offs_cn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
     c_ptrs = c_ptr + stride_cm * offs_cm[:, None] + stride_cn * offs_cn[None, :]
@@ -91,9 +91,9 @@ class TritonQwenMLP:
         self.relu_block_size = 2048
 
         # 预分配缓冲区（最大支持batch=8, seq=2048）
-        self.buffer_gate = torch.empty((8 * 2048, 11008), device=device, dtype=torch.float16)
-        self.buffer_up = torch.empty((8 * 2048, 11008), device=device, dtype=torch.float16)
-        self.buffer_out = torch.empty((8 * 2048, 4096), device=device, dtype=torch.float16)
+        self.buffer_gate = torch.empty((8 * 2048, 11008), device=device, dtype=torch.bfloat16)
+        self.buffer_up = torch.empty((8 * 2048, 11008), device=device, dtype=torch.bfloat16)
+        self.buffer_out = torch.empty((8 * 2048, 4096), device=device, dtype=torch.bfloat16)
 
         # 加载Qwen-7B权重
         self.load_qwen_weights(model)
@@ -110,9 +110,9 @@ class TritonQwenMLP:
         layers = model.transformer.h
         self.weights = []
         for layer in layers:
-            w1 = layer.mlp.w1.weight.data.T.half().to(self.device)  # gate_proj
-            w2 = layer.mlp.c_proj.weight.data.T.half().to(self.device)  # down_proj
-            w3 = layer.mlp.w2.weight.data.T.half().to(self.device)  # up_proj
+            w1 = layer.mlp.w1.weight.data.T.to(self.device)  # 保留 BF16
+            w2 = layer.mlp.c_proj.weight.data.T.to(self.device)  # 保留 BF16
+            w3 = layer.mlp.w2.weight.data.T.to(self.device)  # 保留 BF16
             self.weights.append((w1, w2, w3))
 
 
@@ -206,8 +206,6 @@ def test_kernels():
 
 def test_end_to_end():
     print("\n🔍 端到端验证 (Qwen-7B MLP)...")
-    triton_mlp = TritonQwenMLP()
-    x = torch.randn(2, 32, 4096, device='cuda', dtype=torch.float16)
 
     # 从本地加载 PyTorch 模型
     from transformers import AutoModelForCausalLM, AutoConfig
@@ -219,8 +217,10 @@ def test_end_to_end():
         torch_dtype=torch.float16,
         local_files_only=True,
         trust_remote_code=True,
+    )
 
-    ).half().to('cuda')
+    triton_mlp = TritonQwenMLP(model=model)
+    x = torch.randn(2, 32, 4096, device='cuda', dtype=torch.bfloat16)  # 改为 BF16
 
     with torch.no_grad():
         # ✅ 全部使用 w1/w2/c_proj
@@ -247,7 +247,18 @@ def test_end_to_end():
 
 def benchmark():
     print("\n🚀 性能测试 (A100 40GB)...")
-    triton_mlp = TritonQwenMLP()
+    # 从本地加载 PyTorch 模型
+    from transformers import AutoModelForCausalLM, AutoConfig
+    model_path = "/root/Qwen-7B-Chat"
+    config = AutoConfig.from_pretrained(model_path, local_files_only=True)
+    model = AutoModelForCausalLM.from_pretrained(
+        model_path,
+        config=config,
+        torch_dtype=torch.float16,
+        local_files_only=True,
+        trust_remote_code=True,
+    )
+    triton_mlp = TritonQwenMLP(model=model)
     x = torch.randn(8, 2048, 4096, device='cuda', dtype=torch.float16)
 
     # 预热
@@ -280,7 +291,19 @@ if __name__ == "__main__":
 
     # 示例使用
     print("\n📌 示例使用:")
-    mlp = TritonQwenMLP()
+    # 从本地加载 PyTorch 模型
+    from transformers import AutoModelForCausalLM, AutoConfig
+
+    model_path = "/root/Qwen-7B-Chat"
+    config = AutoConfig.from_pretrained(model_path, local_files_only=True)
+    model = AutoModelForCausalLM.from_pretrained(
+        model_path,
+        config=config,
+        torch_dtype=torch.float16,
+        local_files_only=True,
+        trust_remote_code=True,
+    )
+    mlp = TritonQwenMLP(model=model)
     x = torch.randn(1, 10, 4096, device='cuda', dtype=torch.float16)
     output = mlp.forward(x, layer_idx=0)
     print(f"输入: {x.shape} → 输出: {output.shape}")
