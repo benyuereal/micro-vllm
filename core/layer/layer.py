@@ -109,7 +109,7 @@ class ModelLayerAdapter:
 
     def _compile_mlp(self):
         """编译 MLP 模块，提升性能"""
-        for layer in self.model.layers:  # 假设 model 是全局变量，或传入
+        for layer in self.model.transformer.h:  # 假设 model 是全局变量，或传入
             if hasattr(layer, 'mlp') and isinstance(layer.mlp, torch.nn.Module):
                 try:
                     # 编译 MLP（支持动态 shape）
