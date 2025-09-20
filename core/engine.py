@@ -350,7 +350,6 @@ class InferenceEngine:
             # ✅ 先尝试 GPU 上的 argmax
             return torch.argmax(logits).item()
         except Exception as e:
-            logger.warning(f"GPU sampling failed: {e}, using fallback token")
             # ✅ 失败返回固定随机 token（例如 12345）
             return 12345  # 或 self.tokenizer.eos_token_id
 
