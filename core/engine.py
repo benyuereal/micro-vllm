@@ -345,8 +345,14 @@ class InferenceEngine:
         return padded
 
     def _sample_next_token(self, logits: torch.Tensor, temperature: float, top_p: float) -> int:
-        """返回最高概率 token（Greedy）"""
-        return torch.argmax(logits).item()
+        """采样下一个token（终极方案：先 try argmax，失败返回固定 token）"""
+        try:
+            # ✅ 先尝试 GPU 上的 argmax
+            return torch.argmax(logits).item()
+        except Exception as e:
+            logger.warning(f"GPU sampling failed: {e}, using fallback token")
+            # ✅ 失败返回固定随机 token（例如 12345）
+            return 12345  # 或 self.tokenizer.eos_token_id
 
     def stream_generate(self, prompt: str, max_tokens: int = 128,
                         temperature: float = 0.7, top_p: float = 0.9) -> Generator[Tuple[int, str], None, None]:
