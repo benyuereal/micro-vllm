@@ -204,8 +204,10 @@ class ModelLayerAdapter:
         proj_start = time.time()
 
         proj_fn = getattr(layer.self_attn if self.cfg["qkv_proj"] else layer.attn, self.cfg["proj"])
-        attn_output = proj_fn(attn_output.reshape(batch_size, -1)).unsqueeze(1)  # [B, 1, D]
-        hidden_states = residual + attn_output
+        proj_out = cache_manager.proj_out
+        attn_output_flat = attn_output.reshape(batch_size, -1)
+        proj_fn(attn_output_flat, out=proj_out.squeeze(1))  # 直接写入
+        hidden_states = residual + proj_out
 
 
         proj_time = time.time() - proj_start
