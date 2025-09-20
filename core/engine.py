@@ -345,7 +345,7 @@ class InferenceEngine:
         return padded
 
     def _sample_next_token(self, logits: torch.Tensor, temperature: float, top_p: float) -> int:
-        """采样下一个token（函数式，推荐）"""
+        """采样下一个token（最安全：避免 torch.cat 和 torch.tensor）"""
         # 确保 logits 是 float32
         logits = logits.float() / temperature
 
@@ -354,12 +354,11 @@ class InferenceEngine:
         probs = torch.softmax(sorted_logits, dim=-1)
         cumulative_probs = torch.cumsum(probs, dim=-1)
 
-        # ✅ 函数式：不修改原张量
+        # ✅ 创建副本，避免 torch.cat 和 torch.tensor
         mask = cumulative_probs > top_p
-        mask = torch.cat([
-            torch.tensor([False], device=mask.device, dtype=torch.bool),
-            mask[1:]
-        ])
+        mask = mask.clone()  # 克隆副本
+        mask[1:] = mask[:-1]  # 移动
+        mask[0] = False  # 第一个位置 False
 
         indices_to_remove = sorted_indices[mask]
         logits[indices_to_remove] = float('-inf')
