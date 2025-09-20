@@ -159,11 +159,12 @@ class ModelLayerAdapter:
 
         # 3. QKV计算 (自动处理不同投影方式)
         qkv_start = time.time()
+
         if self.cfg["qkv_split"]:
             # Qwen 7B: 合并的c_attn投影
-            qkv_out = cache_manager.qkv_out
-            layer.attn.c_attn(hidden_states, out=qkv_out)  # 使用 out= 参数避免新建张量
-            q, k, v = qkv_out.unflatten(-1, (3, 4096)).unbind(dim=-2)
+            qkv = layer.attn.c_attn(hidden_states)
+            hidden_size = qkv.shape[-1] // 3
+            q, k, v = qkv.split(hidden_size, dim=-1)
         else:
             # Qwen 1.5: 分开的q_proj/k_proj/v_proj
             q = layer.self_attn.q_proj(hidden_states)
@@ -204,11 +205,8 @@ class ModelLayerAdapter:
         proj_start = time.time()
 
         proj_fn = getattr(layer.self_attn if self.cfg["qkv_proj"] else layer.attn, self.cfg["proj"])
-        proj_out = cache_manager.proj_out
-        attn_output_flat = attn_output.reshape(batch_size, -1)
-        proj_fn(attn_output_flat, out=proj_out.squeeze(1))  # 直接写入
-        hidden_states = residual + proj_out
-
+        attn_output = proj_fn(attn_output.reshape(batch_size, -1)).unsqueeze(1)  # [B, 1, D]
+        hidden_states = residual + attn_output
 
         proj_time = time.time() - proj_start
         logger.debug(f"Layer {layer_idx}: 输出投影耗时 {proj_time * 1000:.2f}ms")
