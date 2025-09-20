@@ -93,11 +93,8 @@ class ModelLayerAdapter:
     def _get_layer_hash(self, layer) -> int:
         norm_weight = getattr(layer, self.cfg["norm"]).weight.data_ptr()
         attn_weight = layer.attn.c_attn.weight.data_ptr()
-        # ❌ 原错误行：
-        # proj_weight = getattr(layer, self.cfg["proj"]).weight.data_ptr()
-        # ✅ 修复：直接写死 layer.attn.c_proj（因为你的 layer 是 Qwen7B）
-        proj_weight = layer.attn.c_proj.weight.data_ptr()  # ✅ 只改这里！
-        mlp_weight = layer.mlp[0].weight.data_ptr()
+        proj_weight = layer.attn.c_proj.weight.data_ptr()
+        mlp_weight = layer.mlp.w1.weight.data_ptr()  # ✅ 修复：直接访问 w1
         return hash((norm_weight, attn_weight, proj_weight, mlp_weight))
 
 
