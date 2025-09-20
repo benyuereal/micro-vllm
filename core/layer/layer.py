@@ -145,7 +145,6 @@ class ModelLayerAdapter:
         # 1. 自动适配模型架构
         norm_fn = getattr(layer, self.cfg["norm"])
         mlp_norm_fn = getattr(layer, self.cfg["mlp_norm"])
-        mlp_fn = getattr(layer, self.cfg["mlp"])
 
         # 记录LayerNorm前的时间
         norm_start = time.time()
@@ -160,16 +159,11 @@ class ModelLayerAdapter:
         # 3. QKV计算 (自动处理不同投影方式)
         qkv_start = time.time()
 
-        if self.cfg["qkv_split"]:
-            # Qwen 7B: 合并的c_attn投影
-            qkv = layer.attn.c_attn(hidden_states)
-            hidden_size = qkv.shape[-1] // 3
-            q, k, v = qkv.split(hidden_size, dim=-1)
-        else:
-            # Qwen 1.5: 分开的q_proj/k_proj/v_proj
-            q = layer.self_attn.q_proj(hidden_states)
-            k = layer.self_attn.k_proj(hidden_states)
-            v = layer.self_attn.v_proj(hidden_states)
+        # Qwen 7B: 合并的c_attn投影
+        qkv = layer.attn.c_attn(hidden_states)
+        hidden_size = qkv.shape[-1] // 3
+        q, k, v = qkv.split(hidden_size, dim=-1)
+
 
         qkv_time = time.time() - qkv_start
         logger.debug(f"Layer {layer_idx}: QKV投影耗时 {qkv_time * 1000:.2f}ms")
@@ -216,13 +210,7 @@ class ModelLayerAdapter:
 
         residual = hidden_states
         hidden_states = mlp_norm_fn(hidden_states)
-        if self.cfg.get("moe", False):
-            # ✅ Qwen3 MoE: 使用 mlp 模块 (包含 experts 和 gate)
-            if hasattr(layer, 'mlp') and hasattr(layer.mlp, 'experts'):
-                hidden_states = layer.mlp(hidden_states)  # 直接调用mlp模块
-        else:
-            # Qwen2: 普通MLP
-            hidden_states = mlp_fn(hidden_states)
+        hidden_states = layer.mlp(hidden_states)  # 直接调用mlp模块
         hidden_states = residual + hidden_states
 
         mlp_time = time.time() - mlp_start
