@@ -324,29 +324,25 @@ class InferenceEngine:
             self.cache_manager.free(seq.seq_id)
             self.logger.info(f"FINISHED: {seq.seq_id}")
 
-
-    def _pad_batch(self, sequences: List[List[int]], pad_token_id: int) -> torch.Tensor:
-        """填充批次"""
+    def _pad_batch(self, sequences, pad_token_id):
         max_len = max(len(seq) for seq in sequences)
-        padded = [seq + [pad_token_id] * (max_len - len(seq)) for seq in sequences]
-        return torch.tensor(padded, dtype=torch.long)
+        padded = torch.full((len(sequences), max_len), pad_token_id, dtype=torch.long, device='cpu')
+        for i, seq in enumerate(sequences):
+            padded[i, :len(seq)] = torch.tensor(seq, dtype=torch.long)
+        return padded
 
-    def _sample_next_token(self, logits: torch.Tensor, temperature: float, top_p: float) -> int:
-        """采样下一个token"""
-        logits = logits / temperature
-
-        # Top-p 采样
+    def _sample_next_token(self, logits, temperature, top_p):
+        logits = logits.float() / temperature
         sorted_logits, sorted_indices = torch.sort(logits, descending=True)
-        cumulative_probs = torch.cumsum(F.softmax(sorted_logits, dim=-1), dim=-1)
-
+        probs = torch.softmax(sorted_logits, dim=-1)
+        cumulative_probs = torch.cumsum(probs, dim=-1)
         sorted_indices_to_remove = cumulative_probs > top_p
-        sorted_indices_to_remove[..., 1:] = sorted_indices_to_remove[..., :-1].clone()
-        sorted_indices_to_remove[..., 0] = 0
-
+        sorted_indices_to_remove = sorted_indices_to_remove.bool()
+        sorted_indices_to_remove[1:] = sorted_indices_to_remove[:-1].clone()
+        sorted_indices_to_remove[0] = False
         indices_to_remove = sorted_indices[sorted_indices_to_remove]
         logits[indices_to_remove] = float('-inf')
-
-        probs = F.softmax(logits, dim=-1)
+        probs = torch.softmax(logits, dim=-1)
         return torch.multinomial(probs, num_samples=1).item()
 
     def stream_generate(self, prompt: str, max_tokens: int = 128,
