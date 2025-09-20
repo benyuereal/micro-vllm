@@ -103,9 +103,9 @@ class ModelLayerAdapter:
         if self.model_type not in self.MODEL_CONFIGS:
             raise ValueError(f"Unsupported model type: {self.model_type}")
         self.cfg = self.MODEL_CONFIGS[self.model_type]
+        self.model = model
         # 编译 MLP（关键！）
         self._compile_mlp()
-        self.model = model
 
     def _compile_mlp(self):
         """编译 MLP 模块，提升性能"""
