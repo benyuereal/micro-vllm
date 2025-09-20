@@ -104,7 +104,37 @@ class ModelLayerAdapter:
             raise ValueError(f"Unsupported model type: {self.model_type}")
         self.cfg = self.MODEL_CONFIGS[self.model_type]
 
-    def process_layer(self,
+
+        self.batch_size = 1
+        self.dtype = torch.bfloat16
+        # CUDA Graph 相关
+        self.cuda_graph: Optional[torch.cuda.CUDAGraph] = None
+        self.capture_hidden_states: Optional[torch.Tensor] = None
+        self.capture_outputs: Optional[Tuple[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]] = None
+        self.is_capturing = False
+        self.graph_warmup_steps = 3
+        self.step_count = 0
+
+        # 预分配 dummy 张量（延迟初始化）
+        self._dummy_hidden_states = None
+        self._hidden_size = None
+
+        logger.info(f"ModelLayerAdapter initialized (batch_size={1}, dtype={torch.bfloat16}) with CUDA Graph.")
+
+    def _init_dummy_tensors(self, hidden_size: int):
+        """初始化 dummy 张量（bfloat16）"""
+        if self._dummy_hidden_states is not None:
+            return
+        self._hidden_size = hidden_size
+        self._dummy_hidden_states = torch.zeros(
+            self.batch_size, 1, hidden_size,
+            device=self.device, dtype=self.dtype
+        )
+        logger.info(f"Dummy tensors: {tuple(self._dummy_hidden_states.shape)}, dtype={self.dtype}")
+
+
+
+    def _process_layer(self,
                       layer,
                       hidden_states: torch.Tensor,  # [B, S, D]
                       cache_manager,
@@ -225,3 +255,63 @@ class ModelLayerAdapter:
                         f"Proj({proj_time * 1000:.2f}ms)+MLP({mlp_time * 1000:.2f}ms)")
 
         return hidden_states, (k.squeeze(2), v.squeeze(2))  # [B, H, D]
+
+    def process_layer(self,
+                      layer,
+                      hidden_states: torch.Tensor,
+                      cache_manager,
+                      seq_ids: List[int],
+                      context_lens: List[int],
+                      layer_idx: int = 0) -> Tuple[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+        self.step_count += 1
+        B, S, D = hidden_states.shape
+        assert B == self.batch_size and S == 1, f"Expected [B,1,D], got {tuple(hidden_states.shape)}"
+
+        if self._dummy_hidden_states is None:
+            self._init_dummy_tensors(D)
+
+        if hidden_states.device != self.device or hidden_states.dtype != self.dtype:
+            hidden_states = hidden_states.to(self.device, dtype=self.dtype)
+
+        # CUDA Graph 捕获
+        if self.cuda_graph is None and self.step_count > self.graph_warmup_steps:
+            logger.info(f"Step {self.step_count}: Capturing CUDA Graph (bfloat16)...")
+            self.is_capturing = True
+            self.capture_hidden_states = self._dummy_hidden_states
+
+            self.cuda_graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(self.cuda_graph, pool=None, stream=torch.cuda.Stream()):
+                outputs = self._process_layer(
+                    layer, self._dummy_hidden_states, cache_manager, seq_ids, context_lens, layer_idx
+                )
+                self.capture_outputs = (
+                    outputs[0].clone(),
+                    (outputs[1][0].clone(), outputs[1][1].clone())
+                )
+
+            self.is_capturing = False
+            logger.info("CUDA Graph captured.")
+
+        # CUDA Graph 重放
+        if self.cuda_graph is not None and not self.is_capturing:
+            self.capture_hidden_states.copy_(hidden_states)
+            self.cuda_graph.replay()
+            return self.capture_outputs
+
+        # 正常执行
+        with torch.cuda.amp.autocast(enabled=False):  # bfloat16 不需要 autocast
+            outputs = self._process_layer(layer, hidden_states, cache_manager, seq_ids, context_lens, layer_idx)
+        return outputs
+
+    def reset_graph(self):
+        if self.cuda_graph is not None:
+            self.cuda_graph.reset()
+            self.cuda_graph = None
+            self.capture_hidden_states = None
+            self.capture_outputs = None
+            self.step_count = 0
+            logger.info("CUDA Graph reset.")
+
+    def __del__(self):
+        if self.cuda_graph is not None:
+            self.cuda_graph.reset()
