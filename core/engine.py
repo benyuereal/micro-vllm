@@ -324,12 +324,25 @@ class InferenceEngine:
             self.cache_manager.free(seq.seq_id)
             self.logger.info(f"FINISHED: {seq.seq_id}")
 
-    def _pad_batch(self, sequences, pad_token_id):
+    def _pad_batch(self, sequences: List[List[int]], pad_token_id: int) -> torch.Tensor:
+        """填充批次（修复：直接在 GPU 上分配）"""
+        if not sequences:
+            return torch.empty(0, 0, dtype=torch.long, device=self.device)
+
         max_len = max(len(seq) for seq in sequences)
-        padded = torch.full((len(sequences), max_len), pad_token_id, dtype=torch.long, device='cpu')
+        batch_size = len(sequences)
+        # ✅ 直接在 GPU 上分配（避免 CPU -> GPU 拷贝）
+        padded = torch.full(
+            (batch_size, max_len),
+            pad_token_id,
+            dtype=torch.long,
+            device=self.device  # ✅ 使用 GPU
+        )
+        # ✅ 直接在 GPU 上填充
         for i, seq in enumerate(sequences):
-            padded[i, :len(seq)] = torch.tensor(seq, dtype=torch.long)
-        return padded
+            seq_tensor = torch.tensor(seq, dtype=torch.long, device=self.device)  # 直接在 GPU 上创建
+            padded[i, :len(seq)] = seq_tensor
+        return padded  # ✅ 返回 GPU 上的连续内存 tensor
 
     def _sample_next_token(self, logits, temperature, top_p):
         logits = logits.float() / temperature
