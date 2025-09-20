@@ -75,7 +75,7 @@ class ModelLayerAdapter:
         },
     }
 
-    def __init__(self, model_config, device: str, num_heads: int, head_size: int, kv_num_heads: int):
+    def __init__(self, model_config, device: str, num_heads: int, head_size: int, kv_num_heads: int, model=None):
         """
         📌 **初始化**
 
@@ -103,6 +103,27 @@ class ModelLayerAdapter:
         if self.model_type not in self.MODEL_CONFIGS:
             raise ValueError(f"Unsupported model type: {self.model_type}")
         self.cfg = self.MODEL_CONFIGS[self.model_type]
+        # 编译 MLP（关键！）
+        self._compile_mlp()
+        self.model = model
+
+    def _compile_mlp(self):
+        """编译 MLP 模块，提升性能"""
+        for layer in self.model.layers:  # 假设 model 是全局变量，或传入
+            if hasattr(layer, 'mlp') and isinstance(layer.mlp, torch.nn.Module):
+                try:
+                    # 编译 MLP（支持动态 shape）
+                    layer.mlp = torch.compile(
+                        layer.mlp,
+                        mode="max-autotune",  # 最高性能
+                        dynamic=True,  # 支持动态 batch/seq
+                        fullgraph=True  # 尽可能编译整个图
+                    )
+                    logger.info("MLP compiled with torch.compile (mode=max-autotune)")
+                except Exception as e:
+                    logger.warning(f"Failed to compile MLP: {e}")
+                    # 回退：编译为 "default" 模式
+                    layer.mlp = torch.compile(layer.mlp, mode="default")
 
     def process_layer(self,
                       layer,
