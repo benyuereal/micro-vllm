@@ -259,55 +259,93 @@ class InferenceEngine:
 
         return next_tokens
 
+    import time
+    from typing import List
+
     @torch.no_grad()
     def _process_decode_batch(self, batch: List[Sequence]):
-        """处理解码批次，适配不同模型架构"""
-        # 准备输入数据
+        """处理解码批次，适配不同模型架构（关键阶段埋点 + 日志输出）"""
+        timing = {
+            "prepare_input": 0.0,
+            "embedding": 0.0,
+            "cache_update": 0.0,
+            "model_layers": 0.0,
+            "final_norm": 0.0,
+            "lm_head": 0.0,
+            "sample_token": 0.0,
+            "update_sequence": 0.0,
+        }
+
+        # === 1. 准备输入数据 ===
+        start = time.time()
         input_ids = torch.tensor([seq.get_next_input_ids() for seq in batch], device=self.device)
         token_positions = [[pos for pos in range(seq.current_position - 1)] for seq in batch]
         seq_ids = [seq.seq_id for seq in batch]
+        timing["prepare_input"] = time.time() - start
 
+        # === 2. 嵌入层 ===
+        start = time.time()
         hidden_states = self.embedding_layer(input_ids)
+        timing["embedding"] = time.time() - start
 
-        # 逐层处理
-        all_layer_kvs = []
-
-        for i, seq in enumerate(batch):
-            # 追加新的token
+        # === 3. 更新缓存（append + pre-update）===
+        start = time.time()
+        for seq in batch:
             self.cache_manager.append(seq.seq_id)
-
-        # 预更新block table
         context_lens = [seq.current_position for seq in batch]
         self.cache_manager.cache_batch_data(seq_ids, context_lens)
+        timing["cache_update"] = time.time() - start
 
-
-        ## 追加新的token
+        # === 4. 逐层处理（聚合总耗时）===
+        start = time.time()
+        all_layer_kvs = []
         for layer_idx, layer in enumerate(self.model_layers):
-
-            # 使用模型层适配器处理不同架构的层
             hidden_states, layer_kv = self.layer_adapter.process_layer(
                 layer, hidden_states, self.cache_manager, seq_ids,
                 context_lens, token_positions, layer_idx,
                 [seq.current_position - 1 for seq in batch]
             )
-
             all_layer_kvs.append(layer_kv)
+        timing["model_layers"] = time.time() - start
 
-
-        # 最终层归一化 - 使用模型特定的归一化层
+        # === 5. 最终归一化 ===
+        start = time.time()
         hidden_states = self.norm_layer(hidden_states)
+        timing["final_norm"] = time.time() - start
+
+        # === 6. 输出层 (lm_head) ===
+        start = time.time()
         logits = self.model.lm_head(hidden_states).float()
+        timing["lm_head"] = time.time() - start
 
-        # 采样下一个token
-        next_tokens = []
-        for i, seq in enumerate(batch):
-            next_token = self._sample_next_token(logits[i, -1, :], seq.temperature, seq.top_p)
-            next_tokens.append(next_token)
+        # === 7. 采样下一个token ===
+        start = time.time()
+        next_tokens = [
+            self._sample_next_token(logits[i, -1, :], seq.temperature, seq.top_p)
+            for i, seq in enumerate(batch)
+        ]
+        timing["sample_token"] = time.time() - start
 
-        # 序列更新
+        # === 8. 更新序列 ===
+        start = time.time()
         for i, seq in enumerate(batch):
             self._update_sequence(seq, next_tokens[i])
+        timing["update_sequence"] = time.time() - start
 
+        # === 📊 使用 logger 输出耗时（单行简洁格式）===
+        total_time = sum(timing.values())
+        self.logger.info(
+            "decode_timing | "
+            f"total={total_time * 1000:.1f}ms | "
+            f"input={timing['prepare_input'] * 1000:.1f}ms | "
+            f"embed={timing['embedding'] * 1000:.1f}ms | "
+            f"cache={timing['cache_update'] * 1000:.1f}ms | "
+            f"layers={timing['model_layers'] * 1000:.1f}ms | "
+            f"norm={timing['final_norm'] * 1000:.1f}ms | "
+            f"head={timing['lm_head'] * 1000:.1f}ms | "
+            f"sample={timing['sample_token'] * 1000:.1f}ms | "
+            f"update={timing['update_sequence'] * 1000:.1f}ms"
+        )
 
         return next_tokens
 
