@@ -336,8 +336,6 @@ class KVCacheManager:
             dtype=torch.int32, device=self.device
         )
         self.cache_seqlens = torch.tensor([1], dtype=torch.int32, device=self.device)
-        self.qkv_out = torch.empty(10, 1, 3 * 4096, dtype=torch.bfloat16, device=self.device)
-        self.proj_out = torch.empty(10, 1, 4096, dtype=torch.bfloat16, device=self.device)
 
     def alloc(self, seq_id: int, n_tokens: int):
         """
@@ -506,9 +504,9 @@ class KVCacheManager:
 
         self.cache_seqlens = torch.tensor(context_lens, dtype=torch.int32, device=self.device)
 
-        batch_size = len(seq_ids)
-        self.qkv_out = torch.empty(batch_size, 1, 3 * 4096, dtype=torch.bfloat16, device=self.device)
-        self.proj_out = torch.empty(batch_size, 1, 4096, dtype=torch.bfloat16, device=self.device)
+                
+    
+      
 
     def get_slots(self, seq_id: int, token_positions: list) -> list:
         """
