@@ -345,25 +345,8 @@ class InferenceEngine:
         return padded
 
     def _sample_next_token(self, logits: torch.Tensor, temperature: float, top_p: float) -> int:
-        """采样下一个token（最安全：完全在 CPU 上）"""
-        # ✅ 完全在 CPU 上采样（避免 CUDA 问题）
-        logits = logits.float().cpu() / temperature
-
-        sorted_logits, sorted_indices = torch.sort(logits, descending=True)
-        probs = torch.softmax(sorted_logits, dim=-1)
-        cumulative_probs = torch.cumsum(probs, dim=-1)
-
-        mask = cumulative_probs > top_p
-        mask = torch.cat([
-            torch.zeros(1, dtype=torch.bool),
-            mask[:-1]
-        ])
-
-        indices_to_remove = sorted_indices[mask]
-        logits[indices_to_remove] = float('-inf')
-
-        probs = torch.softmax(logits, dim=-1)
-        return torch.multinomial(probs, num_samples=1).item()
+        """返回最高概率 token（Greedy）"""
+        return torch.argmax(logits).item()
 
     def stream_generate(self, prompt: str, max_tokens: int = 128,
                         temperature: float = 0.7, top_p: float = 0.9) -> Generator[Tuple[int, str], None, None]:
