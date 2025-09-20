@@ -344,17 +344,24 @@ class InferenceEngine:
         padded = pad_sequence(tensors, batch_first=True, padding_value=pad_token_id)
         return padded
 
-    def _sample_next_token(self, logits, temperature, top_p):
+    def _sample_next_token(self, logits: torch.Tensor, temperature: float, top_p: float) -> int:
+        """采样下一个token（修复：创建副本）"""
+        # 确保 logits 是 float32
         logits = logits.float() / temperature
+
+        # Top-p 采样
         sorted_logits, sorted_indices = torch.sort(logits, descending=True)
         probs = torch.softmax(sorted_logits, dim=-1)
         cumulative_probs = torch.cumsum(probs, dim=-1)
-        sorted_indices_to_remove = cumulative_probs > top_p
-        sorted_indices_to_remove = sorted_indices_to_remove.bool()
+
+        # ✅ 创建副本，避免修改只读视图
+        sorted_indices_to_remove = (cumulative_probs > top_p).clone()  # 克隆副本
         sorted_indices_to_remove[1:] = sorted_indices_to_remove[:-1].clone()
         sorted_indices_to_remove[0] = False
+
         indices_to_remove = sorted_indices[sorted_indices_to_remove]
         logits[indices_to_remove] = float('-inf')
+
         probs = torch.softmax(logits, dim=-1)
         return torch.multinomial(probs, num_samples=1).item()
 
