@@ -345,17 +345,21 @@ class InferenceEngine:
         return padded
 
     def _sample_next_token(self, logits: torch.Tensor, temperature: float, top_p: float) -> int:
-        """采样下一个token（最终修复：创建副本）"""
+        """采样下一个token（函数式，终极修复）"""
+        # 确保 logits 是 float32
         logits = logits.float() / temperature
+
+        # Top-p 采样
         sorted_logits, sorted_indices = torch.sort(logits, descending=True)
         probs = torch.softmax(sorted_logits, dim=-1)
         cumulative_probs = torch.cumsum(probs, dim=-1)
 
-        # ✅ 创建副本
+        # ✅ 函数式：不修改原张量
         mask = cumulative_probs > top_p
-        mask = torch.roll(mask, shifts=1, dims=0)
-        mask = mask.clone()  # ✅ 克隆副本
-        mask[0] = False  # ✅ 现在可以安全赋值
+        mask = torch.cat([
+            torch.zeros(1, dtype=torch.bool, device=mask.device),  # 第一个位置 False
+            mask[:-1]  # 其余位置
+        ])
 
         indices_to_remove = sorted_indices[mask]
         logits[indices_to_remove] = float('-inf')
