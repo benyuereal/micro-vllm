@@ -162,8 +162,7 @@ class ModelLayerAdapter:
         if self.cfg["qkv_split"]:
             # Qwen 7B: 合并的c_attn投影
             qkv_out = cache_manager.qkv_out
-            with torch.no_grad():
-                qkv_out.copy_(layer.attn.c_attn(hidden_states))
+            layer.attn.c_attn(hidden_states, out=qkv_out)  # 使用 out= 参数避免新建张量
             q, k, v = qkv_out.unflatten(-1, (3, 4096)).unbind(dim=-2)
         else:
             # Qwen 1.5: 分开的q_proj/k_proj/v_proj
