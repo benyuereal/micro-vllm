@@ -39,6 +39,7 @@ from .cache_manager import KVCacheManager, store_kvcache
 from .sequence import Sequence
 from .model_loader import load_model
 import logging
+from torch.nn.utils.rnn import pad_sequence
 
 class InferenceEngine:
     """
@@ -325,24 +326,23 @@ class InferenceEngine:
             self.logger.info(f"FINISHED: {seq.seq_id}")
 
     def _pad_batch(self, sequences: List[List[int]], pad_token_id: int) -> torch.Tensor:
-        """填充批次（修复：直接在 GPU 上分配）"""
+        """填充批次（修复：确保 pad_token_id 有效，GPU 直接分配）"""
+        # 确保 pad_token_id 有效
+        if pad_token_id is None:
+            self.logger.warning("pad_token_id is None, using 0")
+            pad_token_id = 0
+
         if not sequences:
             return torch.empty(0, 0, dtype=torch.long, device=self.device)
 
-        max_len = max(len(seq) for seq in sequences)
-        batch_size = len(sequences)
-        # ✅ 直接在 GPU 上分配（避免 CPU -> GPU 拷贝）
-        padded = torch.full(
-            (batch_size, max_len),
-            pad_token_id,
-            dtype=torch.long,
-            device=self.device  # ✅ 使用 GPU
-        )
-        # ✅ 直接在 GPU 上填充
-        for i, seq in enumerate(sequences):
-            seq_tensor = torch.tensor(seq, dtype=torch.long, device=self.device)  # 直接在 GPU 上创建
-            padded[i, :len(seq)] = seq_tensor
-        return padded  # ✅ 返回 GPU 上的连续内存 tensor
+        # 直接在 GPU 上创建 tensor
+        tensors = []
+        for seq in sequences:
+            tensors.append(torch.tensor(seq, dtype=torch.long, device=self.device))
+
+        # 使用 pad_sequence（GPU 上连续内存）
+        padded = pad_sequence(tensors, batch_first=True, padding_value=pad_token_id)
+        return padded
 
     def _sample_next_token(self, logits, temperature, top_p):
         logits = logits.float() / temperature
