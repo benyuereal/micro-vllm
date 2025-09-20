@@ -178,6 +178,7 @@ async def generate_stream(request: GenerateRequest):
             while True:
                 engine.step()
 
+                # 消费所有已生成 token
                 while not token_queue.empty():
                     token, text = token_queue.get()
                     full_text += text
@@ -188,12 +189,12 @@ async def generate_stream(request: GenerateRequest):
                         "full_text": full_text,
                         "finished": token == engine.eos_token_id
                     }
-
                     yield f"data: {json.dumps(data, ensure_ascii=False)}\n\n"
+
+                # 检查序列是否结束
                 running_seqs = [seq for seq in engine.scheduler.running_sequences if seq.seq_id == seq_id]
                 if not running_seqs:
                     print("[DONE]")
-                    # 流式结束时打印统计信息
                     end_time = time.time()
                     gen_time = end_time - start_time
                     tokens_per_sec = token_count / gen_time if gen_time > 0 else 0
@@ -202,12 +203,13 @@ async def generate_stream(request: GenerateRequest):
                     print(f"Throughput: {tokens_per_sec:.2f} tokens/sec")
                     break
 
-                await asyncio.sleep(0.01)
+                # ✅ 关键：让出控制权，但不等待
+                await asyncio.sleep(0)  # ← 原为 0.01，现在改为 0
+
         finally:
             engine.unregister_stream_callback(seq_id)
 
     return StreamingResponse(event_generator(), media_type="text/event-stream")
-
 
 if __name__ == "__main__":
     import uvicorn
