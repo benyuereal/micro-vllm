@@ -255,7 +255,7 @@ class PagedAttention(nn.Module):
 
         # 6. FlashAttention 调用
         t0 = time.time()
-        with torch.cuda.amp.autocast(enabled=False):  # 确保精度
+        with torch.amp.autocast('cuda', enabled=False):  # 确保精度
             output = flash_attn_with_kvcache(
                 q=query.unsqueeze(1),
                 k_cache=k_cache,
