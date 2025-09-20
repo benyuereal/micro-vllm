@@ -287,8 +287,7 @@ class InferenceEngine:
             # 使用模型层适配器处理不同架构的层
             hidden_states, layer_kv = self.layer_adapter.process_layer(
                 layer, hidden_states, self.cache_manager, seq_ids,
-                context_lens, token_positions, layer_idx,
-                [seq.current_position - 1 for seq in batch]
+                context_lens, layer_idx
             )
 
             all_layer_kvs.append(layer_kv)

@@ -140,9 +140,7 @@ class ModelLayerAdapter:
                       cache_manager,
                       seq_ids: List[int],
                       context_lens: List[int],
-                      token_positions: Optional[torch.Tensor] = None,
-                      layer_idx: int = 0,
-                      current_positions: Optional[torch.Tensor] = None) -> Tuple[
+                      layer_idx: int = 0) -> Tuple[
         torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
         """
         📌 **处理单层计算** (统一接口，自动适配模型架构)
