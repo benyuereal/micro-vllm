@@ -91,13 +91,15 @@ class ModelLayerAdapter:
         logger.info(f"Dummy tensors initialized: {tuple(self._dummy_hidden_states.shape)}, dtype={self.dtype}")
 
     def _get_layer_hash(self, layer) -> int:
-        """获取 layer 的哈希值（用于检测参数是否变化）"""
-        # 只检查关键参数（避免全参数遍历）
         norm_weight = getattr(layer, self.cfg["norm"]).weight.data_ptr()
         attn_weight = layer.attn.c_attn.weight.data_ptr()
-        proj_weight = getattr(layer, self.cfg["proj"]).weight.data_ptr()
-        mlp_weight = layer.mlp[0].weight.data_ptr()  # 假设 mlp 是 Sequential
+        # ❌ 原错误行：
+        # proj_weight = getattr(layer, self.cfg["proj"]).weight.data_ptr()
+        # ✅ 修复：直接写死 layer.attn.c_proj（因为你的 layer 是 Qwen7B）
+        proj_weight = layer.attn.c_proj.weight.data_ptr()  # ✅ 只改这里！
+        mlp_weight = layer.mlp[0].weight.data_ptr()
         return hash((norm_weight, attn_weight, proj_weight, mlp_weight))
+
 
     def _process_layer(self,
                       layer,
@@ -137,7 +139,7 @@ class ModelLayerAdapter:
         )
 
         # 5. 输出投影 + 残差
-        proj_fn = getattr(layer.self_attn if self.cfg["qkv_proj"] else layer.attn, self.cfg["proj"])
+        proj_fn = layer.attn.c_proj
         attn_output = proj_fn(attn_output.reshape(batch_size, -1)).unsqueeze(1)
         hidden_states = residual + attn_output
 
