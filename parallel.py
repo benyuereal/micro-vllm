@@ -28,10 +28,6 @@ async def main():
         {"prompt": "如何学习深度学习？给出学习路径", "max_tokens": 500, "temperature": 0.7, "stream": True},
         {"prompt": "比较React和Vue框架的优缺点", "max_tokens": 500, "temperature": 0.6, "stream": True},
         {"prompt": "写一个关于太空探索的科幻故事开头", "max_tokens": 500, "temperature": 0.9, "stream": True},
-        {"prompt": "介绍一下大学学习生活", "max_tokens": 500, "temperature": 0.5, "stream": True},
-        {"prompt": "介绍一下明朝", "max_tokens": 500, "temperature": 0.8, "stream": True},
-        {"prompt": "如何学习深度学习？给出学习路径", "max_tokens": 500, "temperature": 0.7, "stream": True},
-        {"prompt": "写一个springboot分片上传", "max_tokens": 500, "temperature": 0.6, "stream": True},
 
     ]
 
