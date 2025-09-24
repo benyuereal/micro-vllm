@@ -45,7 +45,8 @@ def load_model(config_path):
         quantization_config=quantization_config,
         device_map="auto",
         trust_remote_code=True,
-        local_files_only=True
+        local_files_only=True,
+        torch_dtype=torch.bfloat16  # 这里明确指定数据类型
     )
     return model, tokenizer
 

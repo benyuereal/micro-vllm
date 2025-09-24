@@ -157,7 +157,22 @@ class InferenceEngine:
         )
         return logging.getLogger("InferenceEngine")
 
+    def _is_gptq_model(self):
+        """检查是否是GPTQ量化模型"""
+        try:
+            # 检查模型是否具有GPTQ配置        if hasattr(self.model, 'quantization_config'):
+            config = self.model.quantization_config
+            if hasattr(config, 'quant_method') and config.quant_method == 'gptq':
+                return True
 
+            # 检查模型架构中是否有QuantLinear层
+            for name, module in self.model.named_modules():
+              if 'QuantLinear' in str(type(module)):
+                return True
+            return False
+        except Exception as e:
+            self.logger.warning(f"GPTQ检测错误: {e}")
+        return False
 
     def _auto_configure(self):
         """自动配置设备和精度"""
@@ -172,7 +187,13 @@ class InferenceEngine:
         # 2. 获取设备配置
         config = self.DEVICE_CONFIGS[device]
         dtype = config["dtype"]
+        # 关键修复：检查是否是GPTQ模型
+        is_gptq_model = self._is_gptq_model()
+
         if device == "cuda" and dtype is None:
+            if is_gptq_model:
+                dtype = next(self.model.parameters()).dtype
+                self.logger.info(f"GPTQ模型使用原始数据类型: {dtype}")
             dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
             if dtype == torch.bfloat16: self.model.to(torch.bfloat16)
 
