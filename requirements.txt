@@ -16,3 +16,5 @@ openai
 einops>=0.6.1
 transformers_stream_generator>=0.0.4
 tiktoken>=0.5.2
+optimum
+auto-gptq  # 添加GPTQ支持
