@@ -158,21 +158,34 @@ class InferenceEngine:
         return logging.getLogger("InferenceEngine")
 
     def _is_gptq_model(self):
-        """检查是否是GPTQ量化模型"""
+        """更健壮的GPTQ模型检测"""
         try:
-            # 检查模型是否具有GPTQ配置        if hasattr(self.model, 'quantization_config'):
-            config = self.model.quantization_config
-            if hasattr(config, 'quant_method') and config.quant_method == 'gptq':
+            # 方法1: 检查模型类型名称
+            model_name = str(type(self.model)).lower()
+            if 'qwen' in model_name and ('int4' in model_name.lower() or 'gptq' in model_name.lower()):
                 return True
 
-            # 检查模型架构中是否有QuantLinear层
+            # 方法2: 检查模型路径
+            if hasattr(self.model, 'name_or_path'):
+                model_path = self.model.name_or_path.lower()
+                if 'int4' in model_path or 'gptq' in model_path:
+                    return True
+
+            # 方法3: 检查模型参数类型 (GPTQ模型通常使用特定量化层)
             for name, module in self.model.named_modules():
-              if 'QuantLinear' in str(type(module)):
+                module_type = str(type(module))
+                if 'quant' in module_type.lower() or 'int' in module_type.lower():
+                    return True
+
+            # 方法4: 检查模型是否有量化属性
+            if hasattr(self.model, 'config') and hasattr(self.model.config, 'quantization_config'):
                 return True
+
             return False
         except Exception as e:
             self.logger.warning(f"GPTQ检测错误: {e}")
-        return False
+            # 如果检测出错，保守起见认为不是GPTQ模型
+            return False
 
     def _auto_configure(self):
         """自动配置设备和精度"""
@@ -187,17 +200,31 @@ class InferenceEngine:
         # 2. 获取设备配置
         config = self.DEVICE_CONFIGS[device]
         dtype = config["dtype"]
-        # 关键修复：检查是否是GPTQ模型
+
+        # 关键修复：更健壮的GPTQ模型检测
         is_gptq_model = self._is_gptq_model()
+        self.logger.info(f"Model type: {type(self.model)}, is_gptq: {is_gptq_model}")
+
+        # 3. 获取模型当前的数据类型
+        model_dtype = next(self.model.parameters()).dtype
+        self.logger.info(f"Model dtype: {model_dtype}")
 
         if device == "cuda" and dtype is None:
+            # 如果是GPTQ模型，使用模型当前的数据类型
             if is_gptq_model:
-                dtype = next(self.model.parameters()).dtype
+                dtype = model_dtype
                 self.logger.info(f"GPTQ模型使用原始数据类型: {dtype}")
-            dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
-            if dtype == torch.bfloat16: self.model.to(torch.bfloat16)
+            else:
+                dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
+                # 只对非GPTQ模型进行类型转换
+                if model_dtype != dtype:
+                    self.model.to(dtype)
+                    model_dtype = dtype
 
-        return device, dtype, config["block_size"], config["max_blocks"]
+        # 4. 确保返回的dtype与模型实际dtype一致
+        actual_dtype = next(self.model.parameters()).dtype
+        return device, actual_dtype, config["block_size"], config["max_blocks"]
+
 
     def add_request(self, prompt: str, max_tokens: int = 128,
                     temperature: float = 0.7, top_p: float = 0.9, priority: int = 0) -> int:
