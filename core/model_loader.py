@@ -40,14 +40,27 @@ def load_model(config_path):
                 dtype=torch.bfloat16
             )
 
-    model = AutoModelForCausalLM.from_pretrained(
-        config["model_path"],
-        quantization_config=quantization_config,
-        device_map="auto",
-        trust_remote_code=True,
-        local_files_only=True,
-        torch_dtype=torch.bfloat16  # 这里明确指定数据类型
-    )
+        # 加载模型
+    try:
+        model = AutoModelForCausalLM.from_pretrained(
+            config["model_path"],
+            quantization_config=quantization_config,
+            device_map="auto",
+            trust_remote_code=True,
+            local_files_only=True,
+            torch_dtype=torch.bfloat16
+        )
+    except Exception as e:
+        print(f"Error loading model with quantization: {e}")
+        # 回退方案：不使用量化配置
+        model = AutoModelForCausalLM.from_pretrained(
+            config["model_path"],
+            device_map="auto",
+            trust_remote_code=True,
+            local_files_only=True,
+            torch_dtype=torch.bfloat16
+        )
+
     return model, tokenizer
 
 
