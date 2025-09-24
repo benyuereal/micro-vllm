@@ -1,11 +1,15 @@
-from transformers import AutoTokenizer, AutoModelForCausalLM, BitsAndBytesConfig
+import json
+from transformers import AutoTokenizer, AutoModelForCausalLM, BitsAndBytesConfig, GPTQConfig
 import torch
 
-def load_model(model_path):
+def load_model_from_config(config_path):
+    with open(config_path) as f:
+        config = json.load(f)
+
+    # 加载tokenizer (保持不变)
     try:
-        # 先尝试直接加载
         tokenizer = AutoTokenizer.from_pretrained(
-            model_path,
+            config["model_path"],
             trust_remote_code=True,
             use_fast=True,
             local_files_only=True
@@ -13,25 +17,38 @@ def load_model(model_path):
     except Exception as e:
         print(f"Fast tokenizer failed: {e}, trying slow tokenizer")
         tokenizer = AutoTokenizer.from_pretrained(
-            model_path,
+            config["model_path"],
             trust_remote_code=True,
             use_fast=False,
             local_files_only=True
         )
 
-    # 配置4-bit量化
-    quantization_config = BitsAndBytesConfig(
-        load_in_4bit=True,  # 启用4-bit量化
-        bnb_4bit_compute_dtype=torch.bfloat16,  # 计算时使用bfloat16
-        bnb_4bit_use_double_quant=True,  # 使用双量化进一步节省内存
-        bnb_4bit_quant_type="nf4",  # 量化类型为nf4
-    )
+    quantization_config = None
+    if config.get("use_quantization", False):
+        if config["quantization_type"] == "bitsandbytes":
+            quantization_config = BitsAndBytesConfig(
+                load_in_4bit=True,
+                bnb_4bit_compute_dtype=torch.bfloat16,
+                bnb_4bit_use_double_quant=True,
+                bnb_4bit_quant_type="nf4"
+            )
+        elif config["quantization_type"] == "gptq":
+            quantization_config = GPTQConfig(
+                bits=4,
+                group_size=128,
+                desc_act=False,
+                dtype=torch.bfloat16
+            )
 
     model = AutoModelForCausalLM.from_pretrained(
-        model_path,
+        config["model_path"],
         quantization_config=quantization_config,
-        device_map="auto",  # 自动分配设备
+        device_map="auto",
         trust_remote_code=True,
         local_files_only=True
     )
     return model, tokenizer
+
+
+# 使用示例
+# model, tokenizer = load_model_from_config("config.json")

@@ -1,0 +1,5 @@
+{
+  "use_quantization": true,
+  "quantization_type": "gptq",
+  "model_path": "/root/Qwen-7B-Chat-Int4"
+}

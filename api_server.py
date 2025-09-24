@@ -54,7 +54,7 @@ class HealthResponse(BaseModel):
 @app.on_event("startup")
 async def startup_event():
     global engine
-    model_path = Config.ModelConfig.MODEL_PATH  # fixme  修改为您的模型路径
+    model_path = "config.json"  # fixme  修改为您的模型路径
     print(f"Loading model from {model_path}...")
     try:
         engine = InferenceEngine(model_path)
