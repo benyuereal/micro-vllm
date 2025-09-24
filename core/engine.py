@@ -309,53 +309,81 @@ class InferenceEngine:
 
     @torch.no_grad()
     def _process_decode_batch(self, batch: List[Sequence]):
-        """处理解码批次，适配不同模型架构"""
-        # 准备输入数据
+        """处理解码批次，适配不同模型架构 - 添加性能埋点"""
+        # 初始化阶段耗时统计
+        stage_times = {
+            "input_prep": 0,  # 输入准备
+            "embedding": 0,  # 嵌入层处理
+            "layers": 0,  # 所有层处理
+            "norm_logits": 0,  # 归一化和logits计算
+            "sampling": 0,  # token采样
+            "seq_update": 0  # 序列更新
+        }
+
+        # 阶段1: 准备输入数据
+        start_time = time.time()
         input_ids = torch.tensor([seq.get_next_input_ids() for seq in batch], device=self.device)
         token_positions = [[pos for pos in range(seq.current_position - 1)] for seq in batch]
         seq_ids = [seq.seq_id for seq in batch]
+        stage_times["input_prep"] = time.time() - start_time
 
+        # 阶段2: 嵌入层处理
+        start_time = time.time()
         hidden_states = self.embedding_layer(input_ids)
+        stage_times["embedding"] = time.time() - start_time
 
-        # 逐层处理
-        all_layer_kvs = []
-
+        # 阶段3: 缓存更新
+        start_time = time.time()
         for i, seq in enumerate(batch):
-            # 追加新的token
             self.cache_manager.append(seq.seq_id)
-
-        # 预更新block table
         context_lens = [seq.current_position for seq in batch]
         self.cache_manager.cache_batch_data(seq_ids, context_lens)
+        cache_time = time.time() - start_time
 
-
-        ## 追加新的token
+        # 阶段4: 所有层处理（合并计时）
+        start_time = time.time()
+        all_layer_kvs = []
         for layer_idx, layer in enumerate(self.model_layers):
-
-            # 使用模型层适配器处理不同架构的层
             hidden_states, layer_kv = self.layer_adapter.process_layer(
                 layer, hidden_states, self.cache_manager, seq_ids,
                 context_lens, token_positions, layer_idx,
                 [seq.current_position - 1 for seq in batch]
             )
-
             all_layer_kvs.append(layer_kv)
+        stage_times["layers"] = time.time() - start_time
 
-
-        # 最终层归一化 - 使用模型特定的归一化层
+        # 阶段5: 归一化和logits计算
+        start_time = time.time()
         hidden_states = self.norm_layer(hidden_states)
         logits = self.model.lm_head(hidden_states).float()
+        stage_times["norm_logits"] = time.time() - start_time
 
-        # 采样下一个token
+        # 阶段6: 采样下一个token
+        start_time = time.time()
         next_tokens = []
         for i, seq in enumerate(batch):
             next_token = self._sample_next_token(logits[i, -1, :], seq.temperature, seq.top_p)
             next_tokens.append(next_token)
+        stage_times["sampling"] = time.time() - start_time
 
-        # 序列更新
+        # 阶段7: 序列更新
+        start_time = time.time()
         for i, seq in enumerate(batch):
             self._update_sequence(seq, next_tokens[i])
+        stage_times["seq_update"] = time.time() - start_time
 
+        # 计算总耗时和吞吐量
+
+        # 详细耗时分布（调试级别）
+        self.logger.info(
+            f"STAGE BREAKDOWN | "
+            f"Input: {stage_times['input_prep'] * 1000:.1f}ms | "
+            f"Embed: {stage_times['embedding'] * 1000:.1f}ms | "
+            f"Layers: {stage_times['layers'] * 1000:.1f}ms | "
+            f"Norm: {stage_times['norm_logits'] * 1000:.1f}ms | "
+            f"Sample: {stage_times['sampling'] * 1000:.1f}ms | "
+            f"Update: {stage_times['seq_update'] * 1000:.1f}ms"
+        )
 
         return next_tokens
 
