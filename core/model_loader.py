@@ -2,7 +2,7 @@ import json
 from transformers import AutoTokenizer, AutoModelForCausalLM, BitsAndBytesConfig, GPTQConfig
 import torch
 
-def load_model_from_config(config_path):
+def load_model(config_path):
     with open(config_path) as f:
         config = json.load(f)
 
