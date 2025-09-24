@@ -126,8 +126,8 @@ curl "http://localhost:8000/health"
 curl -X POST "http://localhost:8000/generate" \
   -H "Content-Type: application/json" \
   -d '{
-    "prompt": "Hello, my name is",
-    "max_tokens": 100,
+    "prompt": "写一个java版本的文件上传代码",
+    "max_tokens": 500,
     "temperature": 0.7
   }'
   ```
