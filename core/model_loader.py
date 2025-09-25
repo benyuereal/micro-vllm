@@ -1,7 +1,8 @@
 import json
-from transformers import AutoTokenizer, AutoModelForCausalLM, BitsAndBytesConfig
+from transformers import AutoTokenizer, AutoModelForCausalLM, BitsAndBytesConfig, \
+    GPTQConfig  # GPTQConfig从transformers导入
 import torch
-from auto_gptq import AutoGPTQForCausalLM, GPTQConfig  # 添加AutoGPTQ支持
+from auto_gptq import AutoGPTQForCausalLM  # 仅导入AutoGPTQForCausalLM
 
 
 def load_model(config_path):
@@ -45,7 +46,7 @@ def load_model(config_path):
                     torch_dtype=torch.bfloat16
                 )
             elif config["quantization_type"] == "gptq":
-                # GPTQ量化配置 - 优化参数设置
+                # GPTQ量化配置 - 使用transformers中的GPTQConfig
                 quantization_config = GPTQConfig(
                     bits=4,  # 4-bit量化
                     group_size=128,  # 推荐组大小
@@ -58,6 +59,7 @@ def load_model(config_path):
                     config["model_path"],
                     device="cuda:0",  # 指定GPU设备
                     use_safetensors=True,  # 使用safetensors格式
+                    use_triton=False,  # 禁用Triton（除非已安装）
                     quantization_config=quantization_config,
                     trust_remote_code=True,
                     local_files_only=True,
