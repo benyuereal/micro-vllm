@@ -272,7 +272,7 @@ def test_fused_quant_qkv_proj():
                                 device="cuda", dtype=torch.float16)
 
     # 创建模拟量化权重 (INT4)
-    qkv_weight = torch.randint(0, 255, (hidden_dim, 3 * hidden_dim),
+    qkv_weight = torch.randint(-128, 128, (hidden_dim, 3 * hidden_dim),
                                device="cuda", dtype=torch.int8)
     qkv_scale = torch.ones(hidden_dim // group_size, device="cuda", dtype=torch.float16)
     qkv_zero = torch.zeros(hidden_dim // group_size, device="cuda", dtype=torch.float16)
@@ -330,7 +330,7 @@ def test_fused_quant_out_proj():
                               device="cuda", dtype=torch.float16)
 
     # 创建模拟量化权重 (INT4)
-    out_weight = torch.randint(0, 255, (hidden_dim, hidden_dim),
+    out_weight = torch.randint(-128, 128, (hidden_dim, hidden_dim),
                                device="cuda", dtype=torch.int8)
     out_scale = torch.ones(hidden_dim // group_size, device="cuda", dtype=torch.float16)
     out_zero = torch.zeros(hidden_dim // group_size, device="cuda", dtype=torch.float16)
@@ -382,7 +382,7 @@ def test_performance_comparison():
                                 device="cuda", dtype=torch.float16)
 
     # 创建模拟量化权重
-    qkv_weight = torch.randint(0, 255, (hidden_dim, 3 * hidden_dim),
+    qkv_weight = torch.randint(-128, 128, (hidden_dim, 3 * hidden_dim),
                                device="cuda", dtype=torch.int8)
     qkv_scale = torch.ones(hidden_dim // group_size, device="cuda", dtype=torch.float16)
     qkv_zero = torch.zeros(hidden_dim // group_size, device="cuda", dtype=torch.float16)
@@ -471,7 +471,7 @@ def test_correctness_comparison():
                                 device="cuda", dtype=torch.float16)
 
     # 创建模拟量化权重
-    qkv_weight = torch.randint(0, 255, (hidden_dim, 3*hidden_dim),
+    qkv_weight = torch.randint(-128, 128, (hidden_dim, 3*hidden_dim),
     device = "cuda", dtype = torch.int8)
     qkv_scale = torch.ones(hidden_dim // group_size, device="cuda", dtype=torch.float16)
     qkv_zero = torch.zeros(hidden_dim // group_size, device="cuda", dtype=torch.float16)
