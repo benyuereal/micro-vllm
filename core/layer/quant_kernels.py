@@ -128,19 +128,22 @@ class QuantKernels:
             else:
                 curr_block_k = BLOCK_K
 
+            # 创建有效的 mask
+            offsets = tl.arange(0, BLOCK_M) < BLOCK_M
+            mask = offsets and (tl.arange(0, BLOCK_K) < curr_block_k)
+
             # 加载输入块 [BLOCK_M, curr_block_k]
-            # 使用 mask 参数替代 shape 参数
             input_block = tl.load(
                 hidden_states_ptr + input_offset + k,
-                mask=None,  # 加载整个块
-                other=0.0
+                mask=mask,  # 提供有效的 mask
+                other=0.0  # 当超出边界时使用 0.0
             )
 
             # 加载量化权重块 (INT4 打包存储)
             weight_offset = k * 3 * hidden_dim
             quant_weight = tl.load(
                 qkv_weight_ptr + weight_offset,
-                mask=None,  # 加载整个块
+                mask=mask,  # 提供有效的 mask
                 other=0
             )
 
@@ -166,22 +169,19 @@ class QuantKernels:
         q_offset = pid_b * num_heads * seq_len * head_dim + pid_s * BLOCK_M * head_dim
         tl.store(
             q_ptr + q_offset,
-            acc_q,
-            mask=None  # 存储整个块
+            acc_q
         )
 
         # 存储 K (类似 Q)
         tl.store(
             k_ptr + q_offset,
-            acc_k,
-            mask=None  # 存储整个块
+            acc_k
         )
 
         # 存储 V (类似 Q)
         tl.store(
             v_ptr + q_offset,
-            acc_v,
-            mask=None  # 存储整个块
+            acc_v
         )
 
     @staticmethod
@@ -213,25 +213,29 @@ class QuantKernels:
             else:
                 curr_block_k = BLOCK_K
 
+            # 创建有效的 mask
+            offsets = tl.arange(0, BLOCK_M) < BLOCK_M
+            mask = offsets and (tl.arange(0, BLOCK_K) < curr_block_k)
+
             # 加载输入块
             input_block = tl.load(
                 attn_output_ptr + input_offset + k,
-                mask=None,  # 加载整个块
-                other=0.0
+                mask=mask,  # 提供有效的 mask
+                other=0.0  # 当超出边界时使用 0.0
             )
 
             # 加载量化权重
             weight_offset = k * hidden_dim
             quant_weight = tl.load(
                 out_weight_ptr + weight_offset,
-                mask=None,  # 加载整个块
+                mask=mask,  # 提供有效的 mask
                 other=0
             )
 
             # 加载量化参数
             group_idx = k // group_size
             scale = tl.load(out_scale_ptr + group_idx)
-            zero = tl.load(out_scale_ptr + group_idx)
+            zero = tl.load(out_scale_ptr + group_idx)  # 注意：这里应该是 out_zero_ptr
 
             # 反量化权重
             weight_fp32 = (quant_weight.to(tl.float32) - zero) * scale
@@ -243,8 +247,7 @@ class QuantKernels:
         out_offset = pid_b * seq_len * hidden_dim + pid_s * BLOCK_M * hidden_dim
         tl.store(
             out_ptr + out_offset,
-            acc,
-            mask=None  # 存储整个块
+            acc
         )
 
 
