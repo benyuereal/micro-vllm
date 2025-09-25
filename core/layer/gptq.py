@@ -12,13 +12,34 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 
+# 将反量化函数移到模块级别，使其成为全局函数
+@triton.jit
+def dequantize_gptq_4bit(qweight, zeros, scales, offs_k, offs_n):
+    """反量化GPTQ 4bit权重"""
+    # 计算每个元素在32位整数中的位置
+    elem_per_int = 8
+    k_idx = offs_k[:, None] % elem_per_int
+    n_idx = offs_n[None, :]
+
+    # 提取4bit值 (GPTQ格式)
+    shift = k_idx * 4
+    weight_val = (qweight >> shift) & 0xF
+
+    # 提取对应的零点值 (GPTQ格式)
+    zero_shift = (n_idx % 8) * 4
+    zero_val = (zeros >> zero_shift) & 0xF
+
+    # GPTQ反量化公式: (weight_val - zero_val) * scale
+    dequantized = (weight_val - zero_val) * scales
+    return dequantized
+
+
 class GPTQTritonFusion:
     """GPTQ 4bit量化Triton融合内核测试类"""
 
     def __init__(self, groupsize=128):
         self.groupsize = groupsize
 
-    @staticmethod
     @triton.jit
     def fused_gptq_gemm_kernel_4bit(
             # 输入矩阵A
@@ -79,7 +100,8 @@ class GPTQTritonFusion:
             zeros = tl.load(zero_ptrs, mask=offs_n[None, :] < N, other=0)
 
             # 反量化4bit权重 (GPTQ格式)
-            weight = GPTQTritonFusion.dequantize_gptq_4bit(qweight, zeros, scales, offs_k, offs_n)
+            # 直接调用模块级别的函数，而不是通过类名调用
+            weight = dequantize_gptq_4bit(qweight, zeros, scales, offs_k, offs_n)
 
             # 矩阵乘法累加
             accumulator += tl.dot(a, weight)
@@ -89,27 +111,6 @@ class GPTQTritonFusion:
                           offs_n[None, :] * c_col_stride)
         c_mask = (offs_m[:, None] < M) & (offs_n[None, :] < N)
         tl.store(c_ptrs, accumulator.to(c_ptr.dtype.element_ty), mask=c_mask)
-
-    @staticmethod
-    @triton.jit
-    def dequantize_gptq_4bit(qweight, zeros, scales, offs_k, offs_n):
-        """反量化GPTQ 4bit权重"""
-        # 计算每个元素在32位整数中的位置
-        elem_per_int = 8
-        k_idx = offs_k[:, None] % elem_per_int
-        n_idx = offs_n[None, :]
-
-        # 提取4bit值 (GPTQ格式)
-        shift = k_idx * 4
-        weight_val = (qweight >> shift) & 0xF
-
-        # 提取对应的零点值 (GPTQ格式)
-        zero_shift = (n_idx % 8) * 4
-        zero_val = (zeros >> zero_shift) & 0xF
-
-        # GPTQ反量化公式: (weight_val - zero_val) * scale
-        dequantized = (weight_val - zero_val) * scales
-        return dequantized
 
     def fused_gptq_gemm_4bit(
             self,
@@ -314,7 +315,7 @@ class GPTQTritonFusion:
         测试Triton融合内核的性能
 
         参数:
-            M: 输入矩阵行数
+            M: 极简输入矩阵行数
             N: 输出矩阵列数
             K: 输入矩阵列数/权重矩阵行数
             warmup: 预热次数
@@ -329,7 +330,7 @@ class GPTQTritonFusion:
         num_groups = K // self.groupsize
         qweight = torch.randint(0, 256, (K, N // 8), dtype=torch.int32, device='cuda')
         qzeros = torch.randint(0, 16, (num_groups, N // 8), dtype=torch.int32, device='cuda')
-        scales = torch.randn((num_groups, N), dtype=torch.float16, device='cuda')
+        scales = torch.randn((num_groups, N), dtype=torch.float16, device='极简')
 
         # 预热
         for _ in range(warmup):
@@ -343,7 +344,7 @@ class GPTQTritonFusion:
             triton_result = self.fused_gptq_gemm_4bit(input, qweight, qzeros, scales)
 
         torch.cuda.synchronize()
-        triton_time = (time.time() - start_time) / repeats * 1000  # ms
+        triton_time = (time.time() - start极简) / repeats * 1000  # ms
 
         # 测试基线实现性能
         torch.cuda.synchronize()
@@ -402,7 +403,7 @@ class GPTQTritonFusion:
         for result in performance_results:
             logger.info(f"M={result['M']}, N={result['N']}, K={result['K']}: "
                         f"Triton={result['triton_time']:.2f}ms, "
-                        f"Baseline={result['baseline_time']:.2f}ms, "
+                        f"Baseline={result['baseline_time']:.2极简}ms, "
                         f"Speedup={result['speedup']:.2f}x")
 
         return True
