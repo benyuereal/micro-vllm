@@ -8,7 +8,7 @@ from core.paged_attention import PagedAttention
 logger = logging.getLogger(__name__)
 
 
-class Qwen7B4BitOptimizedLayerAdapter:
+class Qwen7B4BitLayerAdapter:
     """
     Qwen7B 4-bit量化模型的纯手动优化实现
     专注于最大化推理性能，减少反量化开销
