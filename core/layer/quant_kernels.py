@@ -119,28 +119,14 @@ class QuantKernels:
         acc_k = tl.zeros((BLOCK_M, BLOCK_K), dtype=tl.float32)
         acc_v = tl.zeros((BLOCK_M, BLOCK_K), dtype=tl.float32)
 
-        # 循环处理 K 维度
+        # 循环处理 K 维度 - 移除边界检查，假设 hidden_dim 是 BLOCK_K 的整数倍
         for k in range(0, hidden_dim, BLOCK_K):
-            # 计算当前块大小 (处理边界情况)
-            next_k = k + BLOCK_K
-            if next_k > hidden_dim:
-                curr_block_k = hidden_dim - k
-            else:
-                curr_block_k = BLOCK_K
-
             # 加载输入块 [BLOCK_M, BLOCK_K]
-            # 简单加载整个块，后续处理边界
-            input_block = tl.load(
-                hidden_states_ptr + input_offset + k,
-                other=0.0  # 超出边界部分自动填充0
-            )
+            input_block = tl.load(hidden_states_ptr + input_offset + k)
 
             # 加载量化权重块 (INT4 打包存储)
             weight_offset = k * 3 * hidden_dim
-            quant_weight = tl.load(
-                qkv_weight_ptr + weight_offset,
-                other=0  # 超出边界部分自动填充0
-            )
+            quant_weight = tl.load(qkv_weight_ptr + weight_offset)
 
             # 加载量化参数
             group_idx = k // group_size
@@ -162,22 +148,9 @@ class QuantKernels:
 
         # 存储输出
         q_offset = pid_b * num_heads * seq_len * head_dim + pid_s * BLOCK_M * head_dim
-        tl.store(
-            q_ptr + q_offset,
-            acc_q
-        )
-
-        # 存储 K (类似 Q)
-        tl.store(
-            k_ptr + q_offset,
-            acc_k
-        )
-
-        # 存储 V (类似 Q)
-        tl.store(
-            v_ptr + q_offset,
-            acc_v
-        )
+        tl.store(q_ptr + q_offset, acc_q)
+        tl.store(k_ptr + q_offset, acc_k)
+        tl.store(v_ptr + q_offset, acc_v)
 
     @staticmethod
     @triton.jit
