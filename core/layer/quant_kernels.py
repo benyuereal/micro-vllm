@@ -119,7 +119,7 @@ class QuantKernels:
         acc_k = tl.zeros((BLOCK_M, BLOCK_K), dtype=tl.float32)
         acc_v = tl.zeros((BLOCK_M, BLOCK_K), dtype=tl.float32)
 
-        # 循环处理 K 维度 - 移除边界检查，假设 hidden_dim 是 BLOCK_K 的整数倍
+        # 循环处理 K 维度
         for k in range(0, hidden_dim, BLOCK_K):
             # 加载输入块 [BLOCK_M, BLOCK_K]
             input_block = tl.load(hidden_states_ptr + input_offset + k)
@@ -136,21 +136,32 @@ class QuantKernels:
             # 反量化权重 (INT4 -> FP32)
             weight_fp32 = (quant_weight.to(tl.float32) - zero) * scale
 
-            # 分割 QKV 权重
-            q_weight = weight_fp32[:, :hidden_dim]
-            k_weight = weight_fp32[:, hidden_dim:2 * hidden_dim]
-            v_weight = weight_fp32[:, 2 * hidden_dim:3 * hidden_dim]
+            # 手动分割 QKV 权重
+            for i in range(hidden_dim):
+                # 提取 Q 部分的列
+                q_col = weight_fp32[:, i]
+                # 提取 K 部分的列
+                k_col = weight_fp32[:, hidden_dim + i]
+                # 提取 V 部分的列
+                v_col = weight_fp32[:, 2 * hidden_dim + i]
 
-            # 矩阵乘法
-            acc_q += tl.dot(input_block, q_weight)
-            acc_k += tl.dot(input_block, k_weight)
-            acc_v += tl.dot(input_block, v_weight)
+                # 计算 Q 的列
+                acc_q += tl.dot(input_block, q_col)
+                # 计算 K 的列
+                acc_k += tl.dot(input_block, k_col)
+                # 计算 V 的列
+                acc_v += tl.dot(input_block, v_col)
 
         # 存储输出
         q_offset = pid_b * num_heads * seq_len * head_dim + pid_s * BLOCK_M * head_dim
         tl.store(q_ptr + q_offset, acc_q)
+
+        # 存储 K (类似 Q)
         tl.store(k_ptr + q_offset, acc_k)
+
+        # 存储 V (类似 Q)
         tl.store(v_ptr + q_offset, acc_v)
+
 
     @staticmethod
     @triton.jit
