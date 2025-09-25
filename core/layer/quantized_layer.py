@@ -60,7 +60,7 @@ class Qwen7B4BitLayerAdapter:
         logger.debug("✅ 已分配4-bit量化优化缓冲区")
 
     def _quantized_linear(self, x, quantized_linear_layer, buffer):
-        """优化4-bit量化线性层计算"""
+        """优化4-bit量化线性层计算 - 修复维度问题"""
         # 获取量化参数
         qweight = quantized_linear_layer.qweight
         scales = quantized_linear_layer.scales
@@ -70,26 +70,48 @@ class Qwen7B4BitLayerAdapter:
         if buffer.shape != qweight.shape:
             buffer = torch.empty_like(qweight, dtype=torch.float16)
 
-        # 4-bit反量化优化
-        group_size = scales.shape[0]
-        orig_shape = qweight.shape
-        qweight = qweight.reshape(group_size, -1)
-        scales = scales.view(-1, 1)
-        qzeros = qzeros.view(-1, 1)
+        # 获取分组大小（从量化层获取）
+        group_size = getattr(quantized_linear_layer, "group_size", 128)
 
-        # 高效反量化计算
-        dequantized = (qweight - qzeros) * scales
-        buffer = dequantized.reshape(orig_shape).to(torch.bfloat16)
+        # 4-bit反量化优化
+        orig_shape = qweight.shape
+
+        # 计算分组数量
+        num_groups = (orig_shape[0] + group_size - 1) // group_size
+
+        # 确保scales和qzeros有正确的形状
+        if scales.shape[0] != num_groups:
+            # 调整scales形状
+            scales = scales.view(num_groups, -1)[:, 0]
+        if qzeros.shape[0] != num_groups:
+            # 调整qzeros形状
+            qzeros = qzeros.view(num_groups, -1)[:, 0]
+
+        # 重塑权重为分组格式
+        padded_weight = torch.zeros(num_groups * group_size, orig_shape[1],
+                                    device=qweight.device, dtype=qweight.dtype)
+        padded_weight[:orig_shape[0], :] = qweight
+
+        # 执行反量化
+        dequantized = torch.zeros_like(padded_weight, dtype=torch.float16)
+        for i in range(num_groups):
+            start_idx = i * group_size
+            end_idx = min(start_idx + group_size, orig_shape[0])
+
+            if end_idx > start_idx:
+                group_weight = padded_weight[start_idx:end_idx, :]
+                group_scale = scales[i]
+                group_zero = qzeros[i]
+
+                # 反量化计算
+                dequantized_group = (group_weight - group_zero) * group_scale
+                dequantized[start_idx:end_idx, :] = dequantized_group
+
+        # 复制到缓冲区
+        buffer = dequantized[:orig_shape[0], :].to(torch.bfloat16)
 
         self.dequant_count += 1
         return torch.nn.functional.linear(x, buffer, quantized_linear_layer.bias)
-
-    def _rms_norm(self, x, weight, eps):
-        """RMSNorm实现（无均值中心化）"""
-        # 计算均方根
-        rms = torch.sqrt(torch.mean(x * x, dim=-1, keepdim=True) + eps)
-        # 归一化并应用权重
-        return weight * x / rms
 
     def _optimized_mlp(self, hidden_states, mlp_norm_fn, mlp_fn):
         """Qwen7B 4-bit量化模型优化的MLP计算路径"""
