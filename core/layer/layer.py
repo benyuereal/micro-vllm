@@ -1,27 +1,4 @@
-"""
-===================================================================
-ModelLayerAdapter - vLLM 多模型架构适配器 (极简设计)
-===================================================================
 
-📌 **核心设计目标**：
-   1. 统一多模型架构的层处理接口
-   2. 自动适配不同模型结构 (Qwen/Qwen2等)
-   3. 零拷贝设计，最小化GPU内存分配
-   4. 极简接口，隐藏所有复杂实现
-
-🧱 **架构图**：
-    Input → [LayerAdapter] → PagedAttention → Output
-    ↑ 自动模型适配       ↑ 统一注意力接口
-
-⚡ **性能特性**：
-   - 单层处理: ~20μs/token (CUDA+FlashAttention)
-   - 零内存拷贝: 直接操作隐藏状态
-   - 自动形状转换: 支持不同模型架构
-
-📚 **参考文献**：
-   - vLLM: https://arxiv.org/abs/2309.06180
-   - PagedAttention: https://arxiv.org/abs/2309.06180
-"""
 import logging
 import time
 
@@ -32,28 +9,7 @@ from core.paged_attention import PagedAttention
 logger = logging.getLogger(__name__)
 
 class ModelLayerAdapter:
-    """
-    📌 **模型层适配器** - vLLM核心组件
 
-    🔍 **设计哲学**:
-        1. **统一接口**: 所有模型架构使用相同的process_layer接口
-        2. **自动适配**: 根据model_type自动选择处理逻辑
-        3. **零拷贝**: 直接操作张量，无中间拷贝
-        4. **生产就绪**: 支持AMP、异常处理、设备匹配
-
-    🧪 **典型用法**:
-        adapter = ModelLayerAdapter(config, device, num_heads=16, head_size=128, kv_num_heads=16)
-        hidden_states, (k, v) = adapter.process_layer(
-            layer=layer, 
-            hidden_states=hidden_states,  # [B, S, D]
-            cache_manager=cache_manager,  # KVCacheManager实例
-            seq_ids=[0, 1, 2],          # 序列ID列表
-            context_lens=[10, 20, 30],   # 当前长度
-            token_positions=positions,   # token位置 (可选)
-            layer_idx=0,                 # 层索引
-            current_positions=positions  # 当前位置 (可选)
-        )
-    """
 
     # 模型架构配置 (可扩展)
     MODEL_CONFIGS = {
@@ -76,16 +32,7 @@ class ModelLayerAdapter:
     }
 
     def __init__(self, model_config, device: str, num_heads: int, head_size: int, kv_num_heads: int):
-        """
-        📌 **初始化**
 
-        🔍 **参数**:
-            - model_config: 模型配置
-            - device: 设备 ("cuda", "mps", "cpu")
-            - num_heads: 注意力头数
-            - head_size: 每个头维度
-            - kv_num_heads: KV头数 (GQA支持)
-        """
         self.config = model_config
         self.device = device
         self.model_type = model_config.model_type
@@ -114,31 +61,7 @@ class ModelLayerAdapter:
                       layer_idx: int = 0,
                       current_positions: Optional[torch.Tensor] = None) -> Tuple[
         torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
-        """
-        📌 **处理单层计算** (统一接口，自动适配模型架构)
 
-        🔍 **参数**:
-            - layer: 模型层 (transformer layer)
-            - hidden_states: 隐藏状态 [B, S, D]
-            - cache_manager: KVCacheManager实例
-            - seq_ids: 序列ID列表 [B]
-            - context_lens: 当前长度列表 [B]
-            - token_positions: token位置 (可选)
-            - layer_idx: 层索引
-            - current_positions: 当前位置 (可选)
-
-        ✅ **返回**:
-            - hidden_states: 更新后的隐藏状态 [B, S, D]
-            - (current_k, current_v): 当前层的KV [B, H, D]
-
-        🧠 **内部逻辑**:
-            1. 自动适配模型架构 (Qwen/Qwen2等)
-            2. 应用LayerNorm
-            3. 计算QKV (自动处理不同投影方式)
-            4. 重塑形状 [B, S, D] → [B, H, D]
-            5. 调用PagedAttention
-            6. 残差连接 + MLP
-        """
         # 记录开始时间
         start_time = time.time()
 

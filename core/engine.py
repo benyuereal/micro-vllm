@@ -36,6 +36,7 @@ from models.qwen_adapter import QwenModelAdapter
 from . import Scheduler
 from .layer.layer import ModelLayerAdapter
 from .cache_manager import KVCacheManager, store_kvcache
+from .layer.quantized_layer import QuantizedModelLayerAdapter
 from .sequence import Sequence
 from .model_loader import load_model
 import logging
@@ -127,7 +128,7 @@ class InferenceEngine:
         )
 
         # 6. 初始化层适配器
-        self.layer_adapter = ModelLayerAdapter(
+        self.layer_adapter = QuantizedModelLayerAdapter(
             model_config=self.config,
             device=self.device,
             num_heads=self.num_heads,
