@@ -7,11 +7,15 @@ import triton.language as tl
 import numpy as np
 import time
 
+# File: quant_kernels.py
+import torch
+import triton
+import triton.language as tl
+
 
 class QuantKernels:
     """
-    INT4 GPTQ 量化内核 - Qwen7B 专用
-    专注消除量化模型的反量化开销
+    INT4 GPTQ 量化内核 - Qwen7B 专用（简化版）
     """
 
     @staticmethod
@@ -24,9 +28,6 @@ class QuantKernels:
             head_dim: int,
             group_size: int = 128
     ) -> tuple:
-        """
-        融合反量化的 QKV 投影内核 (Qwen7B 专用)
-        """
         batch_size, seq_len, hidden_dim = hidden_states.shape
 
         # 创建输出张量 [B, H, S, D]
@@ -38,7 +39,7 @@ class QuantKernels:
                         device=hidden_states.device, dtype=torch.float16)
 
         # 设置 Triton 网格
-        grid = (batch_size, triton.cdiv(seq_len, 16))
+        grid = (batch_size * triton.cdiv(seq_len, 16), 1)
 
         # 启动量化内核
         QuantKernels._fused_quant_qkv_proj_kernel[grid](
@@ -51,7 +52,7 @@ class QuantKernels:
             num_heads, head_dim,
             group_size,
             BLOCK_M=16,
-            BLOCK_K=32
+            BLOCK_K=128  # 使用更大的块大小减少循环次数
         )
 
         return q, k, v
@@ -64,16 +65,13 @@ class QuantKernels:
             out_zero: torch.Tensor,
             group_size: int = 128
     ) -> torch.Tensor:
-        """
-        融合反量化的输出投影内核 (Qwen7B 专用)
-        """
         batch_size, seq_len, hidden_dim = attn_output.shape
 
         # 创建输出张量
         output = torch.empty_like(attn_output)
 
         # 设置 Triton 网格
-        grid = (batch_size, triton.cdiv(seq_len, 16))
+        grid = (batch_size * triton.cdiv(seq_len, 16), 1)
 
         # 启动量化内核
         QuantKernels._fused_quant_out_proj_kernel[grid](
@@ -85,7 +83,7 @@ class QuantKernels:
             batch_size, seq_len, hidden_dim,
             group_size,
             BLOCK_M=16,
-            BLOCK_K=32
+            BLOCK_K=128  # 使用更大的块大小减少循环次数
         )
 
         return output
@@ -99,62 +97,52 @@ class QuantKernels:
             batch_size, seq_len, hidden_dim, num_heads, head_dim,
             group_size: tl.constexpr,
             BLOCK_M: tl.constexpr = 16,
-            BLOCK_K: tl.constexpr = 32
+            BLOCK_K: tl.constexpr = 128
     ):
         # 计算 PID 和偏移
-        pid_b = tl.program_id(0)
-        pid_s = tl.program_id(1)
+        pid = tl.program_id(0)
+        pid_b = pid // triton.cdiv(seq_len, BLOCK_M)
+        pid_s = pid % triton.cdiv(seq_len, BLOCK_M)
 
         # 计算输入偏移 [B, S, D]
         input_offset = pid_b * seq_len * hidden_dim + pid_s * BLOCK_M * hidden_dim
 
-        # 计算输出偏移 [B, H, S, D]
-        q_offset = pid_b * num_heads * seq_len * head_dim + pid_s * BLOCK_M * head_dim
+        # 初始化累加器 [BLOCK_M, BLOCK_K]
+        acc_q = tl.zeros((BLOCK_M, BLOCK_K), dtype=tl.float32)
+        acc_k = tl.zeros((BLOCK_M, BLOCK_K), dtype=tl.float32)
+        acc_v = tl.zeros((BLOCK_M, BLOCK_K), dtype=tl.float32)
 
-        # 初始化累加器
-        acc_q = tl.zeros((BLOCK_M, head_dim), dtype=tl.float32)
-        acc_k = tl.zeros((BLOCK_M, head_dim), dtype=tl.float32)
-        acc_v = tl.zeros((BLOCK_M, head_dim), dtype=tl.float32)
-
-        # 加载输入块 [BLOCK_M, hidden_dim]
-        input_block = tl.load(
-            hidden_states_ptr + input_offset,
-            shape=(BLOCK_M, hidden_dim),
-            other=0.0
-        )
-
-        # 循环处理 K 维度（分组处理）
+        # 循环处理 K 维度 (简化边界处理)
         for k in range(0, hidden_dim, BLOCK_K):
-            # 加载量化权重块 [hidden_dim, 3*hidden_dim]
-            weight_offset = k * 3 * hidden_dim
-            quant_weight = tl.load(
-                qkv_weight_ptr + weight_offset,
-                shape=(hidden_dim, 3 * hidden_dim),
-                other=0
-            )
+            # 加载输入块 [BLOCK_M, BLOCK_K]
+            input_block = tl.load(hidden_states_ptr + input_offset + k)
 
-            # 加载量化参数
+            # 加载量化权重块 [BLOCK_K, 3*BLOCK_K]
+            weight_offset = k * 3 * hidden_dim
+            q_weight = tl.load(qkv_weight_ptr + weight_offset)  # [BLOCK_K, BLOCK_K]
+            k_weight = tl.load(qkv_weight_ptr + weight_offset + hidden_dim)  # [BLOCK_K, BLOCK_K]
+            v_weight = tl.load(qkv_weight_ptr + weight_offset + 2 * hidden_dim)  # [BLOCK_K, BLOCK_K]
+
+            # 加载量化参数 (标量)
             group_idx = k // group_size
             scale = tl.load(qkv_scale_ptr + group_idx)
             zero = tl.load(qkv_zero_ptr + group_idx)
 
-            # 反量化权重 (INT8 -> FP32)
-            weight_fp32 = (quant_weight.to(tl.float32) - zero) * scale
-
-            # 分割 QKV 权重
-            q_weight = weight_fp32[:, :hidden_dim]
-            k_weight = weight_fp32[:, hidden_dim:2 * hidden_dim]
-            v_weight = weight_fp32[:, 2 * hidden_dim:3 * hidden_dim]
+            # 反量化权重 (直接标量计算)
+            q_weight = (q_weight.to(tl.float32) - zero) * scale
+            k_weight = (k_weight.to(tl.float32) - zero) * scale
+            v_weight = (v_weight.to(tl.float32) - zero) * scale
 
             # 矩阵乘法
             acc_q += tl.dot(input_block, q_weight)
             acc_k += tl.dot(input_block, k_weight)
             acc_v += tl.dot(input_block, v_weight)
 
-        # 存储输出 [BLOCK_M, head_dim]
-        tl.store(q_ptr + q_offset, acc_q)
-        tl.store(k_ptr + q_offset, acc_k)
-        tl.store(v_ptr + q_offset, acc_v)
+        # 存储输出 [BLOCK_M, BLOCK_K] -> [B, H, S, D]
+        q_offset = pid_b * num_heads * seq_len * head_dim + pid_s * BLOCK_M * head_dim
+        tl.store(q_ptr + q_offset, acc_q.to(tl.float16))
+        tl.store(k_ptr + q_offset, acc_k.to(tl.float16))
+        tl.store(v_ptr + q_offset, acc_v.to(tl.float16))
 
     @staticmethod
     @triton.jit
@@ -163,51 +151,42 @@ class QuantKernels:
             attn_output_ptr, out_weight_ptr, out_scale_ptr, out_zero_ptr,
             out_ptr, batch_size, seq_len, hidden_dim, group_size: tl.constexpr,
             BLOCK_M: tl.constexpr = 16,
-            BLOCK_K: tl.constexpr = 32
+            BLOCK_K: tl.constexpr = 128
     ):
         # 计算 PID 和偏移
-        pid_b = tl.program_id(0)
-        pid_s = tl.program_id(1)
+        pid = tl.program_id(0)
+        pid_b = pid // triton.cdiv(seq_len, BLOCK_M)
+        pid_s = pid % triton.cdiv(seq_len, BLOCK_M)
 
-        # 计算输入偏移 [B, S, D]
+        # 计算输入偏移
         input_offset = pid_b * seq_len * hidden_dim + pid_s * BLOCK_M * hidden_dim
 
-        # 计算输出偏移 [B, S, D]
-        out_offset = pid_b * seq_len * hidden_dim + pid_s * BLOCK_M * hidden_dim
-
         # 初始化累加器
-        acc = tl.zeros((BLOCK_M, hidden_dim), dtype=tl.float32)
+        acc = tl.zeros((BLOCK_M, BLOCK_K), dtype=tl.float32)
 
-        # 加载输入块 [BLOCK_M, hidden_dim]
-        input_block = tl.load(
-            attn_output_ptr + input_offset,
-            shape=(BLOCK_M, hidden_dim),
-            other=0.0
-        )
-
-        # 循环处理 K 维度（分组处理）
+        # 循环处理 K 维度
         for k in range(0, hidden_dim, BLOCK_K):
-            # 加载量化权重块 [hidden_dim, hidden_dim]
-            weight_offset = k * hidden_dim
-            quant_weight = tl.load(
-                out_weight_ptr + weight_offset,
-                shape=(hidden_dim, hidden_dim),
-                other=0
-            )
+            # 加载输入块
+            input_block = tl.load(attn_output_ptr + input_offset + k)
 
-            # 加载量化参数
+            # 加载量化权重
+            weight_offset = k * hidden_dim
+            weight = tl.load(out_weight_ptr + weight_offset)
+
+            # 加载量化参数 (标量)
             group_idx = k // group_size
             scale = tl.load(out_scale_ptr + group_idx)
             zero = tl.load(out_zero_ptr + group_idx)
 
-            # 反量化权重 (INT8 -> FP32)
-            weight_fp32 = (quant_weight.to(tl.float32) - zero) * scale
+            # 反量化
+            weight = (weight.to(tl.float32) - zero) * scale
 
             # 矩阵乘法
-            acc += tl.dot(input_block, weight_fp32)
+            acc += tl.dot(input_block, weight)
 
-        # 存储输出 [BLOCK_M, hidden_dim]
-        tl.store(out_ptr + out_offset, acc)
+        # 存储输出
+        out_offset = pid_b * seq_len * hidden_dim + pid_s * BLOCK_M * hidden_dim
+        tl.store(out_ptr + out_offset, acc.to(tl.float16))
 
 
 # ==================== 测试方法 ====================
