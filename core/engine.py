@@ -80,8 +80,7 @@ class InferenceEngine:
             model_config=self.config,
             device=self.device,
             num_heads=self.num_heads,
-            head_size=self.head_size,
-            kv_num_heads=self.kv_num_heads
+            head_size=self.head_size
         )
 
         self.scheduler = Scheduler(max_batch_size, max_prefill_tokens)
