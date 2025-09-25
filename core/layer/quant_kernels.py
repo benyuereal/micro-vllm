@@ -122,7 +122,6 @@ class QuantKernels:
         # 循环处理 K 维度
         for k in range(0, hidden_dim, BLOCK_K):
             # 计算当前块大小 (处理边界情况)
-            # 修复：使用 triton 的 min 函数处理边界
             next_k = k + BLOCK_K
             if next_k > hidden_dim:
                 curr_block_k = hidden_dim - k
@@ -130,10 +129,10 @@ class QuantKernels:
                 curr_block_k = BLOCK_K
 
             # 加载输入块 [BLOCK_M, curr_block_k]
+            # 使用 mask 参数替代 shape 参数
             input_block = tl.load(
                 hidden_states_ptr + input_offset + k,
-                shape=(BLOCK_M, curr_block_k),
-                mask=None,
+                mask=None,  # 加载整个块
                 other=0.0
             )
 
@@ -141,8 +140,7 @@ class QuantKernels:
             weight_offset = k * 3 * hidden_dim
             quant_weight = tl.load(
                 qkv_weight_ptr + weight_offset,
-                shape=(curr_block_k, 3 * hidden_dim),
-                mask=None,
+                mask=None,  # 加载整个块
                 other=0
             )
 
@@ -169,27 +167,23 @@ class QuantKernels:
         tl.store(
             q_ptr + q_offset,
             acc_q,
-            shape=(BLOCK_M, head_dim),
-            mask=None
+            mask=None  # 存储整个块
         )
 
         # 存储 K (类似 Q)
         tl.store(
             k_ptr + q_offset,
             acc_k,
-            shape=(BLOCK_M, head_dim),
-            mask=None
+            mask=None  # 存储整个块
         )
 
         # 存储 V (类似 Q)
         tl.store(
             v_ptr + q_offset,
             acc_v,
-            shape=(BLOCK_M, head_dim),
-            mask=None
+            mask=None  # 存储整个块
         )
 
-    @staticmethod
     @staticmethod
     @triton.jit
     def _fused_quant_out_proj_kernel(
@@ -213,7 +207,6 @@ class QuantKernels:
         # 循环处理 K 维度
         for k in range(0, hidden_dim, BLOCK_K):
             # 计算当前块大小 (处理边界情况)
-            # 修复：使用 triton 的 min 函数处理边界
             next_k = k + BLOCK_K
             if next_k > hidden_dim:
                 curr_block_k = hidden_dim - k
@@ -223,8 +216,7 @@ class QuantKernels:
             # 加载输入块
             input_block = tl.load(
                 attn_output_ptr + input_offset + k,
-                shape=(BLOCK_M, curr_block_k),
-                mask=None,
+                mask=None,  # 加载整个块
                 other=0.0
             )
 
@@ -232,8 +224,7 @@ class QuantKernels:
             weight_offset = k * hidden_dim
             quant_weight = tl.load(
                 out_weight_ptr + weight_offset,
-                shape=(curr_block_k, hidden_dim),
-                mask=None,
+                mask=None,  # 加载整个块
                 other=0
             )
 
@@ -253,8 +244,7 @@ class QuantKernels:
         tl.store(
             out_ptr + out_offset,
             acc,
-            shape=(BLOCK_M, BLOCK_K),
-            mask=None
+            mask=None  # 存储整个块
         )
 
 
