@@ -51,6 +51,7 @@ class QuantizedModelLayerAdapter:
 
         # 量化模型优化配置
         self.is_quantized = hasattr(model_config, "quantization_config")
+        print("Quantization Config:", self.is_quantized)
         logger.info(f"Quantization config: {self.is_quantized}")
         self.quant_bits = 16
         if self.is_quantized:
