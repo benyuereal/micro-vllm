@@ -128,23 +128,18 @@ class QuantKernels:
             else:
                 curr_block_k = BLOCK_K
 
-            # 创建与累加器形状兼容的 mask
-            # 使用二维 mask: (BLOCK_M, curr_block_k)
-            mask = tl.arange(0, BLOCK_M)[:, None] < BLOCK_M and tl.arange(0, BLOCK_K) < curr_block_k
-
-            # 加载输入块 [BLOCK_M, curr_block_k]
+            # 加载输入块 [BLOCK_M, BLOCK_K]
+            # 简单加载整个块，后续处理边界
             input_block = tl.load(
                 hidden_states_ptr + input_offset + k,
-                mask=mask,
-                other=0.0
+                other=0.0  # 超出边界部分自动填充0
             )
 
             # 加载量化权重块 (INT4 打包存储)
             weight_offset = k * 3 * hidden_dim
             quant_weight = tl.load(
                 qkv_weight_ptr + weight_offset,
-                mask=mask,
-                other=0
+                other=0  # 超出边界部分自动填充0
             )
 
             # 加载量化参数
@@ -206,36 +201,23 @@ class QuantKernels:
 
         # 循环处理 K 维度
         for k in range(0, hidden_dim, BLOCK_K):
-            # 计算当前块大小 (处理边界情况)
-            next_k = k + BLOCK_K
-            if next_k > hidden_dim:
-                curr_block_k = hidden_dim - k
-            else:
-                curr_block_k = BLOCK_K
-
-            # 创建与累加器形状兼容的 mask
-            # 使用二维 mask: (BLOCK_M, curr_block_k)
-            mask = tl.arange(0, BLOCK_M)[:, None] < BLOCK_M and tl.arange(0, BLOCK_K) < curr_block_k
-
             # 加载输入块
             input_block = tl.load(
                 attn_output_ptr + input_offset + k,
-                mask=mask,
-                other=0.0
+                other=0.0  # 超出边界部分自动填充0
             )
 
             # 加载量化权重
             weight_offset = k * hidden_dim
             quant_weight = tl.load(
                 out_weight_ptr + weight_offset,
-                mask=mask,
-                other=0
+                other=0  # 超出边界部分自动填充0
             )
 
             # 加载量化参数
             group_idx = k // group_size
             scale = tl.load(out_scale_ptr + group_idx)
-            zero = tl.load(out_zero_ptr + group_idx)  # 修正：使用 out_zero_ptr
+            zero = tl.load(out_zero_ptr + group_idx)
 
             # 反量化权重
             weight_fp32 = (quant_weight.to(tl.float32) - zero) * scale
