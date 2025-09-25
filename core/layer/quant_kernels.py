@@ -147,21 +147,24 @@ class QuantKernels:
                 q_col_fp32 = (q_col.to(tl.float32) - zero) * scale
 
                 # 提取 K 部分的列 (K 部分: [hidden_dim, 2*hidden_dim])
-                k_col_offset = hidden_dim + col_offset
-                k_col_ptr = qkv_weight_ptr + weight_offset + k_col_offset
+                k_col_ptr = qkv_weight_ptr + weight_offset + hidden_dim + col_offset
                 k_col = tl.load(k_col_ptr)
                 k_col_fp32 = (k_col.to(tl.float32) - zero) * scale
 
                 # 提取 V 部分的列 (V 部分: [2*hidden_dim, 3*hidden_dim])
-                v_col_offset = 2 * hidden_dim + col_offset
-                v_col_ptr = qkv_weight_ptr + weight_offset + v_col_offset
+                v_col_ptr = qkv_weight_ptr + weight_offset + 2 * hidden_dim + col_offset
                 v_col = tl.load(v_col_ptr)
                 v_col_fp32 = (v_col.to(tl.float32) - zero) * scale
 
+                # 将列向量扩展为二维张量 [BLOCK_K, 1]
+                q_col_2d = q_col_fp32[:, None]
+                k_col_2d = k_col_fp32[:, None]
+                v_col_2d = v_col_fp32[:, None]
+
                 # 矩阵乘法 (每个列向量)
-                acc_q += tl.dot(input_block, q_col_fp32[:, None])
-                acc_k += tl.dot(input_block, k_col_fp32[:, None])
-                acc_v += tl.dot(input_block, v_col_fp32[:, None])
+                acc_q += tl.dot(input_block, q_col_2d)
+                acc_k += tl.dot(input_block, k_col_2d)
+                acc_v += tl.dot(input_block, v_col_2d)
 
         # 存储输出
         q_offset = pid_b * num_heads * seq_len * head_dim + pid_s * BLOCK_M * head_dim
