@@ -1,30 +1,3 @@
-"""
-===================================================================
-InferenceEngine - vLLM 推理引擎 (极简设计)
-===================================================================
-
-📌 **核心设计目标**：
-   1. 自动适配多模型架构 (Qwen/Qwen2等)
-   2. 零拷贝设计，最小化GPU内存分配
-   3. 极简配置，隐藏所有复杂实现
-   4. 生产就绪，支持AMP、异常处理
-
-🧱 **架构图**：
-    Input → [Engine] → [LayerAdapter] → PagedAttention → Output
-    ↑ 自动模型加载       ↑ 自动适配架构       ↑ 统一注意力
-
-⚡ **性能特性**：
-   - 初始化: ~1s (自动模型加载)
-   - 单token推理: ~20μs/token (CUDA+FlashAttention)
-   - 零内存拷贝: 直接操作模型参数
-   - 自动精度: 自动选择bfloat16/float16
-
-📚 **参考文献**：
-   - vLLM: https://arxiv.org/abs/2309.06180
-   - FlashAttention: https://arxiv.org/abs/2205.14135
-"""
-
-
 
 import torch
 import torch.nn.functional as F
@@ -36,24 +9,13 @@ from models.qwen_adapter import QwenModelAdapter
 from . import Scheduler
 from .layer.layer import ModelLayerAdapter
 from .cache_manager import KVCacheManager, store_kvcache
+from .layer.qwen_layer import QwenModelLayerAdapter
 from .sequence import Sequence
 from .model_loader import load_model
 import logging
 
 class InferenceEngine:
-    """
-    📌 **推理引擎** - vLLM核心组件
 
-    🔍 **设计哲学**:
-        1. **极简接口**: 自动加载模型，隐藏所有复杂配置
-        2. **自动适配**: 根据模型类型自动选择最佳配置
-        3. **零拷贝**: 直接操作模型参数，无中间拷贝
-        4. **生产就绪**: 支持AMP、日志、回调
-
-    🧪 **典型用法**:
-        engine = InferenceEngine(model_path="Qwen/Qwen2-0.5B", max_batch_size=8)
-        output = engine.generate(input_ids, max_new_tokens=100)
-    """
 
     # 设备配置 (可扩展)
     # 扩展DEVICE_CONFIGS (支持Qwen3 MoE)
@@ -65,20 +27,7 @@ class InferenceEngine:
     }
 
     def __init__(self, model_path: str, max_batch_size: int = 8, max_prefill_tokens: int = 2048):
-        """
-        📌 **初始化推理引擎** (自动加载模型，隐藏所有配置)
 
-        🔍 **参数**:
-            - model_path: 模型路径 (HuggingFace格式)
-            - max_batch_size: 最大批次大小
-            - max_prefill_tokens: 最大预填充token数
-
-        🧠 **内部逻辑**:
-            1. 自动加载模型和分词器
-            2. 自动检测设备和模型架构
-            3. 初始化KV缓存和注意力模块
-            4. 设置日志和回调
-        """
         self.logger = self._init_logging()
         self.logger.info(f"Initializing InferenceEngine for {model_path}")
 
@@ -127,7 +76,7 @@ class InferenceEngine:
         )
 
         # 6. 初始化层适配器
-        self.layer_adapter = ModelLayerAdapter(
+        self.layer_adapter = QwenModelLayerAdapter(
             model_config=self.config,
             device=self.device,
             num_heads=self.num_heads,
@@ -158,33 +107,22 @@ class InferenceEngine:
         return logging.getLogger("InferenceEngine")
 
     def _is_gptq_model(self):
-        """更健壮的GPTQ模型检测"""
+        """检测是否为GPTQ模型"""
         try:
-            # 方法1: 检查模型类型名称
-            model_name = str(type(self.model)).lower()
-            if 'qwen' in model_name and ('int4' in model_name.lower() or 'gptq' in model_name.lower()):
-                return True
-
-            # 方法2: 检查模型路径
-            if hasattr(self.model, 'name_or_path'):
-                model_path = self.model.name_or_path.lower()
-                if 'int4' in model_path or 'gptq' in model_path:
-                    return True
-
-            # 方法3: 检查模型参数类型 (GPTQ模型通常使用特定量化层)
-            for name, module in self.model.named_modules():
-                module_type = str(type(module))
-                if 'quant' in module_type.lower() or 'int' in module_type.lower():
-                    return True
-
-            # 方法4: 检查模型是否有量化属性
+            # 检查模型配置
             if hasattr(self.model, 'config') and hasattr(self.model.config, 'quantization_config'):
+                quant_config = self.model.config.quantization_config
+                if quant_config and quant_config.get('quant_method') == 'gptq':
+                    return True
+
+            # 检查模型类型名称
+            model_name = str(type(self.model)).lower()
+            if 'gptq' in model_name or 'int4' in model_name:
                 return True
 
             return False
         except Exception as e:
             self.logger.warning(f"GPTQ检测错误: {e}")
-            # 如果检测出错，保守起见认为不是GPTQ模型
             return False
 
     def _auto_configure(self):
@@ -203,6 +141,8 @@ class InferenceEngine:
 
         # 关键修复：更健壮的GPTQ模型检测
         is_gptq_model = self._is_gptq_model()
+        # 6. 初始化层适配器 - 传递GPTQ标识
+        self.is_gptq_model = self._is_gptq_model()
         self.logger.info(f"Model type: {type(self.model)}, is_gptq: {is_gptq_model}")
 
         # 3. 获取模型当前的数据类型
@@ -212,18 +152,16 @@ class InferenceEngine:
         if device == "cuda" and dtype is None:
             # 如果是GPTQ模型，使用模型当前的数据类型
             if is_gptq_model:
-                dtype = model_dtype
                 self.logger.info(f"GPTQ模型使用原始数据类型: {dtype}")
             else:
                 dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
                 # 只对非GPTQ模型进行类型转换
                 if model_dtype != dtype:
                     self.model.to(dtype)
-                    model_dtype = dtype
 
         # 4. 确保返回的dtype与模型实际dtype一致
-        actual_dtype = next(self.model.parameters()).dtype
-        return device, actual_dtype, config["block_size"], config["max_blocks"]
+        dtype = next(self.model.parameters()).dtype
+        return device, dtype, config["block_size"], config["max_blocks"]
 
 
     def add_request(self, prompt: str, max_tokens: int = 128,
