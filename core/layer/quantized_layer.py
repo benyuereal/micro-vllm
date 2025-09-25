@@ -8,7 +8,12 @@ from core.paged_attention import PagedAttention
 logger = logging.getLogger(__name__)
 
 
-class Qwen7B4BitLayerAdapter:
+class Qwen7B4BitOptimizedLayerAdapter:
+    """
+    Qwen7B 4-bit量化模型的纯手动优化实现
+    专注于最大化推理性能，减少反量化开销
+    """
+
     def __init__(self, model_config, device: str, num_heads: int, head_size: int, kv_num_heads: int):
         self.config = model_config
         self.device = device
@@ -22,94 +27,162 @@ class Qwen7B4BitLayerAdapter:
             device=device
         )
 
-        # 动态缓冲区（不需要预分配）
-        self.dequant_buffers = {}
+        # 模型维度
+        self.hidden_size = getattr(self.config, "hidden_size", 4096)
+        self.intermediate_size = getattr(self.config, "intermediate_size", 11008)
 
         # 性能计数器
         self.dequant_count = 0
         self.fused_ops = 0
-        logger.info("✅ 初始化Qwen7B 4-bit量化模型优化层")
 
-    def _quantized_linear(self, x, quantized_linear_layer):
-        """优化4-bit量化线性层计算 - 修复矩阵形状问题"""
-        # 获取量化参数
-        qweight = quantized_linear_layer.qweight
-        scales = quantized_linear_layer.scales
-        qzeros = quantized_linear_layer.qzeros
+        # 预分配优化缓冲区        self._setup_optimized_buffers()
 
-        # 获取原始权重形状
+        logger.info("🚀 初始化Qwen7B 4-bit量化模型纯手动优化层")
+
+    def _setup_optimized_buffers(self):
+        """为优化计算预分配CUDA缓冲区"""
+        # 使用Pinned Memory提高传输速度
+        pin_memory = True if self.device == "cuda:0" else False
+
+        # 主要缓冲区
+        self.buffer1 = torch.zeros(
+            (1, 1, self.hidden_size * 3),
+            device=self.device,
+            dtype=torch.float16,
+            pin_memory=pin_memory
+        )
+        self.buffer2 = torch.zeros(
+            (1, 1, self.intermediate_size),
+            device=self.device,
+            dtype=torch.float16,
+            pin_memory=pin_memory
+        )
+        self.buffer3 = torch.zeros(
+            (1, 1, self.hidden_size),
+            device=self.device,
+            dtype=torch.float16,
+            pin_memory=pin_memory
+        )
+
+        logger.debug("✅ 已分配优化CUDA缓冲区")
+
+    def _fused_rms_norm(self, x, weight, eps=1e-6):
+        """融合RMSNorm计算（无均值中心化）"""
+        # 融合计算减少内核启动
+        variance = ((x * x).mean(dim=-1, keepdim=True))
+        x = weight * x / torch.sqrt(variance + eps)
+        return x
+
+    def _quantized_matmul(self, x, qweight, scales, qzeros, bias, out_features):
+        """
+        优化4-bit量化矩阵乘法
+        融合反量化与矩阵乘法，减少内存访问
+        """
+        # 获取分组大小（GPTQ默认128）
+        group_size = 128
+
+        # 重塑量化权重 [out_features, in_features]
         orig_shape = qweight.shape
-
-        # 获取分组大小（从量化层获取）
-        group_size = getattr(quantized_linear_layer, "group_size", 128)
+        in_features = orig_shape[1]
 
         # 计算分组数量
         num_groups = (orig_shape[0] + group_size - 1) // group_size
 
-        # 确保scales和qzeros有正确的形状
+        # 调整scales和qzeros形状 [num_groups]
         if scales.shape[0] != num_groups:
             scales = scales.view(num_groups, -1)[:, 0]
         if qzeros.shape[0] != num_groups:
             qzeros = qzeros.view(num_groups, -1)[:, 0]
 
-        # 创建反量化权重张量
-        dequantized = torch.zeros(orig_shape, dtype=torch.float16, device=x.device)
+        # 输出张量 [batch_size, out_features]
+        batch_size = x.shape[0]
+        output = torch.zeros(
+            (batch_size, out_features),
+            device=x.device,
+            dtype=torch.bfloat16
+        )
 
-        # 执行分组反量化
-        for i in range(num_groups):
-            start_idx = i * group_size
-            end_idx = min(start_idx + group_size, orig_shape[0])
+        # 分块矩阵乘法（减少内存压力）
+        chunk_size = min(1024, in_features)  # 优化块大小
+        for i in range(0, in_features, chunk_size):
+            end_i = min(i + chunk_size, in_features)
+            x_chunk = x[:, i:end_i]  # [batch_size, chunk_size]
 
-            if end_idx > start_idx:
-                group_weight = qweight[start_idx:end_idx, :]
-                group_scale = scales[i]
-                group_zero = qzeros[i]
+            # 计算当前块涉及的分组
+            start_group = i // group_size
+            end_group = (end_i + group_size - 1) // group_size
 
-                # 反量化计算
-                dequantized_group = (group_weight - group_zero) * group_scale
-                dequantized[start_idx:end_idx, :] = dequantized_group
+            for g in range(start_group, end_group):
+                # 分组权重反量化
+                start_row = g * group_size
+                end_row = min(start_row + group_size, out_features)
+
+                # 反量化当前分组 [group_size, chunk_size]
+                group_weight = qweight[start_row:end_row, i:end_i]
+                group_scale = scales[g]
+                group_zero = qzeros[g]
+                dequantized = (group_weight - group_zero) * group_scale
+
+                # 矩阵乘法 [batch_size, group_size]
+                output[:, start_row:end_row] += torch.matmul(
+                    x_chunk,
+                    dequantized.t()
+                )
+
+        # 添加偏置
+        if bias is not None:
+            output += bias.unsqueeze(0)
 
         self.dequant_count += 1
-
-        # 执行线性变换
-        return torch.nn.functional.linear(x, dequantized.to(torch.bfloat16), quantized_linear_layer.bias)
+        return output
 
     def _optimized_mlp(self, hidden_states, mlp_norm_fn, mlp_fn):
-        """Qwen7B 4-bit量化模型优化的MLP计算路径"""
-        # 保存原始输入（用于值计算）
+        """优化MLP计算路径，融合反量化"""
+        # 保存原始输入用于值计算
         original_hidden_states = hidden_states
 
-        # 1. RMSNorm计算（无均值中心化）
-        variance = ((hidden_states * hidden_states).mean(dim=-1, keepdim=True))
-        hidden_states = mlp_norm_fn.weight * hidden_states / torch.sqrt(variance + 1e-6)
-
+        # 1. RMSNorm计算
+        hidden_states = self._fused_rms_norm(
+            hidden_states,
+            mlp_norm_fn.weight
+        )
         self.fused_ops += 1
 
-        # 2. 门控线性变换 (w1)
-        gate = self._quantized_linear(
+        # 2. 门控路径（w1 -> act -> w2）
+        gate = self._quantized_matmul(
             hidden_states,
-            mlp_fn.w1
+            mlp_fn.w1.qweight,
+            mlp_fn.w1.scales,
+            mlp_fn.w1.qzeros,
+            mlp_fn.w1.bias,
+            self.intermediate_size
         )
 
-        # 3. 值线性变换 (w3) - 使用原始输入
-        value = self._quantized_linear(
-            original_hidden_states,
-            mlp_fn.w3
-        )
-
-        # 4. 激活函数 (SiLU)
+        # 3. 激活函数（SiLU）
         gate = torch.nn.functional.silu(gate)
 
-        # 5. 输出线性变换 (w2)
-        gate = self._quantized_linear(
+        # 4. 值路径（w3）
+        value = self._quantized_matmul(
+            original_hidden_states,
+            mlp_fn.w3.qweight,
+            mlp_fn.w3.scales,
+            mlp_fn.w3.qzeros,
+            mlp_fn.w3.bias,
+            self.intermediate_size
+        )
+
+        # 5. 输出投影（w2）
+        gate = self._quantized_matmul(
             gate,
-            mlp_fn.w2
+            mlp_fn.w2.qweight,
+            mlp_fn.w2.scales,
+            mlp_fn.w2.qzeros,
+            mlp_fn.w2.bias,
+            self.hidden_size
         )
 
         # 6. 合并结果
-        hidden_states = gate * value
-
-        return hidden_states
+        return gate * value
 
     def process_layer(self,
                       layer,
@@ -127,40 +200,36 @@ class Qwen7B4BitLayerAdapter:
 
         # 1. RMSNorm + 残差
         residual = hidden_states
-
-        # 优化版RMSNorm（无均值中心化）
-        variance = ((hidden_states * hidden_states).mean(dim=-1, keepdim=True))
-        hidden_states = layer.ln_1.weight * hidden_states / torch.sqrt(variance + 1e-6)
-
+        hidden_states = self._fused_rms_norm(hidden_states, layer.ln_1.weight)
         norm_time = time.time() - start_time
-        self.fused_ops += 1
 
-        # 2. QKV计算 (量化优化)
+        # 2. QKV计算（量化优化）
         qkv_start = time.time()
 
-        # 使用量化优化计算
-        qkv = self._quantized_linear(
+        # 使用融合矩阵乘法
+        qkv = self._quantized_matmul(
             hidden_states,
-            layer.attn.c_attn
+            layer.attn.c_attn.qweight,
+            layer.attn.c_attn.scales,
+            layer.attn.c_attn.qzeros,
+            layer.attn.c_attn.bias,
+            self.hidden_size * 3
         )
         hidden_size = qkv.shape[-1] // 3
         q, k, v = qkv.split(hidden_size, dim=-1)
 
         qkv_time = time.time() - qkv_start
 
-        # 3. 重塑形状 [B, S, D] → [B, H, D]
+        # 3. 重塑形状
         reshape_start = time.time()
-
         batch_size, seq_len, _ = hidden_states.shape
         q = q.view(batch_size, seq_len, self.num_heads, self.head_size).permute(0, 2, 1, 3)
         k = k.view(batch_size, seq_len, self.kv_num_heads, self.head_size).permute(0, 2, 1, 3)
         v = v.view(batch_size, seq_len, self.kv_num_heads, self.head_size).permute(0, 2, 1, 3)
-
         reshape_time = time.time() - reshape_start
 
         # 4. 注意力计算
         attn_start = time.time()
-
         attn_output = self.attention(
             query=q.squeeze(2),
             cache_manager=cache_manager,
@@ -170,46 +239,35 @@ class Qwen7B4BitLayerAdapter:
             key=k.squeeze(2),
             value=v.squeeze(2)
         )
-
         attn_time = time.time() - attn_start
 
-        # 5. 输出投影 + 残差 (量化优化)
+        # 5. 输出投影（量化优化）
         proj_start = time.time()
-
-        attn_output = self._quantized_linear(
+        attn_output = self._quantized_matmul(
             attn_output.reshape(batch_size, -1),
-            layer.attn.c_proj
+            layer.attn.c_proj.qweight,
+            layer.attn.c_proj.scales,
+            layer.attn.c_proj.qzeros,
+            layer.attn.c_proj.bias,
+            self.hidden_size
         ).unsqueeze(1)
-
         hidden_states = residual + attn_output
-
         proj_time = time.time() - proj_start
 
-        # 6. MLP + 残差 (量化优化)
+        # 6. MLP + 残差（量化优化）
         mlp_start = time.time()
-
         residual = hidden_states
-
-        # 优化版RMSNorm
-        variance = ((hidden_states * hidden_states).mean(dim=-1, keepdim=True))
-        hidden_states = layer.ln_2.weight * hidden_states / torch.sqrt(variance + 1e-6)
-
-        # 优化MLP计算
         hidden_states = self._optimized_mlp(hidden_states, layer.ln_2, layer.mlp)
-
         hidden_states = residual + hidden_states
-
         mlp_time = time.time() - mlp_start
 
-        # 记录总耗时
+        # 记录性能
         total_time = time.time() - start_time
         if layer_idx == 0:
-            logger.info(f"Layer {layer_idx}: 总处理耗时 {total_time * 1000:.2f}ms, "
-                        f"分布: LN({norm_time * 1000:.2f}ms)+QKV({qkv_time * 1000:.2f}ms)+"
+            logger.info(f"优化层 {layer_idx}: 总耗时 {total_time * 1000:.2f}ms | "
+                        f"LN({norm_time * 1000:.2f}ms)+QKV({qkv_time * 1000:.2f}ms)+"
                         f"Reshape({reshape_time * 1000:.2f}ms)+Attn({attn_time * 1000:.2f}ms)+"
                         f"Proj({proj_time * 1000:.2f}ms)+MLP({mlp_time * 1000:.2f}ms)")
-
-            # 记录量化指标
-            logger.info(f"4-bit量化指标 | 反量化次数: {self.dequant_count} | 融合操作: {self.fused_ops}")
+            logger.info(f"⚡ 量化指标 | 反量化: {self.dequant_count}次 | 融合操作: {self.fused_ops}")
 
         return hidden_states, (k.squeeze(2), v.squeeze(2))
