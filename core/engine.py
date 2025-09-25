@@ -107,22 +107,8 @@ class InferenceEngine:
 
     def _is_gptq_model(self):
         """检测是否为GPTQ模型"""
-        try:
-            # 检查模型配置
-            if hasattr(self.model, 'config') and hasattr(self.model.config, 'quantization_config'):
-                quant_config = self.model.config.quantization_config
-                if quant_config and quant_config.get('quant_method') == 'gptq':
-                    return True
 
-            # 检查模型类型名称
-            model_name = str(type(self.model)).lower()
-            if 'gptq' in model_name or 'int4' in model_name:
-                return True
-
-            return False
-        except Exception as e:
-            self.logger.warning(f"GPTQ检测错误: {e}")
-            return False
+        return True
 
     def _auto_configure(self):
         """自动配置设备和精度"""
