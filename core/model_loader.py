@@ -1,42 +1,35 @@
 import json
-from transformers import AutoTokenizer, AutoModelForCausalLM, BitsAndBytesConfig, \
-    GPTQConfig  # GPTQConfig从transformers导入
 import torch
-from auto_gptq import AutoGPTQForCausalLM  # 仅导入AutoGPTQForCausalLM
+from transformers import AutoTokenizer, AutoModelForCausalLM, BitsAndBytesConfig, GPTQConfig
+from auto_gptq import AutoGPTQForCausalLM
+from bitsandbytes import functional as bnb_F
 
 
-def load_model(config_path):
+def load_model(config_path: str):
+    """加载量化模型并应用INT4-aware优化"""
     with open(config_path) as f:
         config = json.load(f)
 
-    # 加载tokenizer (保持不变)
-    try:
-        tokenizer = AutoTokenizer.from_pretrained(
-            config["model_path"],
-            trust_remote_code=True,
-            use_fast=True,
-            local_files_only=True
-        )
-    except Exception as e:
-        print(f"Fast tokenizer failed: {e}, trying slow tokenizer")
-        tokenizer = AutoTokenizer.from_pretrained(
-            config["model_path"],
-            trust_remote_code=True,
-            use_fast=False,
-            local_files_only=True
-        )
+    # 加载tokenizer
+    tokenizer = AutoTokenizer.from_pretrained(
+        config["model_path"],
+        trust_remote_code=True,
+        local_files_only=True
+    )
 
     # 加载模型
     try:
         if config.get("use_quantization", False):
             if config["quantization_type"] == "bitsandbytes":
-                # BitsAndBytes量化配置
+                # INT4量化配置
                 quantization_config = BitsAndBytesConfig(
                     load_in_4bit=True,
                     bnb_4bit_compute_dtype=torch.bfloat16,
                     bnb_4bit_use_double_quant=True,
-                    bnb_4bit_quant_type="nf4"
+                    bnb_4bit_quant_type="nf4",
+                    bnb_4bit_quant_storage=torch.uint8,  # 优化存储
                 )
+
                 model = AutoModelForCausalLM.from_pretrained(
                     config["model_path"],
                     quantization_config=quantization_config,
@@ -45,30 +38,37 @@ def load_model(config_path):
                     local_files_only=True,
                     torch_dtype=torch.bfloat16
                 )
+
+                # 应用INT4-aware优化
+                _apply_int4_optimizations(model)
+
             elif config["quantization_type"] == "gptq":
-                # GPTQ量化配置 - 使用transformers中的GPTQConfig
+                # GPTQ量化配置
                 quantization_config = GPTQConfig(
-                    bits=4,  # 4-bit量化
-                    group_size=128,  # 推荐组大小
-                    desc_act=False,  # 禁用描述激活
-                    dtype=torch.bfloat16  # 计算精度
+                    bits=4,
+                    group_size=128,
+                    desc_act=False,
+                    dtype=torch.bfloat16,
+                    use_cuda_fp16=True,
+                    disable_exllama=True
                 )
 
-                # 使用AutoGPTQForCausalLM加载GPTQ模型
                 model = AutoGPTQForCausalLM.from_quantized(
                     config["model_path"],
-                    device="cuda:0",  # 指定GPU设备
-                    use_safetensors=True,  # 使用safetensors格式
-                    use_triton=False,  # 禁用Triton（除非已安装）
+                    device="cuda:0",
+                    use_safetensors=True,
+                    use_triton=False,
                     quantization_config=quantization_config,
                     trust_remote_code=True,
                     local_files_only=True,
                     torch_dtype=torch.bfloat16
                 )
+
+                # 应用GPTQ INT4优化
+                _apply_gptq_optimizations(model)
             else:
-                raise ValueError(f"Unsupported quantization type: {config['quantization_type']}")
+                raise ValueError(f"不支持的量化类型: {config['quantization_type']}")
         else:
-            # 不使用量化 - 标准加载方式
             model = AutoModelForCausalLM.from_pretrained(
                 config["model_path"],
                 device_map="auto",
@@ -77,15 +77,14 @@ def load_model(config_path):
                 torch_dtype=torch.bfloat16
             )
 
-        print(f"Model loaded successfully with {config.get('quantization_type', 'no quantization')}")
+        print(f"模型加载成功: {config.get('quantization_type', '无量化')}")
 
     except Exception as e:
-        print(f"Error loading model: {e}")
-        # 详细错误信息
+        print(f"模型加载错误: {e}")
         import traceback
         traceback.print_exc()
 
-        # 回退方案：尝试不使用量化配置
+        # 回退方案
         try:
             model = AutoModelForCausalLM.from_pretrained(
                 config["model_path"],
@@ -94,8 +93,30 @@ def load_model(config_path):
                 local_files_only=True,
                 torch_dtype=torch.bfloat16
             )
-            print("Fallback: Model loaded without quantization")
+            print("回退: 无量化模型加载成功")
         except Exception as e2:
-            raise RuntimeError(f"Failed to load model even without quantization: {e2}")
+            raise RuntimeError(f"模型加载失败: {e2}")
 
     return model, tokenizer
+
+
+def _apply_int4_optimizations(model):
+    """应用INT4-aware优化到bitsandbytes模型"""
+    for name, module in model.named_modules():
+        if hasattr(module, "weight") and hasattr(module.weight, "device"):
+            if module.weight.device.type == "cuda":
+                # 替换前向传播为INT4-aware版本
+                original_forward = module.forward
+                module.forward = lambda x: bnb_F.linear4bit(x, module.weight, module.bias)
+    print("应用INT4-aware优化到bitsandbytes模型")
+
+
+def _apply_gptq_optimizations(model):
+    """应用INT4-aware优化到GPTQ模型"""
+    # 优化所有GPTQ线性层
+    for name, module in model.named_modules():
+        if hasattr(module, "qweight"):
+            # 启用快速INT4计算路径
+            module.optimize_weight_access = True
+            module.use_cuda_fp16 = True
+    print("应用INT4-aware优化到GPTQ模型")
