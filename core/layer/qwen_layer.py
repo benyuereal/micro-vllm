@@ -160,18 +160,19 @@ class QwenModelLayerAdapter:
 
         # 检查是否为量化权重
         c_attn = layer.attn.c_attn
-        logger.info("c_attn is ", c_attn)
         # 情况1: GPTQ-for-LLaMa 格式 (有 qweight 属性)
         if hasattr(c_attn, "qweight"):
+            logger.info("have qweight")
             return True
 
         # 情况2: 标准 GPTQ 格式 (权重类型为 int8)
         if hasattr(c_attn, "weight") and c_attn.weight.dtype == torch.int8:
+            logger.info("weight")
             return True
 
             # 情况3: auto_gptq 的 QuantLinear        if hasattr(c_attn, "bits") and c_attn.bits == 4:
             return True
-
+        logger.info("not quantized")
         return False
 
     def _quantized_qkv_proj(self, layer, hidden_states: torch.Tensor):
