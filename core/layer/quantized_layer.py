@@ -22,84 +22,46 @@ class Qwen7B4BitLayerAdapter:
             device=device
         )
 
-        # 预分配优化缓冲区（专为4-bit量化设计）
-        self._setup_quantization_buffers()
+        # 动态缓冲区（不需要预分配）
+        self.dequant_buffers = {}
 
         # 性能计数器
         self.dequant_count = 0
         self.fused_ops = 0
         logger.info("✅ 初始化Qwen7B 4-bit量化模型优化层")
 
-    def _setup_quantization_buffers(self):
-        """为4-bit量化模型预分配优化缓冲区"""
-        # 获取模型维度
-        hidden_size = getattr(self.config, "hidden_size", 4096)
-        intermediate_size = getattr(self.config, "intermediate_size", 11008)
-
-        # MLP反量化缓冲区
-        self.mlp_dequant_buffer = torch.zeros(
-            1, 1, intermediate_size,
-            device=self.device,
-            dtype=torch.bfloat16
-        )
-
-        # QKV反量化缓冲区
-        self.qkv_dequant_buffer = torch.zeros(
-            1, 1, hidden_size * 3,
-            device=self.device,
-            dtype=torch.bfloat16
-        )
-
-        # 输出投影反量化缓冲区
-        self.proj_dequant_buffer = torch.zeros(
-            1, 1, hidden_size,
-            device=self.device,
-            dtype=torch.bfloat16
-        )
-
-        logger.debug("✅ 已分配4-bit量化优化缓冲区")
-
-    def _quantized_linear(self, x, quantized_linear_layer, buffer):
-        """优化4-bit量化线性层计算 - 修复维度问题"""
+    def _quantized_linear(self, x, quantized_linear_layer):
+        """优化4-bit量化线性层计算 - 修复矩阵形状问题"""
         # 获取量化参数
         qweight = quantized_linear_layer.qweight
         scales = quantized_linear_layer.scales
         qzeros = quantized_linear_layer.qzeros
 
-        # 使用预分配缓冲区避免重复分配
-        if buffer.shape != qweight.shape:
-            buffer = torch.empty_like(qweight, dtype=torch.float16)
+        # 获取原始权重形状
+        orig_shape = qweight.shape
 
         # 获取分组大小（从量化层获取）
         group_size = getattr(quantized_linear_layer, "group_size", 128)
-
-        # 4-bit反量化优化
-        orig_shape = qweight.shape
 
         # 计算分组数量
         num_groups = (orig_shape[0] + group_size - 1) // group_size
 
         # 确保scales和qzeros有正确的形状
         if scales.shape[0] != num_groups:
-            # 调整scales形状
             scales = scales.view(num_groups, -1)[:, 0]
         if qzeros.shape[0] != num_groups:
-            # 调整qzeros形状
             qzeros = qzeros.view(num_groups, -1)[:, 0]
 
-        # 重塑权重为分组格式
-        padded_weight = torch.zeros(num_groups * group_size, orig_shape[1],
-                                    device=qweight.device, dtype=qweight.dtype)
-        padded_weight[:orig_shape[0], :] = qweight
+        # 创建反量化权重张量
+        dequantized = torch.zeros(orig_shape, dtype=torch.float16, device=x.device)
 
-        # 执行反量化
-        dequantized = torch.zeros_like(padded_weight, dtype=torch.float16)
+        # 执行分组反量化
         for i in range(num_groups):
             start_idx = i * group_size
             end_idx = min(start_idx + group_size, orig_shape[0])
 
             if end_idx > start_idx:
-                group_weight = padded_weight[start_idx:end_idx, :]
+                group_weight = qweight[start_idx:end_idx, :]
                 group_scale = scales[i]
                 group_zero = qzeros[i]
 
@@ -107,11 +69,10 @@ class Qwen7B4BitLayerAdapter:
                 dequantized_group = (group_weight - group_zero) * group_scale
                 dequantized[start_idx:end_idx, :] = dequantized_group
 
-        # 复制到缓冲区
-        buffer = dequantized[:orig_shape[0], :].to(torch.bfloat16)
-
         self.dequant_count += 1
-        return torch.nn.functional.linear(x, buffer, quantized_linear_layer.bias)
+
+        # 执行线性变换
+        return torch.nn.functional.linear(x, dequantized.to(torch.bfloat16), quantized_linear_layer.bias)
 
     def _optimized_mlp(self, hidden_states, mlp_norm_fn, mlp_fn):
         """Qwen7B 4-bit量化模型优化的MLP计算路径"""
@@ -127,15 +88,13 @@ class Qwen7B4BitLayerAdapter:
         # 2. 门控线性变换 (w1)
         gate = self._quantized_linear(
             hidden_states,
-            mlp_fn.w1,
-            self.mlp_dequant_buffer
+            mlp_fn.w1
         )
 
         # 3. 值线性变换 (w3) - 使用原始输入
         value = self._quantized_linear(
             original_hidden_states,
-            mlp_fn.w3,
-            self.mlp_dequant_buffer
+            mlp_fn.w3
         )
 
         # 4. 激活函数 (SiLU)
@@ -144,8 +103,7 @@ class Qwen7B4BitLayerAdapter:
         # 5. 输出线性变换 (w2)
         gate = self._quantized_linear(
             gate,
-            mlp_fn.w2,
-            self.mlp_dequant_buffer
+            mlp_fn.w2
         )
 
         # 6. 合并结果
@@ -183,8 +141,7 @@ class Qwen7B4BitLayerAdapter:
         # 使用量化优化计算
         qkv = self._quantized_linear(
             hidden_states,
-            layer.attn.c_attn,
-            self.qkv_dequant_buffer
+            layer.attn.c_attn
         )
         hidden_size = qkv.shape[-1] // 3
         q, k, v = qkv.split(hidden_size, dim=-1)
@@ -221,8 +178,7 @@ class Qwen7B4BitLayerAdapter:
 
         attn_output = self._quantized_linear(
             attn_output.reshape(batch_size, -1),
-            layer.attn.c_proj,
-            self.proj_dequant_buffer
+            layer.attn.c_proj
         ).unsqueeze(1)
 
         hidden_states = residual + attn_output
