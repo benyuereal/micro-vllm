@@ -1,4 +1,5 @@
 import json
+from transformers import AutoTokenizer, AutoModelForCausalLM, BitsAndBytesConfig
 from transformers import AutoTokenizer, AutoModelForCausalLM, BitsAndBytesConfig, \
     GPTQConfig  # GPTQConfig从transformers导入
 import torch
@@ -46,39 +47,26 @@ def load_model(config_path):
                     torch_dtype=torch.bfloat16
                 )
             elif config["quantization_type"] == "gptq":
-                # 使用优化的GPTQ加载方式 - 移除GPTQConfig，使用auto_gptq的优化
-                try:
-                    model = AutoGPTQForCausalLM.from_quantized(
-                        config["model_path"],
-                        device="cuda:0",  # 指定GPU设备
-                        use_safetensors=True,  # 使用safetensors格式
-                        use_triton=True,  # 启用Triton优化（关键优化点）
-                        trust_remote_code=True,
-                        local_files_only=True,
-                        torch_dtype=torch.float16,  # 使用float16获得更好性能
-                        # 优化参数
-                        max_memory=None,  # 自动管理内存
-                        device_map="auto",  # 自动分配设备
-                        inject_fused_attention=True,  # 注入融合注意力
-                        inject_fused_mlp=True,  # 注入融合MLP
-                        use_cuda_fp16=True,  # 使用CUDA FP16
-                        disable_exllama=False,  # 启用exllama优化
-                        disable_exllamav2=True,  # 禁用exllamav2（如果exllama已启用）
-                    )
-                except Exception as gptq_error:
-                    print(f"AutoGPTQ with optimizations failed: {gptq_error}")
-                    print("Falling back to basic GPTQ configuration...")
+                # GPTQ量化配置 - 优化参数设置
+                # GPTQ量化配置 - 使用transformers中的GPTQConfig
+                quantization_config = GPTQConfig(
+                    bits=4,  # 4-bit量化
+                    group_size=128,  # 推荐组大小
+                    desc_act=False,  # 禁用描述激活
+                    dtype=torch.bfloat16  # 计算精度
+                )
 
-                    # 回退到基本配置
-                    model = AutoGPTQForCausalLM.from_quantized(
-                        config["model_path"],
-                        device="cuda:0",
-                        use_safetensors=True,
-                        use_triton=False,  # 如果Triton有问题则禁用
-                        trust_remote_code=True,
-                        local_files_only=True,
-                        torch_dtype=torch.float16
-                    )
+                # 使用AutoGPTQForCausalLM加载GPTQ模型
+                model = AutoGPTQForCausalLM.from_quantized(
+                    config["model_path"],
+                    device="cuda:0",  # 指定GPU设备
+                    use_safetensors=True,  # 使用safetensors格式
+                    use_triton=False,  # 禁用Triton（除非已安装）
+                    quantization_config=quantization_config,
+                    trust_remote_code=True,
+                    local_files_only=True,
+                    torch_dtype=torch.bfloat16
+                )
             else:
                 raise ValueError(f"Unsupported quantization type: {config['quantization_type']}")
         else:
@@ -92,14 +80,6 @@ def load_model(config_path):
             )
 
         print(f"Model loaded successfully with {config.get('quantization_type', 'no quantization')}")
-
-        # 启用优化设置
-        model.eval()
-
-        # CUDA优化设置
-        if torch.cuda.is_available():
-            torch.backends.cuda.matmul.allow_tf32 = True
-            torch.backends.cudnn.allow_tf32 = True
 
     except Exception as e:
         print(f"Error loading model: {e}")
