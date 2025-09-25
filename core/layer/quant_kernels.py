@@ -136,30 +136,37 @@ class QuantKernels:
             # 反量化权重 (INT4 -> FP32)
             weight_fp32 = (quant_weight.to(tl.float32) - zero) * scale
 
-            # 手动分割 QKV 权重
-            for i in range(hidden_dim):
-                # 提取 Q 部分的列
-                q_col = weight_fp32[:, i]
-                # 提取 K 部分的列
-                k_col = weight_fp32[:, hidden_dim + i]
-                # 提取 V 部分的列
-                v_col = weight_fp32[:, 2 * hidden_dim + i]
+            # 手动分割 QKV 权重 - 使用指针偏移
+            for i in range(BLOCK_K):  # 限制在 BLOCK_K 范围内
+                # 计算当前列在权重矩阵中的偏移
+                col_offset = i
 
-                # 计算 Q 的列
-                acc_q += tl.dot(input_block, q_col)
-                # 计算 K 的列
-                acc_k += tl.dot(input_block, k_col)
-                # 计算 V 的列
-                acc_v += tl.dot(input_block, v_col)
+                # 提取 Q 部分的列 (Q 部分: [0, hidden_dim])
+                q_col_ptr = qkv_weight_ptr + weight_offset + col_offset
+                q_col = tl.load(q_col_ptr)
+                q_col_fp32 = (q_col.to(tl.float32) - zero) * scale
+
+                # 提取 K 部分的列 (K 部分: [hidden_dim, 2*hidden_dim])
+                k_col_offset = hidden_dim + col_offset
+                k_col_ptr = qkv_weight_ptr + weight_offset + k_col_offset
+                k_col = tl.load(k_col_ptr)
+                k_col_fp32 = (k_col.to(tl.float32) - zero) * scale
+
+                # 提取 V 部分的列 (V 部分: [2*hidden_dim, 3*hidden_dim])
+                v_col_offset = 2 * hidden_dim + col_offset
+                v_col_ptr = qkv_weight_ptr + weight_offset + v_col_offset
+                v_col = tl.load(v_col_ptr)
+                v_col_fp32 = (v_col.to(tl.float32) - zero) * scale
+
+                # 矩阵乘法 (每个列向量)
+                acc_q += tl.dot(input_block, q_col_fp32[:, None])
+                acc_k += tl.dot(input_block, k_col_fp32[:, None])
+                acc_v += tl.dot(input_block, v_col_fp32[:, None])
 
         # 存储输出
         q_offset = pid_b * num_heads * seq_len * head_dim + pid_s * BLOCK_M * head_dim
         tl.store(q_ptr + q_offset, acc_q)
-
-        # 存储 K (类似 Q)
         tl.store(k_ptr + q_offset, acc_k)
-
-        # 存储 V (类似 Q)
         tl.store(v_ptr + q_offset, acc_v)
 
 
