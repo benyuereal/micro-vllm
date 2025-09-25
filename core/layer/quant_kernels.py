@@ -1,14 +1,11 @@
 # File: quant_kernels.py
-import os
 import sys
+
 import torch
 import triton
 import triton.language as tl
 import numpy as np
 import time
-
-# 设置Triton缓存目录
-os.environ["TRITON_CACHE_DIR"] = "./.triton_cache"
 
 
 class QuantKernels:
@@ -54,7 +51,6 @@ class QuantKernels:
             num_heads, head_dim,
             group_size,
             BLOCK_M=16,
-            BLOCK_N=64,
             BLOCK_K=32
         )
 
@@ -89,7 +85,6 @@ class QuantKernels:
             batch_size, seq_len, hidden_dim,
             group_size,
             BLOCK_M=16,
-            BLOCK_N=64,
             BLOCK_K=32
         )
 
@@ -104,7 +99,6 @@ class QuantKernels:
             batch_size, seq_len, hidden_dim, num_heads, head_dim,
             group_size: tl.constexpr,
             BLOCK_M: tl.constexpr = 16,
-            BLOCK_N: tl.constexpr = 64,
             BLOCK_K: tl.constexpr = 32
     ):
         # 计算 PID 和偏移
@@ -114,64 +108,53 @@ class QuantKernels:
         # 计算输入偏移 [B, S, D]
         input_offset = pid_b * seq_len * hidden_dim + pid_s * BLOCK_M * hidden_dim
 
+        # 计算输出偏移 [B, H, S, D]
+        q_offset = pid_b * num_heads * seq_len * head_dim + pid_s * BLOCK_M * head_dim
+
         # 初始化累加器
-        acc_q = tl.zeros((BLOCK_M, BLOCK_K), dtype=tl.float32)
-        acc_k = tl.zeros((BLOCK_M, BLOCK_K), dtype=tl.float32)
-        acc_v = tl.zeros((BLOCK_M, BLOCK_K), dtype=tl.float32)
+        acc_q = tl.zeros((BLOCK_M, head_dim), dtype=tl.float32)
+        acc_k = tl.zeros((BLOCK_M, head_dim), dtype=tl.float32)
+        acc_v = tl.zeros((BLOCK_M, head_dim), dtype=tl.float32)
 
-        # 循环处理 K 维度
+        # 加载输入块 [BLOCK_M, hidden_dim]
+        input_block = tl.load(
+            hidden_states_ptr + input_offset,
+            shape=(BLOCK_M, hidden_dim),
+            other=0.0
+        )
+
+        # 循环处理 K 维度（分组处理）
         for k in range(0, hidden_dim, BLOCK_K):
-            # 加载输入块 [BLOCK_M, BLOCK_K]
-            input_block = tl.load(hidden_states_ptr + input_offset + k)
-
-            # 加载量化权重块 (INT4 打包存储)
+            # 加载量化权重块 [hidden_dim, 3*hidden_dim]
             weight_offset = k * 3 * hidden_dim
-            quant_weight = tl.load(qkv_weight_ptr + weight_offset)
+            quant_weight = tl.load(
+                qkv_weight_ptr + weight_offset,
+                shape=(hidden_dim, 3 * hidden_dim),
+                other=0
+            )
 
             # 加载量化参数
             group_idx = k // group_size
             scale = tl.load(qkv_scale_ptr + group_idx)
             zero = tl.load(qkv_zero_ptr + group_idx)
 
-            # 反量化权重 (INT4 -> FP32)
+            # 反量化权重 (INT8 -> FP32)
             weight_fp32 = (quant_weight.to(tl.float32) - zero) * scale
 
-            # 手动分割 QKV 权重 - 使用指针偏移
-            for i in range(BLOCK_K):  # 限制在 BLOCK_K 范围内
-                # 计算当前列在权重矩阵中的偏移
-                col_offset = i
+            # 分割 QKV 权重
+            q_weight = weight_fp32[:, :hidden_dim]
+            k_weight = weight_fp32[:, hidden_dim:2 * hidden_dim]
+            v_weight = weight_fp32[:, 2 * hidden_dim:3 * hidden_dim]
 
-                # 提取 Q 部分的列 (Q 部分: [0, hidden_dim])
-                q_col_ptr = qkv_weight_ptr + weight_offset + col_offset
-                q_col = tl.load(q_col_ptr)
-                q_col_fp32 = (q_col.to(tl.float32) - zero) * scale
+            # 矩阵乘法
+            acc_q += tl.dot(input_block, q_weight)
+            acc_k += tl.dot(input_block, k_weight)
+            acc_v += tl.dot(input_block, v_weight)
 
-                # 提取 K 部分的列 (K 部分: [hidden_dim, 2*hidden_dim])
-                k_col_ptr = qkv_weight_ptr + weight_offset + hidden_dim + col_offset
-                k_col = tl.load(k_col_ptr)
-                k_col_fp32 = (k_col.to(tl.float32) - zero) * scale
-
-                # 提取 V 部分的列 (V 部分: [2*hidden_dim, 3*hidden_dim])
-                v_col_ptr = qkv_weight_ptr + weight_offset + 2 * hidden_dim + col_offset
-                v_col = tl.load(v_col_ptr)
-                v_col_fp32 = (v_col.to(tl.float32) - zero) * scale
-
-                # 将列向量扩展为二维张量 [BLOCK_K, 1]
-                q_col_2d = q_col_fp32[:, None]
-                k_col_2d = k_col_fp32[:, None]
-                v_col_2d = v_col_fp32[:, None]
-
-                # 矩阵乘法 (每个列向量)
-                acc_q += tl.dot(input_block, q_col_2d)
-                acc_k += tl.dot(input_block, k_col_2d)
-                acc_v += tl.dot(input_block, v_col_2d)
-
-        # 存储输出
-        q_offset = pid_b * num_heads * seq_len * head_dim + pid_s * BLOCK_M * head_dim
+        # 存储输出 [BLOCK_M, head_dim]
         tl.store(q_ptr + q_offset, acc_q)
         tl.store(k_ptr + q_offset, acc_k)
         tl.store(v_ptr + q_offset, acc_v)
-
 
     @staticmethod
     @triton.jit
@@ -180,32 +163,36 @@ class QuantKernels:
             attn_output_ptr, out_weight_ptr, out_scale_ptr, out_zero_ptr,
             out_ptr, batch_size, seq_len, hidden_dim, group_size: tl.constexpr,
             BLOCK_M: tl.constexpr = 16,
-            BLOCK_N: tl.constexpr = 64,
             BLOCK_K: tl.constexpr = 32
     ):
         # 计算 PID 和偏移
         pid_b = tl.program_id(0)
         pid_s = tl.program_id(1)
 
-        # 计算输入偏移
+        # 计算输入偏移 [B, S, D]
         input_offset = pid_b * seq_len * hidden_dim + pid_s * BLOCK_M * hidden_dim
 
+        # 计算输出偏移 [B, S, D]
+        out_offset = pid_b * seq_len * hidden_dim + pid_s * BLOCK_M * hidden_dim
+
         # 初始化累加器
-        acc = tl.zeros((BLOCK_M, BLOCK_K), dtype=tl.float32)
+        acc = tl.zeros((BLOCK_M, hidden_dim), dtype=tl.float32)
 
-        # 循环处理 K 维度
+        # 加载输入块 [BLOCK_M, hidden_dim]
+        input_block = tl.load(
+            attn_output_ptr + input_offset,
+            shape=(BLOCK_M, hidden_dim),
+            other=0.0
+        )
+
+        # 循环处理 K 维度（分组处理）
         for k in range(0, hidden_dim, BLOCK_K):
-            # 加载输入块
-            input_block = tl.load(
-                attn_output_ptr + input_offset + k,
-                other=0.0  # 超出边界部分自动填充0
-            )
-
-            # 加载量化权重
+            # 加载量化权重块 [hidden_dim, hidden_dim]
             weight_offset = k * hidden_dim
             quant_weight = tl.load(
                 out_weight_ptr + weight_offset,
-                other=0  # 超出边界部分自动填充0
+                shape=(hidden_dim, hidden_dim),
+                other=0
             )
 
             # 加载量化参数
@@ -213,18 +200,15 @@ class QuantKernels:
             scale = tl.load(out_scale_ptr + group_idx)
             zero = tl.load(out_zero_ptr + group_idx)
 
-            # 反量化权重
+            # 反量化权重 (INT8 -> FP32)
             weight_fp32 = (quant_weight.to(tl.float32) - zero) * scale
 
             # 矩阵乘法
             acc += tl.dot(input_block, weight_fp32)
 
-        # 存储输出
-        out_offset = pid_b * seq_len * hidden_dim + pid_s * BLOCK_M * hidden_dim
-        tl.store(
-            out_ptr + out_offset,
-            acc
-        )
+        # 存储输出 [BLOCK_M, hidden_dim]
+        tl.store(out_ptr + out_offset, acc)
+
 
 # ==================== 测试方法 ====================
 
@@ -244,7 +228,7 @@ def test_fused_quant_qkv_proj():
     hidden_states = torch.randn(batch_size, seq_len, hidden_dim,
                                 device="cuda", dtype=torch.float16)
 
-    # 创建模拟量化权重 (INT4)
+    # 创建模拟量化权重 (INT8 范围)
     qkv_weight = torch.randint(-128, 128, (hidden_dim, 3 * hidden_dim),
                                device="cuda", dtype=torch.int8)
     qkv_scale = torch.ones(hidden_dim // group_size, device="cuda", dtype=torch.float16)
@@ -302,7 +286,7 @@ def test_fused_quant_out_proj():
     attn_output = torch.randn(batch_size, seq_len, hidden_dim,
                               device="cuda", dtype=torch.float16)
 
-    # 创建模拟量化权重 (INT4)
+    # 创建模拟量化权重 (INT8 范围)
     out_weight = torch.randint(-128, 128, (hidden_dim, hidden_dim),
                                device="cuda", dtype=torch.int8)
     out_scale = torch.ones(hidden_dim // group_size, device="cuda", dtype=torch.float16)
@@ -444,11 +428,10 @@ def test_correctness_comparison():
                                 device="cuda", dtype=torch.float16)
 
     # 创建模拟量化权重
-    qkv_weight = torch.randint(-128, 128, (hidden_dim, 3*hidden_dim),
-    device = "cuda", dtype = torch.int8)
+    qkv_weight = torch.randint(-128, 128, (hidden_dim, 3 * hidden_dim),
+                               device="cuda", dtype=torch.int8)
     qkv_scale = torch.ones(hidden_dim // group_size, device="cuda", dtype=torch.float16)
     qkv_zero = torch.zeros(hidden_dim // group_size, device="cuda", dtype=torch.float16)
-
 
     try:
         # 执行融合内核
@@ -461,7 +444,6 @@ def test_correctness_comparison():
             head_dim=head_dim,
             group_size=group_size
         )
-
 
         # 执行原始实现
         def original_implementation():
@@ -483,7 +465,6 @@ def test_correctness_comparison():
             k = k.view(batch_size, seq_len, num_heads, head_dim).permute(0, 2, 1, 3)
             v = v.view(batch_size, seq_len, num_heads, head_dim).permute(0, 2, 1, 3)
             return q, k, v
-
 
         q_orig, k_orig, v_orig = original_implementation()
 
@@ -516,7 +497,6 @@ def test_correctness_comparison():
     except Exception as e:
         print(f"❌ Correctness comparison failed: {e}")
         import traceback
-
         traceback.print_exc()
         return False
 
