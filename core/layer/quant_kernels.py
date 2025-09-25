@@ -122,10 +122,12 @@ class QuantKernels:
         # 循环处理 K 维度
         for k in range(0, hidden_dim, BLOCK_K):
             # 计算当前块大小 (处理边界情况)
-            curr_block_k = tl.min(
-                tl.constexpr(BLOCK_K),
-                tl.constexpr(hidden_dim - k)
-            )
+            # 修复：使用 triton 的 min 函数处理边界
+            next_k = k + BLOCK_K
+            if next_k > hidden_dim:
+                curr_block_k = hidden_dim - k
+            else:
+                curr_block_k = BLOCK_K
 
             # 加载输入块 [BLOCK_M, curr_block_k]
             input_block = tl.load(
@@ -188,6 +190,7 @@ class QuantKernels:
         )
 
     @staticmethod
+    @staticmethod
     @triton.jit
     def _fused_quant_out_proj_kernel(
             # 输入指针
@@ -210,10 +213,12 @@ class QuantKernels:
         # 循环处理 K 维度
         for k in range(0, hidden_dim, BLOCK_K):
             # 计算当前块大小 (处理边界情况)
-            curr_block_k = tl.min(
-                tl.constexpr(BLOCK_K),
-                tl.constexpr(hidden_dim - k)
-            )
+            # 修复：使用 triton 的 min 函数处理边界
+            next_k = k + BLOCK_K
+            if next_k > hidden_dim:
+                curr_block_k = hidden_dim - k
+            else:
+                curr_block_k = BLOCK_K
 
             # 加载输入块
             input_block = tl.load(
@@ -235,7 +240,7 @@ class QuantKernels:
             # 加载量化参数
             group_idx = k // group_size
             scale = tl.load(out_scale_ptr + group_idx)
-            zero = tl.load(out_zero_ptr + group_idx)
+            zero = tl.load(out_scale_ptr + group_idx)
 
             # 反量化权重
             weight_fp32 = (quant_weight.to(tl.float32) - zero) * scale
