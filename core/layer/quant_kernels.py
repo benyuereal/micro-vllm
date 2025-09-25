@@ -101,8 +101,11 @@ class QuantKernels:
     ):
         # 计算 PID 和偏移
         pid = tl.program_id(0)
-        pid_b = pid // triton.cdiv(seq_len, BLOCK_M)
-        pid_s = pid % triton.cdiv(seq_len, BLOCK_M)
+
+        # 使用整数除法计算批次和序列索引
+        num_seq_blocks = (seq_len + BLOCK_M - 1) // BLOCK_M
+        pid_b = pid // num_seq_blocks
+        pid_s = pid % num_seq_blocks
 
         # 计算输入偏移 [B, S, D]
         input_offset = pid_b * seq_len * hidden_dim + pid_s * BLOCK_M * hidden_dim
@@ -112,7 +115,7 @@ class QuantKernels:
         acc_k = tl.zeros((BLOCK_M, BLOCK_K), dtype=tl.float32)
         acc_v = tl.zeros((BLOCK_M, BLOCK_K), dtype=tl.float32)
 
-        # 循环处理 K 维度 (简化边界处理)
+        # 循环处理 K 维度
         for k in range(0, hidden_dim, BLOCK_K):
             # 加载输入块 [BLOCK_M, BLOCK_K]
             input_block = tl.load(hidden_states_ptr + input_offset + k)
@@ -155,8 +158,11 @@ class QuantKernels:
     ):
         # 计算 PID 和偏移
         pid = tl.program_id(0)
-        pid_b = pid // triton.cdiv(seq_len, BLOCK_M)
-        pid_s = pid % triton.cdiv(seq_len, BLOCK_M)
+
+        # 使用整数除法计算批次和序列索引
+        num_seq_blocks = (seq_len + BLOCK_M - 1) // BLOCK_M
+        pid_b = pid // num_seq_blocks
+        pid_s = pid % num_seq_blocks
 
         # 计算输入偏移
         input_offset = pid_b * seq_len * hidden_dim + pid_s * BLOCK_M * hidden_dim
