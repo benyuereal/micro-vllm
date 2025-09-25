@@ -84,16 +84,21 @@ class Qwen7B4BitLayerAdapter:
         self.dequant_count += 1
         return torch.nn.functional.linear(x, buffer, quantized_linear_layer.bias)
 
+    def _rms_norm(self, x, weight, eps):
+        """RMSNorm实现（无均值中心化）"""
+        # 计算均方根
+        rms = torch.sqrt(torch.mean(x * x, dim=-1, keepdim=True) + eps)
+        # 归一化并应用权重
+        return weight * x / rms
+
     def _optimized_mlp(self, hidden_states, mlp_norm_fn, mlp_fn):
         """Qwen7B 4-bit量化模型优化的MLP计算路径"""
         # 保存原始输入（用于值计算）
         original_hidden_states = hidden_states
 
-        # 1. 融合LayerNorm计算
-        mean = hidden_states.mean(dim=-1, keepdim=True)
-        variance = ((hidden_states - mean) ** 2).mean(dim=-1, keepdim=True)
-        std = (variance + mlp_norm_fn.variance_epsilon).sqrt()
-        hidden_states = mlp_norm_fn.weight * (hidden_states - mean) / std + mlp_norm_fn.bias
+        # 1. RMSNorm计算（无均值中心化）
+        variance = ((hidden_states * hidden_states).mean(dim=-1, keepdim=True))
+        hidden_states = mlp_norm_fn.weight * hidden_states / torch.sqrt(variance + 1e-6)
 
         self.fused_ops += 1
 
@@ -140,14 +145,12 @@ class Qwen7B4BitLayerAdapter:
         # 记录开始时间
         start_time = time.time()
 
-        # 1. LayerNorm + 残差
+        # 1. RMSNorm + 残差
         residual = hidden_states
 
-        # 优化版LayerNorm
-        mean = hidden_states.mean(dim=-1, keepdim=True)
-        variance = ((hidden_states - mean) ** 2).mean(dim=-1, keepdim=True)
-        std = (variance + layer.ln_1.variance_epsilon).sqrt()
-        hidden_states = layer.ln_1.weight * (hidden_states - mean) / std + layer.ln_1.bias
+        # 优化版RMSNorm（无均值中心化）
+        variance = ((hidden_states * hidden_states).mean(dim=-1, keepdim=True))
+        hidden_states = layer.ln_1.weight * hidden_states / torch.sqrt(variance + 1e-6)
 
         norm_time = time.time() - start_time
         self.fused_ops += 1
@@ -209,11 +212,9 @@ class Qwen7B4BitLayerAdapter:
 
         residual = hidden_states
 
-        # 优化版LayerNorm
-        mean = hidden_states.mean(dim=-1, keepdim=True)
-        variance = ((hidden_states - mean) ** 2).mean(dim=-1, keepdim=True)
-        std = (variance + layer.ln_2.variance_epsilon).sqrt()
-        hidden_states = layer.ln_2.weight * (hidden_states - mean) / std + layer.ln_2.bias
+        # 优化版RMSNorm
+        variance = ((hidden_states * hidden_states).mean(dim=-1, keepdim=True))
+        hidden_states = layer.ln_2.weight * hidden_states / torch.sqrt(variance + 1e-6)
 
         # 优化MLP计算
         hidden_states = self._optimized_mlp(hidden_states, layer.ln_2, layer.mlp)
