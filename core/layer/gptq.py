@@ -16,7 +16,7 @@ class GPTQTritonFusion:
         self.groupsize = groupsize
 
     @triton.jit
-    def fused_gptq_gemm_kernel_4bit(
+    def fused_gptq_gemm_kernel_4bit_optimized(
             # 输入矩阵A
             a_ptr, a_row_stride, a_col_stride,
             # GPTQ量化权重参数
@@ -30,15 +30,11 @@ class GPTQTritonFusion:
             # 分块参数
             BLOCK_SIZE_M: tl.constexpr,
             BLOCK_SIZE_N: tl.constexpr,
-            BLOCK_SIZE_K: tl.constexpr,
-            # Tensor Core优化
-            USE_TENSOR_CORE: tl.constexpr = True,
-            # 性能优化参数
-            NUM_STAGES: tl.constexpr = 3,
-            NUM_WARPS: tl.constexpr = 4
+            BLOCK_SIZE_K: tl.constexpr
     ):
         """
-        融合GPTQ 4bit反量化与矩阵乘法的优化内核
+        极致优化的GPTQ 4bit融合内核
+        专注于Qwen7B特定维度优化
         """
         # 程序ID
         pid = tl.program_id(axis=0)
@@ -51,12 +47,11 @@ class GPTQTritonFusion:
         offs_n = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
         offs_k = tl.arange(0, BLOCK_SIZE_K)
 
-        # 初始化累加器 - 使用float32以获得最佳精度
+        # 初始化累加器
         accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
 
-        # 主循环
+        # 主循环 - 优化K维度处理
         for k in range(0, tl.cdiv(K, BLOCK_SIZE_K)):
-            # 计算当前K块
             k_offs = k * BLOCK_SIZE_K
 
             # 加载A矩阵块
@@ -65,43 +60,35 @@ class GPTQTritonFusion:
             a_mask = (offs_m[:, None] < M) & ((k_offs + offs_k[None, :]) < K)
             a = tl.load(a_ptrs, mask=a_mask, other=0.0)
 
-            # 加载量化权重并反量化 (GPTQ格式)
-            # qweight格式: [N, K//8]，每8个4bit值打包为一个int32
+            # 优化的GPTQ反量化
+            # 预计算组索引
+            group_idx = (k_offs + offs_k[:, None]) // groupsize
+            
+            # 批量加载scales和zeros
+            scale_ptrs = scales_ptr + group_idx * K + (k_offs + offs_k[:, None])
+            zero_ptrs = qzeros_ptr + group_idx * (K // 8) + (k_offs + offs_k[:, None]) // 8
+            
+            scales = tl.load(scale_ptrs, mask=(k_offs + offs_k[:, None]) < K, other=0.0)
+            zeros = tl.load(zero_ptrs, mask=(k_offs + offs_k[:, None]) < K, other=0)
+
+            # 批量处理权重
             weight_ptrs = qweight_ptr + offs_n[None, :] * (K // 8) + (k_offs + offs_k[:, None]) // 8
             weight_mask = (offs_n[None, :] < N) & ((k_offs + offs_k[:, None]) < K)
             qweight = tl.load(weight_ptrs, mask=weight_mask, other=0)
 
-            # 加载GPTQ零点和缩放因子
-            group_idx = (k_offs + offs_k[:, None]) // groupsize
-            scale_ptrs = scales_ptr + group_idx * K + (k_offs + offs_k[:, None])
-            zero_ptrs = qzeros_ptr + group_idx * (K // 8) + (k_offs + offs_k[:, None]) // 8
-
-            scales = tl.load(scale_ptrs, mask=(k_offs + offs_k[:, None]) < K, other=0.0)
-            zeros = tl.load(zero_ptrs, mask=(k_offs + offs_k[:, None]) < K, other=0)
-
-            # 反量化4bit权重 (GPTQ格式)
-            elem_per_int = 8
-            k_idx = (k_offs + offs_k[:, None]) % elem_per_int
-            
-            # 提取4bit值
+            # 向量化4bit提取
+            k_idx = (k_offs + offs_k[:, None]) % 8
             weight_shift = k_idx * 4
-            weight_val = (qweight >> weight_shift) & 0xF
-            
-            # 提取对应的零点值
             zero_shift = k_idx * 4
+            
+            weight_val = (qweight >> weight_shift) & 0xF
             zero_val = (zeros >> zero_shift) & 0xF
             
-            # GPTQ反量化公式: (weight_val - zero_val) * scale
-            # 确保数据类型匹配
-            weight_val = weight_val.to(tl.float32)
-            zero_val = zero_val.to(tl.float32)
-            scales = scales.to(tl.float32)
-            a = a.to(tl.float32)
-            
-            weight = (weight_val - zero_val) * scales
+            # 反量化
+            weight = (weight_val.to(tl.float32) - zero_val.to(tl.float32)) * scales.to(tl.float32)
 
-            # 矩阵乘法累加
-            accumulator += tl.dot(a, weight)
+            # 矩阵乘法
+            accumulator += tl.dot(a.to(tl.float32), weight)
 
         # 存储结果
         c_ptrs = c_ptr + (offs_m[:, None] * c_row_stride +
@@ -163,28 +150,30 @@ class GPTQTritonFusion:
         torch.cuda.empty_cache()
         
         # 分块参数 - 极致性能优化
-        # 使用更大的分块以获得更好的GPU利用率
+        # 针对Qwen7B特定维度进行优化
         if M == 1 and K == 4096:  # Qwen7B典型输入
             if N <= 4096:  # 输出投影 - 目标0.20ms
+                # 使用更大的分块以获得更好的GPU利用率
                 BLOCK_SIZE_M = 64
                 BLOCK_SIZE_N = 64
                 BLOCK_SIZE_K = 64
             else:  # QKV投影 (N=12288) - 目标0.10ms
+                # 针对大输出维度优化
                 BLOCK_SIZE_M = 64
                 BLOCK_SIZE_N = 128
                 BLOCK_SIZE_K = 64
         else:
-            # 默认分块大小
-            BLOCK_SIZE_M = 64
-            BLOCK_SIZE_N = 64
-            BLOCK_SIZE_K = 64
+            # 默认分块大小 - 平衡性能和内存
+            BLOCK_SIZE_M = 32
+            BLOCK_SIZE_N = 32
+            BLOCK_SIZE_K = 32
 
         # 计算网格大小
         grid = (triton.cdiv(M, BLOCK_SIZE_M) * triton.cdiv(N, BLOCK_SIZE_N),)
 
         # 启动Triton内核
         try:
-            self.fused_gptq_gemm_kernel_4bit[grid](
+            self.fused_gptq_gemm_kernel_4bit_optimized[grid](
                 # 输入矩阵
                 input, input.stride(0), input.stride(1),
                 # GPTQ参数
@@ -198,10 +187,7 @@ class GPTQTritonFusion:
                 # 分块参数
                 BLOCK_SIZE_M=BLOCK_SIZE_M,
                 BLOCK_SIZE_N=BLOCK_SIZE_N,
-                BLOCK_SIZE_K=BLOCK_SIZE_K,
-                # 性能优化参数
-                NUM_STAGES=3,
-                NUM_WARPS=4
+                BLOCK_SIZE_K=BLOCK_SIZE_K
             )
         except Exception as e:
             # 如果Triton内核失败，尝试更小的分块
@@ -221,7 +207,7 @@ class GPTQTritonFusion:
                 try:
                     grid = (triton.cdiv(M, BLOCK_SIZE_M) * triton.cdiv(N, BLOCK_SIZE_N),)
                     
-                    self.fused_gptq_gemm_kernel_4bit[grid](
+                    self.fused_gptq_gemm_kernel_4bit_optimized[grid](
                         # 输入矩阵
                         input, input.stride(0), input.stride(1),
                         # GPTQ参数
@@ -235,10 +221,7 @@ class GPTQTritonFusion:
                         # 分块参数
                         BLOCK_SIZE_M=BLOCK_SIZE_M,
                         BLOCK_SIZE_N=BLOCK_SIZE_N,
-                        BLOCK_SIZE_K=BLOCK_SIZE_K,
-                        # 性能优化参数
-                        NUM_STAGES=2,
-                        NUM_WARPS=2
+                        BLOCK_SIZE_K=BLOCK_SIZE_K
                     )
                     logger.info(f"✅ 使用分块大小 {BLOCK_SIZE_M}x{BLOCK_SIZE_N}x{BLOCK_SIZE_K} 成功")
                     break
