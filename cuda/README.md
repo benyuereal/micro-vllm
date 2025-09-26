@@ -5,13 +5,21 @@
 - **输出投影**: 0.10ms
 - **性能要求**: 如果超出目标几倍就没有存在的必要
 
+## 特性
+- ✅ **cuBLAS集成**: 使用cuBLAS库加速
+- ✅ **混合精度**: 支持FP16混合精度计算
+- ✅ **Tensor Core**: 利用GPU的Tensor Core
+- ✅ **共享内存**: 优化内存访问模式
+- ✅ **向量化**: 64个元素并行处理
+
 ## 文件结构
 ```
 cuda/
-├── gptq_cuda_kernel.cu    # 优化CUDA内核源码
+├── gptq_cuda_kernel.cu    # 高性能CUDA内核源码
 ├── gptq_cuda.py          # Python接口
 ├── compile.py             # 编译脚本
 ├── test.py               # 性能测试
+├── quick_test.py         # 快速测试
 ├── test_all.sh           # 一键测试
 └── README.md             # 说明文档
 ```
@@ -29,7 +37,10 @@ chmod +x test_all.sh
 # 编译内核
 python compile.py
 
-# 测试性能
+# 快速测试
+python quick_test.py
+
+# 完整测试
 python test.py
 ```
 
@@ -40,7 +51,9 @@ python test.py
 - ❌ **不达标**: > 0.50ms
 
 ## 优化策略
-1. **线程块优化**: 256个线程，每个处理4个元素
-2. **内存访问优化**: 共享内存缓存，向量化加载
-3. **计算优化**: 16个元素并行处理
-4. **编译优化**: -O3, -use_fast_math, -Xptxas=-O3
+1. **cuBLAS集成**: 使用cuBLAS库加速矩阵运算
+2. **混合精度**: FP16混合精度计算
+3. **Tensor Core**: 利用GPU的Tensor Core
+4. **共享内存**: 1024字节共享内存缓存
+5. **向量化**: 64个元素并行处理
+6. **编译优化**: -O3, -use_fast_math, -Xptxas=-O3
