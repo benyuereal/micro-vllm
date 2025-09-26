@@ -40,12 +40,14 @@ def main():
     print("=" * 60)
     
     # 测试列表
-    tests = [
-        ("GPTQ功能测试", "test_gptq_functionality.py"),
-        ("批处理Layer层测试", "test_batch_layer_shapes.py"),
-        ("Layer层集成测试", "test_layer_integration.py"),
-        ("性能优化测试", "test_performance_optimization.py"),
-    ]
+        tests = [
+            ("GPTQ功能测试", "test_gptq_functionality.py"),
+            ("批处理Layer层测试", "test_batch_layer_shapes.py"),
+            ("Layer层集成测试", "test_layer_integration.py"),
+            ("性能优化测试", "test_performance_optimization.py"),
+            ("数据类型修复测试", "test_dtype_fix.py"),
+            ("快速验证测试", "quick_test.py"),
+        ]
     
     passed_tests = 0
     total_tests = len(tests)

@@ -52,7 +52,7 @@ def load_model(config_path):
                     bits=4,  # INT4量化
                     group_size=128,  # 优化组大小
                     desc_act=False,  # 禁用描述激活（提升性能）
-                    dtype=torch.bfloat16,
+                    dtype=torch.float16,  # 🔧 修复：使用float16以兼容CUDA内核
                     # 添加Qwen7B专用参数
                     use_exllama=False,  # 禁用EXLLAMA（兼容性更好）
                     exllama_config={"version": 2}  # 使用EXLLAMA v2
@@ -67,7 +67,7 @@ def load_model(config_path):
                     quantization_config=quantization_config,
                     trust_remote_code=True,
                     local_files_only=True,
-                    torch_dtype=torch.bfloat16,
+                    torch_dtype=torch.float16,  # 🔧 修复：使用float16以兼容CUDA内核
                     # 添加性能优化参数
                     max_memory={0: "24GB"},  # GPU内存限制
                     inject_fused_attention=False,  # 禁用融合注意力（我们的内核已优化）

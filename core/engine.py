@@ -21,7 +21,7 @@ class InferenceEngine:
     # 扩展DEVICE_CONFIGS (支持Qwen3 MoE)
     DEVICE_CONFIGS = {
         "mps": {"block_size": 16, "max_blocks": 512, "dtype": torch.float16},
-        "cuda": {"block_size": 256, "max_blocks": 48, "dtype": None},  # 自动选择bfloat16/float16
+        "cuda": {"block_size": 256, "max_blocks": 48, "dtype": torch.float16},  # 🔧 修复：强制使用float16以兼容CUDA内核
         "cpu": {"block_size": 16, "max_blocks": 128, "dtype": torch.float32},
         "cuda_moe": {"block_size": 256, "max_blocks": 48, "dtype": torch.bfloat16},  # ✅ Qwen3 MoE专用
     }
@@ -134,18 +134,13 @@ class InferenceEngine:
         model_dtype = next(self.model.parameters()).dtype
         self.logger.info(f"Model dtype: {model_dtype}")
 
-        if device == "cuda" and dtype is None:
-            # 如果是GPTQ模型，使用模型当前的数据类型
-            if is_gptq_model:
-                self.logger.info(f"GPTQ模型使用原始数据类型: {dtype}")
-            else:
-                dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
-                # 只对非GPTQ模型进行类型转换
-                if model_dtype != dtype:
-                    self.model.to(dtype)
+        # 🔧 修复：强制使用float16以兼容CUDA内核
+        if device == "cuda":
+            if model_dtype != torch.float16:
+                self.logger.info(f"Converting model from {model_dtype} to float16 for CUDA kernel compatibility")
+                self.model.to(torch.float16)
+            dtype = torch.float16
 
-        # 4. 确保返回的dtype与模型实际dtype一致
-        dtype = next(self.model.parameters()).dtype
         return device, dtype, config["block_size"], config["max_blocks"]
 
 
