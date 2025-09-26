@@ -77,12 +77,7 @@ class GPTQCUDAFusion:
         
         # logger.info(f"CUDA融合内核: input{M}x{K}, qweight{N}x{qweight.shape[1]}, qzeros{qzeros.shape}, scales{scales.shape}")
         
-        # 检测GPTQ格式并自动转换（基于原始qweight）
-        format_key = f"{qweight.shape}_{qzeros.shape}_{scales.shape}"
-        actual_groupsize = self.groupsize  # 默认值
-        
-        
-        # 现在处理qweight格式转换（基于缓存的groupsize）
+        # 首先处理qweight格式转换
         if qweight.shape[1] != K // 8:
             # 如果是 [K//8, N] 格式，转置为 [N, K//8]
             if qweight.shape[0] == K // 8 and qweight.shape[1] == N:
@@ -91,6 +86,10 @@ class GPTQCUDAFusion:
             else:
                 logger.error(f"qweight格式不匹配: shape={qweight.shape}, K//8={K//8}, N={N}")
                 raise ValueError(f"qweight第二维必须是K//8={K//8}，得到{qweight.shape[1]}")
+        
+        # 检测GPTQ格式并自动转换（基于转换后的qweight）
+        format_key = f"{qweight.shape}_{qzeros.shape}_{scales.shape}"
+        actual_groupsize = self.groupsize  # 默认值
         
         if format_key in self._format_cache:
             # 使用缓存的格式信息
@@ -103,25 +102,26 @@ class GPTQCUDAFusion:
                 # 标准格式: [N, K//8]
                 logger.debug("使用标准GPTQ格式")
                 actual_groupsize = self.groupsize
-            elif qweight.shape[0] == K // 8 and qweight.shape[1] == N:
-                # 转置格式: [K//8, N] -> [N, K//8]
-                logger.debug("检测到转置格式，自动转换")
-                qweight = qweight.t()
-                actual_groupsize = self.groupsize
             else:
                 # 尝试更灵活的检测
-                logger.debug(f"尝试灵活检测: qweight{qweight.shape}, K={K}, N={N}")
-                if qweight.shape[0] == K // 8:
-                    # [K//8, N] 格式
-                    logger.debug("检测到 [K//8, N] 格式，自动转换")
-                    qweight = qweight.t()
-                    actual_groupsize = self.groupsize
-                elif qweight.shape[1] == K // 8:
-                    # [N, K//8] 格式
-                    logger.debug("检测到 [N, K//8] 格式")
-                    actual_groupsize = self.groupsize
+                logger.warning(f"qzeros维度不匹配: 期望K//8={K//8}，得到{qzeros.shape[1]}")
+                logger.warning(f"尝试检测实际格式: qzeros{qzeros.shape}, scales{scales.shape}")
+                
+                # 检查scales维度
+                if scales.shape[1] == K or scales.shape[1] == N:
+                    logger.warning(f"scales第二维不匹配: 期望K={K}或N={N}，得到{scales.shape[1]}")
+                    logger.warning(f"尝试宽松检测: qzeros{qzeros.shape}, scales{scales.shape}")
+                    
+                    # 检测特殊格式
+                    if qzeros.shape[1] == scales.shape[1]:
+                        # 特殊格式: qzeros和scales第二维相同
+                        logger.info(f"检测到特殊实际推理格式: qzeros{qzeros.shape}, scales{scales.shape}")
+                        actual_groupsize = scales.shape[1]  # 使用scales的第二维作为groupsize
+                        logger.info(f"推断的groupsize: {actual_groupsize}")
+                    else:
+                        raise ValueError(f"无法识别的GPTQ格式: qzeros{qzeros.shape}, scales{scales.shape}")
                 else:
-                    raise ValueError(f"无法识别的qweight格式: {qweight.shape}，期望 [N, K//8] 或 [K//8, N]")
+                    raise ValueError(f"无法识别的GPTQ格式: qzeros{qzeros.shape}, scales{scales.shape}")
             
             # 缓存格式信息
             self._format_cache[format_key] = actual_groupsize
