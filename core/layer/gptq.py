@@ -517,7 +517,8 @@ class GPTQTritonFusion:
         # 检查是否是Qwen7B的特殊格式
         # 格式1: qweight=[512, 12288], qzeros=[32, 1536], scales=[32, 12288] (QKV投影)
         # 格式2: qweight=[512, 4096], qzeros=[32, 512], scales=[32, 4096] (输出投影)
-        if qweight_cols == scales_cols and qzeros_cols == scales_cols // 8:
+        if (qweight_cols == scales_cols and qzeros_cols == scales_cols // 8) or \
+           (qweight_cols == scales_cols and qzeros_cols == N // 8):
             logger.info("Using Qwen7B special format dequantization")
             
             # 判断是QKV投影还是输出投影
