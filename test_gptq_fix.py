@@ -10,13 +10,50 @@ import os
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 
 from core.layer.gptq import GPTQTritonFusion
+import torch.nn.functional as F
+
+def fast_baseline_gptq_gemm(input, qweight, qzeros, scales, groupsize):
+    """
+    更快的基线实现：使用PyTorch向量化操作
+    但仍然比Triton融合算子慢，作为合理的基准
+    """
+    N, _ = qweight.shape
+    K = scales.shape[1]
+    num_groups = scales.shape[0]
+    
+    # 使用向量化操作进行反量化
+    dequantized_weight = torch.zeros((N, K), dtype=torch.float16, device=qweight.device)
+    
+    for group_idx in range(num_groups):
+        start_idx = group_idx * groupsize
+        end_idx = min(start_idx + groupsize, K)
+        
+        # 获取当前组的参数
+        group_scales = scales[group_idx, start_idx:end_idx]  # [group_size]
+        group_qzeros = qzeros[group_idx, start_idx//8:(end_idx+7)//8]  # [group_size//8]
+        
+        # 向量化处理当前组
+        for k in range(start_idx, end_idx):
+            byte_idx = k // 8
+            bit_shift = (k % 8) * 4
+            
+            # 提取所有输出维度的4bit值
+            weight_vals = (qweight[:, byte_idx] >> bit_shift) & 0xF  # [N]
+            zero_val = (group_qzeros[byte_idx] >> bit_shift) & 0xF
+            
+            # 反量化
+            dequantized_weight[:, k] = (weight_vals - zero_val) * group_scales[k - start_idx]
+    
+    # 矩阵乘法
+    result = torch.matmul(input, dequantized_weight.T)
+    return result
 
 def test_gptq_format():
     """测试GPTQ格式是否正确"""
     print("🧪 测试GPTQ格式修复...")
     
-    # 模拟GPTQ格式的参数
-    M, K, N = 32, 4096, 512  # 输入维度4096，输出维度512
+    # 使用较小的矩阵尺寸来加速测试
+    M, K, N = 8, 512, 64  # 输入维度512，输出维度64
     groupsize = 128
     
     # 创建GPTQ格式的张量
@@ -51,9 +88,9 @@ def test_gptq_format():
         )
         print(f"✅ 融合算子成功！输出形状: {result.shape}")
         
-        # 测试基线实现
+        # 测试基线实现（使用更快的版本）
         print("🐌 测试基线实现...")
-        baseline_result = fusion.baseline_gptq_gemm(
+        baseline_result = fast_baseline_gptq_gemm(
             input=input_tensor,
             qweight=qweight,
             qzeros=qzeros,
@@ -62,12 +99,28 @@ def test_gptq_format():
         )
         print(f"✅ 基线实现成功！输出形状: {baseline_result.shape}")
         
-        # 比较结果
-        diff = torch.abs(result - baseline_result).max()
-        print(f"📊 最大差异: {diff.item():.6f}")
+        # 可选：也测试原始基线实现（更慢但更准确）
+        print("🐌 测试原始基线实现（较慢）...")
+        original_baseline_result = fusion.baseline_gptq_gemm(
+            input=input_tensor,
+            qweight=qweight,
+            qzeros=qzeros,
+            scales=scales,
+            groupsize=groupsize
+        )
+        print(f"✅ 原始基线实现成功！输出形状: {original_baseline_result.shape}")
         
-        if diff < 1e-3:
-            print("🎉 测试通过！融合算子和基线实现结果一致")
+        # 比较结果
+        diff1 = torch.abs(result - baseline_result).max()
+        diff2 = torch.abs(result - original_baseline_result).max()
+        diff3 = torch.abs(baseline_result - original_baseline_result).max()
+        
+        print(f"📊 融合算子 vs 快速基线最大差异: {diff1.item():.6f}")
+        print(f"📊 融合算子 vs 原始基线最大差异: {diff2.item():.6f}")
+        print(f"📊 快速基线 vs 原始基线最大差异: {diff3.item():.6f}")
+        
+        if diff1 < 1e-3 and diff2 < 1e-3:
+            print("🎉 测试通过！所有实现结果一致")
         else:
             print("⚠️  结果有差异，可能需要进一步调试")
             
