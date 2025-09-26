@@ -518,7 +518,8 @@ class GPTQTritonFusion:
         if is_mixed_format:
             # 混合格式：qweight和scales的第二维都是输出维度，不是输入维度
             logger.info("Using mixed GPTQ format dequantization")
-            # 在这种情况下，我们需要重新映射scales
+            # 在这种情况下，qweight和scales都是按输出维度组织的
+            # 我们需要重新映射到输入维度
             for group_idx in range(num_groups):
                 start_idx = group_idx * groupsize
                 end_idx = min(start_idx + groupsize, K)
@@ -527,16 +528,18 @@ class GPTQTritonFusion:
                 if group_size <= 0:
                     continue
                     
-                # 对于混合格式，scales需要重新映射到输入维度
-                # 这里我们假设scales是按组分布的
+                # 对于混合格式，scales是按输出维度分布的
+                # 我们需要为每个输入维度k找到对应的scale
                 for k_offset in range(group_size):
                     k = start_idx + k_offset
                     
                     # 计算在scales中的索引（假设scales是按输出维度分布的）
+                    # 对于混合格式，我们需要为每个输入维度k找到对应的scale
                     scale_idx = k % scales_cols
                     scale_val = scales[group_idx, scale_idx]
                     
                     # 计算在qweight中的索引
+                    # 对于混合格式，qweight也是按输出维度组织的
                     weight_idx = k % qweight_cols
                     weight_vals = qweight[:, weight_idx]  # [N]
                     
@@ -765,6 +768,15 @@ class GPTQTritonFusion:
                 qweight, qzeros, scales, groupsize, input_K, input.dtype
             )
             logger.info(f"Special dequantization result shape: {dequantized_weight.shape}")
+            result = torch.matmul(input, dequantized_weight.T)
+        elif qweight.shape[1] == scales.shape[1] and scales.shape[1] == N:
+            # 混合格式: [N, N], [num_groups, qzeros_cols], [num_groups, N] - qweight和scales都是N维度
+            logger.info("Using mixed format dequantization (qweight and scales both N-dim)")
+            logger.info(f"Calling dequantize_gptq_weight_generic_with_k with K={input_K}, dtype={input.dtype}")
+            dequantized_weight = GPTQTritonFusion.dequantize_gptq_weight_generic_with_k(
+                qweight, qzeros, scales, groupsize, input_K, input.dtype
+            )
+            logger.info(f"Mixed dequantization result shape: {dequantized_weight.shape}")
             result = torch.matmul(input, dequantized_weight.T)
         else:
             # 自定义格式: 尝试通用处理
