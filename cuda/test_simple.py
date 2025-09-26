@@ -50,8 +50,8 @@ def test_cuda_kernel():
     num_groups = K // groupsize
     
     input_tensor = torch.randn(M, K, dtype=torch.float16, device='cuda')
-    qweight = torch.randint(0, 256, (N, K // 8), dtype=torch.int32, device='cuda')
-    qzeros = torch.randint(0, 16, (num_groups, K // 8), dtype=torch.int32, device='cuda')
+    qweight = torch.randint(0, 256, (N, K // 8), dtype=torch.uint32, device='cuda')
+    qzeros = torch.randint(0, 16, (num_groups, K // 8), dtype=torch.uint32, device='cuda')
     scales = torch.randn(num_groups, K, dtype=torch.float16, device='cuda')
     
     print(f"📊 测试数据: input{M}x{K}, qweight{N}x{K//8}")
