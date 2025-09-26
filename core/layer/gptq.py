@@ -86,6 +86,16 @@ class GPTQCUDAFusion:
             cached_groupsize = self._format_cache[format_key]
             actual_groupsize = cached_groupsize
             # logger.debug(f"使用缓存的格式信息: groupsize={actual_groupsize}")
+            
+            # 缓存命中时也需要处理qweight格式转换
+            if qweight.shape[1] != K // 8:
+                # 如果是 [K//8, N] 格式，转置为 [N, K//8]
+                if qweight.shape[0] == K // 8 and qweight.shape[1] == N:
+                    logger.info(f"缓存命中，转换qweight格式: {qweight.shape} -> {qweight.t().shape}")
+                    qweight = qweight.t()
+                else:
+                    logger.error(f"qweight格式不匹配: shape={qweight.shape}, K//8={K//8}, N={N}")
+                    raise ValueError(f"qweight第二维必须是K//8={K//8}，得到{qweight.shape[1]}")
         else:
             # 首次检测格式，处理qweight格式转换
             if qweight.shape[1] != K // 8:
