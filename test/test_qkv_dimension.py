@@ -23,20 +23,27 @@ def test_qkv_output_dimension():
         print("❌ CUDA不可用，跳过测试")
         return False
     
-    # 模拟实际推理场景
-    M, K, N = 1, 4096, 512  # batch_size=1, input_dim=4096, output_dim=512
+    # 模拟实际推理场景 - Qwen7B QKV投影
+    M, K = 1, 4096  # batch_size=1, input_dim=4096
+    hidden_size = 4096  # Qwen7B的hidden_size
+    qkv_output_dim = hidden_size * 3  # QKV投影输出维度: 12288
     groupsize = 128
+    
+    print(f"Qwen7B QKV投影:")
+    print(f"  hidden_size: {hidden_size}")
+    print(f"  QKV输出维度: {qkv_output_dim}")
+    print(f"  分割后: Q({hidden_size}) + K({hidden_size}) + V({hidden_size}) = {qkv_output_dim}")
     
     # 创建测试数据
     input_tensor = torch.randn(M, K, dtype=torch.bfloat16, device='cuda')
     
-    # 模拟实际的GPTQ参数格式
+    # 模拟实际的GPTQ参数格式 - 使用正确的QKV输出维度
     num_groups = K // groupsize
-    qweight = torch.randint(0, 256, (N, N), dtype=torch.int32, device='cuda')
+    qweight = torch.randint(0, 256, (qkv_output_dim, qkv_output_dim), dtype=torch.int32, device='cuda')
     qzeros = torch.randint(0, 16, (num_groups, K // 8), dtype=torch.int32, device='cuda')
-    scales = torch.randn(num_groups, N, dtype=torch.float16, device='cuda')
+    scales = torch.randn(num_groups, qkv_output_dim, dtype=torch.float16, device='cuda')
     
-    print(f"测试矩阵大小: {M}x{K}x{N}")
+    print(f"测试矩阵大小: {M}x{K}x{qkv_output_dim}")
     print(f"qweight形状: {qweight.shape}")
     print(f"qzeros形状: {qzeros.shape}")
     print(f"scales形状: {scales.shape}")
