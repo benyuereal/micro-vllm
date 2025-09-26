@@ -186,7 +186,10 @@ class GPTQTritonFusion:
                 # 不修改N，保持原始值
         
         # 检测是否为自定义格式
-        is_custom_format = (qzeros.shape[1] != K // 8 and qzeros.shape[1] != N // 8 and qzeros.shape[1] != qweight.shape[1])
+        # 输出投影格式: qweight=[512, 4096], qzeros=[32, 512], scales=[32, 4096]
+        # 这种情况下 qzeros.shape[1] == K // 8，但 qweight.shape[1] == K，不是标准格式
+        is_custom_format = (qzeros.shape[1] != K // 8 and qzeros.shape[1] != N // 8 and qzeros.shape[1] != qweight.shape[1]) or \
+                          (qweight.shape[1] == K and qzeros.shape[1] == K // 8 and scales.shape[1] == K)
         
         if not is_custom_format:
             # 标准格式验证
