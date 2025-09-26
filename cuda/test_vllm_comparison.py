@@ -88,42 +88,46 @@ def test_performance_comparison():
     print("==========================================")
     try:
         print("🔨 编译vLLM版本...")
-        vllm_kernel = load(
-            name="fused_gptq_gemm_cuda_vllm",
-            sources=["gptq_cuda_kernel_vllm.cu"],
-            extra_cuda_cflags=["-O3", "-use_fast_math", "-Xptxas=-O3"],
-            verbose=False
-        )
-        print("✅ vLLM版本编译成功!")
+        # 使用专门的编译脚本
+        import subprocess
+        result = subprocess.run(['python', 'compile_vllm.py'], 
+                              capture_output=True, text=True)
+        if result.returncode != 0:
+            print(f"❌ vLLM版本编译失败: {result.stderr}")
+            avg_vllm = float('inf')
+        else:
+            print("✅ vLLM版本编译成功!")
+            # 导入编译的内核
+            import fused_gptq_gemm_cuda_vllm
         
-        # 测试vLLM版本性能
-        times_vllm = []
-        for i in range(20):
-            torch.cuda.synchronize()
-            start_time = torch.cuda.Event(enable_timing=True)
-            end_time = torch.cuda.Event(enable_timing=True)
+            # 测试vLLM版本性能
+            times_vllm = []
+            for i in range(20):
+                torch.cuda.synchronize()
+                start_time = torch.cuda.Event(enable_timing=True)
+                end_time = torch.cuda.Event(enable_timing=True)
+                
+                start_time.record()
+                result = fused_gptq_gemm_cuda_vllm.fused_gptq_gemm_4bit_cuda(
+                    input_tensor, qweight, qzeros, scales, groupsize
+                )
+                end_time.record()
+                
+                torch.cuda.synchronize()
+                elapsed = start_time.elapsed_time(end_time)
+                times_vllm.append(elapsed)
+                
+                if i % 5 == 0:
+                    print(f"  迭代 {i}: {elapsed:.2f}ms")
             
-            start_time.record()
-            result = vllm_kernel.fused_gptq_gemm_4bit_cuda(
-                input_tensor, qweight, qzeros, scales, groupsize
-            )
-            end_time.record()
+            avg_vllm = sum(times_vllm) / len(times_vllm)
+            min_vllm = min(times_vllm)
+            max_vllm = max(times_vllm)
             
-            torch.cuda.synchronize()
-            elapsed = start_time.elapsed_time(end_time)
-            times_vllm.append(elapsed)
-            
-            if i % 5 == 0:
-                print(f"  迭代 {i}: {elapsed:.2f}ms")
-        
-        avg_vllm = sum(times_vllm) / len(times_vllm)
-        min_vllm = min(times_vllm)
-        max_vllm = max(times_vllm)
-        
-        print(f"📊 vLLM版本性能统计:")
-        print(f"  平均时间: {avg_vllm:.2f}ms")
-        print(f"  最小时间: {min_vllm:.2f}ms")
-        print(f"  最大时间: {max_vllm:.2f}ms")
+            print(f"📊 vLLM版本性能统计:")
+            print(f"  平均时间: {avg_vllm:.2f}ms")
+            print(f"  最小时间: {min_vllm:.2f}ms")
+            print(f"  最大时间: {max_vllm:.2f}ms")
         
     except Exception as e:
         print(f"❌ vLLM版本测试失败: {e}")

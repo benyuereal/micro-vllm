@@ -18,8 +18,10 @@ cuda/
 ├── gptq_cuda_kernel.cu        # 当前版本CUDA内核
 ├── gptq_cuda_kernel_vllm.cu   # vLLM风格CUDA内核
 ├── gptq_cuda.py              # Python接口
-├── compile.py                 # 编译脚本
-├── test.py                   # 性能测试
+├── compile.py                 # 编译脚本 (当前版本)
+├── compile_vllm.py            # vLLM版本编译脚本
+├── test.py                   # 性能测试 (当前版本)
+├── test_vllm_only.py         # vLLM版本独立测试
 ├── test_vllm_comparison.py   # 性能对比测试
 ├── test_all.sh               # 一键测试
 └── README.md                 # 说明文档
@@ -35,11 +37,16 @@ chmod +x test_all.sh
 
 ### 2. 分步测试
 ```bash
-# 编译内核
+# 测试当前版本
 python compile.py
-
-# 测试性能
 python test.py
+
+# 测试vLLM版本
+python compile_vllm.py
+python test_vllm_only.py
+
+# 性能对比测试
+python test_vllm_comparison.py
 ```
 
 ## 性能目标

@@ -35,20 +35,7 @@ fi
 # 步骤4: 编译vLLM版本内核
 echo "🔨 步骤4: 编译vLLM版本CUDA内核"
 echo "=========================================="
-if ! python -c "
-from torch.utils.cpp_extension import load
-try:
-    vllm_kernel = load(
-        name='fused_gptq_gemm_cuda_vllm',
-        sources=['gptq_cuda_kernel_vllm.cu'],
-        extra_cuda_cflags=['-O3', '-use_fast_math', '-Xptxas=-O3'],
-        verbose=False
-    )
-    print('✅ vLLM版本CUDA内核编译成功!')
-except Exception as e:
-    print(f'❌ vLLM版本CUDA内核编译失败: {e}')
-    exit(1)
-"; then
+if ! python compile_vllm.py; then
     echo "❌ vLLM版本CUDA内核编译失败"
     exit 1
 fi
