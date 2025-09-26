@@ -175,13 +175,13 @@ class GPTQTritonFusion:
         try:
             self.fused_gptq_gemm_kernel_4bit_optimized[grid](
                 # 输入矩阵
-                input, input.stride(0), input.stride(1),
+            input, input.stride(0), input.stride(1),
                 # GPTQ参数
-                qweight, qzeros, scales,
+            qweight, qzeros, scales,
                 # 输出矩阵
                 output, output.stride(0), output.stride(1),
                 # 矩阵维度
-                M, N, K,
+            M, N, K,
                 # GPTQ参数
                 groupsize=self.groupsize,
                 # 分块参数
