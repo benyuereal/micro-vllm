@@ -341,6 +341,15 @@ class InferenceEngine:
 
     def _sample_next_token(self, logits: torch.Tensor, temperature: float, top_p: float) -> int:
         """采样下一个token"""
+        # 🔧 修复：清理logits中的无效值
+        if torch.isnan(logits).any():
+            self.logger.warning("⚠️ 检测到NaN值，使用零替换")
+            logits = torch.nan_to_num(logits, nan=0.0)
+        
+        if torch.isinf(logits).any():
+            self.logger.warning("⚠️ 检测到Inf值，使用有限值替换")
+            logits = torch.clamp(logits, min=-1e6, max=1e6)
+        
         logits = logits / temperature
 
         # Top-p 采样
@@ -355,6 +364,19 @@ class InferenceEngine:
         logits[indices_to_remove] = float('-inf')
 
         probs = F.softmax(logits, dim=-1)
+        
+        # 🔧 修复：确保概率分布有效
+        if torch.isnan(probs).any() or torch.isinf(probs).any():
+            self.logger.warning("⚠️ 概率分布包含无效值，使用均匀分布")
+            probs = torch.ones_like(probs) / probs.size(-1)
+        
+        if (probs < 0).any():
+            self.logger.warning("⚠️ 概率分布包含负值，使用绝对值")
+            probs = torch.abs(probs)
+        
+        # 确保概率和为1
+        probs = probs / probs.sum(dim=-1, keepdim=True)
+        
         return torch.multinomial(probs, num_samples=1).item()
 
     def stream_generate(self, prompt: str, max_tokens: int = 128,
