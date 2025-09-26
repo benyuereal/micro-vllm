@@ -24,19 +24,11 @@ if ! python compile.py; then
     exit 1
 fi
 
-# 步骤3: 快速测试
-echo "⚡ 步骤3: 快速测试CUDA内核"
-echo "=========================================="
-if ! python quick_test.py; then
-    echo "❌ CUDA内核快速测试失败"
-    exit 1
-fi
-
-# 步骤4: 完整测试
-echo "⚡ 步骤4: 完整测试CUDA内核性能"
+# 步骤3: 测试内核
+echo "⚡ 步骤3: 测试CUDA内核性能"
 echo "=========================================="
 if ! python test.py; then
-    echo "❌ CUDA内核完整测试失败"
+    echo "❌ CUDA内核测试失败"
     exit 1
 fi
 

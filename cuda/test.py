@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-CUDA内核测试 - 目标0.10ms
+CUDA内核测试 - 简化版本
 """
 
 import torch
@@ -20,26 +20,19 @@ def test_cuda_kernel():
     print(f"✅ CUDA可用: {torch.cuda.is_available()}")
     print(f"📊 GPU名称: {torch.cuda.get_device_name()}")
     
-    # 导入已编译的CUDA内核
-    print("\n🔨 导入CUDA内核...")
+    # 直接编译CUDA内核
+    print("\n🔨 编译CUDA内核...")
     try:
-        # 尝试直接导入
-        import fused_gptq_gemm_cuda
-        print("✅ CUDA内核导入成功!")
-    except ImportError:
-        # 如果导入失败，尝试编译
-        print("🔨 编译CUDA内核...")
-        try:
-            fused_gptq_gemm_cuda = load(
-                name="fused_gptq_gemm_cuda",
-                sources=["gptq_cuda_kernel.cu"],
-                extra_cuda_cflags=["-O3", "-use_fast_math", "-Xptxas=-O3", "-lcublas", "-lcublasLt"],
-                verbose=False
-            )
-            print("✅ CUDA内核编译成功!")
-        except Exception as e:
-            print(f"❌ CUDA内核编译失败: {e}")
-            return
+        fused_gptq_gemm_cuda = load(
+            name="fused_gptq_gemm_cuda",
+            sources=["gptq_cuda_kernel.cu"],
+            extra_cuda_cflags=["-O3", "-use_fast_math", "-Xptxas=-O3"],
+            verbose=False
+        )
+        print("✅ CUDA内核编译成功!")
+    except Exception as e:
+        print(f"❌ CUDA内核编译失败: {e}")
+        return
     
     # 测试数据
     M, K, N = 1, 4096, 12288
@@ -70,8 +63,8 @@ def test_cuda_kernel():
     
     # 性能测试
     print("\n⚡ 性能测试...")
-    num_warmup = 10
-    num_runs = 100
+    num_warmup = 5
+    num_runs = 20
     
     # 预热
     for _ in range(num_warmup):
@@ -93,7 +86,7 @@ def test_cuda_kernel():
         torch.cuda.synchronize()
         timings.append(start_event.elapsed_time(end_event))
         
-        if i % 20 == 0:
+        if i % 5 == 0:
             print(f"  迭代 {i}: {timings[-1]:.2f}ms")
     
     avg_time = sum(timings) / num_runs

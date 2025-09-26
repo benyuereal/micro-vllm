@@ -15,18 +15,17 @@
 ## 文件结构
 ```
 cuda/
-├── gptq_cuda_kernel.cu    # 高性能CUDA内核源码
+├── gptq_cuda_kernel.cu    # CUDA内核源码
 ├── gptq_cuda.py          # Python接口
 ├── compile.py             # 编译脚本
 ├── test.py               # 性能测试
-├── quick_test.py         # 快速测试
 ├── test_all.sh           # 一键测试
 └── README.md             # 说明文档
 ```
 
 ## 使用方法
 
-### 1. 一键测试
+### 1. 一键测试（推荐）
 ```bash
 chmod +x test_all.sh
 ./test_all.sh
@@ -37,10 +36,7 @@ chmod +x test_all.sh
 # 编译内核
 python compile.py
 
-# 快速测试
-python quick_test.py
-
-# 完整测试
+# 测试性能
 python test.py
 ```
 
