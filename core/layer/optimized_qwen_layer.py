@@ -157,8 +157,8 @@ class OptimizedQwenModelLayerAdapter:
         result = result.view(batch_size, seq_len, -1)
         
         # 调试信息
-        logger.info(f"QKV projection result shape: {result.shape}")
-        logger.info(f"Expected hidden_size: {hidden_dim}")
+        # logger.info(f"QKV projection result shape: {result.shape}")
+        # logger.info(f"Expected hidden_size: {hidden_dim}")
         
         # 分割QKV - 检查输出维度
         output_dim = result.shape[-1]
@@ -167,7 +167,7 @@ class OptimizedQwenModelLayerAdapter:
             raise ValueError(f"QKV output dimension {output_dim} is not divisible by 3")
         
         hidden_size = output_dim // 3
-        logger.info(f"Calculated hidden_size: {hidden_size}")
+        # logger.info(f"Calculated hidden_size: {hidden_size}")
         
         q, k, v = result.split(hidden_size, dim=-1)
         
@@ -192,12 +192,12 @@ class OptimizedQwenModelLayerAdapter:
         else:
             out_weight, out_scale, out_zero = self._quantization_cache[cache_key]
 
-        # 调试信息
-        logger.info(f"Output projection GPTQ parameters:")
-        logger.info(f"  out_weight shape: {out_weight.shape}")
-        logger.info(f"  out_scale shape: {out_scale.shape}")
-        logger.info(f"  out_zero shape: {out_zero.shape}")
-        logger.info(f"  attn_output shape: {attn_output.shape}")
+        # 调试信息 - 仅在调试时启用
+        # logger.info(f"Output projection GPTQ parameters:")
+        # logger.info(f"  out_weight shape: {out_weight.shape}")
+        # logger.info(f"  out_scale shape: {out_scale.shape}")
+        # logger.info(f"  out_zero shape: {out_zero.shape}")
+        # logger.info(f"  attn_output shape: {attn_output.shape}")
 
         # 重塑注意力输出: [batch_size, num_heads, head_size] -> [batch_size, seq_len, hidden_size]
         batch_size, num_heads, head_size = attn_output.shape
@@ -205,7 +205,7 @@ class OptimizedQwenModelLayerAdapter:
         
         # 重塑为 [batch_size, 1, hidden_size]
         attn_output_reshaped = attn_output.view(batch_size, 1, hidden_size)
-        logger.info(f"Reshaped attn_output: {attn_output_reshaped.shape}")
+        # logger.info(f"Reshaped attn_output: {attn_output_reshaped.shape}")
         
         # 使用GPTQ融合算子
         # 重塑输入为 [M, K] 格式
@@ -221,7 +221,7 @@ class OptimizedQwenModelLayerAdapter:
         
         # 重塑输出
         result = result.view(batch_size, 1, -1)
-        logger.info(f"Output projection result: {result.shape}")
+        # logger.info(f"Output projection result: {result.shape}")
         return result
 
 

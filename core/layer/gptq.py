@@ -514,11 +514,11 @@ class GPTQTritonFusion:
         qzeros_cols = qzeros.shape[1]
         scales_cols = scales.shape[1]
         
-        logger.info(f"Generic dequantization with K: qweight{N}x{qweight_cols}, qzeros{num_groups}x{qzeros_cols}, scales{num_groups}x{scales_cols}, K={K}")
+        # logger.info(f"Generic dequantization with K: qweight{N}x{qweight_cols}, qzeros{num_groups}x{qzeros_cols}, scales{num_groups}x{scales_cols}, K={K}")
 
         # 反量化权重 - 使用指定的数据类型或scales的数据类型
         output_dtype = dtype if dtype is not None else scales.dtype
-        logger.info(f"Using output dtype: {output_dtype}")
+        # logger.info(f"Using output dtype: {output_dtype}")
         dequantized_weight = torch.zeros((N, K), dtype=output_dtype, device=qweight.device)
 
         # 检查是否是Qwen7B的特殊格式
@@ -526,7 +526,7 @@ class GPTQTritonFusion:
         # 格式2: qweight=[512, 4096], qzeros=[32, 512], scales=[32, 4096] (输出投影)
         if (qweight_cols == scales_cols and qzeros_cols == scales_cols // 8) or \
            (qweight_cols == scales_cols and qzeros_cols == N // 8):
-            logger.info("Using Qwen7B special format dequantization")
+            # logger.info("Using Qwen7B special format dequantization")
             
             # 判断是QKV投影还是输出投影
             # QKV投影: qweight=[512, 12288], scales=[32, 12288], qzeros=[32, 1536]
@@ -534,12 +534,12 @@ class GPTQTritonFusion:
             
             if scales_cols > K:
                 # QKV投影格式: [input_dim//8, output_dim] = [512, 12288]
-                logger.info("Detected QKV projection format")
+                # logger.info("Detected QKV projection format")
                 input_dim_compressed = N  # qweight的第一维是input_dim//8
                 output_dim = scales_cols  # scales的第二维是output_dim
                 input_dim = input_dim_compressed * 8  # 实际输入维度
                 
-                logger.info(f"QKV: input_dim={input_dim_compressed}*8={input_dim}, output_dim={output_dim}")
+                # logger.info(f"QKV: input_dim={input_dim_compressed}*8={input_dim}, output_dim={output_dim}")
                 
                 # 重新分配输出张量 [output_dim, input_dim]
                 dequantized_weight = torch.zeros((output_dim, input_dim), dtype=output_dtype, device=qweight.device)
@@ -579,12 +579,12 @@ class GPTQTritonFusion:
                 
             else:
                 # 输出投影格式: [output_dim//8, input_dim] = [512, 4096]
-                logger.info("Detected output projection format")
+                # logger.info("Detected output projection format")
                 output_dim_compressed = N  # qweight的第一维是output_dim//8
                 input_dim = scales_cols  # scales的第二维是input_dim
                 output_dim = output_dim_compressed * 8  # 实际输出维度
                 
-                logger.info(f"Output: input_dim={input_dim}, output_dim={output_dim_compressed}*8={output_dim}")
+                # logger.info(f"Output: input_dim={input_dim}, output_dim={output_dim_compressed}*8={output_dim}")
                 
                 # 重新分配输出张量 [output_dim, input_dim]
                 dequantized_weight = torch.zeros((output_dim, input_dim), dtype=output_dtype, device=qweight.device)
@@ -622,7 +622,7 @@ class GPTQTritonFusion:
                         scale_val = group_scales[in_offset]
                         dequantized_weight[:, in_idx] = (weight_vals - zero_val) * scale_val
             
-            logger.info(f"Qwen7B special dequantization result shape: {dequantized_weight.shape}")
+            # logger.info(f"Qwen7B special dequantization result shape: {dequantized_weight.shape}")
             return dequantized_weight
         
         # 检查是否是混合格式
@@ -846,19 +846,20 @@ class GPTQTritonFusion:
         N, _ = qweight.shape
         input_K = input.shape[1]  # 使用输入的实际K维度
         
-        logger.info(f"baseline_gptq_gemm: input{input_K}x{N}, qweight{qweight.shape}, qzeros{qzeros.shape}, scales{scales.shape}")
+        # 减少日志输出以提高性能
+        # logger.info(f"baseline_gptq_gemm: input{input_K}x{N}, qweight{qweight.shape}, qzeros{qzeros.shape}, scales{scales.shape}")
         
-        # 详细的格式检测日志
-        logger.info(f"Format detection:")
-        logger.info(f"  qweight.shape[1] == input_K // 8: {qweight.shape[1]} == {input_K // 8} = {qweight.shape[1] == input_K // 8}")
-        logger.info(f"  qzeros.shape[1] == input_K // 8: {qzeros.shape[1]} == {input_K // 8} = {qzeros.shape[1] == input_K // 8}")
-        logger.info(f"  scales.shape[1] == input_K: {scales.shape[1]} == {input_K} = {scales.shape[1] == input_K}")
-        logger.info(f"  scales.shape[1] == N: {scales.shape[1]} == {N} = {scales.shape[1] == N}")
+        # 详细的格式检测日志 - 仅在调试时启用
+        # logger.info(f"Format detection:")
+        # logger.info(f"  qweight.shape[1] == input_K // 8: {qweight.shape[1]} == {input_K // 8} = {qweight.shape[1] == input_K // 8}")
+        # logger.info(f"  qzeros.shape[1] == input_K // 8: {qzeros.shape[1]} == {input_K // 8} = {qzeros.shape[1] == input_K // 8}")
+        # logger.info(f"  scales.shape[1] == input_K: {scales.shape[1]} == {input_K} = {scales.shape[1] == input_K}")
+        # logger.info(f"  scales.shape[1] == N: {scales.shape[1]} == {N} = {scales.shape[1] == N}")
         
         # 判断格式类型并使用最优化的函数
         if qweight.shape[1] == input_K // 8 and qzeros.shape[1] == input_K // 8 and scales.shape[1] == input_K:
             # 标准格式: [N, K//8], [num_groups, K//8], [num_groups, K]
-            logger.info("Using standard format dequantization")
+            # logger.info("Using standard format dequantization")
             dequantized_weight = GPTQTritonFusion.dequantize_gptq_weight(
                 qweight, qzeros, scales, groupsize
             )
@@ -868,7 +869,7 @@ class GPTQTritonFusion:
             result = torch.matmul(input, dequantized_weight.T)
         elif qweight.shape[1] == N // 8 and qzeros.shape[1] == N // 8 and scales.shape[1] == input_K:
             # 替代格式: [N, N//8], [num_groups, N//8], [num_groups, K]
-            logger.info("Using alternative format dequantization")
+            # logger.info("Using alternative format dequantization")
             dequantized_weight = GPTQTritonFusion.dequantize_gptq_weight_alternative(
                 qweight, qzeros, scales, groupsize
             )
@@ -878,12 +879,12 @@ class GPTQTritonFusion:
             result = torch.matmul(input, dequantized_weight.T)
         elif qweight.shape[1] == input_K // 8 and qzeros.shape[1] == input_K // 8 and scales.shape[1] == N:
             # 特殊格式: [N, K//8], [num_groups, K//8], [num_groups, N] - scales的第二维是N而不是K
-            logger.info("Using special format dequantization (scales second dim = N)")
-            logger.info(f"Calling dequantize_gptq_weight_special with K={input_K}, dtype={input.dtype}")
+            # logger.info("Using special format dequantization (scales second dim = N)")
+            # logger.info(f"Calling dequantize_gptq_weight_special with K={input_K}, dtype={input.dtype}")
             dequantized_weight = GPTQTritonFusion.dequantize_gptq_weight_special(
                 qweight, qzeros, scales, groupsize, input_K, input.dtype
             )
-            logger.info(f"Special dequantization result shape: {dequantized_weight.shape}")
+            # logger.info(f"Special dequantization result shape: {dequantized_weight.shape}")
             # 确保数据类型匹配
             if dequantized_weight.dtype != input.dtype:
                 dequantized_weight = dequantized_weight.to(input.dtype)
@@ -891,24 +892,24 @@ class GPTQTritonFusion:
         elif qweight.shape[1] == input_K and qzeros.shape[1] == N and scales.shape[1] == input_K:
             # Qwen7B输出投影格式: [N, K], [num_groups, N], [num_groups, K]
             # qweight=[512, 4096], qzeros=[32, 512], scales=[32, 4096]
-            logger.info("Using Qwen7B output projection format dequantization")
-            logger.info(f"Calling dequantize_gptq_weight_generic_with_k with K={input_K}, dtype={input.dtype}")
+            # logger.info("Using Qwen7B output projection format dequantization")
+            # logger.info(f"Calling dequantize_gptq_weight_generic_with_k with K={input_K}, dtype={input.dtype}")
             dequantized_weight = GPTQTritonFusion.dequantize_gptq_weight_generic_with_k(
                 qweight, qzeros, scales, groupsize, input_K, input.dtype
             )
-            logger.info(f"Qwen7B output projection dequantization result shape: {dequantized_weight.shape}")
+            # logger.info(f"Qwen7B output projection dequantization result shape: {dequantized_weight.shape}")
             # 确保数据类型匹配
             if dequantized_weight.dtype != input.dtype:
                 dequantized_weight = dequantized_weight.to(input.dtype)
             result = torch.matmul(input, dequantized_weight.T)
         else:
             # 自定义格式: 尝试通用处理
-            logger.warning(f"Using generic dequantization for custom format: input{input_K}x{N}, qweight{qweight.shape}, qzeros{qzeros.shape}, scales{scales.shape}")
-            logger.info(f"Calling dequantize_gptq_weight_generic with input_K={input_K}, dtype={input.dtype}")
+            # logger.warning(f"Using generic dequantization for custom format: input{input_K}x{N}, qweight{qweight.shape}, qzeros{qzeros.shape}, scales{scales.shape}")
+            # logger.info(f"Calling dequantize_gptq_weight_generic with input_K={input_K}, dtype={input.dtype}")
             dequantized_weight = GPTQTritonFusion.dequantize_gptq_weight_generic_with_k(
                 qweight, qzeros, scales, groupsize, input_K, input.dtype
             )
-            logger.info(f"Generic dequantization result shape: {dequantized_weight.shape}")
+            # logger.info(f"Generic dequantization result shape: {dequantized_weight.shape}")
             # 确保数据类型匹配
             if dequantized_weight.dtype != input.dtype:
                 dequantized_weight = dequantized_weight.to(input.dtype)
