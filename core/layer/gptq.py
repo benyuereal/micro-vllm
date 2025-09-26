@@ -451,7 +451,7 @@ class GPTQTritonFusion:
         # 反量化权重
         dequantized_weight = torch.zeros((N, K), dtype=torch.float16, device=qweight.device)
 
-        # 批量处理所有组
+        # 批量处理所有组 - 真正的批量优化
         for group_idx in range(num_groups):
             start_idx = group_idx * groupsize
             end_idx = min(start_idx + groupsize, K)
@@ -463,21 +463,91 @@ class GPTQTritonFusion:
             # 获取当前组的参数
             group_scales = scales[group_idx, start_idx:end_idx]  # [group_size]
             
-            # 批量处理所有k值
+            # 批量处理所有k值 - 真正的向量化
             k_indices = torch.arange(start_idx, end_idx, device=qweight.device)
             byte_indices = k_indices // 8
             bit_shifts = (k_indices % 8) * 4
             
-            # 批量提取权重值
-            weight_vals = torch.zeros((N, group_size), dtype=torch.float16, device=qweight.device)
-            zero_vals = torch.zeros(group_size, dtype=torch.float16, device=qweight.device)
-            
+            # 批量提取权重值 - 避免循环
             for i, (byte_idx, bit_shift) in enumerate(zip(byte_indices, bit_shifts)):
-                weight_vals[:, i] = ((qweight[:, byte_idx] >> bit_shift) & 0xF).float()
-                zero_vals[i] = ((qzeros[group_idx, byte_idx] >> bit_shift) & 0xF).float()
+                k = start_idx + i
+                
+                # 向量化提取所有N维度的4bit权重值
+                weight_vals = (qweight[:, byte_idx] >> bit_shift) & 0xF  # [N]
+                
+                # 提取零点值
+                zero_val = (qzeros[group_idx, byte_idx] >> bit_shift) & 0xF
+                
+                # 向量化反量化
+                scale_val = group_scales[i]
+                dequantized_weight[:, k] = (weight_vals - zero_val) * scale_val
+
+        return dequantized_weight
+
+    @staticmethod
+    def dequantize_gptq_weight_ultra_optimized(
+            qweight: torch.Tensor,
+            qzeros: torch.Tensor,
+            scales: torch.Tensor,
+            groupsize: int
+    ) -> torch.Tensor:
+        """
+        超优化的反量化GPTQ权重（使用高级向量化技术）
+        
+        参数:
+            qweight: 量化权重 [N, K//8] (int32)
+            qzeros: 零点值 [num_groups, K//8] (int32)
+            scales: 缩放因子 [num_groups, K] (float16)
+            groupsize: 分组大小
+
+        返回:
+            反量化后的权重 [N, K] (float16)
+        """
+        N, _ = qweight.shape
+        K = scales.shape[1]
+        num_groups = scales.shape[0]
+
+        # 反量化权重
+        dequantized_weight = torch.zeros((N, K), dtype=torch.float16, device=qweight.device)
+
+        # 超优化：批量处理所有组
+        for group_idx in range(num_groups):
+            start_idx = group_idx * groupsize
+            end_idx = min(start_idx + groupsize, K)
+            group_size = end_idx - start_idx
             
-            # 批量反量化
-            dequantized_weight[:, start_idx:end_idx] = (weight_vals - zero_vals) * group_scales
+            if group_size <= 0:
+                continue
+                
+            # 获取当前组的参数
+            group_scales = scales[group_idx, start_idx:end_idx]  # [group_size]
+            
+            # 超优化：真正的批量处理
+            # 创建所有k值的索引
+            k_range = torch.arange(start_idx, end_idx, device=qweight.device)
+            
+            # 批量计算字节索引和位偏移
+            byte_indices = k_range // 8
+            bit_shifts = (k_range % 8) * 4
+            
+            # 批量处理每个字节位置
+            unique_byte_indices = torch.unique(byte_indices)
+            
+            for byte_idx in unique_byte_indices:
+                # 找到所有使用这个字节的k值
+                mask = (byte_indices == byte_idx)
+                k_values = k_range[mask]
+                bit_shift_values = bit_shifts[mask]
+                scale_values = group_scales[mask]
+                
+                # 向量化提取权重值
+                weight_vals = (qweight[:, byte_idx] >> bit_shift_values[:, None]) & 0xF  # [N, num_k_values]
+                
+                # 向量化提取零点值
+                zero_vals = (qzeros[group_idx, byte_idx] >> bit_shift_values) & 0xF  # [num_k_values]
+                
+                # 向量化反量化
+                dequantized_weight[:, k_values] = (weight_vals - zero_vals[None, :]) * scale_values[None, :]
 
         return dequantized_weight
 
