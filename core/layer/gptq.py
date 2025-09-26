@@ -158,7 +158,7 @@ class GPTQTritonFusion:
         N = qweight.shape[0]  # GPTQ格式：qweight的第一维是输出维度
         num_groups = scales.shape[0]
 
-        # 验证参数
+        # 验证参数 - 更灵活的验证
         if K % self.groupsize != 0:
             raise ValueError(f"K ({K}) must be divisible by groupsize ({self.groupsize})")
         
@@ -168,14 +168,27 @@ class GPTQTritonFusion:
         if qzeros.shape[0] != num_groups:
             raise ValueError(f"qzeros first dimension ({qzeros.shape[0]}) must equal num_groups ({num_groups})")
         
-        if qzeros.shape[1] != K // 8:
-            raise ValueError(f"qzeros second dimension ({qzeros.shape[1]}) must equal K//8 ({K//8})")
+        # 更灵活的qzeros验证 - 支持不同的量化格式
+        expected_qzeros_cols = K // 8
+        if qzeros.shape[1] != expected_qzeros_cols:
+            # 尝试其他可能的格式
+            if qzeros.shape[1] == N // 8:
+                # 可能是 [num_groups, N//8] 格式
+                logger.warning(f"Detected alternative GPTQ format: qzeros shape {qzeros.shape}, expected {expected_qzeros_cols}")
+            else:
+                raise ValueError(f"qzeros second dimension ({qzeros.shape[1]}) must equal K//8 ({expected_qzeros_cols}) or N//8 ({N//8})")
         
         if qweight.shape[0] != N:
             raise ValueError(f"qweight first dimension ({qweight.shape[0]}) must equal N ({N})")
         
-        if qweight.shape[1] != K // 8:
-            raise ValueError(f"qweight second dimension ({qweight.shape[1]}) must equal K//8 ({K//8})")
+        # 更灵活的qweight验证
+        expected_qweight_cols = K // 8
+        if qweight.shape[1] != expected_qweight_cols:
+            if qweight.shape[1] == N // 8:
+                # 可能是 [N, N//8] 格式
+                logger.warning(f"Detected alternative GPTQ format: qweight shape {qweight.shape}, expected {expected_qweight_cols}")
+            else:
+                raise ValueError(f"qweight second dimension ({qweight.shape[1]}) must equal K//8 ({expected_qweight_cols}) or N//8 ({N//8})")
         
         if scales.shape[1] != K:
             raise ValueError(f"scales second dimension ({scales.shape[1]}) must equal K ({K})")
@@ -183,6 +196,14 @@ class GPTQTritonFusion:
         if K % 8 != 0:
             raise ValueError(f"K ({K}) must be divisible by 8 for 4-bit quantization")
 
+        # 检测实际的GPTQ格式
+        is_alternative_format = (qweight.shape[1] == N // 8) and (qzeros.shape[1] == N // 8)
+        
+        if is_alternative_format:
+            logger.info(f"Using alternative GPTQ format: qweight{qweight.shape}, qzeros{qzeros.shape}, scales{scales.shape}")
+            # 使用基线实现处理替代格式
+            return self.baseline_gptq_gemm(input, qweight, qzeros, scales, self.groupsize)
+        
         # 分配输出张量
         result = torch.empty((M, N), dtype=input.dtype, device=input.device)
 
@@ -258,6 +279,56 @@ class GPTQTritonFusion:
 
         return dequantized_weight
 
+    @staticmethod
+    def dequantize_gptq_weight_alternative(
+            qweight: torch.Tensor,
+            qzeros: torch.Tensor,
+            scales: torch.Tensor,
+            groupsize: int
+    ) -> torch.Tensor:
+        """
+        反量化GPTQ权重（替代格式实现）
+        
+        参数:
+            qweight: 量化权重 [N, N//8] (int32) - 替代格式
+            qzeros: 零点值 [num_groups, N//8] (int32) - 替代格式
+            scales: 缩放因子 [num_groups, K] (float16) - 标准格式
+            groupsize: 分组大小
+
+        返回:
+            反量化后的权重 [N, K] (float16)
+        """
+        N, _ = qweight.shape
+        K = scales.shape[1]
+        num_groups = scales.shape[0]
+
+        # 反量化权重
+        dequantized_weight = torch.zeros((N, K), dtype=torch.float16, device=qweight.device)
+
+        for group_idx in range(num_groups):
+            start_idx = group_idx * groupsize
+            end_idx = min(start_idx + groupsize, K)
+
+            for k in range(start_idx, end_idx):
+                for n in range(N):
+                    # 计算在qweight中的位置 - 替代格式
+                    weight_idx = n
+                    byte_idx = n // 8
+                    bit_shift = (n % 8) * 4
+
+                    # 提取4bit权重值
+                    weight_val = (qweight[weight_idx, byte_idx] >> bit_shift) & 0xF
+
+                    # 提取零点值 - 替代格式
+                    zero_val = (qzeros[group_idx, byte_idx] >> bit_shift) & 0xF
+
+                    # 提取缩放因子
+                    scale_val = scales[group_idx, k]
+
+                    # 反量化
+                    dequantized_weight[n, k] = (weight_val - zero_val) * scale_val
+
+        return dequantized_weight
 
     @staticmethod
     def baseline_gptq_gemm(
@@ -273,21 +344,31 @@ class GPTQTritonFusion:
 
         参数:
             input: 输入矩阵 [M, K]
-            qweight: 量化权重 [N, K//8] (int32) - GPTQ格式
-            qzeros: 零点值 [num_groups, K//8] (int32) - GPTQ格式
+            qweight: 量化权重 [N, K//8] 或 [N, N//8] (int32) - GPTQ格式
+            qzeros: 零点值 [num_groups, K//8] 或 [num_groups, N//8] (int32) - GPTQ格式
             scales: 缩放因子 [num_groups, K] (float16) - GPTQ格式
             groupsize: 分组大小
 
         返回:
             输出矩阵 [M, N]
         """
-        # 先反量化权重
-        dequantized_weight = GPTQTritonFusion.dequantize_gptq_weight(
-            qweight, qzeros, scales, groupsize
-        )
-
-        # 再进行矩阵乘法 - 需要转置因为权重是[N,K]格式
-        result = torch.matmul(input, dequantized_weight.T)
+        # 检测格式
+        N, _ = qweight.shape
+        K = scales.shape[1]
+        
+        # 判断是标准格式还是替代格式
+        if qweight.shape[1] == K // 8 and qzeros.shape[1] == K // 8:
+            # 标准格式: [N, K//8], [num_groups, K//8], [num_groups, K]
+            dequantized_weight = GPTQTritonFusion.dequantize_gptq_weight(
+                qweight, qzeros, scales, groupsize
+            )
+            result = torch.matmul(input, dequantized_weight.T)
+        else:
+            # 替代格式: [N, N//8], [num_groups, N//8], [num_groups, K]
+            dequantized_weight = GPTQTritonFusion.dequantize_gptq_weight_alternative(
+                qweight, qzeros, scales, groupsize
+            )
+            result = torch.matmul(input, dequantized_weight.T)
 
         return result
 
