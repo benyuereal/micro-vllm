@@ -515,22 +515,24 @@ class GPTQTritonFusion:
         # 检查是否是Qwen7B的特殊格式
         # qweight=[512, 12288], qzeros=[32, 1536], scales=[32, 12288]
         # 这可能是 [N//8, K] 格式，其中 N=4096, K=12288
-        if qweight_cols == scales_cols and qzeros_cols == K // 8:
+        if qweight_cols == scales_cols and qzeros_cols == scales_cols // 8:
             logger.info("Using Qwen7B special format dequantization")
             # 在这种情况下，qweight的第二维是K，scales的第二维也是K
             # 但N维度被压缩了，需要重新映射
             
-            # 计算实际的N维度
-            actual_N = N * 8  # 假设N被压缩了8倍
+            # 计算实际的N维度 - 从qweight的第一维推断
+            actual_N = N * 8  # qweight的第一维是N//8，所以N = N * 8
+            actual_K = scales_cols  # scales的第二维就是实际的K维度
             logger.info(f"Detected compressed N: {N} -> actual N: {actual_N}")
+            logger.info(f"Detected K: {K} -> actual K: {actual_K}")
             
             # 重新分配输出张量
-            dequantized_weight = torch.zeros((actual_N, K), dtype=output_dtype, device=qweight.device)
+            dequantized_weight = torch.zeros((actual_N, actual_K), dtype=output_dtype, device=qweight.device)
             
             # 处理每个组
             for group_idx in range(num_groups):
                 start_idx = group_idx * groupsize
-                end_idx = min(start_idx + groupsize, K)
+                end_idx = min(start_idx + groupsize, actual_K)
                 group_size = end_idx - start_idx
                 
                 if group_size <= 0:
