@@ -153,11 +153,22 @@ class OptimizedQwenModelLayerAdapter:
             scales=qkv_scale
         )
         
-        # 重塑输出为 [B*S, 3*D]
+        # 重塑输出为 [B*S, output_dim]
         result = result.view(batch_size, seq_len, -1)
         
-        # 分割QKV
-        hidden_size = result.shape[-1] // 3
+        # 调试信息
+        logger.info(f"QKV projection result shape: {result.shape}")
+        logger.info(f"Expected hidden_size: {hidden_dim}")
+        
+        # 分割QKV - 检查输出维度
+        output_dim = result.shape[-1]
+        if output_dim % 3 != 0:
+            logger.error(f"QKV output dimension {output_dim} is not divisible by 3")
+            raise ValueError(f"QKV output dimension {output_dim} is not divisible by 3")
+        
+        hidden_size = output_dim // 3
+        logger.info(f"Calculated hidden_size: {hidden_size}")
+        
         q, k, v = result.split(hidden_size, dim=-1)
         
         # 重塑为 [B, H, S, D]
