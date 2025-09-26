@@ -76,8 +76,9 @@ def test_gptq_format_detection():
         print("\n🧪 测试3: 实际推理格式 (模拟错误日志)")
         # 从错误日志: qweight512x12288, qzeros[32, 1536], scales[32, 12288]
         # 这里有个问题: scales应该是[32, 4096]而不是[32, 12288]
+        # qzeros也应该是[32, 512]而不是[32, 1536]
         qweight_real = torch.randint(0, 256, (512, 12288), dtype=torch.uint32, device='cuda')
-        qzeros_real = torch.randint(0, 16, (32, 1536), dtype=torch.uint32, device='cuda')
+        qzeros_real = torch.randint(0, 16, (32, 512), dtype=torch.uint32, device='cuda')  # 修正为正确的维度
         scales_real = torch.randn(32, 4096, dtype=torch.float16, device='cuda')  # 修正为正确的维度
         
         print(f"📊 实际格式: qweight{qweight_real.shape}, qzeros{qzeros_real.shape}, scales{scales_real.shape}")

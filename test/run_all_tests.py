@@ -45,6 +45,7 @@ def main():
         ("简单功能测试", "simple_test.py"),
         ("GPTQ格式转换测试", "test_gptq_format_conversion.py"),
         ("GPTQ格式检测测试", "test_gptq_format_detection.py"),
+        ("GPTQ维度验证测试", "test_gptq_dimensions.py"),
         ("GPTQ功能测试", "test_gptq_functionality.py"),
         ("批处理Layer层测试", "test_batch_layer_shapes.py"),
         ("Layer层集成测试", "test_layer_integration.py"),

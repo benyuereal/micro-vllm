@@ -212,8 +212,8 @@ def test_layer_integration():
                     # 模拟量化权重 - 使用正确的维度
                     # QKV投影: [K//8, N] = [512, 12288]
                     self.qweight = torch.randint(0, 256, (512, 12288), dtype=torch.uint32, device='cuda')
-                    self.qzeros = torch.randint(0, 16, (32, 1536), dtype=torch.uint32, device='cuda')
-                    self.scales = torch.randn(32, 4096, dtype=torch.float16, device='cuda')  # 修正为正确的维度
+                    self.qzeros = torch.randint(0, 16, (32, 512), dtype=torch.uint32, device='cuda')  # 修正为正确的维度
+                    self.scales = torch.randn(32, 4096, dtype=torch.float16, device='cuda')
             
             mock_layer = MockLayer()
             
