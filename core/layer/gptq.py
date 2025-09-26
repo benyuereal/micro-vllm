@@ -156,27 +156,27 @@ class GPTQTritonFusion:
         # 避免不必要的类型转换
         output = torch.empty((M, N), dtype=input.dtype, device=input.device)
         
-        # 分块参数 - 针对共享内存限制优化
-        # 硬件限制: 166912 bytes
-        # 使用更小的分块以适应硬件限制
+        # 分块参数 - 针对Triton内核要求优化
+        # Triton要求矩阵维度≥16
+        # 使用16×16×16分块以满足要求
         if M == 1 and K == 4096:  # Qwen7B典型输入
             if N <= 4096:  # 输出投影 - 目标0.17ms
-                BLOCK_SIZE_M = 8
-                BLOCK_SIZE_N = 8
-                BLOCK_SIZE_K = 8
-            else:  # QKV投影 (N=12288) - 目标0.1ms
-                BLOCK_SIZE_M = 8
+                BLOCK_SIZE_M = 16
                 BLOCK_SIZE_N = 16
-                BLOCK_SIZE_K = 8
+                BLOCK_SIZE_K = 16
+            else:  # QKV投影 (N=12288) - 目标0.1ms
+                BLOCK_SIZE_M = 16
+                BLOCK_SIZE_N = 32
+                BLOCK_SIZE_K = 16
         else:
             # 默认分块大小
-            BLOCK_SIZE_M = 8
-            BLOCK_SIZE_N = 8
-            BLOCK_SIZE_K = 8
+            BLOCK_SIZE_M = 16
+            BLOCK_SIZE_N = 16
+            BLOCK_SIZE_K = 16
 
         # 计算网格大小
         grid = (triton.cdiv(M, BLOCK_SIZE_M) * triton.cdiv(N, BLOCK_SIZE_N),)
-        
+
         # 启动Triton内核
         try:
             self.fused_gptq_gemm_kernel_4bit[grid](
@@ -199,8 +199,8 @@ class GPTQTritonFusion:
             # 如果Triton内核失败，尝试更小的分块
             logger.warning(f"Triton内核失败，尝试更小的分块: {e}")
             
-            # 尝试多种分块大小
-            block_sizes = [(8, 8, 8), (4, 4, 4), (2, 2, 2)]
+            # 尝试多种分块大小 - 确保≥16以满足Triton要求
+            block_sizes = [(16, 16, 16), (32, 16, 16), (16, 32, 16)]
             
             for BLOCK_SIZE_M, BLOCK_SIZE_N, BLOCK_SIZE_K in block_sizes:
                 try:
