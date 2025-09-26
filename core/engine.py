@@ -10,7 +10,6 @@ from . import Scheduler
 from .layer.layer import ModelLayerAdapter
 from .cache_manager import KVCacheManager, store_kvcache
 from .layer.optimized_qwen_layer import OptimizedQwenModelLayerAdapter
-from .layer.qwen_layer import QwenModelLayerAdapter
 from .sequence import Sequence
 from .model_loader import load_model
 import logging
