@@ -21,12 +21,12 @@ def dequantize_gptq_4bit(qweight, zeros, scales, offs_k, offs_n):
     k_idx = offs_k[:, None] % elem_per_int
     n_idx = offs_n[None, :]
 
-    # 提取4bit值 (GPTQ格式)
+    # 提取4bit值 (GPTQ格式) - 使用输入维度的bit位置
     shift = k_idx * 4
     weight_val = (qweight >> shift) & 0xF
 
-    # 提取对应的零点值 (GPTQ格式)
-    zero_shift = (n_idx % 8) * 4
+    # 提取对应的零点值 (GPTQ格式) - 使用输入维度的bit位置
+    zero_shift = k_idx * 4
     zero_val = (zeros >> zero_shift) & 0xF
 
     # GPTQ反量化公式: (weight_val - zero_val) * scale
@@ -86,31 +86,31 @@ class GPTQTritonFusion:
             a = tl.load(a_ptrs, mask=a_mask, other=0.0)
 
             # 加载量化权重并反量化 (GPTQ格式)
-            # qweight格式: [K, N//8]，每8个4bit值打包为一个int32
-            weight_ptrs = qweight_ptr + (k_offs + offs_k[:, None]) * (N // 8) + offs_n[None, :] // 8
-            weight_mask = ((k_offs + offs_k[:, None]) < K) & (offs_n[None, :] < N)
+            # qweight格式: [N, K//8]，每8个4bit值打包为一个int32
+            weight_ptrs = qweight_ptr + offs_n[None, :] * (K // 8) + (k_offs + offs_k[:, None]) // 8
+            weight_mask = (offs_n[None, :] < N) & ((k_offs + offs_k[:, None]) < K)
             qweight = tl.load(weight_ptrs, mask=weight_mask, other=0)
 
             # 加载GPTQ零点和缩放因子
             group_idx = (k_offs + offs_k[:, None]) // groupsize
-            scale_ptrs = scales_ptr + group_idx * N + offs_n[None, :]
-            zero_ptrs = qzeros_ptr + group_idx * (N // 8) + offs_n[None, :] // 8
+            scale_ptrs = scales_ptr + group_idx * K + (k_offs + offs_k[:, None])
+            zero_ptrs = qzeros_ptr + group_idx * (K // 8) + (k_offs + offs_k[:, None]) // 8
 
-            scales = tl.load(scale_ptrs, mask=offs_n[None, :] < N, other=0.0)
-            zeros = tl.load(zero_ptrs, mask=offs_n[None, :] < N, other=0)
+            scales = tl.load(scale_ptrs, mask=(k_offs + offs_k[:, None]) < K, other=0.0)
+            zeros = tl.load(zero_ptrs, mask=(k_offs + offs_k[:, None]) < K, other=0)
 
             # 反量化4bit权重 (GPTQ格式) - 正确的实现
             # 计算每个元素在32位整数中的位置
             elem_per_int = 8
-            # 注意：这里应该使用输出维度的bit位置，不是输入维度
-            n_idx = offs_n[None, :] % elem_per_int
+            # 注意：这里应该使用输入维度的bit位置，因为权重是按K维度打包的
+            k_idx = (k_offs + offs_k[:, None]) % elem_per_int
             
-            # 提取4bit值 (GPTQ格式) - 使用输出维度的bit位置
-            weight_shift = n_idx * 4
+            # 提取4bit值 (GPTQ格式) - 使用输入维度的bit位置
+            weight_shift = k_idx * 4
             weight_val = (qweight >> weight_shift) & 0xF
             
-            # 提取对应的零点值 (GPTQ格式) - 使用输出维度的bit位置
-            zero_shift = n_idx * 4
+            # 提取对应的零点值 (GPTQ格式) - 使用输入维度的bit位置
+            zero_shift = k_idx * 4
             zero_val = (zeros >> zero_shift) & 0xF
             
             # GPTQ反量化公式: (weight_val - zero_val) * scale
@@ -140,9 +140,9 @@ class GPTQTritonFusion:
 
         参数:
             input: 输入矩阵 [M, K]
-            qweight: 量化权重 [K, N//8] (int32)
-            qzeros: 零点值 [num_groups, N//8] (int32)
-            scales: 缩放因子 [num_groups, N] (float16)
+            qweight: 量化权重 [N, K//8] (int32) - GPTQ格式
+            qzeros: 零点值 [num_groups, K//8] (int32) - GPTQ格式
+            scales: 缩放因子 [num_groups, K] (float16) - GPTQ格式
             block_size_m: M维度分块大小
             block_size_n: N维度分块大小
             block_size_k: K维度分块大小
@@ -155,7 +155,7 @@ class GPTQTritonFusion:
             raise ValueError(f"Input must be 2D tensor, got {input.dim()}D")
         
         M, K = input.shape
-        N = scales.shape[1]
+        N = qweight.shape[0]  # GPTQ格式：qweight的第一维是输出维度
         num_groups = scales.shape[0]
 
         # 验证参数
@@ -168,17 +168,20 @@ class GPTQTritonFusion:
         if qzeros.shape[0] != num_groups:
             raise ValueError(f"qzeros first dimension ({qzeros.shape[0]}) must equal num_groups ({num_groups})")
         
-        if qzeros.shape[1] != N // 8:
-            raise ValueError(f"qzeros second dimension ({qzeros.shape[1]}) must equal N//8 ({N//8})")
+        if qzeros.shape[1] != K // 8:
+            raise ValueError(f"qzeros second dimension ({qzeros.shape[1]}) must equal K//8 ({K//8})")
         
-        if qweight.shape[0] != K:
-            raise ValueError(f"qweight first dimension ({qweight.shape[0]}) must equal K ({K})")
+        if qweight.shape[0] != N:
+            raise ValueError(f"qweight first dimension ({qweight.shape[0]}) must equal N ({N})")
         
-        if qweight.shape[1] != N // 8:
-            raise ValueError(f"qweight second dimension ({qweight.shape[1]}) must equal N//8 ({N//8})")
+        if qweight.shape[1] != K // 8:
+            raise ValueError(f"qweight second dimension ({qweight.shape[1]}) must equal K//8 ({K//8})")
         
-        if N % 8 != 0:
-            raise ValueError(f"N ({N}) must be divisible by 8 for 4-bit quantization")
+        if scales.shape[1] != K:
+            raise ValueError(f"scales second dimension ({scales.shape[1]}) must equal K ({K})")
+        
+        if K % 8 != 0:
+            raise ValueError(f"K ({K}) must be divisible by 8 for 4-bit quantization")
 
         # 分配输出张量
         result = torch.empty((M, N), dtype=input.dtype, device=input.device)
@@ -214,21 +217,21 @@ class GPTQTritonFusion:
         反量化GPTQ权重（参考实现，用于验证）
 
         参数:
-            qweight: 量化权重 [K, N//8] (int32)
-            qzeros: 零点值 [num_groups, N//8] (int32)
-            scales: 缩放因子 [num_groups, N] (float16)
+            qweight: 量化权重 [N, K//8] (int32) - GPTQ格式
+            qzeros: 零点值 [num_groups, K//8] (int32) - GPTQ格式
+            scales: 缩放因子 [num_groups, K] (float16) - GPTQ格式
             groupsize: 分组大小
 
         返回:
-            反量化后的权重 [K, N] (float16)
+            反量化后的权重 [N, K] (float16)
         """
 
-        K, _ = qweight.shape
-        N = scales.shape[1]
+        N, _ = qweight.shape
+        K = scales.shape[1]
         num_groups = scales.shape[0]
 
         # 反量化权重
-        dequantized_weight = torch.zeros((K, N), dtype=torch.float16, device=qweight.device)
+        dequantized_weight = torch.zeros((N, K), dtype=torch.float16, device=qweight.device)
 
         for group_idx in range(num_groups):
             start_idx = group_idx * groupsize
@@ -236,10 +239,10 @@ class GPTQTritonFusion:
 
             for k in range(start_idx, end_idx):
                 for n in range(N):
-                    # 计算在qweight中的位置
-                    weight_idx = k
-                    byte_idx = n // 8
-                    bit_shift = (n % 8) * 4
+                    # 计算在qweight中的位置 - GPTQ格式
+                    weight_idx = n
+                    byte_idx = k // 8
+                    bit_shift = (k % 8) * 4
 
                     # 提取4bit权重值
                     weight_val = (qweight[weight_idx, byte_idx] >> bit_shift) & 0xF
@@ -248,10 +251,10 @@ class GPTQTritonFusion:
                     zero_val = (qzeros[group_idx, byte_idx] >> bit_shift) & 0xF
 
                     # 提取缩放因子
-                    scale_val = scales[group_idx, n]
+                    scale_val = scales[group_idx, k]
 
                     # 反量化 - 确保与Triton内核逻辑一致
-                    dequantized_weight[k, n] = (weight_val - zero_val) * scale_val
+                    dequantized_weight[n, k] = (weight_val - zero_val) * scale_val
 
         return dequantized_weight
 
@@ -270,9 +273,9 @@ class GPTQTritonFusion:
 
         参数:
             input: 输入矩阵 [M, K]
-            qweight: 量化权重 [K, N//8] (int32)
-            qzeros: 零点值 [num_groups, N//8] (int32)
-            scales: 缩放因子 [num_groups, N] (float16)
+            qweight: 量化权重 [N, K//8] (int32) - GPTQ格式
+            qzeros: 零点值 [num_groups, K//8] (int32) - GPTQ格式
+            scales: 缩放因子 [num_groups, K] (float16) - GPTQ格式
             groupsize: 分组大小
 
         返回:
@@ -283,8 +286,8 @@ class GPTQTritonFusion:
             qweight, qzeros, scales, groupsize
         )
 
-        # 再进行矩阵乘法
-        result = torch.matmul(input, dequantized_weight)
+        # 再进行矩阵乘法 - 需要转置因为权重是[N,K]格式
+        result = torch.matmul(input, dequantized_weight.T)
 
         return result
 
