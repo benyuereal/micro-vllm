@@ -150,6 +150,14 @@ def test_cache_effectiveness():
             return True
         else:
             print("❌ 输出一致性检查失败")
+            # 详细分析误差
+            diff = torch.abs(output1 - output2)
+            max_diff = torch.max(diff).item()
+            mean_diff = torch.mean(diff).item()
+            print(f"📊 误差分析:")
+            print(f"  最大误差: {max_diff:.6f}")
+            print(f"  平均误差: {mean_diff:.6f}")
+            print(f"  相对误差: {max_diff/torch.max(torch.abs(output1)).item():.6f}")
             return False
             
     except Exception as e:
