@@ -249,9 +249,13 @@ class OptimizedQwenModelLayerAdapter:
         qkv_start = time.time()
 
         # 🔧 方案1+2: 确保input数据类型为float16
-        if hidden_states.dtype == torch.bfloat16:
-            logger.debug(f"转换hidden_states从{hidden_states.dtype}到float16")
+        logger.info(f"🔍 Layer {layer_idx} hidden_states类型检查: {hidden_states.shape}, dtype: {hidden_states.dtype}")
+        if hidden_states.dtype != torch.float16:
+            logger.info(f"🔄 转换hidden_states从{hidden_states.dtype}到float16")
             hidden_states = hidden_states.to(torch.float16)
+            logger.info(f"✅ hidden_states转换后: {hidden_states.dtype}")
+        else:
+            logger.info(f"✅ hidden_states已经是正确类型: {hidden_states.dtype}")
 
         if self._is_quantized:
             q, k, v = self._optimized_quantized_qkv_proj(layer, hidden_states, layer_idx)
