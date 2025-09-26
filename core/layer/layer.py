@@ -81,10 +81,13 @@ class ModelLayerAdapter:
 
         # 记录LayerNorm前的时间
         norm_start = time.time()
+        logger.info(f"hidden_states start shape {hidden_states.shape}")
 
         # 2. LayerNorm + 残差
         residual = hidden_states
         hidden_states = norm_fn(hidden_states)
+
+        logger.info(f"hidden_states norm_fn shape {hidden_states.shape}")
 
         norm_time = time.time() - norm_start
         logger.debug(f"Layer {layer_idx}: LayerNorm耗时 {norm_time * 1000:.2f}ms")
@@ -95,6 +98,8 @@ class ModelLayerAdapter:
 
         # Qwen 7B: 合并的c_attn投影
         qkv = layer.attn.c_attn(hidden_states)
+        logger.info(f"qkv   shape {qkv.shape}")
+
         hidden_size = qkv.shape[-1] // 3
         q, k, v = qkv.split(hidden_size, dim=-1)
 
@@ -125,7 +130,8 @@ class ModelLayerAdapter:
             key=k.squeeze(2),  # [B, H, D]
             value=v.squeeze(2)  # [B, H, D]
         )
-        logger.info("attn_output.shape", attn_output.shape)
+        logger.info(f"attn  attn_output shape {attn_output.shape}")
+
         attn_time = time.time() - attn_start
         logger.debug(f"Layer {layer_idx}: 注意力计算耗时 {attn_time * 1000:.2f}ms")
 
@@ -134,7 +140,10 @@ class ModelLayerAdapter:
 
         proj_fn = getattr(layer.self_attn if self.cfg["qkv_proj"] else layer.attn, self.cfg["proj"])
         attn_output = proj_fn(attn_output.reshape(batch_size, -1)).unsqueeze(1)  # [B, 1, D]
+        logger.info(f"proj_fn  attn_output shape {attn_output.shape}")
+
         hidden_states = residual + attn_output
+        logger.info(f"proj  hidden_states shape {hidden_states.shape}")
 
         proj_time = time.time() - proj_start
         logger.debug(f"Layer {layer_idx}: 输出投影耗时 {proj_time * 1000:.2f}ms")
@@ -147,6 +156,9 @@ class ModelLayerAdapter:
 
         hidden_states = layer.mlp(hidden_states)  # 直接调用mlp模块
         hidden_states = residual + hidden_states
+
+        logger.info(f"mlp  hidden_states shape {hidden_states.shape}")
+
 
         mlp_time = time.time() - mlp_start
         logger.debug(f"Layer {layer_idx}: MLP计算耗时 {mlp_time * 1000:.2f}ms")
