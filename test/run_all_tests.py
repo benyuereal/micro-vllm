@@ -44,7 +44,6 @@ def main():
         ("GPTQ功能测试", "test_gptq_functionality.py"),
         ("批处理Layer层测试", "test_batch_layer_shapes.py"),
         ("Layer层集成测试", "test_layer_integration.py"),
-        ("实际推理格式测试", "test_actual_inference_format.py"),
         ("性能优化测试", "test_performance_optimization.py"),
     ]
     

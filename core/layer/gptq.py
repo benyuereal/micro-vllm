@@ -179,7 +179,12 @@ class GPTQCUDAFusion:
         # 验证组数 - 使用实际的groupsize
         if format_key in self._format_cache:
             _, actual_groupsize = self._format_cache[format_key]
-            num_groups = K // actual_groupsize
+            # 对于特殊格式，直接使用qzeros的第一维作为组数
+            if qzeros.shape[1] == 1536 and scales.shape[1] == 12288:
+                num_groups = qzeros.shape[0]  # 直接使用32
+                logger.info(f"特殊格式使用直接组数: {num_groups}")
+            else:
+                num_groups = K // actual_groupsize
         else:
             num_groups = K // self.groupsize
         

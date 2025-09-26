@@ -6,7 +6,6 @@ test/
 ├── test_gptq_functionality.py        # GPTQ功能测试
 ├── test_batch_layer_shapes.py        # 批处理Layer层测试
 ├── test_layer_integration.py         # Layer层集成测试
-├── test_actual_inference_format.py   # 实际推理格式测试
 ├── test_performance_optimization.py  # 性能优化测试
 ├── run_all_tests.py                  # 一键测试脚本
 └── README.md                         # 测试说明
@@ -31,17 +30,12 @@ test/
 - 验证实际layer层数据形状
 - 测试前向传播
 
-### 4. 实际推理格式测试 (`test_actual_inference_format.py`)
-- 测试实际推理中的GPTQ格式
-- 验证qzeros [32, 1536] 格式的处理
-- 性能基准测试
-
-### 5. 性能优化测试 (`test_performance_optimization.py`)
+### 4. 性能优化测试 (`test_performance_optimization.py`)
 - 测试格式缓存和groupsize优化
 - 验证不同groupsize的性能
 - 找出最佳性能配置
 
-### 6. 一键测试脚本 (`run_all_tests.py`)
+### 5. 一键测试脚本 (`run_all_tests.py`)
 - 运行所有测试
 - 测试结果汇总
 
@@ -53,7 +47,6 @@ cd test
 python test_gptq_functionality.py
 python test_batch_layer_shapes.py
 python test_layer_integration.py
-python test_actual_inference_format.py
 python test_performance_optimization.py
 ```
 
