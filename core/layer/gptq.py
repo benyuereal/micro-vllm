@@ -75,7 +75,7 @@ class GPTQCUDAFusion:
         M, K = input.shape
         N = qweight.shape[0]
         
-        logger.info(f"CUDA融合内核: input{M}x{K}, qweight{N}x{qweight.shape[1]}, qzeros{qzeros.shape}, scales{scales.shape}")
+        # logger.info(f"CUDA融合内核: input{M}x{K}, qweight{N}x{qweight.shape[1]}, qzeros{qzeros.shape}, scales{scales.shape}")
         
         # 检测GPTQ格式并自动转换
         format_key = f"{qweight.shape}_{qzeros.shape}_{scales.shape}"
@@ -116,41 +116,42 @@ class GPTQCUDAFusion:
         if qweight.shape[1] != K // 8:
             raise ValueError(f"qweight第二维必须是K//8={K//8}，得到{qweight.shape[1]}")
         
-        # 更灵活的qzeros维度检测
-        if qzeros.shape[1] != K // 8:
-            # 尝试检测实际的groupsize
-            actual_groupsize = qzeros.shape[1] * 8  # 假设qzeros第二维是实际groupsize//8
-            if actual_groupsize == K:
-                # 这是标准格式，但qzeros第二维是groupsize//8
-                logger.debug(f"检测到qzeros格式: [num_groups, groupsize//8] = [{qzeros.shape[0]}, {qzeros.shape[1]}]")
-            else:
-                # 尝试其他可能的格式
-                logger.warning(f"qzeros维度不匹配: 期望K//8={K//8}，得到{qzeros.shape[1]}")
-                logger.warning(f"尝试检测实际格式: qzeros{qzeros.shape}, scales{scales.shape}")
-                
-                # 检测scales的格式
-                if scales.shape[1] == K:
-                    # scales[num_groups, K] 格式
-                    logger.info("检测到可能的GPTQ格式: qzeros[num_groups, groupsize//8], scales[num_groups, K]")
-                    actual_groupsize = qzeros.shape[1] * 8
-                    logger.info(f"推断的groupsize: {actual_groupsize}")
-                elif scales.shape[1] == N:
-                    # scales[num_groups, N] 格式 - 这是实际推理中的格式
-                    logger.info("检测到实际推理GPTQ格式: qzeros[num_groups, groupsize//8], scales[num_groups, N]")
-                    actual_groupsize = qzeros.shape[1] * 8
-                    logger.info(f"推断的groupsize: {actual_groupsize}")
+        # 更灵活的qzeros维度检测 - 只在未缓存时执行
+        if format_key not in self._format_cache:
+            if qzeros.shape[1] != K // 8:
+                # 尝试检测实际的groupsize
+                actual_groupsize = qzeros.shape[1] * 8  # 假设qzeros第二维是实际groupsize//8
+                if actual_groupsize == K:
+                    # 这是标准格式，但qzeros第二维是groupsize//8
+                    logger.debug(f"检测到qzeros格式: [num_groups, groupsize//8] = [{qzeros.shape[0]}, {qzeros.shape[1]}]")
                 else:
-                    # 尝试更宽松的检测
-                    logger.warning(f"scales第二维不匹配: 期望K={K}或N={N}，得到{scales.shape[1]}")
-                    logger.warning(f"尝试宽松检测: qzeros{qzeros.shape}, scales{scales.shape}")
+                    # 尝试其他可能的格式
+                    # logger.warning(f"qzeros维度不匹配: 期望K//8={K//8}，得到{qzeros.shape[1]}")
+                    # logger.warning(f"尝试检测实际格式: qzeros{qzeros.shape}, scales{scales.shape}")
                     
-                    # 如果qzeros第二维是1536，scales第二维是12288，这可能是实际推理格式
-                    if qzeros.shape[1] == 1536 and scales.shape[1] == 12288:
-                        logger.info("检测到特殊实际推理格式: qzeros[32, 1536], scales[32, 12288]")
-                        actual_groupsize = qzeros.shape[1] * 8  # 1536 * 8 = 12288
-                        logger.info(f"推断的groupsize: {actual_groupsize}")
+                    # 检测scales的格式
+                    if scales.shape[1] == K:
+                        # scales[num_groups, K] 格式
+                        # logger.info("检测到可能的GPTQ格式: qzeros[num_groups, groupsize//8], scales[num_groups, K]")
+                        actual_groupsize = qzeros.shape[1] * 8
+                        # logger.info(f"推断的groupsize: {actual_groupsize}")
+                    elif scales.shape[1] == N:
+                        # scales[num_groups, N] 格式 - 这是实际推理中的格式
+                        # logger.info("检测到实际推理GPTQ格式: qzeros[num_groups, groupsize//8], scales[num_groups, N]")
+                        actual_groupsize = qzeros.shape[1] * 8
+                        # logger.info(f"推断的groupsize: {actual_groupsize}")
                     else:
-                        raise ValueError(f"无法识别的qzeros格式: {qzeros.shape}，期望 [num_groups, K//8] 或 [num_groups, groupsize//8]")
+                        # 尝试更宽松的检测
+                        # logger.warning(f"scales第二维不匹配: 期望K={K}或N={N}，得到{scales.shape[1]}")
+                        # logger.warning(f"尝试宽松检测: qzeros{qzeros.shape}, scales{scales.shape}")
+                        
+                        # 如果qzeros第二维是1536，scales第二维是12288，这可能是实际推理格式
+                        if qzeros.shape[1] == 1536 and scales.shape[1] == 12288:
+                            # logger.info("检测到特殊实际推理格式: qzeros[32, 1536], scales[32, 12288]")
+                            actual_groupsize = qzeros.shape[1] * 8  # 1536 * 8 = 12288
+                            # logger.info(f"推断的groupsize: {actual_groupsize}")
+                        else:
+                            raise ValueError(f"无法识别的qzeros格式: {qzeros.shape}，期望 [num_groups, K//8] 或 [num_groups, groupsize//8]")
             
             # 更新缓存中的groupsize
             if format_key in self._format_cache:
@@ -209,7 +210,7 @@ class GPTQCUDAFusion:
             output = self._cuda_kernel.fused_gptq_gemm_4bit_cuda(
                 input, qweight, qzeros, scales, actual_groupsize
             )
-            logger.info(f"✅ CUDA内核执行成功，输出形状: {output.shape}")
+            # logger.info(f"✅ CUDA内核执行成功，输出形状: {output.shape}")
             return output
         except Exception as e:
             logger.error(f"❌ CUDA内核执行失败: {e}")
