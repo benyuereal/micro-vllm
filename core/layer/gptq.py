@@ -83,8 +83,7 @@ class GPTQCUDAFusion:
         
         if format_key in self._format_cache:
             # 使用缓存的格式信息
-            cached_qweight, cached_groupsize = self._format_cache[format_key]
-            qweight = cached_qweight
+            cached_groupsize = self._format_cache[format_key]
             actual_groupsize = cached_groupsize
             # logger.debug(f"使用缓存的格式信息: groupsize={actual_groupsize}")
         else:
@@ -114,7 +113,7 @@ class GPTQCUDAFusion:
                     raise ValueError(f"无法识别的qweight格式: {qweight.shape}，期望 [N, K//8] 或 [K//8, N]")
             
             # 缓存格式信息
-            self._format_cache[format_key] = (qweight, actual_groupsize)
+            self._format_cache[format_key] = actual_groupsize
         
         # 验证转换后的格式
         if qweight.shape[1] != K // 8:
@@ -158,7 +157,7 @@ class GPTQCUDAFusion:
                             raise ValueError(f"无法识别的qzeros格式: {qzeros.shape}，期望 [num_groups, K//8] 或 [num_groups, groupsize//8]")
             
             # 缓存格式信息
-            self._format_cache[format_key] = (qweight, actual_groupsize)
+            self._format_cache[format_key] = actual_groupsize
         
         # 验证scales维度 - 更宽松的验证
         if scales.shape[1] != K and scales.shape[1] != N:

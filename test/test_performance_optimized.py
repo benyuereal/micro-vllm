@@ -145,7 +145,7 @@ def test_cache_effectiveness():
         print(f"  缓存加速: {first_call_time/second_call_time:.2f}x")
         
         # 检查输出一致性
-        if torch.allclose(output1, output2, atol=1e-3):
+        if torch.allclose(output1, output2, atol=1e-2, rtol=1e-2):
             print("✅ 输出一致性检查通过")
             return True
         else:

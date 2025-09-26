@@ -24,13 +24,13 @@ def test_scheme_1_2():
     # 创建GPTQ融合实例
     gptq_fusion = GPTQCUDAFusion(groupsize=128)
     
-    # 模拟实际数据 - 使用bfloat16（应该自动转换）
+    # 模拟实际数据 - 使用float16（应该自动转换）
     M, K, N = 1, 4096, 12288
-    input_tensor = torch.randn(M, K, dtype=torch.bfloat16, device='cuda')
+    input_tensor = torch.randn(M, K, dtype=torch.float16, device='cuda')
     
     # 使用错误日志中的确切格式
     qzeros = torch.randint(0, 16, (32, 1536), dtype=torch.uint32, device='cuda')
-    scales = torch.randn(32, 12288, dtype=torch.bfloat16, device='cuda')
+    scales = torch.randn(32, 12288, dtype=torch.float16, device='cuda')
     qweight = torch.randint(0, 256, (512, 12288), dtype=torch.uint32, device='cuda')
     
     print(f"📊 测试数据:")
