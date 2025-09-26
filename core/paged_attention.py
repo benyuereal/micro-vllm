@@ -256,15 +256,17 @@ class PagedAttention(nn.Module):
         # 6. FlashAttention 调用
         t0 = time.time()
         
-        # 🔧 调试：检查所有输入参数的数据类型
-        logger.info(f"🔍 FlashAttention输入参数类型检查:")
-        logger.info(f"  query: {query.shape}, dtype: {query.dtype}")
-        logger.info(f"  k_cache: {k_cache.shape}, dtype: {k_cache.dtype}")
-        logger.info(f"  v_cache: {v_cache.shape}, dtype: {v_cache.dtype}")
-        logger.info(f"  k_new: {k_new.shape}, dtype: {k_new.dtype}")
-        logger.info(f"  v_new: {v_new.shape}, dtype: {v_new.dtype}")
-        logger.info(f"  rotary_cos: {rotary_cos.shape}, dtype: {rotary_cos.dtype}")
-        logger.info(f"  rotary_sin: {rotary_sin.shape}, dtype: {rotary_sin.dtype}")
+        # 🔧 简化：只在第一次调用时打印详细信息
+        if not hasattr(self, '_logged_once'):
+            logger.info(f"🔍 FlashAttention输入参数类型检查:")
+            logger.info(f"  query: {query.shape}, dtype: {query.dtype}")
+            logger.info(f"  k_cache: {k_cache.shape}, dtype: {k_cache.dtype}")
+            logger.info(f"  v_cache: {v_cache.shape}, dtype: {v_cache.dtype}")
+            logger.info(f"  k_new: {k_new.shape}, dtype: {k_new.dtype}")
+            logger.info(f"  v_new: {v_new.shape}, dtype: {v_new.dtype}")
+            logger.info(f"  rotary_cos: {rotary_cos.shape}, dtype: {rotary_cos.dtype}")
+            logger.info(f"  rotary_sin: {rotary_sin.shape}, dtype: {rotary_sin.dtype}")
+            self._logged_once = True
         
         with torch.cuda.amp.autocast(enabled=False):  # 确保精度
             output = flash_attn_with_kvcache(

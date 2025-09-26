@@ -152,22 +152,9 @@ class GPTQCUDAFusion:
         if self._cuda_kernel is None:
             raise RuntimeError("CUDA内核不可用，无法执行")
         
-        # 🔧 调试：检查所有输入参数的数据类型
-        logger.info(f"🔍 CUDA内核输入参数类型检查:")
-        logger.info(f"  input: {input.shape}, dtype: {input.dtype}")
-        logger.info(f"  qweight: {qweight.shape}, dtype: {qweight.dtype}")
-        logger.info(f"  qzeros: {qzeros.shape}, dtype: {qzeros.dtype}")
-        logger.info(f"  scales: {scales.shape}, dtype: {scales.dtype}")
-        
-        # 检查是否有bfloat16参数
-        if input.dtype == torch.bfloat16:
-            logger.error(f"❌ input参数是bfloat16: {input.dtype}")
-        if scales.dtype == torch.bfloat16:
-            logger.error(f"❌ scales参数是bfloat16: {scales.dtype}")
-        if qweight.dtype == torch.bfloat16:
-            logger.error(f"❌ qweight参数是bfloat16: {qweight.dtype}")
-        if qzeros.dtype == torch.bfloat16:
-            logger.error(f"❌ qzeros参数是bfloat16: {qzeros.dtype}")
+        # 🔧 简化：只检查关键错误
+        if input.dtype == torch.bfloat16 or scales.dtype == torch.bfloat16:
+            logger.error(f"❌ 检测到bfloat16参数，CUDA内核需要float16")
         
         try:
             # 使用检测到的groupsize

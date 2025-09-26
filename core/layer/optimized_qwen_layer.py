@@ -236,25 +236,33 @@ class OptimizedQwenModelLayerAdapter:
 
         # 记录LayerNorm前的时间
         norm_start = time.time()
-        logger.info(f"hidden_states start shape {hidden_states.shape}")
+        # 只在第一层打印形状信息
+        if layer_idx == 0:
+            logger.info(f"hidden_states start shape {hidden_states.shape}")
 
         # 2. LayerNorm + 残差
         residual = hidden_states
         hidden_states = layer.ln_1(hidden_states)
 
-        logger.info(f"hidden_states norm_fn shape {hidden_states.shape}")
+        # 只在第一层打印形状信息
+        if layer_idx == 0:
+            logger.info(f"hidden_states norm_fn shape {hidden_states.shape}")
         norm_time = time.time() - norm_start
 
         # 3. QKV计算 (优化版本)
         qkv_start = time.time()
 
-        # 🔧 方案1+2: 确保input数据类型为float16
-        logger.info(f"🔍 Layer {layer_idx} hidden_states类型检查: {hidden_states.shape}, dtype: {hidden_states.dtype}")
+        # 🔧 简化：只在第一层打印详细信息
+        if layer_idx == 0:
+            logger.info(f"🔍 Layer {layer_idx} hidden_states类型检查: {hidden_states.shape}, dtype: {hidden_states.dtype}")
+        
         if hidden_states.dtype != torch.float16:
-            logger.info(f"🔄 转换hidden_states从{hidden_states.dtype}到float16")
+            if layer_idx == 0:
+                logger.info(f"🔄 转换hidden_states从{hidden_states.dtype}到float16")
             hidden_states = hidden_states.to(torch.float16)
-            logger.info(f"✅ hidden_states转换后: {hidden_states.dtype}")
-        else:
+            if layer_idx == 0:
+                logger.info(f"✅ hidden_states转换后: {hidden_states.dtype}")
+        elif layer_idx == 0:
             logger.info(f"✅ hidden_states已经是正确类型: {hidden_states.dtype}")
 
         if self._is_quantized:
@@ -262,7 +270,8 @@ class OptimizedQwenModelLayerAdapter:
         else:
             # 标准QKV计算
             qkv = layer.attn.c_attn(hidden_states)
-            logger.info(f"qkv   shape {qkv.shape}")
+            if layer_idx == 0:
+                logger.info(f"qkv   shape {qkv.shape}")
             hidden_size = qkv.shape[-1] // 3
             q, k, v = qkv.split(hidden_size, dim=-1)
             batch_size, seq_len, _ = hidden_states.shape
@@ -283,7 +292,8 @@ class OptimizedQwenModelLayerAdapter:
             key=k.squeeze(2),  # [B, H, D]
             value=v.squeeze(2)  # [B, H, D]
         )
-        logger.info(f"attn  attn_output shape {attn_output.shape}")
+        if layer_idx == 0:
+            logger.info(f"attn  attn_output shape {attn_output.shape}")
         attn_time = time.time() - attn_start
 
         # 5. 输出投影 (优化版本)
@@ -296,9 +306,11 @@ class OptimizedQwenModelLayerAdapter:
         else:
             attn_output = layer.attn.c_proj(attn_output.reshape(hidden_states.shape[0], -1)).unsqueeze(1)
 
-        logger.info(f"proj_fn  attn_output shape {attn_output.shape}")
+        if layer_idx == 0:
+            logger.info(f"proj_fn  attn_output shape {attn_output.shape}")
         hidden_states = residual + attn_output
-        logger.info(f"proj  hidden_states shape {hidden_states.shape}")
+        if layer_idx == 0:
+            logger.info(f"proj  hidden_states shape {hidden_states.shape}")
         proj_time = time.time() - proj_start
 
         # 6. MLP + 残差
@@ -309,18 +321,21 @@ class OptimizedQwenModelLayerAdapter:
         # 🔧 快速验证方案：使用数据类型转换处理MLP
         # 确保MLP输入数据类型匹配
         if hidden_states.dtype != torch.bfloat16:
-            logger.info(f"🔄 转换MLP输入: {hidden_states.dtype} -> bfloat16")
+            if layer_idx == 0:
+                logger.info(f"🔄 转换MLP输入: {hidden_states.dtype} -> bfloat16")
             hidden_states = hidden_states.to(torch.bfloat16)
         
         hidden_states = layer.mlp(hidden_states)
         
         # 转换回float16以保持一致性
         if hidden_states.dtype != torch.float16:
-            logger.info(f"🔄 转换MLP输出: {hidden_states.dtype} -> float16")
+            if layer_idx == 0:
+                logger.info(f"🔄 转换MLP输出: {hidden_states.dtype} -> float16")
             hidden_states = hidden_states.to(torch.float16)
         
         hidden_states = residual + hidden_states
-        logger.info(f"mlp  hidden_states shape {hidden_states.shape}")
+        if layer_idx == 0:
+            logger.info(f"mlp  hidden_states shape {hidden_states.shape}")
         mlp_time = time.time() - mlp_start
 
         # 记录总耗时
@@ -351,12 +366,13 @@ class OptimizedQwenModelLayerAdapter:
         batch_size, seq_len, hidden_dim = hidden_states.shape
         input_2d = hidden_states.view(-1, hidden_dim)  # [B*S, D]
         
-        # 🔧 调试：检查输入和量化参数类型
-        logger.info(f"🔍 QKV投影参数类型检查:")
-        logger.info(f"  input_2d: {input_2d.shape}, dtype: {input_2d.dtype}")
-        logger.info(f"  qkv_weight: {qkv_weight.shape}, dtype: {qkv_weight.dtype}")
-        logger.info(f"  qkv_scale: {qkv_scale.shape}, dtype: {qkv_scale.dtype}")
-        logger.info(f"  qkv_zero: {qkv_zero.shape}, dtype: {qkv_zero.dtype}")
+        # 🔧 简化：只在第一层打印详细信息
+        if layer_idx == 0:
+            logger.info(f"🔍 QKV投影参数类型检查:")
+            logger.info(f"  input_2d: {input_2d.shape}, dtype: {input_2d.dtype}")
+            logger.info(f"  qkv_weight: {qkv_weight.shape}, dtype: {qkv_weight.dtype}")
+            logger.info(f"  qkv_scale: {qkv_scale.shape}, dtype: {qkv_scale.dtype}")
+            logger.info(f"  qkv_zero: {qkv_zero.shape}, dtype: {qkv_zero.dtype}")
         
         # 调用CUDA融合算子
         result = self._gptq_fusion.fused_gptq_gemm_4bit(
