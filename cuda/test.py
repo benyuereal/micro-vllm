@@ -18,9 +18,31 @@ def test_cuda_kernel():
     print(f"📊 GPU名称: {torch.cuda.get_device_name()}")
     
     try:
-        import fused_gptq_gemm_cuda
-        print("✅ CUDA内核导入成功!")
-    except ImportError as e:
+        # 尝试导入编译的模块
+        import sys
+        import os
+        
+        # 添加当前目录到Python路径
+        current_dir = os.path.dirname(os.path.abspath(__file__))
+        if current_dir not in sys.path:
+            sys.path.insert(0, current_dir)
+        
+        # 尝试导入
+        try:
+            import fused_gptq_gemm_cuda
+            print("✅ CUDA内核导入成功!")
+        except ImportError:
+            # 如果直接导入失败，尝试从编译脚本导入
+            from compile import compile_cuda_kernel
+            kernel = compile_cuda_kernel()
+            if kernel:
+                fused_gptq_gemm_cuda = kernel
+                print("✅ CUDA内核通过编译脚本导入成功!")
+            else:
+                print("❌ CUDA内核编译失败")
+                return
+                
+    except Exception as e:
         print(f"❌ CUDA内核导入失败: {e}")
         print("💡 请先运行编译脚本: python compile.py")
         return
