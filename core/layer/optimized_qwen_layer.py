@@ -51,17 +51,34 @@ class OptimizedQwenModelLayerAdapter:
         # 转换QKV投影参数
         if hasattr(layer, 'c_attn'):
             qkv_layer = layer.c_attn
-            if hasattr(qkv_layer, 'scales') and qkv_layer.scales.dtype == torch.bfloat16:
-                logger.debug(f"转换QKV scales: {qkv_layer.scales.shape} {qkv_layer.scales.dtype} -> float16")
-                qkv_layer.scales = qkv_layer.scales.to(torch.float16)
+            logger.info(f"🔍 QKV层参数检查:")
             
-            if hasattr(qkv_layer, 'qweight') and qkv_layer.qweight.dtype != torch.uint32:
-                logger.debug(f"转换QKV qweight: {qkv_layer.qweight.shape} {qkv_layer.qweight.dtype} -> uint32")
-                qkv_layer.qweight = qkv_layer.qweight.to(torch.uint32)
+            if hasattr(qkv_layer, 'scales'):
+                logger.info(f"  scales: {qkv_layer.scales.shape}, dtype: {qkv_layer.scales.dtype}")
+                if qkv_layer.scales.dtype == torch.bfloat16:
+                    logger.info(f"🔄 转换QKV scales: {qkv_layer.scales.dtype} -> float16")
+                    qkv_layer.scales = qkv_layer.scales.to(torch.float16)
+                    logger.info(f"✅ QKV scales转换后: {qkv_layer.scales.dtype}")
+                else:
+                    logger.info(f"✅ QKV scales已经是正确类型: {qkv_layer.scales.dtype}")
             
-            if hasattr(qkv_layer, 'qzeros') and qkv_layer.qzeros.dtype != torch.uint32:
-                logger.debug(f"转换QKV qzeros: {qkv_layer.qzeros.shape} {qkv_layer.qzeros.dtype} -> uint32")
-                qkv_layer.qzeros = qkv_layer.qzeros.to(torch.uint32)
+            if hasattr(qkv_layer, 'qweight'):
+                logger.info(f"  qweight: {qkv_layer.qweight.shape}, dtype: {qkv_layer.qweight.dtype}")
+                if qkv_layer.qweight.dtype != torch.uint32:
+                    logger.info(f"🔄 转换QKV qweight: {qkv_layer.qweight.dtype} -> uint32")
+                    qkv_layer.qweight = qkv_layer.qweight.to(torch.uint32)
+                    logger.info(f"✅ QKV qweight转换后: {qkv_layer.qweight.dtype}")
+                else:
+                    logger.info(f"✅ QKV qweight已经是正确类型: {qkv_layer.qweight.dtype}")
+            
+            if hasattr(qkv_layer, 'qzeros'):
+                logger.info(f"  qzeros: {qkv_layer.qzeros.shape}, dtype: {qkv_layer.qzeros.dtype}")
+                if qkv_layer.qzeros.dtype != torch.uint32:
+                    logger.info(f"🔄 转换QKV qzeros: {qkv_layer.qzeros.dtype} -> uint32")
+                    qkv_layer.qzeros = qkv_layer.qzeros.to(torch.uint32)
+                    logger.info(f"✅ QKV qzeros转换后: {qkv_layer.qzeros.dtype}")
+                else:
+                    logger.info(f"✅ QKV qzeros已经是正确类型: {qkv_layer.qzeros.dtype}")
         
         # 转换输出投影参数
         if hasattr(layer, 'c_proj'):
@@ -141,9 +158,13 @@ class OptimizedQwenModelLayerAdapter:
         qkv_start = time.time()
 
         # 🔧 方案1+2: 确保input数据类型为float16
+        logger.info(f"🔍 hidden_states类型检查: {hidden_states.shape}, dtype: {hidden_states.dtype}")
         if hidden_states.dtype == torch.bfloat16:
-            logger.debug(f"转换hidden_states从{hidden_states.dtype}到float16")
+            logger.info(f"🔄 转换hidden_states从{hidden_states.dtype}到float16")
             hidden_states = hidden_states.to(torch.float16)
+            logger.info(f"✅ hidden_states转换后: {hidden_states.dtype}")
+        else:
+            logger.info(f"✅ hidden_states已经是正确类型: {hidden_states.dtype}")
 
         if self._is_quantized:
             q, k, v = self._optimized_quantized_qkv_proj(layer, hidden_states, layer_idx)
@@ -225,6 +246,13 @@ class OptimizedQwenModelLayerAdapter:
         # 重塑输入为 [M, K] 格式
         batch_size, seq_len, hidden_dim = hidden_states.shape
         input_2d = hidden_states.view(-1, hidden_dim)  # [B*S, D]
+        
+        # 🔧 调试：检查输入和量化参数类型
+        logger.info(f"🔍 QKV投影参数类型检查:")
+        logger.info(f"  input_2d: {input_2d.shape}, dtype: {input_2d.dtype}")
+        logger.info(f"  qkv_weight: {qkv_weight.shape}, dtype: {qkv_weight.dtype}")
+        logger.info(f"  qkv_scale: {qkv_scale.shape}, dtype: {qkv_scale.dtype}")
+        logger.info(f"  qkv_zero: {qkv_zero.shape}, dtype: {qkv_zero.dtype}")
         
         # 调用CUDA融合算子
         result = self._gptq_fusion.fused_gptq_gemm_4bit(
