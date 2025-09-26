@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-测试输出投影的GPTQ格式
+测试输出投影的GPTQ格式修复
 """
 import torch
 import sys
@@ -24,11 +24,10 @@ def test_output_projection_gptq_format():
         return False
     
     # 模拟输出投影的参数
-    # 输出投影: 输入128 → 输出4096
-    input_dim = 128  # 注意力输出维度
-    output_dim = 4096  # 隐藏维度
+    input_dim = 4096  # 隐藏维度
+    output_dim = 4096  # 输出维度
     groupsize = 128
-    num_groups = output_dim // groupsize  # 32
+    num_groups = input_dim // groupsize  # 32
     
     print(f"输出投影参数:")
     print(f"  输入维度: {input_dim}")
@@ -39,8 +38,7 @@ def test_output_projection_gptq_format():
     # 创建测试数据
     input_tensor = torch.randn(1, input_dim, dtype=torch.bfloat16, device='cuda')
     
-    # 模拟输出投影的GPTQ格式
-    # 这应该是 [output_dim, input_dim//8] 格式
+    # 模拟输出投影的GPTQ格式: [output_dim, input_dim//8]
     qweight = torch.randint(0, 256, (output_dim, input_dim // 8), dtype=torch.int32, device='cuda')
     qzeros = torch.randint(0, 16, (num_groups, input_dim // 8), dtype=torch.int32, device='cuda')
     scales = torch.randn(num_groups, input_dim, dtype=torch.float16, device='cuda')
@@ -93,11 +91,10 @@ def test_output_projection_gptq_format_alternative():
         return False
     
     # 模拟输出投影的参数
-    # 输出投影: 输入128 → 输出4096
-    input_dim = 128  # 注意力输出维度
-    output_dim = 4096  # 隐藏维度
+    input_dim = 4096  # 隐藏维度
+    output_dim = 4096  # 输出维度
     groupsize = 128
-    num_groups = output_dim // groupsize  # 32
+    num_groups = input_dim // groupsize  # 32
     
     print(f"输出投影参数:")
     print(f"  输入维度: {input_dim}")
@@ -109,10 +106,10 @@ def test_output_projection_gptq_format_alternative():
     input_tensor = torch.randn(1, input_dim, dtype=torch.bfloat16, device='cuda')
     
     # 模拟输出投影的GPTQ格式 - 使用Qwen7B格式
-    # 这可能是 [input_dim//8, output_dim] 格式
-    qweight = torch.randint(0, 256, (input_dim // 8, output_dim), dtype=torch.int32, device='cuda')
-    qzeros = torch.randint(0, 16, (num_groups, output_dim // 8), dtype=torch.int32, device='cuda')
-    scales = torch.randn(num_groups, output_dim, dtype=torch.float16, device='cuda')
+    # 这可能是 [output_dim//8, input_dim] 格式
+    qweight = torch.randint(0, 256, (output_dim // 8, input_dim), dtype=torch.int32, device='cuda')
+    qzeros = torch.randint(0, 16, (num_groups, input_dim // 8), dtype=torch.int32, device='cuda')
+    scales = torch.randn(num_groups, input_dim, dtype=torch.float16, device='cuda')
     
     print(f"测试参数:")
     print(f"  输入形状: {input_tensor.shape}")
@@ -155,7 +152,7 @@ def test_output_projection_gptq_format_alternative():
 
 def main():
     """主测试函数"""
-    print("🚀 输出投影GPTQ格式测试开始...")
+    print("🚀 输出投影GPTQ格式修复测试开始...")
     
     if not torch.cuda.is_available():
         print("❌ CUDA不可用，所有测试跳过")
@@ -195,9 +192,9 @@ def main():
     print(f"\n总计: {passed}/{total} 测试通过")
     
     if passed == total:
-        print("🎉 所有输出投影GPTQ格式测试通过！")
+        print("🎉 所有输出投影GPTQ格式修复测试通过！")
     else:
-        print("⚠️  部分输出投影GPTQ格式测试失败")
+        print("⚠️  部分输出投影GPTQ格式修复测试失败")
 
 if __name__ == "__main__":
     main()

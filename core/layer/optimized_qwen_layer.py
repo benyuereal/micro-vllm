@@ -199,10 +199,17 @@ class OptimizedQwenModelLayerAdapter:
         logger.info(f"  out_zero shape: {out_zero.shape}")
         logger.info(f"  attn_output shape: {attn_output.shape}")
 
+        # 重塑注意力输出: [batch_size, num_heads, head_size] -> [batch_size, seq_len, hidden_size]
+        batch_size, num_heads, head_size = attn_output.shape
+        hidden_size = num_heads * head_size  # 4096 = 32 * 128
+        
+        # 重塑为 [batch_size, 1, hidden_size]
+        attn_output_reshaped = attn_output.view(batch_size, 1, hidden_size)
+        logger.info(f"Reshaped attn_output: {attn_output_reshaped.shape}")
+        
         # 使用GPTQ融合算子
         # 重塑输入为 [M, K] 格式
-        batch_size, seq_len, hidden_dim = attn_output.shape
-        input_2d = attn_output.view(-1, hidden_dim)  # [B*S, D]
+        input_2d = attn_output_reshaped.view(-1, hidden_size)  # [B*S, D]
         
         # 调用融合算子
         result = self._gptq_fusion.fused_gptq_gemm_4bit(
@@ -213,7 +220,8 @@ class OptimizedQwenModelLayerAdapter:
         )
         
         # 重塑输出
-        result = result.view(batch_size, seq_len, -1)
+        result = result.view(batch_size, 1, -1)
+        logger.info(f"Output projection result: {result.shape}")
         return result
 
 

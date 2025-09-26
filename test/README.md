@@ -1,84 +1,77 @@
-# GPTQ测试文件说明
+# 测试目录
 
-## 📁 测试文件结构
+本目录包含GPTQ融合算子的各种测试脚本。
 
-### 🎯 核心测试文件
+## 📁 测试文件说明
 
-#### `test_comprehensive.py` - 综合测试（推荐）
-**用途**: 包含所有重要测试功能的综合测试文件
-**包含测试**:
-- ✅ 混合GPTQ格式测试（实际推理场景）
-- ✅ 标准GPTQ格式测试
-- ✅ 性能优化效果测试
-- ✅ 正确性验证测试
+### 🚀 核心功能测试
+- **`test_qwen7b_gptq_fast.py`** - 快速测试Qwen7B GPTQ格式修复
+  - 使用小矩阵快速验证逻辑
+  - 包含QKV投影和注意力结构测试
+  - 运行时间短，适合快速验证
 
-**运行方式**:
-```bash
-cd test && python test_comprehensive.py
-```
+- **`test_qwen7b_structure.py`** - 完整Qwen7B模型结构测试
+  - 测试完整的Qwen7B模型结构
+  - 验证QKV投影和注意力机制
+  - 确保所有维度正确
 
-#### `test_optimization.py` - 优化效果测试
-**用途**: 专门测试不同反量化方法的性能对比
-**特点**: 详细的性能分析和加速比计算
+### 🔧 专门功能测试
+- **`test_output_projection_gptq_fix.py`** - 输出投影GPTQ格式修复测试
+  - 专门测试输出投影的GPTQ格式
+  - 验证两种不同格式的处理
+  - 确保输出投影正确工作
 
-**运行方式**:
-```bash
-cd test && python test_optimization.py
-```
+- **`test_output_projection_shape.py`** - 输出投影形状处理测试
+  - 测试注意力输出形状重塑
+  - 验证数据一致性
+  - 确保形状转换正确
 
-#### `test_large_matrix.py` - 大矩阵性能测试
-**用途**: 测试大矩阵尺寸下的GPTQ性能
-**特点**: 使用大矩阵（1024x4096x2048）进行压力测试
+### ⚡ 性能测试
+- **`test_large_matrix.py`** - 大矩阵性能测试
+  - 测试GPTQ性能与大型矩阵
+  - 验证内存使用和计算效率
+  - 适合性能基准测试
 
-**运行方式**:
-```bash
-cd test && python test_large_matrix.py
-```
+- **`test_optimization.py`** - 优化方法测试
+  - 比较不同反量化优化方法
+  - 验证性能提升效果
+  - 确保优化正确性
 
-## 🚀 快速开始
+## 🎯 推荐测试顺序
 
-### 1. 运行综合测试（推荐）
-```bash
-cd test && python test_comprehensive.py
-```
+1. **快速功能验证**:
+   ```bash
+   cd test && python test_qwen7b_gptq_fast.py
+   ```
 
-### 2. 运行性能测试
-```bash
-cd test && python test_optimization.py
-```
+2. **输出投影测试**:
+   ```bash
+   cd test && python test_output_projection_gptq_fix.py
+   ```
 
-### 3. 运行大矩阵测试
-```bash
-cd test && python test_large_matrix.py
-```
+3. **完整结构测试**:
+   ```bash
+   cd test && python test_qwen7b_structure.py
+   ```
 
-## 📊 测试说明
+4. **性能测试** (可选):
+   ```bash
+   cd test && python test_large_matrix.py
+   cd test && python test_optimization.py
+   ```
 
-### 测试环境要求
-- CUDA可用
-- PyTorch已安装
-- Triton已安装（可选，用于融合算子）
+## 📊 测试结果
 
-### 测试内容
-1. **格式兼容性**: 测试各种GPTQ格式的兼容性
-2. **性能优化**: 比较不同反量化方法的性能
-3. **正确性验证**: 确保融合算子与基线实现结果一致
-4. **大矩阵支持**: 验证大矩阵尺寸下的稳定性
-
-### 预期结果
-- ✅ 所有格式测试通过
-- ✅ 性能提升明显（2-5倍加速）
-- ✅ 正确性误差 < 1e-3
-- ✅ 大矩阵测试稳定运行
+所有测试通过后，你应该看到：
+- ✅ QKV投影输出维度: 12288
+- ✅ 输出投影输出维度: 4096
+- ✅ 所有形状转换正确
+- ✅ GPTQ格式处理正确
 
 ## 🔧 故障排除
 
-### 常见问题
-1. **CUDA不可用**: 检查CUDA环境配置
-2. **Triton导入错误**: 检查Triton安装
-3. **内存不足**: 减少矩阵尺寸或使用CPU测试
-
-### 调试建议
-- 查看详细日志输出
-- 检查矩阵维度匹配
-- 验证GPTQ格式检测逻辑
+如果测试失败，请检查：
+1. CUDA是否可用
+2. GPTQ参数格式是否正确
+3. 输入输出维度是否匹配
+4. 日志中的错误信息
