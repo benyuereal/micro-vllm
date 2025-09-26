@@ -2,6 +2,7 @@
 #include <cuda_runtime.h>
 #include <cublas_v2.h>
 #include <cuda_fp16.h>
+#include <ATen/cuda/CUDAContext.h>
 
 // vLLM风格的分块大小
 #define BLOCK_KN_SIZE 128
@@ -30,6 +31,17 @@ __forceinline__ __device__ float dot22_8_f(half2 (&dq)[4], const half* a_ptr,
   float result_f =
       __half2float(__low2half(result)) + __half2float(__high2half(result));
   return fma(result_f, qs_f, g_result);
+}
+
+// 简化版本 - 只计算点积
+__forceinline__ __device__ float dot22_8_simple(half2 (&dq)[4], const half* a_ptr) {
+  half2 result = {};
+  const half2* a2_ptr = (const half2*)a_ptr;
+#pragma unroll
+  for (int i = 0; i < 4; i++) result = __hfma2(dq[i], *a2_ptr++, result);
+  float result_f =
+      __half2float(__low2half(result)) + __half2float(__high2half(result));
+  return result_f;
 }
 
 // vLLM风格的4bit反量化
@@ -142,10 +154,17 @@ __global__ void gemm_half_q_half_gptq_4bit_kernel(
       
 #pragma unroll
       for (int m = 0; m < m_count; m++) {
-        block_c[m][0] = fma(dot22_8_f(dq[0], a_ptr + m * a_stride), scales[0], block_c[m][0]);
-        block_c[m][1] = fma(dot22_8_f(dq[1], a_ptr + m * a_stride), scales[1], block_c[m][1]);
-        block_c[m][2] = fma(dot22_8_f(dq[2], a_ptr + m * a_stride), scales[2], block_c[m][2]);
-        block_c[m][3] = fma(dot22_8_f(dq[3], a_ptr + m * a_stride), scales[3], block_c[m][3]);
+        float dot_result = dot22_8_simple(dq[0], a_ptr + m * a_stride);
+        block_c[m][0] = fma(dot_result, __half2float(scales[0]), block_c[m][0]);
+        
+        dot_result = dot22_8_simple(dq[1], a_ptr + m * a_stride);
+        block_c[m][1] = fma(dot_result, __half2float(scales[1]), block_c[m][1]);
+        
+        dot_result = dot22_8_simple(dq[2], a_ptr + m * a_stride);
+        block_c[m][2] = fma(dot_result, __half2float(scales[2]), block_c[m][2]);
+        
+        dot_result = dot22_8_simple(dq[3], a_ptr + m * a_stride);
+        block_c[m][3] = fma(dot_result, __half2float(scales[3]), block_c[m][3]);
       }
       
       b_ptr += size_n;
@@ -210,7 +229,7 @@ void gemm_half_q_half_cuda_part(const half* a, const uint32_t* b_q_weight,
   fp_gemm_half_q_half_gptq_kernel kernel =
       pick_gemm_half_q_half_gptq_kernel(true, m_count);
   
-  const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+  const cudaStream_t stream = c10::cuda::getCurrentCUDAStream();
   kernel<<<gridDim, blockDim, 0, stream>>>(a, b_q_weight, b_gptq_qzeros,
                                            b_gptq_scales, c, size_m, size_n,
                                            size_k, groups);
@@ -252,22 +271,22 @@ torch::Tensor fused_gptq_gemm_4bit_cuda(
   
   if (max_chunks) {
     gemm_half_q_half_cuda_part(
-        input.data_ptr<at::Half>(),
+        reinterpret_cast<const half*>(input.data_ptr<at::Half>()),
         qweight_transposed.data_ptr<uint32_t>(),
         qzeros_contiguous.data_ptr<uint32_t>(),
-        scales_reshaped.data_ptr<at::Half>(),
-        output.data_ptr<at::Half>(),
+        reinterpret_cast<const half*>(scales_reshaped.data_ptr<at::Half>()),
+        reinterpret_cast<half*>(output.data_ptr<at::Half>()),
         last_chunk, N, K, BLOCK_M_SIZE_MAX, num_groups
     );
   }
   
   if (last_chunk_size) {
     gemm_half_q_half_cuda_part(
-        input.data_ptr<at::Half>() + last_chunk * K,
+        reinterpret_cast<const half*>(input.data_ptr<at::Half>()) + last_chunk * K,
         qweight_transposed.data_ptr<uint32_t>(),
         qzeros_contiguous.data_ptr<uint32_t>(),
-        scales_reshaped.data_ptr<at::Half>(),
-        output.data_ptr<at::Half>() + last_chunk * N,
+        reinterpret_cast<const half*>(scales_reshaped.data_ptr<at::Half>()),
+        reinterpret_cast<half*>(output.data_ptr<at::Half>()) + last_chunk * N,
         last_chunk_size, N, K, last_chunk_size, num_groups
     );
   }
