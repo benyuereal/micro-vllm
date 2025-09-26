@@ -127,7 +127,7 @@ __global__ void gemm_half_q_half_gptq_4bit_kernel(
   }
   
   // 列结果
-  float block_c[m_count][4] = {};
+  float block_c[m_count][4] = {0.0f};
   
   // 反量化和乘法
   int k = offset_k;
