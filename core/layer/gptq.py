@@ -73,7 +73,7 @@ class GPTQCUDAFusion:
             raise ValueError(f"输入必须是2D矩阵，得到 {input.dim()}D")
         
         M, K = input.shape
-        N = qweight.shape[0]
+        N = qweight.shape[1]  # 🔧 修复：N应该是输出维度
         
         # logger.info(f"CUDA融合内核: input{M}x{K}, qweight{N}x{qweight.shape[1]}, qzeros{qzeros.shape}, scales{scales.shape}")
         
