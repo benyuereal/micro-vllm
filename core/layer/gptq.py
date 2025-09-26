@@ -99,17 +99,17 @@ class GPTQTritonFusion:
             scales = tl.load(scale_ptrs, mask=offs_n[None, :] < N, other=0.0)
             zeros = tl.load(zero_ptrs, mask=offs_n[None, :] < N, other=0)
 
-            # 反量化4bit权重 (GPTQ格式) - 内联实现
+            # 反量化4bit权重 (GPTQ格式) - 正确的实现
             # 计算每个元素在32位整数中的位置
             elem_per_int = 8
-            k_idx = offs_k[:, None] % elem_per_int
+            # 注意：这里应该使用输出维度的bit位置，不是输入维度
             n_idx = offs_n[None, :] % elem_per_int
             
-            # 提取4bit值 (GPTQ格式)
-            shift = k_idx * 4
-            weight_val = (qweight >> shift) & 0xF
+            # 提取4bit值 (GPTQ格式) - 使用输出维度的bit位置
+            weight_shift = n_idx * 4
+            weight_val = (qweight >> weight_shift) & 0xF
             
-            # 提取对应的零点值 (GPTQ格式)
+            # 提取对应的零点值 (GPTQ格式) - 使用输出维度的bit位置
             zero_shift = n_idx * 4
             zero_val = (zeros >> zero_shift) & 0xF
             
