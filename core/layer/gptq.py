@@ -365,11 +365,11 @@ class GPTQTritonFusion:
         input = torch.randn((M, K), dtype=torch.float16, device='cuda')
         logger.info(f"Input shape: {input.shape}")
 
-        # 生成随机GPTQ量化权重
+        # 生成随机GPTQ量化权重 - GPTQ格式
         num_groups = K // self.groupsize
-        qweight = torch.randint(0, 256, (K, N // 8), dtype=torch.int32, device='cuda')
-        qzeros = torch.randint(0, 16, (num_groups, N // 8), dtype=torch.int32, device='cuda')
-        scales = torch.randn((num_groups, N), dtype=torch.float16, device='cuda')
+        qweight = torch.randint(0, 256, (N, K // 8), dtype=torch.int32, device='cuda')  # [N, K//8]
+        qzeros = torch.randint(0, 16, (num_groups, K // 8), dtype=torch.int32, device='cuda')  # [num_groups, K//8]
+        scales = torch.randn((num_groups, K), dtype=torch.float16, device='cuda')  # [num_groups, K]
 
         logger.info(f"qweight shape: {qweight.shape}")
         logger.info(f"qzeros shape: {qzeros.shape}")
@@ -425,12 +425,12 @@ class GPTQTritonFusion:
         """
         logger.info(f"Benchmarking performance with M={M}, N={N}, K={K}")
         
-        # 生成测试数据
+        # 生成测试数据 - GPTQ格式
         input = torch.randn((M, K), dtype=torch.float16, device='cuda')
         num_groups = K // self.groupsize
-        qweight = torch.randint(0, 256, (K, N // 8), dtype=torch.int32, device='cuda')
-        qzeros = torch.randint(0, 16, (num_groups, N // 8), dtype=torch.int32, device='cuda')
-        scales = torch.randn((num_groups, N), dtype=torch.float16, device='cuda')
+        qweight = torch.randint(0, 256, (N, K // 8), dtype=torch.int32, device='cuda')  # [N, K//8]
+        qzeros = torch.randint(0, 16, (num_groups, K // 8), dtype=torch.int32, device='cuda')  # [num_groups, K//8]
+        scales = torch.randn((num_groups, K), dtype=torch.float16, device='cuda')  # [num_groups, K]
         
         # 预热
         logger.info("Warming up...")
@@ -490,21 +490,21 @@ if __name__ == "__main__":
     # 创建GPTQ融合实例
     gptq_fusion = GPTQTritonFusion(groupsize=128)
     
-    # 先进行调试
+    # 先进行调试 - 使用GPTQ格式
     print("🔍 Debugging dequantization...")
     gptq_fusion.debug_dequantization(
-        qweight=torch.randint(0, 256, (128, 8), dtype=torch.int32, device='cuda'),
-        qzeros=torch.randint(0, 16, (1, 8), dtype=torch.int32, device='cuda'),
-        scales=torch.randn(1, 64, dtype=torch.float16, device='cuda'),
+        qweight=torch.randint(0, 256, (64, 16), dtype=torch.int32, device='cuda'),  # [N, K//8]
+        qzeros=torch.randint(0, 16, (1, 16), dtype=torch.int32, device='cuda'),     # [num_groups, K//8]
+        scales=torch.randn(1, 128, dtype=torch.float16, device='cuda'),            # [num_groups, K]
         groupsize=128
     )
     
-    # 测试正确性
+    # 测试正确性 - 使用GPTQ格式
     print("\nTesting correctness...")
     success = gptq_fusion.test_correctness(M=32, N=64, K=128)
     print(f"Correctness test: {'PASSED' if success else 'FAILED'}")
     
-    # 性能基准测试
+    # 性能基准测试 - 使用GPTQ格式
     print("\nBenchmarking performance...")
     perf_results = gptq_fusion.benchmark_performance(M=512, N=2048, K=2048)
     print(f"Performance results: {perf_results}")
