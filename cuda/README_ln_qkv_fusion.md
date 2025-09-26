@@ -1,403 +1,229 @@
-# 融合LN+QKV GPTQ量化方案
+# 融合LN+QKV GPTQ CUDA内核
 
 ## 概述
 
-本方案实现了LayerNorm + QKV投影的CUDA融合算子，支持GPTQ 4bit量化，旨在显著提升Transformer层的推理性能。
+本目录包含了融合LayerNorm + QKV投影的GPTQ量化CUDA内核实现，基于vLLM的优秀设计，实现了高效的融合算子。
 
 ## 文件结构
 
 ```
 cuda/
-├── ln_qkv_fusion_kernel.cu          # CUDA融合内核实现
-├── compile_ln_qkv_fusion.sh         # 编译脚本
-└── test_all.sh                      # 一键测试脚本
-
-core/layer/
-└── fused_ln_qkv_gptq.py             # Python包装器
-
-test/
-├── test_fused_ln_qkv_gptq.py        # 功能测试
-├── test_fused_ln_qkv_gptq_performance.py  # 性能测试
-└── test_fused_ln_qkv_gptq_integration.py  # 集成测试
+├── ln_qkv_fusion_kernel.cu          # 融合LN+QKV CUDA内核源码
+├── compile_ln_qkv_fusion.py         # Python编译脚本
+├── compile_ln_qkv_fusion.sh         # Shell编译脚本
+├── test_ln_qkv_fusion.py           # Python测试脚本
+├── test_ln_qkv_fusion_all.sh       # 一键测试脚本
+└── README_ln_qkv_fusion.md         # 本文件
 ```
 
-## 技术特性
+## 核心特性
 
 ### 1. 融合算子
-- **LayerNorm + QKV投影**：将两个操作融合为一个CUDA内核
-- **GPTQ 4bit量化**：支持GPTQ量化权重的解量化和矩阵乘法
-- **多输出处理**：同时输出Q、K、V三个张量
-- **批处理支持**：支持不同的batch size和sequence length
+- **LayerNorm + QKV投影**: 将LayerNorm和QKV投影融合为单个CUDA内核
+- **GPTQ 4bit量化**: 支持GPTQ 4bit量化权重
+- **vLLM优化**: 基于vLLM的优秀实现
 
 ### 2. 性能优化
-- **共享内存**：使用shared memory缓存LayerNorm统计信息
-- **向量化操作**：使用CUDA向量化指令优化计算
-- **内存访问优化**：减少内存访问次数和延迟
-- **内核融合**：避免中间结果的存储和读取
+- **向量化计算**: 使用 `half2` 和 `__hfma2` 指令
+- **高效分块**: 128x8的分块策略
+- **共享内存**: 减少全局内存访问
+- **原子操作**: 使用 `atomicAdd` 避免竞争条件
 
-### 3. 数值稳定性
-- **LayerNorm epsilon**：防止除零错误
-- **GPTQ解量化**：正确处理4bit权重的解量化
-- **数据类型转换**：确保float16精度
+### 3. 目标性能
+- **融合LN+QKV**: ≤ 0.25ms
+- **加速比**: ≥ 2.0x (vs 分离算子)
+- **内存效率**: 显著提升
 
 ## 使用方法
 
-### 1. 编译
+### 编译内核
 
+**使用Python脚本**:
 ```bash
-cd cuda
+python3 compile_ln_qkv_fusion.py
+```
+
+**使用Shell脚本**:
+```bash
 bash compile_ln_qkv_fusion.sh
 ```
 
-### 2. 基本使用
+### 运行测试
 
-```python
-from core.layer.fused_ln_qkv_gptq import fused_ln_qkv_gptq
-import torch
-
-# 创建输入数据
-input_data = torch.randn(1, 1, 4096, dtype=torch.float16)
-
-# 创建GPTQ参数
-qweight = torch.randint(0, 255, (512, 12288), dtype=torch.uint32)
-qzeros = torch.randint(0, 255, (32, 1536), dtype=torch.uint32)
-scales = torch.randn(32, 12288, dtype=torch.float16)
-
-# 创建LayerNorm参数
-ln_weight = torch.randn(4096, dtype=torch.float16)
-ln_bias = torch.randn(4096, dtype=torch.float16)
-
-# 调用融合算子
-q, k, v = fused_ln_qkv_gptq(
-    input=input_data,
-    qweight=qweight,
-    qzeros=qzeros,
-    scales=scales,
-    ln_weight=ln_weight,
-    ln_bias=ln_bias,
-    num_heads=32,
-    kv_num_heads=32,
-    head_size=128,
-    groupsize=128
-)
-```
-
-### 3. 高级使用
-
-```python
-from core.layer.fused_ln_qkv_gptq import FusedLNQKVGPTQ
-
-# 创建融合算子实例
-fused_op = FusedLNQKVGPTQ()
-
-# 检查可用性
-if fused_op.is_available():
-    q, k, v = fused_op.fused_ln_qkv_gptq(
-        input=input_data,
-        qweight=qweight,
-        qzeros=qzeros,
-        scales=scales,
-        ln_weight=ln_weight,
-        ln_bias=ln_bias,
-        num_heads=32,
-        kv_num_heads=32,
-        head_size=128,
-        groupsize=128
-    )
-```
-
-## 性能目标
-
-### 1. 延迟目标
-- **融合LN+QKV**：≤ 0.25ms
-- **GPTQ QKV投影**：≤ 0.10ms
-- **LayerNorm**：≤ 0.05ms
-
-### 2. 加速比目标
-- **融合 vs 分离**：≥ 2x
-- **融合 vs PyTorch**：≥ 5x
-
-### 3. 内存效率
-- **减少内存访问**：避免中间结果存储
-- **共享内存利用**：缓存LayerNorm统计
-- **批处理优化**：支持不同batch size
-
-## 测试
-
-### 1. 功能测试
-
+**Python测试**:
 ```bash
-cd test
-python test_fused_ln_qkv_gptq.py
+python3 test_ln_qkv_fusion.py
 ```
 
-测试内容：
-- 基础功能验证
-- 输出形状检查
-- 数值稳定性
-- 批处理支持
+**一键测试**:
+```bash
+bash test_ln_qkv_fusion_all.sh
+```
+
+## 测试内容
+
+### 1. 基础功能测试
+- 验证融合算子的基本功能
+- 检查输出形状和数据类型
+- 验证CUDA内核是否正确加载
 
 ### 2. 性能测试
+- 测量融合算子的执行时间
+- 计算统计信息（平均、最小、最大时间）
+- 性能目标验证
 
-```bash
-cd test
-python test_fused_ln_qkv_gptq_performance.py
-```
+### 3. 批处理测试
+- 测试不同批处理配置
+- 验证批处理性能
+- 检查内存使用
 
-测试内容：
-- 融合算子性能
-- 分离算子性能
-- PyTorch实现性能
-- 性能对比分析
+### 4. 正确性测试
+- 验证输出正确性
+- 检查数值稳定性
+- 检查输出范围
 
-### 3. 集成测试
+## 技术实现
 
-```bash
-cd test
-python test_fused_ln_qkv_gptq_integration.py
-```
-
-测试内容：
-- Layer集成测试
-- 性能对比测试
-- 批处理测试
-- 实际应用场景
-
-### 4. 一键测试
-
-```bash
-cd cuda
-bash test_all.sh
-```
-
-运行所有测试：
-- GPTQ内核编译和测试
-- 融合LN+QKV内核编译和测试
-- 功能测试
-- 性能测试
-- 集成测试
-
-## 实现细节
-
-### 1. CUDA内核
-
+### 1. 内核设计
 ```cpp
-// 融合LayerNorm + GPTQ QKV投影内核
-template<typename T>
+// 融合LayerNorm + GPTQ QKV投影内核（基于vLLM实现）
+template <int m_count>
 __global__ void fused_ln_qkv_gptq_kernel(
-    const T* input,           // [batch_size, seq_len, hidden_dim]
-    const uint32_t* qweight,  // GPTQ量化权重 [K//8, N]
-    const uint32_t* qzeros,   // GPTQ量化零点 [num_groups, groupsize//8]
-    const T* scales,          // GPTQ量化缩放 [num_groups, N]
-    const T* ln_weight,      // LayerNorm权重 [hidden_dim]
-    const T* ln_bias,        // LayerNorm偏置 [hidden_dim]
-    T* q_output,             // Q输出 [batch_size, num_heads, seq_len, head_size]
-    T* k_output,             // K输出 [batch_size, kv_num_heads, seq_len, head_size]
-    T* v_output,             // V输出 [batch_size, kv_num_heads, seq_len, head_size]
+    const half* __restrict__ input,           // [batch_size, seq_len, hidden_dim]
+    const uint32_t* __restrict__ qweight,     // GPTQ量化权重 [K//8, N]
+    const uint32_t* __restrict__ qzeros,      // GPTQ量化零点 [num_groups, groupsize//8]
+    const half* __restrict__ scales,          // GPTQ量化缩放 [num_groups, N]
+    const half* __restrict__ ln_weight,       // LayerNorm权重 [hidden_dim]
+    const half* __restrict__ ln_bias,         // LayerNorm偏置 [hidden_dim]
+    half* __restrict__ q_output,              // Q输出 [batch_size, num_heads, seq_len, head_size]
+    half* __restrict__ k_output,              // K输出 [batch_size, kv_num_heads, seq_len, head_size]
+    half* __restrict__ v_output,              // V输出 [batch_size, kv_num_heads, seq_len, head_size]
     // ... 其他参数
 );
 ```
 
-### 2. GPTQ解量化
+### 2. 优化技术
+- **vLLM风格的分块策略**: `BLOCK_KN_SIZE=128`, `BLOCK_M_SIZE_MAX=8`
+- **向量化点积**: 使用 `half2` 和 `__hfma2` 指令
+- **高效4bit解量化**: 批量处理4bit权重
+- **共享内存优化**: 缓存输入数据
 
-```cpp
-// GPTQ 4bit解量化内核
-__device__ __forceinline__ void dequantize_4bit_gptq(
-    const uint32_t* qweight,
-    const uint32_t* qzeros,
-    const half* scales,
-    int weight_idx,
-    int group_idx,
-    int groupsize,
-    half* output
-) {
-    // 计算4bit权重的索引
-    int weight_group = weight_idx / groupsize;
-    int weight_offset = weight_idx % groupsize;
-    
-    // 获取量化权重
-    int qweight_idx = weight_group * (groupsize / 8) + weight_offset / 8;
-    int bit_offset = (weight_offset % 8) * 4;
-    
-    uint32_t packed_weight = qweight[qweight_idx];
-    uint32_t weight_4bit = (packed_weight >> bit_offset) & 0xF;
-    
-    // 获取零点和缩放
-    int zero_idx = group_idx * (groupsize / 8) + weight_offset / 8;
-    int zero_bit_offset = (weight_offset % 8) * 4;
-    
-    uint32_t packed_zero = qzeros[zero_idx];
-    uint32_t zero_4bit = (packed_zero >> zero_bit_offset) & 0xF;
-    
-    // 解量化
-    float scale = __half2float(scales[group_idx]);
-    float dequantized = (weight_4bit - zero_4bit) * scale;
-    
-    *output = __float2half(dequantized);
-}
+### 3. 内存布局
+- **输入**: `[batch_size, seq_len, hidden_dim]`
+- **QKV输出**: `[batch_size, num_heads, seq_len, head_size]`
+- **GPTQ权重**: `[hidden_dim//8, hidden_dim*3]`
+- **LayerNorm参数**: `[hidden_dim]`
+
+## 性能基准
+
+### 目标性能
+- **融合LN+QKV**: ≤ 0.25ms
+- **GPTQ QKV**: ≤ 0.10ms
+- **LayerNorm**: ≤ 0.05ms
+- **加速比**: ≥ 2.0x (vs 分离算子)
+
+### 测试配置
+- **批处理大小**: [1, 2, 4, 8]
+- **序列长度**: [1, 16, 32, 64]
+- **隐藏维度**: [4096]
+- **头数**: [32]
+- **头大小**: [128]
+
+## 环境要求
+
+### 硬件要求
+- NVIDIA GPU (计算能力 ≥ 7.0)
+- GPU内存 ≥ 4GB
+- CUDA版本 ≥ 11.0
+
+### 软件要求
+- Python ≥ 3.8
+- PyTorch ≥ 1.12.0
+- CUDA Toolkit ≥ 11.0
+
+### 依赖库
+```bash
+pip install torch torchvision torchaudio
+pip install numpy
 ```
-
-### 3. LayerNorm计算
-
-```cpp
-// LayerNorm计算
-__shared__ float shared_stats[64];  // 缓存统计信息
-
-if (threadIdx.x < 2) {
-    // 计算均值和方差
-    float sum = 0.0f, sum_sq = 0.0f;
-    for (int i = 0; i < hidden_dim; i++) {
-        int idx = batch_idx * seq_len * hidden_dim + seq_idx * hidden_dim + i;
-        float val = __half2float(input[idx]);
-        sum += val;
-        sum_sq += val * val;
-    }
-    
-    float mean = sum / hidden_dim;
-    float var = (sum_sq / hidden_dim) - (mean * mean);
-    
-    shared_stats[seq_idx * 2] = mean;
-    shared_stats[seq_idx * 2 + 1] = var;
-}
-__syncthreads();
-
-// 归一化
-int input_idx = batch_idx * seq_len * hidden_dim + seq_idx * hidden_dim + hidden_idx;
-float normalized = (__half2float(input[input_idx]) - shared_stats[seq_idx * 2]) / 
-                  sqrtf(shared_stats[seq_idx * 2 + 1] + eps);
-
-normalized = normalized * __half2float(ln_weight[hidden_idx]) + __half2float(ln_bias[hidden_idx]);
-```
-
-## 性能分析
-
-### 1. 理论分析
-
-**融合前：**
-- LayerNorm: ~0.33ms
-- QKV投影: ~0.42ms
-- **总计**: ~0.75ms
-
-**融合后：**
-- 融合算子: ~0.25ms
-- **性能提升**: 3x加速
-
-### 2. 收益来源
-
-1. **减少内存访问**：避免中间结果的存储和读取
-2. **减少内核启动开销**：从2个内核减少到1个
-3. **更好的缓存利用**：数据在GPU缓存中保持热度
-4. **减少同步开销**：避免内核间的同步
-
-### 3. 优化策略
-
-1. **共享内存优化**：缓存LayerNorm统计信息
-2. **向量化操作**：使用CUDA向量化指令
-3. **内存访问优化**：减少内存访问次数
-4. **计算融合**：将多个操作合并为一个内核
 
 ## 故障排除
 
-### 1. 编译问题
+### 常见问题
 
-**问题**：找不到CUDA_HOME
-```bash
-export CUDA_HOME=/usr/local/cuda
-export PATH=$CUDA_HOME/bin:$PATH
-export LD_LIBRARY_PATH=$CUDA_HOME/lib64:$LD_LIBRARY_PATH
-```
+1. **编译失败**
+   ```
+   ❌ 融合LN+QKV CUDA内核编译失败
+   ```
+   - 检查CUDA Toolkit安装
+   - 检查编译环境
+   - 检查内核代码
 
-**问题**：找不到Python头文件
-```bash
-export PYTHON_INCLUDE=$(python -c "import torch; print(torch.utils.cpp_extension.include_paths()[0])")
-```
+2. **性能不达标**
+   ```
+   ⚠️ 未达到性能目标: 0.30ms > 0.25ms
+   ```
+   - 检查GPU性能
+   - 检查内核优化
+   - 检查测试环境
 
-### 2. 运行时问题
+3. **输出形状错误**
+   ```
+   ❌ Q形状错误: torch.Size([1, 32, 1, 128]) != torch.Size([1, 32, 1, 128])
+   ```
+   - 检查输入数据
+   - 检查内核实现
+   - 检查参数配置
 
-**问题**：CUDA内核不可用
-```python
-# 检查CUDA环境
-if not torch.cuda.is_available():
-    print("CUDA不可用")
-    
-# 检查内核库
-if not os.path.exists("ln_qkv_fusion_kernel.so"):
-    print("内核库不存在")
-```
+### 调试技巧
 
-**问题**：数据类型不匹配
-```python
-# 确保数据类型正确
-if input.dtype != torch.float16:
-    input = input.to(torch.float16)
-if scales.dtype != torch.float16:
-    scales = scales.to(torch.float16)
-```
+1. **启用详细日志**
+   ```bash
+   python3 test_ln_qkv_fusion.py --verbose
+   ```
 
-### 3. 性能问题
+2. **检查CUDA内核**
+   ```bash
+   ls -la fused_ln_qkv_gptq_cuda.so
+   ```
 
-**问题**：性能不达标
-- 检查CUDA架构支持
-- 检查内存带宽
-- 检查批处理大小
-- 检查序列长度
+3. **检查GPU状态**
+   ```bash
+   nvidia-smi
+   ```
 
-**问题**：数值不稳定
-- 检查LayerNorm epsilon
-- 检查GPTQ参数
-- 检查数据类型转换
+## 性能优化
 
-## 未来优化
+### 内核优化
+- 使用共享内存
+- 向量化操作
+- 减少内存访问
+- 优化线程配置
 
-### 1. 短期优化
-- **内存访问优化**：进一步减少内存访问
-- **计算优化**：优化GPTQ解量化算法
-- **批处理优化**：支持更大的批处理
-
-### 2. 中期优化
-- **多GPU支持**：支持多GPU并行
-- **动态批处理**：支持动态批处理大小
-- **混合精度**：支持混合精度计算
-
-### 3. 长期优化
-- **自动调优**：自动优化内核参数
-- **硬件适配**：适配不同的GPU架构
-- **算法优化**：探索新的融合算法
+### 测试优化
+- 预热GPU
+- 减少测试开销
+- 优化内存使用
+- 并行测试
 
 ## 贡献指南
 
-### 1. 代码规范
-- 遵循CUDA编程规范
-- 使用清晰的变量命名
-- 添加详细的注释
-- 进行充分的测试
+### 添加新功能
+1. 修改 `ln_qkv_fusion_kernel.cu`
+2. 更新测试脚本
+3. 更新文档
+4. 运行测试验证
 
-### 2. 测试要求
-- 功能测试必须通过
-- 性能测试必须达标
-- 集成测试必须通过
-- 代码覆盖率 > 80%
-
-### 3. 提交流程
-1. Fork项目
-2. 创建功能分支
-3. 实现功能
-4. 编写测试
-5. 提交PR
-6. 代码审查
-7. 合并代码
+### 报告问题
+1. 提供测试日志
+2. 提供环境信息
+3. 提供复现步骤
+4. 提供期望结果
 
 ## 许可证
 
-本项目采用MIT许可证，详见LICENSE文件。
+本项目采用MIT许可证。
 
 ## 联系方式
 
-如有问题或建议，请通过以下方式联系：
-- 提交Issue
-- 发送邮件
-- 参与讨论
-
----
-
-**注意**：本方案仍在开发中，可能存在bug和性能问题。建议在生产环境使用前进行充分测试。
+如有问题，请联系项目维护者。
