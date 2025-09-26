@@ -16,19 +16,48 @@ if ! python -c "import torch; print('CUDA可用:', torch.cuda.is_available())" 2
     exit 1
 fi
 
-# 步骤2: 编译内核
-echo "🔨 步骤2: 编译CUDA内核"
+# 步骤2: 编译当前版本内核
+echo "🔨 步骤2: 编译当前版本CUDA内核"
 echo "=========================================="
 if ! python compile.py; then
-    echo "❌ CUDA内核编译失败"
+    echo "❌ 当前版本CUDA内核编译失败"
     exit 1
 fi
 
-# 步骤3: 测试内核
-echo "⚡ 步骤3: 测试CUDA内核性能"
+# 步骤3: 测试当前版本
+echo "⚡ 步骤3: 测试当前版本CUDA内核性能"
 echo "=========================================="
 if ! python test.py; then
-    echo "❌ CUDA内核测试失败"
+    echo "❌ 当前版本CUDA内核测试失败"
+    exit 1
+fi
+
+# 步骤4: 编译vLLM版本内核
+echo "🔨 步骤4: 编译vLLM版本CUDA内核"
+echo "=========================================="
+if ! python -c "
+from torch.utils.cpp_extension import load
+try:
+    vllm_kernel = load(
+        name='fused_gptq_gemm_cuda_vllm',
+        sources=['gptq_cuda_kernel_vllm.cu'],
+        extra_cuda_cflags=['-O3', '-use_fast_math', '-Xptxas=-O3', '-lcublas'],
+        verbose=False
+    )
+    print('✅ vLLM版本CUDA内核编译成功!')
+except Exception as e:
+    print(f'❌ vLLM版本CUDA内核编译失败: {e}')
+    exit(1)
+"; then
+    echo "❌ vLLM版本CUDA内核编译失败"
+    exit 1
+fi
+
+# 步骤5: 性能对比测试
+echo "⚡ 步骤5: 性能对比测试"
+echo "=========================================="
+if ! python test_vllm_comparison.py; then
+    echo "❌ 性能对比测试失败"
     exit 1
 fi
 
