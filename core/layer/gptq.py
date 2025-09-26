@@ -538,7 +538,10 @@ class GPTQTritonFusion:
                 mask = (byte_indices == byte_idx)
                 k_values = k_range[mask]
                 bit_shift_values = bit_shifts[mask]
-                scale_values = group_scales[mask]
+                
+                # 计算scale_values的正确索引
+                scale_indices = k_values - start_idx  # 转换为group_scales的索引
+                scale_values = group_scales[scale_indices]
                 
                 # 向量化提取权重值
                 weight_vals = (qweight[:, byte_idx] >> bit_shift_values[:, None]) & 0xF  # [N, num_k_values]
