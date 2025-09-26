@@ -134,12 +134,18 @@ class InferenceEngine:
         model_dtype = next(self.model.parameters()).dtype
         self.logger.info(f"Model dtype: {model_dtype}")
 
-        # 🔧 修复：强制使用float16以兼容CUDA内核
+        # 🔧 修复：GPTQ模型不能转换数据类型，使用模型原始类型
         if device == "cuda":
-            if model_dtype != torch.float16:
-                self.logger.info(f"Converting model from {model_dtype} to float16 for CUDA kernel compatibility")
-                self.model.to(torch.float16)
-            dtype = torch.float16
+            if is_gptq_model:
+                # GPTQ模型已经在model_loader.py中使用float16加载
+                dtype = model_dtype
+                self.logger.info(f"GPTQ模型使用原始数据类型: {dtype}")
+            else:
+                # 非GPTQ模型可以转换
+                if model_dtype != torch.float16:
+                    self.logger.info(f"Converting model from {model_dtype} to float16 for CUDA kernel compatibility")
+                    self.model.to(torch.float16)
+                dtype = torch.float16
 
         return device, dtype, config["block_size"], config["max_blocks"]
 

@@ -46,6 +46,7 @@ def main():
             ("Layer层集成测试", "test_layer_integration.py"),
             ("性能优化测试", "test_performance_optimization.py"),
             ("数据类型修复测试", "test_dtype_fix.py"),
+            ("GPTQ数据类型修复测试", "test_gptq_dtype_fix.py"),
             ("快速验证测试", "quick_test.py"),
         ]
     
