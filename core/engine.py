@@ -147,6 +147,12 @@ class InferenceEngine:
                     self.model.to(torch.float16)
                 dtype = torch.float16
                 self.logger.info(f"非GPTQ模型也强制使用float16以兼容CUDA内核")
+            
+            # 🔧 额外修复：确保lm_head也使用float16
+            if hasattr(self.model, 'lm_head') and hasattr(self.model.lm_head, 'weight'):
+                if self.model.lm_head.weight.dtype != torch.float16:
+                    self.logger.info(f"🔄 转换lm_head权重: {self.model.lm_head.weight.dtype} -> float16")
+                    self.model.lm_head.weight = self.model.lm_head.weight.to(torch.float16)
 
         return device, dtype, config["block_size"], config["max_blocks"]
 
