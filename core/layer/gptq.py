@@ -80,7 +80,7 @@ class GPTQCUDAFusion:
         if qweight.shape[1] != K // 8:
             # 如果是 [K//8, N] 格式，转置为 [N, K//8]
             if qweight.shape[0] == K // 8 and qweight.shape[1] == N:
-                logger.info(f"转换qweight格式: {qweight.shape} -> {qweight.t().shape}")
+                # logger.info(f"转换qweight格式: {qweight.shape} -> {qweight.t().shape}")
                 qweight = qweight.t().contiguous()  # 确保内存连续
             else:
                 logger.error(f"qweight格式不匹配: shape={qweight.shape}, K//8={K//8}, N={N}")
