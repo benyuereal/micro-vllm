@@ -205,6 +205,10 @@ class GPTQTritonFusion:
             # 自定义格式，使用qweight的实际维度作为N
             N = qweight.shape[0]
             logger.info(f"Using custom format: N={N} from qweight.shape[0]")
+            
+            # 对于自定义格式，跳过严格的格式验证，直接使用基线实现
+            logger.warning(f"Custom format detected, using baseline implementation")
+            return self.baseline_gptq_gemm(input, qweight, qzeros, scales, self.groupsize)
         
         # 更灵活的scales验证 - 支持不同的GPTQ格式
         if scales.shape[1] != K:
