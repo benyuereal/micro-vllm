@@ -85,7 +85,17 @@ class GPTQCUDAFusion:
             logger.debug("检测到转置格式，自动转换")
             qweight = qweight.t()
         else:
-            raise ValueError(f"无法识别的qweight格式: {qweight.shape}，期望 [N, K//8] 或 [K//8, N]")
+            # 尝试更灵活的检测
+            logger.debug(f"尝试灵活检测: qweight{qweight.shape}, K={K}, N={N}")
+            if qweight.shape[0] == K // 8:
+                # [K//8, N] 格式
+                logger.debug("检测到 [K//8, N] 格式，自动转换")
+                qweight = qweight.t()
+            elif qweight.shape[1] == K // 8:
+                # [N, K//8] 格式
+                logger.debug("检测到 [N, K//8] 格式")
+            else:
+                raise ValueError(f"无法识别的qweight格式: {qweight.shape}，期望 [N, K//8] 或 [K//8, N]")
         
         # 验证转换后的格式
         if qweight.shape[1] != K // 8:
