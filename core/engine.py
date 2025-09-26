@@ -148,12 +148,25 @@ class InferenceEngine:
                 dtype = torch.float16
                 self.logger.info(f"非GPTQ模型也强制使用float16以兼容CUDA内核")
             
-            # 🔧 额外修复：确保lm_head也使用float16
+            # 🔧 额外修复：确保所有组件都使用float16
             if hasattr(self.model, 'lm_head') and hasattr(self.model.lm_head, 'weight'):
                 if self.model.lm_head.weight.dtype != torch.float16:
                     self.logger.info(f"🔄 转换lm_head权重: {self.model.lm_head.weight.dtype} -> float16")
                     # 正确转换Parameter：保持Parameter的封装
                     self.model.lm_head.weight.data = self.model.lm_head.weight.data.to(torch.float16)
+            
+            # 🔧 确保embedding层也使用float16
+            if hasattr(self.model, 'transformer') and hasattr(self.model.transformer, 'wte'):
+                if self.model.transformer.wte.weight.dtype != torch.float16:
+                    self.logger.info(f"🔄 转换embedding权重: {self.model.transformer.wte.weight.dtype} -> float16")
+                    self.model.transformer.wte.weight.data = self.model.transformer.wte.weight.data.to(torch.float16)
+            
+            # 🔧 确保norm层也使用float16
+            if hasattr(self.model, 'transformer') and hasattr(self.model.transformer, 'ln_f'):
+                for param in self.model.transformer.ln_f.parameters():
+                    if param.dtype != torch.float16:
+                        self.logger.info(f"🔄 转换norm层参数: {param.dtype} -> float16")
+                        param.data = param.data.to(torch.float16)
 
         return device, dtype, config["block_size"], config["max_blocks"]
 
@@ -209,7 +222,13 @@ class InferenceEngine:
         input_tensor = self._pad_batch(input_ids, self.tokenizer.pad_token_id).to(self.device)
 
         # 2. 前向传播
-        outputs = self.model(input_ids=input_tensor, use_cache=True)
+        # 🔧 修复：确保输入数据类型正确
+        if input_tensor.dtype != torch.long:
+            input_tensor = input_tensor.long()
+        
+        # 确保模型在正确的数据类型下运行
+        with torch.cuda.amp.autocast(enabled=False):
+            outputs = self.model(input_ids=input_tensor, use_cache=True)
         logits, past_kvs = outputs.logits, outputs.past_key_values
 
         # 3. 存储KV (按序列处理)
