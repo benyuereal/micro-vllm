@@ -76,7 +76,18 @@ class GPTQCUDAFusion:
         
         logger.info(f"CUDA融合内核: input{M}x{K}, qweight{N}x{qweight.shape[1]}, qzeros{qzeros.shape}, scales{scales.shape}")
         
-        # 验证GPTQ格式
+        # 检测GPTQ格式并自动转换
+        if qweight.shape[1] == K // 8:
+            # 标准格式: [N, K//8]
+            logger.debug("使用标准GPTQ格式")
+        elif qweight.shape[0] == K // 8 and qweight.shape[1] == N:
+            # 转置格式: [K//8, N] -> [N, K//8]
+            logger.debug("检测到转置格式，自动转换")
+            qweight = qweight.t()
+        else:
+            raise ValueError(f"无法识别的qweight格式: {qweight.shape}，期望 [N, K//8] 或 [K//8, N]")
+        
+        # 验证转换后的格式
         if qweight.shape[1] != K // 8:
             raise ValueError(f"qweight第二维必须是K//8={K//8}，得到{qweight.shape[1]}")
         

@@ -43,6 +43,7 @@ def main():
     tests = [
         ("导入测试", "test_import.py"),
         ("简单功能测试", "simple_test.py"),
+        ("GPTQ格式转换测试", "test_gptq_format_conversion.py"),
         ("GPTQ功能测试", "test_gptq_functionality.py"),
         ("批处理Layer层测试", "test_batch_layer_shapes.py"),
         ("Layer层集成测试", "test_layer_integration.py"),
