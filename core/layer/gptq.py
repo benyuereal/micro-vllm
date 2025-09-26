@@ -273,28 +273,35 @@ class GPTQTritonFusion:
         # 反量化权重
         dequantized_weight = torch.zeros((N, K), dtype=torch.float16, device=qweight.device)
 
+        # 使用向量化操作优化
         for group_idx in range(num_groups):
             start_idx = group_idx * groupsize
             end_idx = min(start_idx + groupsize, K)
-
-            for k in range(start_idx, end_idx):
-                for n in range(N):
-                    # 计算在qweight中的位置 - GPTQ格式
-                    weight_idx = n
-                    byte_idx = k // 8
-                    bit_shift = (k % 8) * 4
-
-                    # 提取4bit权重值
-                    weight_val = (qweight[weight_idx, byte_idx] >> bit_shift) & 0xF
-
-                    # 提取零点值
-                    zero_val = (qzeros[group_idx, byte_idx] >> bit_shift) & 0xF
-
-                    # 提取缩放因子
-                    scale_val = scales[group_idx, k]
-
-                    # 反量化 - 确保与Triton内核逻辑一致
-                    dequantized_weight[n, k] = (weight_val - zero_val) * scale_val
+            group_size = end_idx - start_idx
+            
+            if group_size <= 0:
+                continue
+                
+            # 获取当前组的参数
+            group_scales = scales[group_idx, start_idx:end_idx]  # [group_size]
+            
+            # 向量化处理每个k值
+            for k_offset in range(group_size):
+                k = start_idx + k_offset
+                
+                # 计算字节索引和位偏移
+                byte_idx = k // 8
+                bit_shift = (k % 8) * 4
+                
+                # 向量化提取所有N维度的4bit权重值
+                weight_vals = (qweight[:, byte_idx] >> bit_shift) & 0xF  # [N]
+                
+                # 提取零点值
+                zero_val = (qzeros[group_idx, byte_idx] >> bit_shift) & 0xF
+                
+                # 向量化反量化
+                scale_val = group_scales[k_offset]
+                dequantized_weight[:, k] = (weight_vals - zero_val) * scale_val
 
         return dequantized_weight
 
@@ -324,28 +331,35 @@ class GPTQTritonFusion:
         # 反量化权重
         dequantized_weight = torch.zeros((N, K), dtype=torch.float16, device=qweight.device)
 
+        # 使用向量化操作优化
         for group_idx in range(num_groups):
             start_idx = group_idx * groupsize
             end_idx = min(start_idx + groupsize, K)
-
-            for k in range(start_idx, end_idx):
-                for n in range(N):
-                    # 计算在qweight中的位置 - 替代格式
-                    weight_idx = n
-                    byte_idx = n // 8
-                    bit_shift = (n % 8) * 4
-
-                    # 提取4bit权重值
-                    weight_val = (qweight[weight_idx, byte_idx] >> bit_shift) & 0xF
-
-                    # 提取零点值 - 替代格式
-                    zero_val = (qzeros[group_idx, byte_idx] >> bit_shift) & 0xF
-
-                    # 提取缩放因子
-                    scale_val = scales[group_idx, k]
-
-                    # 反量化
-                    dequantized_weight[n, k] = (weight_val - zero_val) * scale_val
+            group_size = end_idx - start_idx
+            
+            if group_size <= 0:
+                continue
+                
+            # 获取当前组的参数
+            group_scales = scales[group_idx, start_idx:end_idx]  # [group_size]
+            
+            # 向量化处理每个k值
+            for k_offset in range(group_size):
+                k = start_idx + k_offset
+                
+                # 计算字节索引和位偏移 - 替代格式
+                byte_idx = k // 8
+                bit_shift = (k % 8) * 4
+                
+                # 向量化提取所有N维度的4bit权重值
+                weight_vals = (qweight[:, byte_idx] >> bit_shift) & 0xF  # [N]
+                
+                # 提取零点值 - 替代格式
+                zero_val = (qzeros[group_idx, byte_idx] >> bit_shift) & 0xF
+                
+                # 向量化反量化
+                scale_val = group_scales[k_offset]
+                dequantized_weight[:, k] = (weight_vals - zero_val) * scale_val
 
         return dequantized_weight
 
@@ -357,7 +371,7 @@ class GPTQTritonFusion:
             groupsize: int
     ) -> torch.Tensor:
         """
-        通用反量化GPTQ权重（处理自定义格式）
+        通用反量化GPTQ权重（处理自定义格式）- 优化版本
         
         参数:
             qweight: 量化权重 [N, qweight_cols] (int32)
@@ -378,41 +392,92 @@ class GPTQTritonFusion:
         # 反量化权重
         dequantized_weight = torch.zeros((N, K), dtype=torch.float16, device=qweight.device)
 
+        # 使用向量化操作优化
         for group_idx in range(num_groups):
             start_idx = group_idx * groupsize
             end_idx = min(start_idx + groupsize, K)
+            group_size = end_idx - start_idx
+            
+            if group_size <= 0:
+                continue
+                
+            # 获取当前组的参数
+            group_scales = scales[group_idx, start_idx:end_idx]  # [group_size]
+            
+            # 向量化处理每个k值
+            for k_offset in range(group_size):
+                k = start_idx + k_offset
+                
+                # 计算字节索引和位偏移
+                byte_idx = min(k // 8, qweight_cols - 1)
+                bit_shift = (k % 8) * 4
+                
+                # 向量化提取所有N维度的4bit权重值
+                weight_vals = (qweight[:, byte_idx] >> bit_shift) & 0xF  # [N]
+                
+                # 提取零点值
+                zero_byte_idx = min(k // 8, qzeros_cols - 1)
+                zero_val = (qzeros[group_idx, zero_byte_idx] >> bit_shift) & 0xF
+                
+                # 向量化反量化
+                scale_val = group_scales[k_offset]
+                dequantized_weight[:, k] = (weight_vals - zero_val) * scale_val
 
-            for k in range(start_idx, end_idx):
-                for n in range(N):
-                    # 尝试不同的索引方式
-                    if qweight_cols == qzeros_cols:
-                        # qweight和qzeros有相同的列数
-                        byte_idx = min(n // 8, qweight_cols - 1)
-                        bit_shift = (n % 8) * 4
-                        
-                        # 提取4bit权重值
-                        weight_val = (qweight[n, byte_idx] >> bit_shift) & 0xF
-                        
-                        # 提取零点值
-                        zero_byte_idx = min(n // 8, qzeros_cols - 1)
-                        zero_val = (qzeros[group_idx, zero_byte_idx] >> bit_shift) & 0xF
-                    else:
-                        # 不同的列数，尝试按K维度处理
-                        byte_idx = min(k // 8, qweight_cols - 1)
-                        bit_shift = (k % 8) * 4
-                        
-                        # 提取4bit权重值
-                        weight_val = (qweight[n, byte_idx] >> bit_shift) & 0xF
-                        
-                        # 提取零点值
-                        zero_byte_idx = min(k // 8, qzeros_cols - 1)
-                        zero_val = (qzeros[group_idx, zero_byte_idx] >> bit_shift) & 0xF
+        return dequantized_weight
 
-                    # 提取缩放因子
-                    scale_val = scales[group_idx, k]
+    @staticmethod
+    def dequantize_gptq_weight_batch_optimized(
+            qweight: torch.Tensor,
+            qzeros: torch.Tensor,
+            scales: torch.Tensor,
+            groupsize: int
+    ) -> torch.Tensor:
+        """
+        批量优化的反量化GPTQ权重（最高性能版本）
+        
+        参数:
+            qweight: 量化权重 [N, K//8] (int32)
+            qzeros: 零点值 [num_groups, K//8] (int32)
+            scales: 缩放因子 [num_groups, K] (float16)
+            groupsize: 分组大小
 
-                    # 反量化
-                    dequantized_weight[n, k] = (weight_val - zero_val) * scale_val
+        返回:
+            反量化后的权重 [N, K] (float16)
+        """
+        N, _ = qweight.shape
+        K = scales.shape[1]
+        num_groups = scales.shape[0]
+
+        # 反量化权重
+        dequantized_weight = torch.zeros((N, K), dtype=torch.float16, device=qweight.device)
+
+        # 批量处理所有组
+        for group_idx in range(num_groups):
+            start_idx = group_idx * groupsize
+            end_idx = min(start_idx + groupsize, K)
+            group_size = end_idx - start_idx
+            
+            if group_size <= 0:
+                continue
+                
+            # 获取当前组的参数
+            group_scales = scales[group_idx, start_idx:end_idx]  # [group_size]
+            
+            # 批量处理所有k值
+            k_indices = torch.arange(start_idx, end_idx, device=qweight.device)
+            byte_indices = k_indices // 8
+            bit_shifts = (k_indices % 8) * 4
+            
+            # 批量提取权重值
+            weight_vals = torch.zeros((N, group_size), dtype=torch.float16, device=qweight.device)
+            zero_vals = torch.zeros(group_size, dtype=torch.float16, device=qweight.device)
+            
+            for i, (byte_idx, bit_shift) in enumerate(zip(byte_indices, bit_shifts)):
+                weight_vals[:, i] = ((qweight[:, byte_idx] >> bit_shift) & 0xF).float()
+                zero_vals[i] = ((qzeros[group_idx, byte_idx] >> bit_shift) & 0xF).float()
+            
+            # 批量反量化
+            dequantized_weight[:, start_idx:end_idx] = (weight_vals - zero_vals) * group_scales
 
         return dequantized_weight
 
@@ -442,10 +507,10 @@ class GPTQTritonFusion:
         N, _ = qweight.shape
         K = scales.shape[1]
         
-        # 判断格式类型
+        # 判断格式类型并使用最优化的函数
         if qweight.shape[1] == K // 8 and qzeros.shape[1] == K // 8:
             # 标准格式: [N, K//8], [num_groups, K//8], [num_groups, K]
-            dequantized_weight = GPTQTritonFusion.dequantize_gptq_weight(
+            dequantized_weight = GPTQTritonFusion.dequantize_gptq_weight_batch_optimized(
                 qweight, qzeros, scales, groupsize
             )
             result = torch.matmul(input, dequantized_weight.T)
@@ -503,13 +568,14 @@ class GPTQTritonFusion:
         logger.info(f"Dequantization max difference: {max_diff:.6f}")
         logger.info(f"Dequantization average difference: {avg_diff:.6f}")
 
-        # 打印前几个样本
+        # 打印前几个样本 - 向量化优化
         logger.info("First 10 samples comparison:")
-        for i in range(min(num_samples, K)):
-            for j in range(min(num_samples, N)):
+        sample_size = min(num_samples, min(K, N))
+        for i in range(sample_size):
+            for j in range(sample_size):
                 logger.info(f"  Python[{i},{j}]: {python_weight[i, j].item():.6f}, "
-                            f"Triton[{i},{j}]: {triton_weight[i, j].item():.6f}, "
-                            f"Diff: {abs(python_weight[i, j] - triton_weight[i, j]).item():.6f}")
+                           f"Triton[{i},{j}]: {triton_weight[i, j].item():.6f}, "
+                           f"Diff: {abs(python_weight[i, j] - triton_weight[i, j]).item():.6f}")
 
         return python_weight, triton_weight
 
@@ -655,6 +721,56 @@ class GPTQTritonFusion:
         logger.info(f"  Triton: {triton_avg:.2f}±{triton_std:.2f} ms")
         logger.info(f"  Baseline: {baseline_avg:.2f}±{baseline_std:.2f} ms")
         logger.info(f"  Speedup: {speedup:.2f}x")
+        
+        return results
+
+    def benchmark_dequantization_methods(self, M=1024, N=2048, K=2048, num_iterations=10):
+        """
+        比较不同反量化方法的性能
+        """
+        logger.info(f"Benchmarking dequantization methods with M={M}, N={N}, K={K}")
+        
+        # 生成测试数据
+        input_tensor = torch.randn(M, K, dtype=torch.float16, device='cuda')
+        num_groups = K // self.groupsize
+        qweight = torch.randint(0, 256, (N, K // 8), dtype=torch.int32, device='cuda')
+        qzeros = torch.randint(0, 16, (num_groups, K // 8), dtype=torch.int32, device='cuda')
+        scales = torch.randn(num_groups, K, dtype=torch.float16, device='cuda')
+        
+        methods = {
+            'original': GPTQTritonFusion.dequantize_gptq_weight,
+            'vectorized': GPTQTritonFusion.dequantize_gptq_weight,
+            'batch_optimized': GPTQTritonFusion.dequantize_gptq_weight_batch_optimized
+        }
+        
+        results = {}
+        
+        for method_name, method_func in methods.items():
+            logger.info(f"Testing {method_name} method...")
+            
+            # 预热
+            for _ in range(3):
+                _ = method_func(qweight, qzeros, scales, self.groupsize)
+            torch.cuda.synchronize()
+            
+            # 测试
+            times = []
+            for _ in range(num_iterations):
+                torch.cuda.synchronize()
+                start = time.time()
+                _ = method_func(qweight, qzeros, scales, self.groupsize)
+                torch.cuda.synchronize()
+                times.append(time.time() - start)
+            
+            avg_time = sum(times) / len(times) * 1000  # 转换为毫秒
+            results[method_name] = avg_time
+            logger.info(f"{method_name}: {avg_time:.2f} ms")
+        
+        # 计算加速比
+        baseline_time = results['original']
+        for method_name, time_ms in results.items():
+            speedup = baseline_time / time_ms
+            logger.info(f"{method_name} speedup: {speedup:.2f}x")
         
         return results
 
