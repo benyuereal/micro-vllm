@@ -153,13 +153,7 @@ class GPTQCUDAFusion:
             raise RuntimeError("CUDA内核不可用，无法执行")
         
         try:
-            # 使用缓存的groupsize
-            if format_key in self._format_cache:
-                actual_groupsize = self._format_cache[format_key]
-                logger.debug(f"使用缓存的groupsize: {actual_groupsize}")
-            else:
-                actual_groupsize = self.groupsize
-            
+            # 使用检测到的groupsize
             output = self._cuda_kernel.fused_gptq_gemm_4bit_cuda(
                 input, qweight, qzeros, scales, actual_groupsize
             )
