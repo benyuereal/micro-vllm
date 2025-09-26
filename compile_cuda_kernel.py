@@ -18,6 +18,14 @@ def compile_cuda_kernel():
     cuda_version = torch.version.cuda
     print(f"检测到CUDA版本: {cuda_version}")
     
+    # 检查CUDA文件是否存在
+    cuda_file = "core/layer/gptq_cuda_kernel.cu"
+    if not os.path.exists(cuda_file):
+        print(f"❌ CUDA文件不存在: {cuda_file}")
+        return None
+    
+    print(f"✅ CUDA文件存在: {cuda_file}")
+    
     # 编译选项
     extra_cuda_cflags = [
         "-O3",
@@ -28,18 +36,13 @@ def compile_cuda_kernel():
         "-maxrregcount=255"
     ]
     
-    extra_cuda_ldflags = [
-        "-lcublas",
-        "-lcurand"
-    ]
-    
     # 编译内核
     try:
+        print("🔨 开始编译CUDA内核...")
         fused_gptq_gemm = load(
             name="fused_gptq_gemm_cuda",
-            sources=["core/layer/gptq_cuda_kernel.cu"],
+            sources=[cuda_file],
             extra_cuda_cflags=extra_cuda_cflags,
-            extra_cuda_ldflags=extra_cuda_ldflags,
             verbose=True
         )
         print("✅ CUDA C++内核编译成功!")
