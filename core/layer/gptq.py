@@ -484,7 +484,8 @@ class GPTQTritonFusion:
             qzeros: torch.Tensor,
             scales: torch.Tensor,
             groupsize: int,
-            K: int
+            K: int,
+            dtype: torch.dtype = None
     ) -> torch.Tensor:
         """
         通用反量化GPTQ权重（处理自定义格式）- 带K参数版本
@@ -506,8 +507,10 @@ class GPTQTritonFusion:
         
         logger.info(f"Generic dequantization with K: qweight{N}x{qweight_cols}, qzeros{num_groups}x{qzeros_cols}, scales{num_groups}x{scales_cols}, K={K}")
 
-        # 反量化权重
-        dequantized_weight = torch.zeros((N, K), dtype=torch.float16, device=qweight.device)
+        # 反量化权重 - 使用指定的数据类型或scales的数据类型
+        output_dtype = dtype if dtype is not None else scales.dtype
+        logger.info(f"Using output dtype: {output_dtype}")
+        dequantized_weight = torch.zeros((N, K), dtype=output_dtype, device=qweight.device)
 
         # 检查是否是混合格式
         is_mixed_format = (qweight_cols == scales_cols and qweight_cols != K)
@@ -643,7 +646,8 @@ class GPTQTritonFusion:
             qzeros: torch.Tensor,
             scales: torch.Tensor,
             groupsize: int,
-            K: int
+            K: int,
+            dtype: torch.dtype = None
     ) -> torch.Tensor:
         """
         特殊格式反量化GPTQ权重 - scales的第二维是N而不是K
@@ -665,7 +669,10 @@ class GPTQTritonFusion:
         logger.info(f"Special dequantization: qweight{N}x{qweight_cols}, qzeros{num_groups}x{qzeros_cols}, scales{num_groups}x{N}, K={K}")
         logger.info(f"Expected output shape: {N}x{K}")
 
-        dequantized_weight = torch.zeros((N, K), dtype=torch.float16, device=qweight.device)
+        # 使用指定的数据类型或scales的数据类型
+        output_dtype = dtype if dtype is not None else scales.dtype
+        logger.info(f"Using output dtype: {output_dtype}")
+        dequantized_weight = torch.zeros((N, K), dtype=output_dtype, device=qweight.device)
 
         # 使用向量化操作优化
         for group_idx in range(num_groups):
@@ -753,18 +760,18 @@ class GPTQTritonFusion:
         elif qweight.shape[1] == input_K // 8 and qzeros.shape[1] == input_K // 8 and scales.shape[1] == N:
             # 特殊格式: [N, K//8], [num_groups, K//8], [num_groups, N] - scales的第二维是N而不是K
             logger.info("Using special format dequantization (scales second dim = N)")
-            logger.info(f"Calling dequantize_gptq_weight_special with K={input_K}")
+            logger.info(f"Calling dequantize_gptq_weight_special with K={input_K}, dtype={input.dtype}")
             dequantized_weight = GPTQTritonFusion.dequantize_gptq_weight_special(
-                qweight, qzeros, scales, groupsize, input_K
+                qweight, qzeros, scales, groupsize, input_K, input.dtype
             )
             logger.info(f"Special dequantization result shape: {dequantized_weight.shape}")
             result = torch.matmul(input, dequantized_weight.T)
         else:
             # 自定义格式: 尝试通用处理
             logger.warning(f"Using generic dequantization for custom format: input{input_K}x{N}, qweight{qweight.shape}, qzeros{qzeros.shape}, scales{scales.shape}")
-            logger.info(f"Calling dequantize_gptq_weight_generic with input_K={input_K}")
+            logger.info(f"Calling dequantize_gptq_weight_generic with input_K={input_K}, dtype={input.dtype}")
             dequantized_weight = GPTQTritonFusion.dequantize_gptq_weight_generic_with_k(
-                qweight, qzeros, scales, groupsize, input_K
+                qweight, qzeros, scales, groupsize, input_K, input.dtype
             )
             logger.info(f"Generic dequantization result shape: {dequantized_weight.shape}")
             result = torch.matmul(input, dequantized_weight.T)
