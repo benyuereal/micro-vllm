@@ -152,7 +152,7 @@ class InferenceEngine:
             if hasattr(self.model, 'lm_head') and hasattr(self.model.lm_head, 'weight'):
                 if self.model.lm_head.weight.dtype != torch.float16:
                     self.logger.info(f"🔄 转换lm_head权重: {self.model.lm_head.weight.dtype} -> float16")
-                    self.model.lm_head.weight = self.model.lm_head.weight.to(torch.float16)
+                    self.model.lm_head.weight = torch.nn.Parameter(self.model.lm_head.weight.to(torch.float16))
 
         return device, dtype, config["block_size"], config["max_blocks"]
 
