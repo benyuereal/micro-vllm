@@ -513,7 +513,7 @@ class GPTQTritonFusion:
         # 判断格式类型并使用最优化的函数
         if qweight.shape[1] == K // 8 and qzeros.shape[1] == K // 8:
             # 标准格式: [N, K//8], [num_groups, K//8], [num_groups, K]
-            dequantized_weight = GPTQTritonFusion.dequantize_gptq_weight_batch_optimized(
+            dequantized_weight = GPTQTritonFusion.dequantize_gptq_weight(
                 qweight, qzeros, scales, groupsize
             )
             result = torch.matmul(input, dequantized_weight.T)
