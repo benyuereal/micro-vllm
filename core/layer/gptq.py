@@ -128,10 +128,15 @@ class GPTQCUDAFusion:
                 logger.warning(f"qzeros维度不匹配: 期望K//8={K//8}，得到{qzeros.shape[1]}")
                 logger.warning(f"尝试检测实际格式: qzeros{qzeros.shape}, scales{scales.shape}")
                 
-                # 如果scales第二维是K，那么qzeros可能是[num_groups, groupsize//8]格式
+                # 检测scales的格式
                 if scales.shape[1] == K:
+                    # scales[num_groups, K] 格式
                     logger.info("检测到可能的GPTQ格式: qzeros[num_groups, groupsize//8], scales[num_groups, K]")
-                    # 这种情况下，我们需要重新计算groupsize
+                    actual_groupsize = qzeros.shape[1] * 8
+                    logger.info(f"推断的groupsize: {actual_groupsize}")
+                elif scales.shape[1] == N:
+                    # scales[num_groups, N] 格式 - 这是实际推理中的格式
+                    logger.info("检测到实际推理GPTQ格式: qzeros[num_groups, groupsize//8], scales[num_groups, N]")
                     actual_groupsize = qzeros.shape[1] * 8
                     logger.info(f"推断的groupsize: {actual_groupsize}")
                 else:
@@ -141,11 +146,25 @@ class GPTQCUDAFusion:
             if format_key in self._format_cache:
                 self._format_cache[format_key] = (qweight, actual_groupsize)
         
-        if scales.shape[1] != K:
-            raise ValueError(f"scales第二维必须是K={K}，得到{scales.shape[1]}")
+        # 验证scales维度
+        if scales.shape[1] != K and scales.shape[1] != N:
+            raise ValueError(f"scales第二维必须是K={K}或N={N}，得到{scales.shape[1]}")
         
-        # 验证组数
-        num_groups = K // self.groupsize
+        # 根据scales格式确定验证方式
+        if scales.shape[1] == K:
+            # 标准格式: scales[num_groups, K]
+            logger.debug("使用标准scales格式验证")
+        else:
+            # 实际推理格式: scales[num_groups, N]
+            logger.debug("使用实际推理scales格式验证")
+        
+        # 验证组数 - 使用实际的groupsize
+        if format_key in self._format_cache:
+            _, actual_groupsize = self._format_cache[format_key]
+            num_groups = K // actual_groupsize
+        else:
+            num_groups = K // self.groupsize
+        
         if qzeros.shape[0] != num_groups:
             raise ValueError(f"qzeros第一维必须是num_groups={num_groups}，得到{qzeros.shape[0]}")
         
