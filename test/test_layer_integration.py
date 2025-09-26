@@ -217,11 +217,44 @@ def test_layer_integration():
             
             mock_layer = MockLayer()
             
+            # 创建模拟的cache_manager
+            class MockCacheManager:
+                def __init__(self):
+                    # 模拟KV缓存
+                    self.k_caches = {}
+                    self.v_caches = {}
+                    # 为每一层创建模拟缓存
+                    for layer_idx in range(32):  # 假设32层
+                        self.k_caches[layer_idx] = torch.randn(48, 256, 32, 128, dtype=torch.float16, device='cuda')
+                        self.v_caches[layer_idx] = torch.randn(48, 256, 32, 128, dtype=torch.float16, device='cuda')
+                
+                def get(self, layer_idx):
+                    """模拟KVCacheManager的get方法"""
+                    return self.k_caches[layer_idx], self.v_caches[layer_idx]
+                
+                def put(self, seq_id, key, value, layer, slot_map):
+                    """模拟put方法"""
+                    pass
+                
+                def alloc(self, seq_id, n_tokens):
+                    """模拟alloc方法"""
+                    return True, list(range(n_tokens))
+                
+                def append(self, seq_id):
+                    """模拟append方法"""
+                    return 0
+                
+                def free(self, seq_id):
+                    """模拟free方法"""
+                    pass
+            
+            mock_cache_manager = MockCacheManager()
+            
             # 使用process_layer方法
             output, (k, v) = layer.process_layer(
                 layer=mock_layer,
                 hidden_states=hidden_states,
-                cache_manager=None,  # 模拟cache_manager
+                cache_manager=mock_cache_manager,
                 seq_ids=[0],
                 context_lens=[1],
                 layer_idx=0
