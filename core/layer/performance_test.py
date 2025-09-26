@@ -6,9 +6,15 @@ import torch
 import time
 import numpy as np
 import logging
-from .qwen_layer import QwenModelLayerAdapter
-from .optimized_qwen_layer import OptimizedQwenModelLayerAdapter
-from .gptq import GPTQTritonFusion
+import sys
+import os
+
+# 添加项目根目录到Python路径
+sys.path.append(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
+
+from core.layer.qwen_layer import QwenModelLayerAdapter
+from core.layer.optimized_qwen_layer import OptimizedQwenModelLayerAdapter
+from core.layer.gptq import GPTQTritonFusion
 
 # 设置日志
 logging.basicConfig(level=logging.INFO)
