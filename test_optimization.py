@@ -38,8 +38,7 @@ def test_optimization():
     # 测试不同的反量化方法
     methods = {
         'vectorized': fusion.dequantize_gptq_weight,
-        'batch_optimized': fusion.dequantize_gptq_weight_batch_optimized,
-        'ultra_optimized': fusion.dequantize_gptq_weight_ultra_optimized
+        'batch_optimized': fusion.dequantize_gptq_weight_batch_optimized
     }
     
     results = {}
