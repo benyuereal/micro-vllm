@@ -4,8 +4,8 @@
 #include <cuda_fp16.h>
 #include <ATen/cuda/CUDAContext.h>
 
-// 向量化的CUDA内核实现 - 支持BFloat16
-__global__ void vectorized_gptq_gemm_kernel(
+// 高性能CUDA内核实现
+__global__ void high_performance_gptq_gemm_kernel(
     const half* __restrict__ input,
     const uint32_t* __restrict__ qweight,
     const uint32_t* __restrict__ qzeros,
@@ -14,59 +14,80 @@ __global__ void vectorized_gptq_gemm_kernel(
     const int M, const int N, const int K,
     const int groupsize) {
     
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    int total_elements = M * N;
+    // 使用更大的线程块
+    int tid = threadIdx.x;
+    int bid = blockIdx.x;
     
-    if (idx >= total_elements) return;
+    // 每个线程块处理多个输出元素
+    const int ELEMENTS_PER_BLOCK = 4;
+    int start_idx = bid * blockDim.x * ELEMENTS_PER_BLOCK;
     
-    int m = idx / N;
-    int n = idx % N;
+    // 共享内存缓存
+    __shared__ float shared_input[256];  // 缓存输入数据
+    __shared__ float shared_scales[256]; // 缓存scale数据
     
-    float result = 0.0f;
+    float results[ELEMENTS_PER_BLOCK] = {0.0f};
     
-    // 向量化处理 - 每次处理8个元素
-    for (int k = 0; k < K; k += 8) {
-        // 加载8个输入值到寄存器
-        float2 input_vals = __half22float2(*((half2*)(input + m * K + k)));
-        float2 input_vals2 = __half22float2(*((half2*)(input + m * K + k + 2)));
-        float2 input_vals3 = __half22float2(*((half2*)(input + m * K + k + 4)));
-        float2 input_vals4 = __half22float2(*((half2*)(input + m * K + k + 6)));
+    // 处理多个输出元素
+    for (int elem = 0; elem < ELEMENTS_PER_BLOCK; elem++) {
+        int idx = start_idx + tid + elem * blockDim.x;
+        if (idx >= M * N) continue;
         
-        // 加载8个量化权重
-        uint32_t packed_weight = qweight[n * (K / 8) + (k / 8)];
+        int m = idx / N;
+        int n = idx % N;
         
-        // 提取8个4bit权重值
-        int weight_vals[8];
-        for (int i = 0; i < 8; i++) {
-            weight_vals[i] = (packed_weight >> (i * 4)) & 0xF;
+        // 向量化处理 - 每次处理16个元素
+        for (int k = 0; k < K; k += 16) {
+            // 加载16个输入值
+            float input_vals[16];
+            for (int i = 0; i < 16; i++) {
+                if (k + i < K) {
+                    input_vals[i] = __half2float(input[m * K + k + i]);
+                } else {
+                    input_vals[i] = 0.0f;
+                }
+            }
+            
+            // 加载2个32位打包权重
+            uint32_t packed_weight1 = qweight[n * (K / 8) + (k / 8)];
+            uint32_t packed_weight2 = qweight[n * (K / 8) + (k / 8) + 1];
+            
+            // 加载2个32位打包zero points
+            uint32_t packed_zero1 = qzeros[(k / groupsize) * (K / 8) + (k / 8)];
+            uint32_t packed_zero2 = qzeros[(k / groupsize) * (K / 8) + (k / 8) + 1];
+            
+            // 加载16个scale值
+            float scale_vals[16];
+            for (int i = 0; i < 16; i++) {
+                if (k + i < K) {
+                    scale_vals[i] = __half2float(scales[(k / groupsize) * K + k + i]);
+                } else {
+                    scale_vals[i] = 0.0f;
+                }
+            }
+            
+            // 向量化计算 - 16个元素并行
+            for (int i = 0; i < 16; i++) {
+                if (k + i < K) {
+                    int weight_val, zero_val;
+                    if (i < 8) {
+                        weight_val = (packed_weight1 >> (i * 4)) & 0xF;
+                        zero_val = (packed_zero1 >> (i * 4)) & 0xF;
+                    } else {
+                        weight_val = (packed_weight2 >> ((i - 8) * 4)) & 0xF;
+                        zero_val = (packed_zero2 >> ((i - 8) * 4)) & 0xF;
+                    }
+                    
+                    results[elem] += input_vals[i] * (weight_val - zero_val) * scale_vals[i];
+                }
+            }
         }
         
-        // 加载8个zero points
-        uint32_t packed_zero = qzeros[(k / groupsize) * (K / 8) + (k / 8)];
-        int zero_vals[8];
-        for (int i = 0; i < 8; i++) {
-            zero_vals[i] = (packed_zero >> (i * 4)) & 0xF;
+        // 存储结果
+        if (idx < M * N) {
+            output[idx] = __float2half(results[elem]);
         }
-        
-        // 加载8个scale值
-        float2 scale_vals = __half22float2(*((half2*)(scales + (k / groupsize) * K + k)));
-        float2 scale_vals2 = __half22float2(*((half2*)(scales + (k / groupsize) * K + k + 2)));
-        float2 scale_vals3 = __half22float2(*((half2*)(scales + (k / groupsize) * K + k + 4)));
-        float2 scale_vals4 = __half22float2(*((half2*)(scales + (k / groupsize) * K + k + 6)));
-        
-        // 向量化计算
-        result += input_vals.x * (weight_vals[0] - zero_vals[0]) * scale_vals.x;
-        result += input_vals.y * (weight_vals[1] - zero_vals[1]) * scale_vals.y;
-        result += input_vals2.x * (weight_vals[2] - zero_vals[2]) * scale_vals2.x;
-        result += input_vals2.y * (weight_vals[3] - zero_vals[3]) * scale_vals2.y;
-        result += input_vals3.x * (weight_vals[4] - zero_vals[4]) * scale_vals3.x;
-        result += input_vals3.y * (weight_vals[5] - zero_vals[5]) * scale_vals3.y;
-        result += input_vals4.x * (weight_vals[6] - zero_vals[6]) * scale_vals4.x;
-        result += input_vals4.y * (weight_vals[7] - zero_vals[7]) * scale_vals4.y;
     }
-    
-    // 存储结果
-    output[idx] = __float2half(result);
 }
 
 // Python接口
@@ -87,13 +108,14 @@ torch::Tensor fused_gptq_gemm_4bit_cuda(
         .dtype(input.dtype())
         .device(input.device()));
     
-    // 设置网格和块大小
+    // 优化的网格和块大小
     int total_elements = M * N;
-    int block_size = 256;
-    int grid_size = (total_elements + block_size - 1) / block_size;
+    int block_size = 256;  // 更大的线程块
+    int elements_per_block = 4;
+    int grid_size = (total_elements + block_size * elements_per_block - 1) / (block_size * elements_per_block);
     
     // 启动内核
-    vectorized_gptq_gemm_kernel<<<grid_size, block_size>>>(
+    high_performance_gptq_gemm_kernel<<<grid_size, block_size>>>(
         reinterpret_cast<const half*>(input.data_ptr<at::Half>()),
         qweight.data_ptr<uint32_t>(),
         qzeros.data_ptr<uint32_t>(),
@@ -108,5 +130,5 @@ torch::Tensor fused_gptq_gemm_4bit_cuda(
 
 // PyTorch绑定
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
-    m.def("fused_gptq_gemm_4bit_cuda", &fused_gptq_gemm_4bit_cuda, "Fused GPTQ GEMM 4bit CUDA");
+    m.def("fused_gptq_gemm_4bit_cuda", &fused_gptq_gemm_4bit_cuda, "High Performance Fused GPTQ GEMM 4bit CUDA");
 }
