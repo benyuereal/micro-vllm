@@ -47,6 +47,7 @@ def main():
             ("性能优化测试", "test_performance_optimization.py"),
             ("数据类型修复测试", "test_dtype_fix.py"),
             ("GPTQ数据类型修复测试", "test_gptq_dtype_fix.py"),
+            ("方案1+2测试", "test_scheme_1_2.py"),
             ("快速验证测试", "quick_test.py"),
         ]
     

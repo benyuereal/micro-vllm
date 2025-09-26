@@ -35,6 +35,73 @@ class OptimizedQwenModelLayerAdapter:
         self._gptq_fusion = None
         self._is_quantized = None
         self._quant_group_size = self._get_quant_group_size()
+        
+        # 🔧 方案1+2: 初始化时转换数据类型
+        self._converted_layers = set()  # 记录已转换的层
+
+    def _convert_layer_dtypes_to_float16(self, layer, layer_idx: int):
+        """
+        将层的量化参数转换为float16，避免运行时转换
+        """
+        if layer_idx in self._converted_layers:
+            return  # 已经转换过
+        
+        logger.info(f"Layer {layer_idx}: 转换量化参数为float16")
+        
+        # 转换QKV投影参数
+        if hasattr(layer, 'c_attn'):
+            qkv_layer = layer.c_attn
+            if hasattr(qkv_layer, 'scales') and qkv_layer.scales.dtype == torch.bfloat16:
+                logger.debug(f"转换QKV scales: {qkv_layer.scales.shape} {qkv_layer.scales.dtype} -> float16")
+                qkv_layer.scales = qkv_layer.scales.to(torch.float16)
+            
+            if hasattr(qkv_layer, 'qweight') and qkv_layer.qweight.dtype != torch.uint32:
+                logger.debug(f"转换QKV qweight: {qkv_layer.qweight.shape} {qkv_layer.qweight.dtype} -> uint32")
+                qkv_layer.qweight = qkv_layer.qweight.to(torch.uint32)
+            
+            if hasattr(qkv_layer, 'qzeros') and qkv_layer.qzeros.dtype != torch.uint32:
+                logger.debug(f"转换QKV qzeros: {qkv_layer.qzeros.shape} {qkv_layer.qzeros.dtype} -> uint32")
+                qkv_layer.qzeros = qkv_layer.qzeros.to(torch.uint32)
+        
+        # 转换输出投影参数
+        if hasattr(layer, 'c_proj'):
+            proj_layer = layer.c_proj
+            if hasattr(proj_layer, 'scales') and proj_layer.scales.dtype == torch.bfloat16:
+                logger.debug(f"转换输出投影 scales: {proj_layer.scales.shape} {proj_layer.scales.dtype} -> float16")
+                proj_layer.scales = proj_layer.scales.to(torch.float16)
+            
+            if hasattr(proj_layer, 'qweight') and proj_layer.qweight.dtype != torch.uint32:
+                logger.debug(f"转换输出投影 qweight: {proj_layer.qweight.shape} {proj_layer.qweight.dtype} -> uint32")
+                proj_layer.qweight = proj_layer.qweight.to(torch.uint32)
+            
+            if hasattr(proj_layer, 'qzeros') and proj_layer.qzeros.dtype != torch.uint32:
+                logger.debug(f"转换输出投影 qzeros: {proj_layer.qzeros.shape} {proj_layer.qzeros.dtype} -> uint32")
+                proj_layer.qzeros = proj_layer.qzeros.to(torch.uint32)
+        
+        # 转换MLP参数
+        if hasattr(layer, 'mlp'):
+            mlp_layer = layer.mlp
+            if hasattr(mlp_layer, 'gate_proj'):
+                gate_proj = mlp_layer.gate_proj
+                if hasattr(gate_proj, 'scales') and gate_proj.scales.dtype == torch.bfloat16:
+                    logger.debug(f"转换MLP gate_proj scales: {gate_proj.scales.shape} {gate_proj.scales.dtype} -> float16")
+                    gate_proj.scales = gate_proj.scales.to(torch.float16)
+            
+            if hasattr(mlp_layer, 'up_proj'):
+                up_proj = mlp_layer.up_proj
+                if hasattr(up_proj, 'scales') and up_proj.scales.dtype == torch.bfloat16:
+                    logger.debug(f"转换MLP up_proj scales: {up_proj.scales.shape} {up_proj.scales.dtype} -> float16")
+                    up_proj.scales = up_proj.scales.to(torch.float16)
+            
+            if hasattr(mlp_layer, 'down_proj'):
+                down_proj = mlp_layer.down_proj
+                if hasattr(down_proj, 'scales') and down_proj.scales.dtype == torch.bfloat16:
+                    logger.debug(f"转换MLP down_proj scales: {down_proj.scales.shape} {down_proj.scales.dtype} -> float16")
+                    down_proj.scales = down_proj.scales.to(torch.float16)
+        
+        # 标记为已转换
+        self._converted_layers.add(layer_idx)
+        logger.info(f"Layer {layer_idx}: 数据类型转换完成")
 
     def process_layer(self,
                       layer,
@@ -48,6 +115,9 @@ class OptimizedQwenModelLayerAdapter:
         torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
 
         start_time = time.time()
+
+        # 🔧 方案1+2: 首次处理时转换数据类型
+        self._convert_layer_dtypes_to_float16(layer, layer_idx)
 
         # 1. 检测量化状态
         if self._is_quantized is None:
@@ -69,6 +139,11 @@ class OptimizedQwenModelLayerAdapter:
 
         # 3. QKV计算 (优化版本)
         qkv_start = time.time()
+
+        # 🔧 方案1+2: 确保input数据类型为float16
+        if hidden_states.dtype == torch.bfloat16:
+            logger.debug(f"转换hidden_states从{hidden_states.dtype}到float16")
+            hidden_states = hidden_states.to(torch.float16)
 
         if self._is_quantized:
             q, k, v = self._optimized_quantized_qkv_proj(layer, hidden_states, layer_idx)
