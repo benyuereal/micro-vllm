@@ -534,7 +534,7 @@ class GPTQTritonFusion:
             if group_size <= 0:
                 continue
                 
-            # 获取当前组的参数 - scales的第二维是N，所以需要转置
+            # 获取当前组的参数 - scales的第二维是N，每个输出维度对应一个scale
             group_scales = scales[group_idx, :]  # [N] - 每个输出维度对应一个scale
             
             # 向量化处理每个k值
