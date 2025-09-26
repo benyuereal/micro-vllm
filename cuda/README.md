@@ -6,40 +6,23 @@
 
 ```
 cuda/
-├── src/                    # CUDA源码
-│   ├── gptq_cuda_kernel.cu # CUDA内核源码
-│   └── gptq_cuda.py        # CUDA内核Python接口
-├── tests/                  # 测试文件
-│   └── test_cuda_simple.py # CUDA内核测试
-├── scripts/                # 脚本文件
-│   ├── compile_cuda_kernel.py # 编译脚本
-│   ├── test_cuda_all.sh    # 一键测试脚本
-│   └── check_cuda_env.sh   # 环境检查脚本
-├── setup_cuda.py           # CUDA编译配置
-└── README.md               # 本文件
+├── gptq_cuda_kernel.cu        # CUDA内核源码（向量化优化）
+├── gptq_cuda.py               # CUDA内核Python接口
+├── compile.py                 # 编译脚本
+├── test.py                    # 测试脚本
+└── README.md                  # 本文件
 ```
 
 ## 使用方法
 
-### 1. 检查CUDA环境
+### 1. 编译CUDA内核
 ```bash
-cd cuda
-bash scripts/check_cuda_env.sh
+python compile.py
 ```
 
-### 2. 编译CUDA内核
+### 2. 测试CUDA内核
 ```bash
-python scripts/compile_cuda_kernel.py
-```
-
-### 3. 测试CUDA内核
-```bash
-python tests/test_cuda_simple.py
-```
-
-### 4. 一键测试
-```bash
-bash scripts/test_cuda_all.sh
+python test.py
 ```
 
 ## 环境要求
@@ -54,3 +37,10 @@ bash scripts/test_cuda_all.sh
 - QKV投影: < 0.1ms
 - 输出投影: < 0.2ms
 - 总体加速: > 10x vs PyTorch
+
+## 优化特性
+
+- ✅ **向量化运算**: 使用half2向量化处理
+- ✅ **内存优化**: 减少内存访问次数
+- ✅ **寄存器优化**: 高效使用GPU寄存器
+- ✅ **简化结构**: 扁平化目录结构
