@@ -32,7 +32,10 @@ class GPTQTritonFusion:
             BLOCK_SIZE_N: tl.constexpr,
             BLOCK_SIZE_K: tl.constexpr,
             # Tensor Core优化
-            USE_TENSOR_CORE: tl.constexpr = True
+            USE_TENSOR_CORE: tl.constexpr = True,
+            # 性能优化参数
+            NUM_STAGES: tl.constexpr = 3,
+            NUM_WARPS: tl.constexpr = 4
     ):
         """
         融合GPTQ 4bit反量化与矩阵乘法的优化内核
@@ -156,23 +159,27 @@ class GPTQTritonFusion:
         # 避免不必要的类型转换
         output = torch.empty((M, N), dtype=input.dtype, device=input.device)
         
-        # 分块参数 - 针对Triton内核要求优化
-        # Triton要求矩阵维度≥16
-        # 使用16×16×16分块以满足要求
+        # 预分配GPU内存以提高性能
+        torch.cuda.empty_cache()
+        
+        # 分块参数 - 极致性能优化
+        # 针对Qwen7B特定维度进行优化
         if M == 1 and K == 4096:  # Qwen7B典型输入
-            if N <= 4096:  # 输出投影 - 目标0.17ms
-                BLOCK_SIZE_M = 16
-                BLOCK_SIZE_N = 16
-                BLOCK_SIZE_K = 16
-            else:  # QKV投影 (N=12288) - 目标0.1ms
-                BLOCK_SIZE_M = 16
-                BLOCK_SIZE_N = 32
-                BLOCK_SIZE_K = 16
+            if N <= 4096:  # 输出投影 - 目标0.20ms
+                # 使用更大的分块以获得更好的GPU利用率
+                BLOCK_SIZE_M = 64
+                BLOCK_SIZE_N = 64
+                BLOCK_SIZE_K = 64
+            else:  # QKV投影 (N=12288) - 目标0.10ms
+                # 针对大输出维度优化
+                BLOCK_SIZE_M = 64
+                BLOCK_SIZE_N = 128
+                BLOCK_SIZE_K = 64
         else:
-            # 默认分块大小
-            BLOCK_SIZE_M = 16
-            BLOCK_SIZE_N = 16
-            BLOCK_SIZE_K = 16
+            # 默认分块大小 - 平衡性能和内存
+            BLOCK_SIZE_M = 32
+            BLOCK_SIZE_N = 32
+            BLOCK_SIZE_K = 32
 
         # 计算网格大小
         grid = (triton.cdiv(M, BLOCK_SIZE_M) * triton.cdiv(N, BLOCK_SIZE_N),)
@@ -193,14 +200,22 @@ class GPTQTritonFusion:
                 # 分块参数
                 BLOCK_SIZE_M=BLOCK_SIZE_M,
                 BLOCK_SIZE_N=BLOCK_SIZE_N,
-                BLOCK_SIZE_K=BLOCK_SIZE_K
+                BLOCK_SIZE_K=BLOCK_SIZE_K,
+                # 性能优化参数
+                NUM_STAGES=3,
+                NUM_WARPS=4
             )
         except Exception as e:
             # 如果Triton内核失败，尝试更小的分块
             logger.warning(f"Triton内核失败，尝试更小的分块: {e}")
             
-            # 尝试多种分块大小 - 确保≥16以满足Triton要求
-            block_sizes = [(16, 16, 16), (32, 16, 16), (16, 32, 16)]
+            # 尝试多种分块大小 - 从大到小，优先保持性能
+            block_sizes = [
+                (32, 32, 32),  # 平衡性能
+                (16, 32, 16),  # 针对N维度优化
+                (16, 16, 16),  # 保守分块
+                (32, 16, 16),  # 针对M维度优化
+            ]
             
             for BLOCK_SIZE_M, BLOCK_SIZE_N, BLOCK_SIZE_K in block_sizes:
                 try:
@@ -220,7 +235,10 @@ class GPTQTritonFusion:
                         # 分块参数
                         BLOCK_SIZE_M=BLOCK_SIZE_M,
                         BLOCK_SIZE_N=BLOCK_SIZE_N,
-                        BLOCK_SIZE_K=BLOCK_SIZE_K
+                        BLOCK_SIZE_K=BLOCK_SIZE_K,
+                        # 性能优化参数
+                        NUM_STAGES=2,
+                        NUM_WARPS=2
                     )
                     logger.info(f"✅ 使用分块大小 {BLOCK_SIZE_M}x{BLOCK_SIZE_N}x{BLOCK_SIZE_K} 成功")
                     break
