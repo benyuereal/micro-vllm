@@ -179,26 +179,30 @@ class GPTQTritonFusion:
                 # 可能是 [num_groups, qweight_cols] 格式
                 logger.warning(f"Detected qzeros matching qweight format: qzeros shape {qzeros.shape}, qweight shape {qweight.shape}")
             else:
-                # 尝试计算实际的输出维度
-                actual_N = qzeros.shape[1] * 8
-                if actual_N > 0:
-                    logger.warning(f"Detected custom GPTQ format: qzeros shape {qzeros.shape}, inferred N={actual_N}")
-                    # 更新N的值
-                    N = actual_N
+                # 对于自定义格式，不修改N的值，让后续的通用处理来处理
+                logger.warning(f"Detected custom GPTQ format: qzeros shape {qzeros.shape}, qweight shape {qweight.shape}")
+                # 不修改N，保持原始值
+        
+        # 检测是否为自定义格式
+        is_custom_format = (qzeros.shape[1] != K // 8 and qzeros.shape[1] != N // 8 and qzeros.shape[1] != qweight.shape[1])
+        
+        if not is_custom_format:
+            # 标准格式验证
+            if qweight.shape[0] != N:
+                raise ValueError(f"qweight first dimension ({qweight.shape[0]}) must equal N ({N})")
+            
+            # 更灵活的qweight验证
+            expected_qweight_cols = K // 8
+            if qweight.shape[1] != expected_qweight_cols:
+                if qweight.shape[1] == N // 8:
+                    # 可能是 [N, N//8] 格式
+                    logger.warning(f"Detected alternative GPTQ format: qweight shape {qweight.shape}, expected {expected_qweight_cols}")
                 else:
-                    raise ValueError(f"qzeros second dimension ({qzeros.shape[1]}) must equal K//8 ({expected_qzeros_cols}), N//8 ({N//8}), or qweight.shape[1] ({qweight.shape[1]})")
-        
-        if qweight.shape[0] != N:
-            raise ValueError(f"qweight first dimension ({qweight.shape[0]}) must equal N ({N})")
-        
-        # 更灵活的qweight验证
-        expected_qweight_cols = K // 8
-        if qweight.shape[1] != expected_qweight_cols:
-            if qweight.shape[1] == N // 8:
-                # 可能是 [N, N//8] 格式
-                logger.warning(f"Detected alternative GPTQ format: qweight shape {qweight.shape}, expected {expected_qweight_cols}")
-            else:
-                raise ValueError(f"qweight second dimension ({qweight.shape[1]}) must equal K//8 ({expected_qweight_cols}) or N//8 ({N//8})")
+                    raise ValueError(f"qweight second dimension ({qweight.shape[1]}) must equal K//8 ({expected_qweight_cols}) or N//8 ({N//8})")
+        else:
+            # 自定义格式，使用qweight的实际维度作为N
+            N = qweight.shape[0]
+            logger.info(f"Using custom format: N={N} from qweight.shape[0]")
         
         if scales.shape[1] != K:
             raise ValueError(f"scales second dimension ({scales.shape[1]}) must equal K ({K})")
@@ -206,10 +210,10 @@ class GPTQTritonFusion:
         if K % 8 != 0:
             raise ValueError(f"K ({K}) must be divisible by 8 for 4-bit quantization")
 
-        # 检测实际的GPTQ格式
+        # 检测实际的GPTQ格式（使用更新后的N值）
         is_standard_format = (qweight.shape[1] == K // 8) and (qzeros.shape[1] == K // 8)
         is_alternative_format = (qweight.shape[1] == N // 8) and (qzeros.shape[1] == N // 8)
-        is_custom_format = (qzeros.shape[1] == qweight.shape[1]) or (qzeros.shape[1] != K // 8 and qzeros.shape[1] != N // 8)
+        is_custom_format = (qzeros.shape[1] != K // 8 and qzeros.shape[1] != N // 8 and qzeros.shape[1] != qweight.shape[1])
         
         if not is_standard_format:
             if is_alternative_format:
