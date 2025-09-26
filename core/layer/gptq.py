@@ -531,7 +531,7 @@ class GPTQTritonFusion:
             # 重新分配输出张量 [output_dim, input_dim]
             dequantized_weight = torch.zeros((output_dim, input_dim), dtype=output_dtype, device=qweight.device)
             
-            # 处理每个组 (按output_dim分组)
+            # 向量化处理每个组 (按output_dim分组)
             for group_idx in range(num_groups):
                 start_idx = group_idx * groupsize
                 end_idx = min(start_idx + groupsize, output_dim)
@@ -543,27 +543,26 @@ class GPTQTritonFusion:
                 # 获取当前组的参数
                 group_scales = scales[group_idx, start_idx:end_idx]  # [group_size]
                 
-                # 处理每个output维度
+                # 向量化处理每个output维度
                 for out_offset in range(group_size):
                     out_idx = start_idx + out_offset
                     
-                    # 处理每个input维度
-                    for in_idx in range(input_dim):
-                        # 计算在qweight中的索引
-                        in_compressed = in_idx // 8  # 压缩的输入索引
-                        bit_shift = (in_idx % 8) * 4
-                        
-                        # 提取4bit权重值
-                        weight_val = (qweight[in_compressed, out_idx] >> bit_shift) & 0xF
-                        
-                        # 提取零点值
-                        zero_byte_idx = min(out_idx // 8, qzeros_cols - 1)
-                        zero_bit_shift = (out_idx % 8) * 4
-                        zero_val = (qzeros[group_idx, zero_byte_idx] >> zero_bit_shift) & 0xF
-                        
-                        # 向量化反量化
-                        scale_val = group_scales[out_offset]
-                        dequantized_weight[out_idx, in_idx] = (weight_val - zero_val) * scale_val
+                    # 向量化处理所有input维度
+                    # 计算压缩的input索引
+                    in_compressed_indices = torch.arange(input_dim, device=qweight.device) // 8
+                    bit_shifts = (torch.arange(input_dim, device=qweight.device) % 8) * 4
+                    
+                    # 向量化提取4bit权重值
+                    weight_vals = (qweight[in_compressed_indices, out_idx] >> bit_shifts) & 0xF
+                    
+                    # 提取零点值
+                    zero_byte_idx = min(out_idx // 8, qzeros_cols - 1)
+                    zero_bit_shift = (out_idx % 8) * 4
+                    zero_val = (qzeros[group_idx, zero_byte_idx] >> zero_bit_shift) & 0xF
+                    
+                    # 向量化反量化
+                    scale_val = group_scales[out_offset]
+                    dequantized_weight[out_idx, :] = (weight_vals - zero_val) * scale_val
             
             logger.info(f"Qwen7B special dequantization result shape: {dequantized_weight.shape}")
             return dequantized_weight
