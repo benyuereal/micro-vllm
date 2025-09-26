@@ -55,7 +55,7 @@ class OptimizedQwenModelLayerAdapter:
             
             if hasattr(qkv_layer, 'scales'):
                 logger.info(f"  scales: {qkv_layer.scales.shape}, dtype: {qkv_layer.scales.dtype}")
-                if qkv_layer.scales.dtype == torch.bfloat16:
+                if qkv_layer.scales.dtype != torch.float16:
                     logger.info(f"🔄 转换QKV scales: {qkv_layer.scales.dtype} -> float16")
                     qkv_layer.scales = qkv_layer.scales.to(torch.float16)
                     logger.info(f"✅ QKV scales转换后: {qkv_layer.scales.dtype}")
@@ -83,38 +83,129 @@ class OptimizedQwenModelLayerAdapter:
         # 转换输出投影参数
         if hasattr(layer, 'c_proj'):
             proj_layer = layer.c_proj
-            if hasattr(proj_layer, 'scales') and proj_layer.scales.dtype == torch.bfloat16:
-                logger.debug(f"转换输出投影 scales: {proj_layer.scales.shape} {proj_layer.scales.dtype} -> float16")
-                proj_layer.scales = proj_layer.scales.to(torch.float16)
+            logger.info(f"🔍 输出投影层参数检查:")
             
-            if hasattr(proj_layer, 'qweight') and proj_layer.qweight.dtype != torch.uint32:
-                logger.debug(f"转换输出投影 qweight: {proj_layer.qweight.shape} {proj_layer.qweight.dtype} -> uint32")
-                proj_layer.qweight = proj_layer.qweight.to(torch.uint32)
+            if hasattr(proj_layer, 'scales'):
+                logger.info(f"  scales: {proj_layer.scales.shape}, dtype: {proj_layer.scales.dtype}")
+                if proj_layer.scales.dtype != torch.float16:
+                    logger.info(f"🔄 转换输出投影 scales: {proj_layer.scales.dtype} -> float16")
+                    proj_layer.scales = proj_layer.scales.to(torch.float16)
+                    logger.info(f"✅ 输出投影 scales转换后: {proj_layer.scales.dtype}")
+                else:
+                    logger.info(f"✅ 输出投影 scales已经是正确类型: {proj_layer.scales.dtype}")
             
-            if hasattr(proj_layer, 'qzeros') and proj_layer.qzeros.dtype != torch.uint32:
-                logger.debug(f"转换输出投影 qzeros: {proj_layer.qzeros.shape} {proj_layer.qzeros.dtype} -> uint32")
-                proj_layer.qzeros = proj_layer.qzeros.to(torch.uint32)
+            if hasattr(proj_layer, 'qweight'):
+                logger.info(f"  qweight: {proj_layer.qweight.shape}, dtype: {proj_layer.qweight.dtype}")
+                if proj_layer.qweight.dtype != torch.uint32:
+                    logger.info(f"🔄 转换输出投影 qweight: {proj_layer.qweight.dtype} -> uint32")
+                    proj_layer.qweight = proj_layer.qweight.to(torch.uint32)
+                    logger.info(f"✅ 输出投影 qweight转换后: {proj_layer.qweight.dtype}")
+                else:
+                    logger.info(f"✅ 输出投影 qweight已经是正确类型: {proj_layer.qweight.dtype}")
+            
+            if hasattr(proj_layer, 'qzeros'):
+                logger.info(f"  qzeros: {proj_layer.qzeros.shape}, dtype: {proj_layer.qzeros.dtype}")
+                if proj_layer.qzeros.dtype != torch.uint32:
+                    logger.info(f"🔄 转换输出投影 qzeros: {proj_layer.qzeros.dtype} -> uint32")
+                    proj_layer.qzeros = proj_layer.qzeros.to(torch.uint32)
+                    logger.info(f"✅ 输出投影 qzeros转换后: {proj_layer.qzeros.dtype}")
+                else:
+                    logger.info(f"✅ 输出投影 qzeros已经是正确类型: {proj_layer.qzeros.dtype}")
         
         # 转换MLP参数
         if hasattr(layer, 'mlp'):
             mlp_layer = layer.mlp
+            logger.info(f"🔍 MLP层参数检查:")
+            
+            # 转换gate_proj
             if hasattr(mlp_layer, 'gate_proj'):
                 gate_proj = mlp_layer.gate_proj
-                if hasattr(gate_proj, 'scales') and gate_proj.scales.dtype == torch.bfloat16:
-                    logger.debug(f"转换MLP gate_proj scales: {gate_proj.scales.shape} {gate_proj.scales.dtype} -> float16")
-                    gate_proj.scales = gate_proj.scales.to(torch.float16)
+                if hasattr(gate_proj, 'scales'):
+                    logger.info(f"  gate_proj scales: {gate_proj.scales.shape}, dtype: {gate_proj.scales.dtype}")
+                    if gate_proj.scales.dtype != torch.float16:
+                        logger.info(f"🔄 转换MLP gate_proj scales: {gate_proj.scales.dtype} -> float16")
+                        gate_proj.scales = gate_proj.scales.to(torch.float16)
+                        logger.info(f"✅ MLP gate_proj scales转换后: {gate_proj.scales.dtype}")
+                    else:
+                        logger.info(f"✅ MLP gate_proj scales已经是正确类型: {gate_proj.scales.dtype}")
+                
+                if hasattr(gate_proj, 'qweight'):
+                    logger.info(f"  gate_proj qweight: {gate_proj.qweight.shape}, dtype: {gate_proj.qweight.dtype}")
+                    if gate_proj.qweight.dtype != torch.uint32:
+                        logger.info(f"🔄 转换MLP gate_proj qweight: {gate_proj.qweight.dtype} -> uint32")
+                        gate_proj.qweight = gate_proj.qweight.to(torch.uint32)
+                        logger.info(f"✅ MLP gate_proj qweight转换后: {gate_proj.qweight.dtype}")
+                    else:
+                        logger.info(f"✅ MLP gate_proj qweight已经是正确类型: {gate_proj.qweight.dtype}")
+                
+                if hasattr(gate_proj, 'qzeros'):
+                    logger.info(f"  gate_proj qzeros: {gate_proj.qzeros.shape}, dtype: {gate_proj.qzeros.dtype}")
+                    if gate_proj.qzeros.dtype != torch.uint32:
+                        logger.info(f"🔄 转换MLP gate_proj qzeros: {gate_proj.qzeros.dtype} -> uint32")
+                        gate_proj.qzeros = gate_proj.qzeros.to(torch.uint32)
+                        logger.info(f"✅ MLP gate_proj qzeros转换后: {gate_proj.qzeros.dtype}")
+                    else:
+                        logger.info(f"✅ MLP gate_proj qzeros已经是正确类型: {gate_proj.qzeros.dtype}")
             
+            # 转换up_proj
             if hasattr(mlp_layer, 'up_proj'):
                 up_proj = mlp_layer.up_proj
-                if hasattr(up_proj, 'scales') and up_proj.scales.dtype == torch.bfloat16:
-                    logger.debug(f"转换MLP up_proj scales: {up_proj.scales.shape} {up_proj.scales.dtype} -> float16")
-                    up_proj.scales = up_proj.scales.to(torch.float16)
+                if hasattr(up_proj, 'scales'):
+                    logger.info(f"  up_proj scales: {up_proj.scales.shape}, dtype: {up_proj.scales.dtype}")
+                    if up_proj.scales.dtype != torch.float16:
+                        logger.info(f"🔄 转换MLP up_proj scales: {up_proj.scales.dtype} -> float16")
+                        up_proj.scales = up_proj.scales.to(torch.float16)
+                        logger.info(f"✅ MLP up_proj scales转换后: {up_proj.scales.dtype}")
+                    else:
+                        logger.info(f"✅ MLP up_proj scales已经是正确类型: {up_proj.scales.dtype}")
+                
+                if hasattr(up_proj, 'qweight'):
+                    logger.info(f"  up_proj qweight: {up_proj.qweight.shape}, dtype: {up_proj.qweight.dtype}")
+                    if up_proj.qweight.dtype != torch.uint32:
+                        logger.info(f"🔄 转换MLP up_proj qweight: {up_proj.qweight.dtype} -> uint32")
+                        up_proj.qweight = up_proj.qweight.to(torch.uint32)
+                        logger.info(f"✅ MLP up_proj qweight转换后: {up_proj.qweight.dtype}")
+                    else:
+                        logger.info(f"✅ MLP up_proj qweight已经是正确类型: {up_proj.qweight.dtype}")
+                
+                if hasattr(up_proj, 'qzeros'):
+                    logger.info(f"  up_proj qzeros: {up_proj.qzeros.shape}, dtype: {up_proj.qzeros.dtype}")
+                    if up_proj.qzeros.dtype != torch.uint32:
+                        logger.info(f"🔄 转换MLP up_proj qzeros: {up_proj.qzeros.dtype} -> uint32")
+                        up_proj.qzeros = up_proj.qzeros.to(torch.uint32)
+                        logger.info(f"✅ MLP up_proj qzeros转换后: {up_proj.qzeros.dtype}")
+                    else:
+                        logger.info(f"✅ MLP up_proj qzeros已经是正确类型: {up_proj.qzeros.dtype}")
             
+            # 转换down_proj
             if hasattr(mlp_layer, 'down_proj'):
                 down_proj = mlp_layer.down_proj
-                if hasattr(down_proj, 'scales') and down_proj.scales.dtype == torch.bfloat16:
-                    logger.debug(f"转换MLP down_proj scales: {down_proj.scales.shape} {down_proj.scales.dtype} -> float16")
-                    down_proj.scales = down_proj.scales.to(torch.float16)
+                if hasattr(down_proj, 'scales'):
+                    logger.info(f"  down_proj scales: {down_proj.scales.shape}, dtype: {down_proj.scales.dtype}")
+                    if down_proj.scales.dtype != torch.float16:
+                        logger.info(f"🔄 转换MLP down_proj scales: {down_proj.scales.dtype} -> float16")
+                        down_proj.scales = down_proj.scales.to(torch.float16)
+                        logger.info(f"✅ MLP down_proj scales转换后: {down_proj.scales.dtype}")
+                    else:
+                        logger.info(f"✅ MLP down_proj scales已经是正确类型: {down_proj.scales.dtype}")
+                
+                if hasattr(down_proj, 'qweight'):
+                    logger.info(f"  down_proj qweight: {down_proj.qweight.shape}, dtype: {down_proj.qweight.dtype}")
+                    if down_proj.qweight.dtype != torch.uint32:
+                        logger.info(f"🔄 转换MLP down_proj qweight: {down_proj.qweight.dtype} -> uint32")
+                        down_proj.qweight = down_proj.qweight.to(torch.uint32)
+                        logger.info(f"✅ MLP down_proj qweight转换后: {down_proj.qweight.dtype}")
+                    else:
+                        logger.info(f"✅ MLP down_proj qweight已经是正确类型: {down_proj.qweight.dtype}")
+                
+                if hasattr(down_proj, 'qzeros'):
+                    logger.info(f"  down_proj qzeros: {down_proj.qzeros.shape}, dtype: {down_proj.qzeros.dtype}")
+                    if down_proj.qzeros.dtype != torch.uint32:
+                        logger.info(f"🔄 转换MLP down_proj qzeros: {down_proj.qzeros.dtype} -> uint32")
+                        down_proj.qzeros = down_proj.qzeros.to(torch.uint32)
+                        logger.info(f"✅ MLP down_proj qzeros转换后: {down_proj.qzeros.dtype}")
+                    else:
+                        logger.info(f"✅ MLP down_proj qzeros已经是正确类型: {down_proj.qzeros.dtype}")
         
         # 标记为已转换
         self._converted_layers.add(layer_idx)
