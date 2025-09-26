@@ -47,7 +47,7 @@ class PrecomputedRotaryEmbedding(nn.Module):
         self.max_position = max_position
 
         # 预先计算所有位置的旋转矩阵
-        inv_freq = 1.0 / (base ** (torch.arange(0, dim, 2, device=self.device).to(torch.bfloat16) / dim))
+        inv_freq = 1.0 / (base ** (torch.arange(0, dim, 2, device=self.device).to(torch.float16) / dim))
         t = torch.arange(max_position, device=self.device, dtype=inv_freq.dtype)
         freqs = torch.einsum("i,j->ij", t, inv_freq)
         emb = torch.cat((freqs, freqs), dim=-1)
@@ -265,33 +265,6 @@ class PagedAttention(nn.Module):
         logger.info(f"  v_new: {v_new.shape}, dtype: {v_new.dtype}")
         logger.info(f"  rotary_cos: {rotary_cos.shape}, dtype: {rotary_cos.dtype}")
         logger.info(f"  rotary_sin: {rotary_sin.shape}, dtype: {rotary_sin.dtype}")
-        
-        # 🔧 转换所有参数为float16
-        if k_cache.dtype != torch.float16:
-            logger.info(f"🔄 转换k_cache: {k_cache.dtype} -> float16")
-            k_cache = k_cache.to(torch.float16)
-        
-        if v_cache.dtype != torch.float16:
-            logger.info(f"🔄 转换v_cache: {v_cache.dtype} -> float16")
-            v_cache = v_cache.to(torch.float16)
-        
-        if rotary_cos.dtype != torch.float16:
-            logger.info(f"🔄 转换rotary_cos: {rotary_cos.dtype} -> float16")
-            rotary_cos = rotary_cos.to(torch.float16)
-        
-        if rotary_sin.dtype != torch.float16:
-            logger.info(f"🔄 转换rotary_sin: {rotary_sin.dtype} -> float16")
-            rotary_sin = rotary_sin.to(torch.float16)
-        
-        # 检查数据类型一致性
-        if query.dtype != k_cache.dtype:
-            logger.error(f"❌ query和k_cache数据类型不一致: {query.dtype} vs {k_cache.dtype}")
-        if query.dtype != v_cache.dtype:
-            logger.error(f"❌ query和v_cache数据类型不一致: {query.dtype} vs {v_cache.dtype}")
-        if query.dtype != k_new.dtype:
-            logger.error(f"❌ query和k_new数据类型不一致: {query.dtype} vs {k_new.dtype}")
-        if query.dtype != v_new.dtype:
-            logger.error(f"❌ query和v_new数据类型不一致: {query.dtype} vs {v_new.dtype}")
         
         with torch.cuda.amp.autocast(enabled=False):  # 确保精度
             output = flash_attn_with_kvcache(

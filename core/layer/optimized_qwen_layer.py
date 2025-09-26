@@ -249,13 +249,9 @@ class OptimizedQwenModelLayerAdapter:
         qkv_start = time.time()
 
         # 🔧 方案1+2: 确保input数据类型为float16
-        logger.info(f"🔍 hidden_states类型检查: {hidden_states.shape}, dtype: {hidden_states.dtype}")
         if hidden_states.dtype == torch.bfloat16:
-            logger.info(f"🔄 转换hidden_states从{hidden_states.dtype}到float16")
+            logger.debug(f"转换hidden_states从{hidden_states.dtype}到float16")
             hidden_states = hidden_states.to(torch.float16)
-            logger.info(f"✅ hidden_states转换后: {hidden_states.dtype}")
-        else:
-            logger.info(f"✅ hidden_states已经是正确类型: {hidden_states.dtype}")
 
         if self._is_quantized:
             q, k, v = self._optimized_quantized_qkv_proj(layer, hidden_states, layer_idx)
@@ -356,11 +352,6 @@ class OptimizedQwenModelLayerAdapter:
         # 重塑输出为 [B*S, output_dim]
         result = result.view(batch_size, seq_len, -1)
         
-        # 🔧 确保输出数据类型为float16
-        if result.dtype != torch.float16:
-            logger.info(f"🔄 转换QKV输出: {result.dtype} -> float16")
-            result = result.to(torch.float16)
-        
         # 分割QKV
         output_dim = result.shape[-1]
         if output_dim % 3 != 0:
@@ -370,18 +361,10 @@ class OptimizedQwenModelLayerAdapter:
         hidden_size = output_dim // 3
         q, k, v = result.split(hidden_size, dim=-1)
         
-        # 🔧 确保q, k, v都是float16
-        q = q.to(torch.float16)
-        k = k.to(torch.float16)
-        v = v.to(torch.float16)
-        
         # 重塑为 [B, H, S, D]
         q = q.view(batch_size, seq_len, self.num_heads, self.head_size).permute(0, 2, 1, 3)
         k = k.view(batch_size, seq_len, self.kv_num_heads, self.head_size).permute(0, 2, 1, 3)
         v = v.view(batch_size, seq_len, self.kv_num_heads, self.head_size).permute(0, 2, 1, 3)
-        
-        # 🔧 最终检查数据类型
-        logger.info(f"🔍 QKV输出类型检查: q={q.dtype}, k={k.dtype}, v={v.dtype}")
         
         return q, k, v
 
