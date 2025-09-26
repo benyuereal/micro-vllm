@@ -11,8 +11,8 @@ import logging
 # 添加项目根目录到Python路径
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-# 设置日志
-logging.basicConfig(level=logging.INFO)
+# 设置日志级别为WARNING以减少输出
+logging.basicConfig(level=logging.WARNING)
 logger = logging.getLogger(__name__)
 
 from core.layer.gptq import GPTQTritonFusion

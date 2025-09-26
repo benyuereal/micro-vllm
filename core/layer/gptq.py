@@ -150,13 +150,13 @@ class GPTQTritonFusion:
         if num_groups != K // self.groupsize:
             raise ValueError(f"分组数量 ({num_groups}) 必须等于 K//groupsize ({K // self.groupsize})")
         
-        # 分配输出矩阵
-        output = torch.empty((M, N), dtype=torch.float32, device=input.device)
+        # 分配输出矩阵 - 使用更高效的内存分配
+        output = torch.empty((M, N), dtype=input.dtype, device=input.device)
         
-        # 分块参数 - 优化为更大的块以提高性能
-        BLOCK_SIZE_M = 128
-        BLOCK_SIZE_N = 128
-        BLOCK_SIZE_K = 128
+        # 分块参数 - 更激进的分块以提高性能
+        BLOCK_SIZE_M = 256
+        BLOCK_SIZE_N = 256
+        BLOCK_SIZE_K = 256
         
         # 计算网格大小
         grid = (triton.cdiv(M, BLOCK_SIZE_M) * triton.cdiv(N, BLOCK_SIZE_N),)
@@ -179,9 +179,9 @@ class GPTQTritonFusion:
             BLOCK_SIZE_K=BLOCK_SIZE_K
         )
         
-        # 转换输出数据类型以匹配输入
-        if output.dtype != input.dtype:
-            output = output.to(input.dtype)
+        # 转换输出数据类型以匹配输入 - 优化：直接使用输入类型
+        # if output.dtype != input.dtype:
+        #     output = output.to(input.dtype)
         
         # logger.info(f"Triton融合内核完成: 输出形状 {output.shape}")
         return output
