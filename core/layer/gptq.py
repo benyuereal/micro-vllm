@@ -1,41 +1,16 @@
+# File: gptq.py
+import torch
 import triton
 import triton.language as tl
-import torch
-import torch.nn as nn
-import time
 import logging
-from typing import Tuple, Optional
-import numpy as np
 
-# 设置日志记录
-logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-
-# 将反量化函数移到模块级别，使其成为全局函数
-@triton.jit
-def dequantize_gptq_4bit(qweight, zeros, scales, offs_k, offs_n):
-    """反量化GPTQ 4bit权重"""
-    # 计算每个元素在32位整数中的位置
-    elem_per_int = 8
-    k_idx = offs_k[:, None] % elem_per_int
-    n_idx = offs_n[None, :]
-
-    # 提取4bit值 (GPTQ格式) - 使用输入维度的bit位置
-    shift = k_idx * 4
-    weight_val = (qweight >> shift) & 0xF
-
-    # 提取对应的零点值 (GPTQ格式) - 使用输入维度的bit位置
-    zero_shift = k_idx * 4
-    zero_val = (zeros >> zero_shift) & 0xF
-
-    # GPTQ反量化公式: (weight_val - zero_val) * scale
-    dequantized = (weight_val - zero_val) * scales
-    return dequantized
-
-
 class GPTQTritonFusion:
-    """GPTQ 4bit量化Triton融合内核测试类"""
+    """
+    GPTQ Triton融合内核实现
+    专注于高性能推理加速
+    """
 
     def __init__(self, groupsize=128):
         self.groupsize = groupsize
@@ -99,23 +74,27 @@ class GPTQTritonFusion:
             scales = tl.load(scale_ptrs, mask=(k_offs + offs_k[:, None]) < K, other=0.0)
             zeros = tl.load(zero_ptrs, mask=(k_offs + offs_k[:, None]) < K, other=0)
 
-            # 反量化4bit权重 (GPTQ格式) - 正确的实现
-            # 计算每个元素在32位整数中的位置
+            # 反量化4bit权重 (GPTQ格式)
             elem_per_int = 8
-            # 注意：这里应该使用输入维度的bit位置，因为权重是按K维度打包的
             k_idx = (k_offs + offs_k[:, None]) % elem_per_int
             
-            # 提取4bit值 (GPTQ格式) - 使用输入维度的bit位置
+            # 提取4bit值
             weight_shift = k_idx * 4
             weight_val = (qweight >> weight_shift) & 0xF
             
-            # 提取对应的零点值 (GPTQ格式) - 使用输入维度的bit位置
+            # 提取对应的零点值
             zero_shift = k_idx * 4
             zero_val = (zeros >> zero_shift) & 0xF
             
             # GPTQ反量化公式: (weight_val - zero_val) * scale
+            # 确保数据类型匹配
+            weight_val = weight_val.to(tl.float32)
+            zero_val = zero_val.to(tl.float32)
+            scales = scales.to(tl.float32)
+            a = a.to(tl.float32)
+            
             weight = (weight_val - zero_val) * scales
-
+            
             # 矩阵乘法累加
             accumulator += tl.dot(a, weight)
 
@@ -123,820 +102,94 @@ class GPTQTritonFusion:
         c_ptrs = c_ptr + (offs_m[:, None] * c_row_stride +
                           offs_n[None, :] * c_col_stride)
         c_mask = (offs_m[:, None] < M) & (offs_n[None, :] < N)
-        tl.store(c_ptrs, accumulator.to(c_ptr.dtype.element_ty), mask=c_mask)
+        tl.store(c_ptrs, accumulator, mask=c_mask)
 
     def fused_gptq_gemm_4bit(
             self,
             input: torch.Tensor,
             qweight: torch.Tensor,
             qzeros: torch.Tensor,
-            scales: torch.Tensor,
-            block_size_m: int = 64,
-            block_size_n: int = 64,
-            block_size_k: int = 64
+            scales: torch.Tensor
     ) -> torch.Tensor:
         """
-        融合GPTQ 4bit反量化与矩阵乘法的优化函数
-
+        融合GPTQ 4bit反量化与矩阵乘法的优化实现
+        
         参数:
             input: 输入矩阵 [M, K]
             qweight: 量化权重 [N, K//8] (int32) - GPTQ格式
             qzeros: 零点值 [num_groups, K//8] (int32) - GPTQ格式
             scales: 缩放因子 [num_groups, K] (float16) - GPTQ格式
-            block_size_m: M维度分块大小
-            block_size_n: N维度分块大小
-            block_size_k: K维度分块大小
 
         返回:
             输出矩阵 [M, N]
         """
         # 输入验证
         if input.dim() != 2:
-            raise ValueError(f"Input must be 2D tensor, got {input.dim()}D")
+            raise ValueError(f"输入必须是2D矩阵，得到 {input.dim()}D")
         
         M, K = input.shape
-        N = qweight.shape[0]  # GPTQ格式：qweight的第一维是输出维度
-        num_groups = scales.shape[0]
-
-        # 验证参数 - 更灵活的验证
-        if K % self.groupsize != 0:
-            raise ValueError(f"K ({K}) must be divisible by groupsize ({self.groupsize})")
+        N = qweight.shape[0]
         
-        if num_groups != K // self.groupsize:
-            logger.warning(f"Number of groups ({num_groups}) does not equal K//groupsize ({K//self.groupsize}), using custom format handling")
-            # 对于非标准分组，直接使用基线实现
-            return self.baseline_gptq_gemm(input, qweight, qzeros, scales, self.groupsize)
+        logger.info(f"Triton融合内核: input{M}x{K}, qweight{N}x{qweight.shape[1]}, qzeros{qzeros.shape}, scales{scales.shape}")
         
-        if qzeros.shape[0] != num_groups:
-            raise ValueError(f"qzeros first dimension ({qzeros.shape[0]}) must equal num_groups ({num_groups})")
+        # 验证GPTQ格式
+        if qweight.shape[1] != K // 8:
+            raise ValueError(f"qweight第二维 ({qweight.shape[1]}) 必须等于 K//8 ({K // 8})")
         
-        # 更灵活的qzeros验证 - 支持不同的量化格式
-        expected_qzeros_cols = K // 8
-        if qzeros.shape[1] != expected_qzeros_cols:
-            # 尝试其他可能的格式
-            if qzeros.shape[1] == N // 8:
-                # 可能是 [num_groups, N//8] 格式
-                logger.warning(f"Detected alternative GPTQ format: qzeros shape {qzeros.shape}, expected {expected_qzeros_cols}")
-            elif qzeros.shape[1] == qweight.shape[1]:
-                # 可能是 [num_groups, qweight_cols] 格式
-                logger.warning(f"Detected qzeros matching qweight format: qzeros shape {qzeros.shape}, qweight shape {qweight.shape}")
-            else:
-                # 对于自定义格式，不修改N的值，让后续的通用处理来处理
-                logger.warning(f"Detected custom GPTQ format: qzeros shape {qzeros.shape}, qweight shape {qweight.shape}")
-                # 不修改N，保持原始值
+        if qzeros.shape[1] != K // 8:
+            raise ValueError(f"qzeros第二维 ({qzeros.shape[1]}) 必须等于 K//8 ({K // 8})")
         
-        # 检测是否为自定义格式
-        # 输出投影格式: qweight=[512, 4096], qzeros=[32, 512], scales=[32, 4096]
-        # 这种情况下 qzeros.shape[1] == K // 8，但 qweight.shape[1] == K，不是标准格式
-        is_custom_format = (qzeros.shape[1] != K // 8 and qzeros.shape[1] != N // 8 and qzeros.shape[1] != qweight.shape[1]) or \
-                          (qweight.shape[1] == K and qzeros.shape[1] == K // 8 and scales.shape[1] == K)
-        
-        if not is_custom_format:
-            # 标准格式验证
-            if qweight.shape[0] != N:
-                raise ValueError(f"qweight first dimension ({qweight.shape[0]}) must equal N ({N})")
-            
-            # 更灵活的qweight验证
-            expected_qweight_cols = K // 8
-            if qweight.shape[1] != expected_qweight_cols:
-                if qweight.shape[1] == N // 8:
-                    # 可能是 [N, N//8] 格式
-                    logger.warning(f"Detected alternative GPTQ format: qweight shape {qweight.shape}, expected {expected_qweight_cols}")
-                else:
-                    raise ValueError(f"qweight second dimension ({qweight.shape[1]}) must equal K//8 ({expected_qweight_cols}) or N//8 ({N//8})")
-        else:
-            # 自定义格式，使用qweight的实际维度作为N
-            N = qweight.shape[0]
-            logger.info(f"Using custom format: N={N} from qweight.shape[0]")
-            
-            # 对于Qwen7B格式，我们需要特殊处理而不是回退到基线实现
-            # 检查是否是Qwen7B的QKV投影格式: qweight=[512, 12288], qzeros=[32, 1536], scales=[32, 12288]
-            if qweight.shape[1] == scales.shape[1] and qzeros.shape[1] == scales.shape[1] // 8:
-                # Qwen7B QKV投影格式: [input_dim//8, output_dim]
-                logger.info("Detected Qwen7B QKV projection format, using optimized Triton kernel")
-                # 重新计算维度
-                input_dim_compressed = N  # 512
-                output_dim = scales.shape[1]  # 12288
-                input_dim = input_dim_compressed * 8  # 4096
-                
-                # 调整参数以匹配Triton内核期望的格式
-                # 我们需要重新排列数据以匹配标准格式
-                return self._handle_qwen7b_qkv_format(input, qweight, qzeros, scales, input_dim, output_dim)
-            elif qweight.shape[1] == K and qzeros.shape[1] == N and scales.shape[1] == K:
-                # Qwen7B输出投影格式: qweight=[512, 4096], qzeros=[32, 512], scales=[32, 4096]
-                logger.info("Detected Qwen7B output projection format, using optimized Triton kernel")
-                return self._handle_qwen7b_output_format(input, qweight, qzeros, scales, N, K)
-            else:
-                # 其他自定义格式，使用基线实现
-                logger.warning(f"Custom format detected, using baseline implementation")
-                return self.baseline_gptq_gemm(input, qweight, qzeros, scales, self.groupsize)
-        
-        # 更灵活的scales验证 - 支持不同的GPTQ格式
         if scales.shape[1] != K:
-            logger.warning(f"scales second dimension ({scales.shape[1]}) does not equal K ({K}), using custom format handling")
-            # 对于非标准scales格式，直接使用基线实现
-            return self.baseline_gptq_gemm(input, qweight, qzeros, scales, self.groupsize)
+            raise ValueError(f"scales第二维 ({scales.shape[1]}) 必须等于 K ({K})")
         
         if K % 8 != 0:
-            raise ValueError(f"K ({K}) must be divisible by 8 for 4-bit quantization")
-
-        # 检测实际的GPTQ格式（使用更新后的N值）
-        is_standard_format = (qweight.shape[1] == K // 8) and (qzeros.shape[1] == K // 8)
-        is_alternative_format = (qweight.shape[1] == N // 8) and (qzeros.shape[1] == N // 8)
-        is_custom_format = (qzeros.shape[1] != K // 8 and qzeros.shape[1] != N // 8 and qzeros.shape[1] != qweight.shape[1])
+            raise ValueError(f"K ({K}) 必须能被8整除以支持4bit量化")
         
-        if not is_standard_format:
-            if is_alternative_format:
-                logger.info(f"Using alternative GPTQ format: qweight{qweight.shape}, qzeros{qzeros.shape}, scales{scales.shape}")
-            elif is_custom_format:
-                logger.info(f"Using custom GPTQ format: qweight{qweight.shape}, qzeros{qzeros.shape}, scales{scales.shape}")
-            # 使用基线实现处理非标准格式
-            return self.baseline_gptq_gemm(input, qweight, qzeros, scales, self.groupsize)
+        # 检查分组大小
+        num_groups = scales.shape[0]
+        if num_groups != K // self.groupsize:
+            raise ValueError(f"分组数量 ({num_groups}) 必须等于 K//groupsize ({K // self.groupsize})")
         
-        # 分配输出张量
-        result = torch.empty((M, N), dtype=input.dtype, device=input.device)
-
+        # 分配输出矩阵
+        output = torch.empty((M, N), dtype=torch.float32, device=input.device)
+        
+        # 分块参数
+        BLOCK_SIZE_M = 64
+        BLOCK_SIZE_N = 64
+        BLOCK_SIZE_K = 64
+        
         # 计算网格大小
-        grid = lambda META: (
-            triton.cdiv(M, META['BLOCK_SIZE_M']) * triton.cdiv(N, META['BLOCK_SIZE_N']),
-        )
-
-        # 启动内核
+        grid = (triton.cdiv(M, BLOCK_SIZE_M) * triton.cdiv(N, BLOCK_SIZE_N),)
+        
+        # 启动Triton内核
         self.fused_gptq_gemm_kernel_4bit[grid](
+            # 输入矩阵
             input, input.stride(0), input.stride(1),
+            # GPTQ参数
             qweight, qzeros, scales,
-            result, result.stride(0), result.stride(1),
+            # 输出矩阵
+            output, output.stride(0), output.stride(1),
+            # 矩阵维度
             M, N, K,
-            self.groupsize,
-            BLOCK_SIZE_M=block_size_m,
-            BLOCK_SIZE_N=block_size_n,
-            BLOCK_SIZE_K=block_size_k
+            # GPTQ参数
+            groupsize=self.groupsize,
+            # 分块参数
+            BLOCK_SIZE_M=BLOCK_SIZE_M,
+            BLOCK_SIZE_N=BLOCK_SIZE_N,
+            BLOCK_SIZE_K=BLOCK_SIZE_K
         )
-
-        return result
-
-    @staticmethod
-    def dequantize_gptq_weight(
-            qweight: torch.Tensor,
-            qzeros: torch.Tensor,
-            scales: torch.Tensor,
-            groupsize: int
-    ) -> torch.Tensor:
-
-        """
-        反量化GPTQ权重（参考实现，用于验证）
-
-        参数:
-            qweight: 量化权重 [N, K//8] (int32) - GPTQ格式
-            qzeros: 零点值 [num_groups, K//8] (int32) - GPTQ格式
-            scales: 缩放因子 [num_groups, K] (float16) - GPTQ格式
-            groupsize: 分组大小
-
-        返回:
-            反量化后的权重 [N, K] (float16)
-        """
-
-        N, _ = qweight.shape
-        K = scales.shape[1]
-        num_groups = scales.shape[0]
-
-        # 反量化权重
-        dequantized_weight = torch.zeros((N, K), dtype=torch.float16, device=qweight.device)
-
-        # 使用向量化操作优化
-        for group_idx in range(num_groups):
-            start_idx = group_idx * groupsize
-            end_idx = min(start_idx + groupsize, K)
-            group_size = end_idx - start_idx
-            
-            if group_size <= 0:
-                continue
-                
-            # 获取当前组的参数
-            group_scales = scales[group_idx, start_idx:end_idx]  # [group_size]
-            
-            # 向量化处理每个k值
-            for k_offset in range(group_size):
-                k = start_idx + k_offset
-                
-                # 计算字节索引和位偏移
-                byte_idx = k // 8
-                bit_shift = (k % 8) * 4
-                
-                # 向量化提取所有N维度的4bit权重值
-                weight_vals = (qweight[:, byte_idx] >> bit_shift) & 0xF  # [N]
-                
-                # 提取零点值
-                zero_val = (qzeros[group_idx, byte_idx] >> bit_shift) & 0xF
-                
-                # 向量化反量化
-                scale_val = group_scales[k_offset]
-                dequantized_weight[:, k] = (weight_vals - zero_val) * scale_val
-
-        return dequantized_weight
-
-    @staticmethod
-    def dequantize_gptq_weight_alternative(
-            qweight: torch.Tensor,
-            qzeros: torch.Tensor,
-            scales: torch.Tensor,
-            groupsize: int
-    ) -> torch.Tensor:
-        """
-        反量化GPTQ权重（替代格式实现）
         
-        参数:
-            qweight: 量化权重 [N, N//8] (int32) - 替代格式
-            qzeros: 零点值 [num_groups, N//8] (int32) - 替代格式
-            scales: 缩放因子 [num_groups, K] (float16) - 标准格式
-            groupsize: 分组大小
-
-        返回:
-            反量化后的权重 [N, K] (float16)
-        """
-        N, _ = qweight.shape
-        K = scales.shape[1]
-        num_groups = scales.shape[0]
-
-        # 反量化权重
-        dequantized_weight = torch.zeros((N, K), dtype=torch.float16, device=qweight.device)
-
-        # 使用向量化操作优化
-        for group_idx in range(num_groups):
-            start_idx = group_idx * groupsize
-            end_idx = min(start_idx + groupsize, K)
-            group_size = end_idx - start_idx
-            
-            if group_size <= 0:
-                continue
-                
-            # 获取当前组的参数
-            group_scales = scales[group_idx, start_idx:end_idx]  # [group_size]
-            
-            # 向量化处理每个k值
-            for k_offset in range(group_size):
-                k = start_idx + k_offset
-                
-                # 计算字节索引和位偏移 - 替代格式
-                byte_idx = k // 8
-                bit_shift = (k % 8) * 4
-                
-                # 向量化提取所有N维度的4bit权重值
-                weight_vals = (qweight[:, byte_idx] >> bit_shift) & 0xF  # [N]
-                
-                # 提取零点值 - 替代格式
-                zero_val = (qzeros[group_idx, byte_idx] >> bit_shift) & 0xF
-                
-                # 向量化反量化
-                scale_val = group_scales[k_offset]
-                dequantized_weight[:, k] = (weight_vals - zero_val) * scale_val
-
-        return dequantized_weight
-
-    @staticmethod
-    def dequantize_gptq_weight_generic(
-            qweight: torch.Tensor,
-            qzeros: torch.Tensor,
-            scales: torch.Tensor,
-            groupsize: int
-    ) -> torch.Tensor:
-        """
-        通用反量化GPTQ权重（处理自定义格式）- 优化版本
+        # 转换输出数据类型以匹配输入
+        if output.dtype != input.dtype:
+            output = output.to(input.dtype)
         
-        参数:
-            qweight: 量化权重 [N, qweight_cols] (int32)
-            qzeros: 零点值 [num_groups, qzeros_cols] (int32)
-            scales: 缩放因子 [num_groups, K] (float16)
-            groupsize: 分组大小
-
-        返回:
-            反量化后的权重 [N, K] (float16)
-        """
-        N, qweight_cols = qweight.shape
-        num_groups = scales.shape[0]
-        qzeros_cols = qzeros.shape[1]
-        scales_cols = scales.shape[1]
-        
-        # 尝试推断K值 - 更灵活的方法
-        # 检查是否是混合格式（qweight和scales的第二维都是输出维度）
-        if qweight_cols == scales_cols:
-            # qweight和scales的列数相同，但这可能是输出维度而不是输入维度
-            # 需要检查是否与输入维度匹配
-            logger.info(f"Detected potential mixed GPTQ format: qweight and scales both have {qweight_cols} columns")
-            # 对于混合格式，我们需要使用实际的输入维度
-            # 这里我们需要从外部传入正确的K值
-            K = qweight_cols  # 临时设置，后面会被修正
-            logger.info(f"Initial K inference: {K}")
-        elif qweight_cols == qzeros_cols:
-            # qweight和qzeros的列数相同，说明K = qweight_cols * 8
-            K = qweight_cols * 8
-        else:
-            # 如果不同，使用scales的列数作为K（但需要验证）
-            K = scales_cols
-            
-        logger.info(f"Generic dequantization: qweight{N}x{qweight_cols}, qzeros{num_groups}x{qzeros_cols}, scales{num_groups}x{scales_cols}, inferred K={K}")
-
-        # 反量化权重
-        dequantized_weight = torch.zeros((N, K), dtype=torch.float16, device=qweight.device)
-
-        # 检查是否是转置的GPTQ格式
-        is_transposed_format = (qweight_cols == scales_cols)
-        
-        if is_transposed_format:
-            # 转置格式：qweight的第二维是K，直接使用
-            logger.info("Using transposed GPTQ format dequantization")
-            for group_idx in range(num_groups):
-                start_idx = group_idx * groupsize
-                end_idx = min(start_idx + groupsize, K)
-                group_size = end_idx - start_idx
-                
-                if group_size <= 0:
-                    continue
-                    
-                # 获取当前组的参数
-                group_scales = scales[group_idx, start_idx:end_idx]  # [group_size]
-                
-                # 向量化处理每个k值
-                for k_offset in range(group_size):
-                    k = start_idx + k_offset
-                    
-                    # 转置格式：qweight的第二维是K，直接索引
-                    weight_vals = qweight[:, k]  # [N] - 直接获取权重值
-                    
-                    # 提取零点值
-                    zero_byte_idx = min(k // 8, qzeros_cols - 1)
-                    zero_val = (qzeros[group_idx, zero_byte_idx] >> ((k % 8) * 4)) & 0xF
-                    
-                    # 向量化反量化
-                    scale_val = group_scales[k_offset]
-                    dequantized_weight[:, k] = (weight_vals - zero_val) * scale_val
-        else:
-            # 标准格式：qweight的第二维是K//8
-            logger.info("Using standard GPTQ format dequantization")
-            for group_idx in range(num_groups):
-                start_idx = group_idx * groupsize
-                end_idx = min(start_idx + groupsize, K)
-                group_size = end_idx - start_idx
-                
-                if group_size <= 0:
-                    continue
-                    
-                # 获取当前组的参数
-                group_scales = scales[group_idx, start_idx:end_idx]  # [group_size]
-                
-                # 向量化处理每个k值
-                for k_offset in range(group_size):
-                    k = start_idx + k_offset
-                    
-                    # 计算字节索引和位偏移
-                    byte_idx = min(k // 8, qweight_cols - 1)
-                    bit_shift = (k % 8) * 4
-                    
-                    # 向量化提取所有N维度的4bit权重值
-                    weight_vals = (qweight[:, byte_idx] >> bit_shift) & 0xF  # [N]
-                    
-                    # 提取零点值
-                    zero_byte_idx = min(k // 8, qzeros_cols - 1)
-                    zero_val = (qzeros[group_idx, zero_byte_idx] >> bit_shift) & 0xF
-                    
-                    # 向量化反量化
-                    scale_val = group_scales[k_offset]
-                    dequantized_weight[:, k] = (weight_vals - zero_val) * scale_val
-
-        return dequantized_weight
-
-    @staticmethod
-    def dequantize_gptq_weight_generic_with_k(
-            qweight: torch.Tensor,
-            qzeros: torch.Tensor,
-            scales: torch.Tensor,
-            groupsize: int,
-            K: int,
-            dtype: torch.dtype = None
-    ) -> torch.Tensor:
-        """
-        通用反量化GPTQ权重（处理自定义格式）- 带K参数版本
-        
-        参数:
-            qweight: 量化权重 [N, qweight_cols] (int32)
-            qzeros: 零点值 [num_groups, qzeros_cols] (int32)
-            scales: 缩放因子 [num_groups, scales_cols] (float16)
-            groupsize: 分组大小
-            K: 输入维度（显式指定）
-
-        返回:
-            反量化后的权重 [N, K] (float16)
-        """
-        N, qweight_cols = qweight.shape
-        num_groups = scales.shape[0]
-        qzeros_cols = qzeros.shape[1]
-        scales_cols = scales.shape[1]
-        
-        # logger.info(f"Generic dequantization with K: qweight{N}x{qweight_cols}, qzeros{num_groups}x{qzeros_cols}, scales{num_groups}x{scales_cols}, K={K}")
-
-        # 反量化权重 - 使用指定的数据类型或scales的数据类型
-        output_dtype = dtype if dtype is not None else scales.dtype
-        # logger.info(f"Using output dtype: {output_dtype}")
-        dequantized_weight = torch.zeros((N, K), dtype=output_dtype, device=qweight.device)
-
-        # 检查是否是Qwen7B的特殊格式
-        # 格式1: qweight=[512, 12288], qzeros=[32, 1536], scales=[32, 12288] (QKV投影)
-        # 格式2: qweight=[512, 4096], qzeros=[32, 512], scales=[32, 4096] (输出投影)
-        if (qweight_cols == scales_cols and qzeros_cols == scales_cols // 8) or \
-           (qweight_cols == scales_cols and qzeros_cols == N // 8):
-            # logger.info("Using Qwen7B special format dequantization")
-            
-            # 判断是QKV投影还是输出投影
-            # QKV投影: qweight=[512, 12288], scales=[32, 12288], qzeros=[32, 1536]
-            # 输出投影: qweight=[512, 4096], scales=[32, 4096], qzeros=[32, 512]
-            
-            if scales_cols > K:
-                # QKV投影格式: [input_dim//8, output_dim] = [512, 12288]
-                # logger.info("Detected QKV projection format")
-                input_dim_compressed = N  # qweight的第一维是input_dim//8
-                output_dim = scales_cols  # scales的第二维是output_dim
-                input_dim = input_dim_compressed * 8  # 实际输入维度
-                
-                # logger.info(f"QKV: input_dim={input_dim_compressed}*8={input_dim}, output_dim={output_dim}")
-                
-                # 重新分配输出张量 [output_dim, input_dim]
-                dequantized_weight = torch.zeros((output_dim, input_dim), dtype=output_dtype, device=qweight.device)
-                
-                # 向量化处理每个组 (按output_dim分组)
-                for group_idx in range(num_groups):
-                    start_idx = group_idx * groupsize
-                    end_idx = min(start_idx + groupsize, output_dim)
-                    group_size = end_idx - start_idx
-                    
-                    if group_size <= 0:
-                        continue
-                        
-                    # 获取当前组的参数
-                    group_scales = scales[group_idx, start_idx:end_idx]  # [group_size]
-                    
-                    # 向量化处理每个output维度
-                    for out_offset in range(group_size):
-                        out_idx = start_idx + out_offset
-                        
-                        # 向量化处理所有input维度
-                        # 计算压缩的input索引
-                        in_compressed_indices = torch.arange(input_dim, device=qweight.device) // 8
-                        bit_shifts = (torch.arange(input_dim, device=qweight.device) % 8) * 4
-                        
-                        # 向量化提取4bit权重值
-                        weight_vals = (qweight[in_compressed_indices, out_idx] >> bit_shifts) & 0xF
-                        
-                        # 提取零点值
-                        zero_byte_idx = min(out_idx // 8, qzeros_cols - 1)
-                        zero_bit_shift = (out_idx % 8) * 4
-                        zero_val = (qzeros[group_idx, zero_byte_idx] >> zero_bit_shift) & 0xF
-                        
-                        # 向量化反量化
-                        scale_val = group_scales[out_offset]
-                        dequantized_weight[out_idx, :] = (weight_vals - zero_val) * scale_val
-                
-            else:
-                # 输出投影格式: [output_dim//8, input_dim] = [512, 4096]
-                # logger.info("Detected output projection format")
-                output_dim_compressed = N  # qweight的第一维是output_dim//8
-                input_dim = scales_cols  # scales的第二维是input_dim
-                output_dim = output_dim_compressed * 8  # 实际输出维度
-                
-                # logger.info(f"Output: input_dim={input_dim}, output_dim={output_dim_compressed}*8={output_dim}")
-                
-                # 重新分配输出张量 [output_dim, input_dim]
-                dequantized_weight = torch.zeros((output_dim, input_dim), dtype=output_dtype, device=qweight.device)
-                
-                # 向量化处理每个组 (按input_dim分组)
-                for group_idx in range(num_groups):
-                    start_idx = group_idx * groupsize
-                    end_idx = min(start_idx + groupsize, input_dim)
-                    group_size = end_idx - start_idx
-                    
-                    if group_size <= 0:
-                        continue
-                        
-                    # 获取当前组的参数
-                    group_scales = scales[group_idx, start_idx:end_idx]  # [group_size]
-                    
-                    # 向量化处理每个input维度
-                    for in_offset in range(group_size):
-                        in_idx = start_idx + in_offset
-                        
-                        # 向量化处理所有output维度
-                        # 计算压缩的output索引
-                        out_compressed_indices = torch.arange(output_dim, device=qweight.device) // 8
-                        bit_shifts = (torch.arange(output_dim, device=qweight.device) % 8) * 4
-                        
-                        # 向量化提取4bit权重值
-                        weight_vals = (qweight[out_compressed_indices, in_idx] >> bit_shifts) & 0xF
-                        
-                        # 提取零点值
-                        zero_byte_idx = min(in_idx // 8, qzeros_cols - 1)
-                        zero_bit_shift = (in_idx % 8) * 4
-                        zero_val = (qzeros[group_idx, zero_byte_idx] >> zero_bit_shift) & 0xF
-                        
-                        # 向量化反量化
-                        scale_val = group_scales[in_offset]
-                        dequantized_weight[:, in_idx] = (weight_vals - zero_val) * scale_val
-            
-            # logger.info(f"Qwen7B special dequantization result shape: {dequantized_weight.shape}")
-            return dequantized_weight
-        
-        # 检查是否是混合格式
-        is_mixed_format = (qweight_cols == scales_cols and qweight_cols != K)
-        
-        if is_mixed_format:
-            # 混合格式：qweight和scales的第二维都是输出维度，不是输入维度
-            logger.info("Using mixed GPTQ format dequantization")
-            # 在这种情况下，我们需要重新映射scales
-            for group_idx in range(num_groups):
-                start_idx = group_idx * groupsize
-                end_idx = min(start_idx + groupsize, K)
-                group_size = end_idx - start_idx
-                
-                if group_size <= 0:
-                    continue
-                    
-                # 对于混合格式，scales需要重新映射到输入维度
-                # 这里我们假设scales是按组分布的
-                for k_offset in range(group_size):
-                    k = start_idx + k_offset
-                    
-                    # 计算在scales中的索引（假设scales是按输出维度分布的）
-                    scale_idx = k % scales_cols
-                    scale_val = scales[group_idx, scale_idx]
-                    
-                    # 计算在qweight中的索引
-                    weight_idx = k % qweight_cols
-                    weight_vals = qweight[:, weight_idx]  # [N]
-                    
-                    # 提取零点值
-                    zero_byte_idx = min(k // 8, qzeros_cols - 1)
-                    zero_val = (qzeros[group_idx, zero_byte_idx] >> ((k % 8) * 4)) & 0xF
-                    
-                    # 向量化反量化
-                    dequantized_weight[:, k] = (weight_vals - zero_val) * scale_val
-        else:
-            # 标准格式处理
-            logger.info("Using standard GPTQ format dequantization")
-            for group_idx in range(num_groups):
-                start_idx = group_idx * groupsize
-                end_idx = min(start_idx + groupsize, K)
-                group_size = end_idx - start_idx
-                
-                if group_size <= 0:
-                    continue
-                    
-                # 获取当前组的参数
-                group_scales = scales[group_idx, start_idx:end_idx]  # [group_size]
-                
-                # 向量化处理每个k值
-                for k_offset in range(group_size):
-                    k = start_idx + k_offset
-                    
-                    # 计算字节索引和位偏移
-                    byte_idx = min(k // 8, qweight_cols - 1)
-                    bit_shift = (k % 8) * 4
-                    
-                    # 向量化提取所有N维度的4bit权重值
-                    weight_vals = (qweight[:, byte_idx] >> bit_shift) & 0xF  # [N]
-                    
-                    # 提取零点值
-                    zero_byte_idx = min(k // 8, qzeros_cols - 1)
-                    zero_val = (qzeros[group_idx, zero_byte_idx] >> bit_shift) & 0xF
-                    
-                    # 向量化反量化
-                    scale_val = group_scales[k_offset]
-                    dequantized_weight[:, k] = (weight_vals - zero_val) * scale_val
-
-        return dequantized_weight
-
-    @staticmethod
-    def dequantize_gptq_weight_batch_optimized(
-            qweight: torch.Tensor,
-            qzeros: torch.Tensor,
-            scales: torch.Tensor,
-            groupsize: int
-    ) -> torch.Tensor:
-        """
-        批量优化的反量化GPTQ权重（最高性能版本）
-        
-        参数:
-            qweight: 量化权重 [N, K//8] (int32)
-            qzeros: 零点值 [num_groups, K//8] (int32)
-            scales: 缩放因子 [num_groups, K] (float16)
-            groupsize: 分组大小
-
-        返回:
-            反量化后的权重 [N, K] (float16)
-        """
-        N, _ = qweight.shape
-        K = scales.shape[1]
-        num_groups = scales.shape[0]
-
-        # 反量化权重
-        dequantized_weight = torch.zeros((N, K), dtype=torch.float16, device=qweight.device)
-
-        # 批量处理所有组 - 真正的批量优化
-        for group_idx in range(num_groups):
-            start_idx = group_idx * groupsize
-            end_idx = min(start_idx + groupsize, K)
-            group_size = end_idx - start_idx
-            
-            if group_size <= 0:
-                continue
-                
-            # 获取当前组的参数
-            group_scales = scales[group_idx, start_idx:end_idx]  # [group_size]
-            
-            # 批量处理所有k值 - 真正的向量化
-            k_indices = torch.arange(start_idx, end_idx, device=qweight.device)
-            byte_indices = k_indices // 8
-            bit_shifts = (k_indices % 8) * 4
-            
-            # 批量提取权重值 - 避免循环
-            for i, (byte_idx, bit_shift) in enumerate(zip(byte_indices, bit_shifts)):
-                k = start_idx + i
-                
-                # 向量化提取所有N维度的4bit权重值
-                weight_vals = (qweight[:, byte_idx] >> bit_shift) & 0xF  # [N]
-                
-                # 提取零点值
-                zero_val = (qzeros[group_idx, byte_idx] >> bit_shift) & 0xF
-                
-                # 向量化反量化
-                scale_val = group_scales[i]
-                dequantized_weight[:, k] = (weight_vals - zero_val) * scale_val
-
-        return dequantized_weight
-
-    @staticmethod
-    def dequantize_gptq_weight_special(
-            qweight: torch.Tensor,
-            qzeros: torch.Tensor,
-            scales: torch.Tensor,
-            groupsize: int,
-            K: int,
-            dtype: torch.dtype = None
-    ) -> torch.Tensor:
-        """
-        特殊格式反量化GPTQ权重 - scales的第二维是N而不是K
-        
-        参数:
-            qweight: 量化权重 [N, K//8] (int32)
-            qzeros: 零点值 [num_groups, K//8] (int32)
-            scales: 缩放因子 [num_groups, N] (float16) - 注意：第二维是N
-            groupsize: 分组大小
-            K: 输入维度（需要显式指定）
-
-        返回:
-            反量化后的权重 [N, K] (float16)
-        """
-        N, qweight_cols = qweight.shape
-        num_groups = scales.shape[0]
-        qzeros_cols = qzeros.shape[1]
-        
-        logger.info(f"Special dequantization: qweight{N}x{qweight_cols}, qzeros{num_groups}x{qzeros_cols}, scales{num_groups}x{N}, K={K}")
-        logger.info(f"Expected output shape: {N}x{K}")
-
-        # 使用指定的数据类型或scales的数据类型
-        output_dtype = dtype if dtype is not None else scales.dtype
-        logger.info(f"Using output dtype: {output_dtype}")
-        dequantized_weight = torch.zeros((N, K), dtype=output_dtype, device=qweight.device)
-
-        # 使用向量化操作优化
-        for group_idx in range(num_groups):
-            start_idx = group_idx * groupsize
-            end_idx = min(start_idx + groupsize, K)
-            group_size = end_idx - start_idx
-            
-            if group_size <= 0:
-                continue
-                
-            # 获取当前组的参数 - scales的第二维是N，每个输出维度对应一个scale
-            group_scales = scales[group_idx, :]  # [N] - 每个输出维度对应一个scale
-            
-            # 向量化处理每个k值
-            for k_offset in range(group_size):
-                k = start_idx + k_offset
-                
-                # 计算字节索引和位偏移
-                byte_idx = min(k // 8, qweight_cols - 1)
-                bit_shift = (k % 8) * 4
-                
-                # 向量化提取所有N维度的4bit权重值
-                weight_vals = (qweight[:, byte_idx] >> bit_shift) & 0xF  # [N]
-                
-                # 提取零点值
-                zero_byte_idx = min(k // 8, qzeros_cols - 1)
-                zero_val = (qzeros[group_idx, zero_byte_idx] >> bit_shift) & 0xF
-                
-                # 向量化反量化 - 每个N维度使用对应的scale
-                dequantized_weight[:, k] = (weight_vals - zero_val) * group_scales
-
-        logger.info(f"Actual output shape: {dequantized_weight.shape}")
-        return dequantized_weight
-
-    @staticmethod
-    def baseline_gptq_gemm(
-            input: torch.Tensor,
-            qweight: torch.Tensor,
-            qzeros: torch.Tensor,
-            scales: torch.Tensor,
-            groupsize: int
-    ) -> torch.Tensor:
-        """
-        基线实现：先反量化权重，再进行矩阵乘法
-        使用Python循环实现，代表未优化的实现
-
-        参数:
-            input: 输入矩阵 [M, K]
-            qweight: 量化权重 [N, K//8] 或 [N, N//8] (int32) - GPTQ格式
-            qzeros: 零点值 [num_groups, K//8] 或 [num_groups, N//8] (int32) - GPTQ格式
-            scales: 缩放因子 [num_groups, K] (float16) - GPTQ格式
-            groupsize: 分组大小
-
-        返回:
-            输出矩阵 [M, N]
-        """
-        # 检测格式 - 更灵活的处理
-        N, _ = qweight.shape
-        input_K = input.shape[1]  # 使用输入的实际K维度
-        
-        # 减少日志输出以提高性能
-        # logger.info(f"baseline_gptq_gemm: input{input_K}x{N}, qweight{qweight.shape}, qzeros{qzeros.shape}, scales{scales.shape}")
-        
-        # 详细的格式检测日志 - 仅在调试时启用
-        # logger.info(f"Format detection:")
-        # logger.info(f"  qweight.shape[1] == input_K // 8: {qweight.shape[1]} == {input_K // 8} = {qweight.shape[1] == input_K // 8}")
-        # logger.info(f"  qzeros.shape[1] == input_K // 8: {qzeros.shape[1]} == {input_K // 8} = {qzeros.shape[1] == input_K // 8}")
-        # logger.info(f"  scales.shape[1] == input_K: {scales.shape[1]} == {input_K} = {scales.shape[1] == input_K}")
-        # logger.info(f"  scales.shape[1] == N: {scales.shape[1]} == {N} = {scales.shape[1] == N}")
-        
-        # 判断格式类型并使用最优化的函数
-        if qweight.shape[1] == input_K // 8 and qzeros.shape[1] == input_K // 8 and scales.shape[1] == input_K:
-            # 标准格式: [N, K//8], [num_groups, K//8], [num_groups, K]
-            # logger.info("Using standard format dequantization")
-            dequantized_weight = GPTQTritonFusion.dequantize_gptq_weight(
-                qweight, qzeros, scales, groupsize
-            )
-            # 确保数据类型匹配
-            if dequantized_weight.dtype != input.dtype:
-                dequantized_weight = dequantized_weight.to(input.dtype)
-            result = torch.matmul(input, dequantized_weight.T)
-        elif qweight.shape[1] == N // 8 and qzeros.shape[1] == N // 8 and scales.shape[1] == input_K:
-            # 替代格式: [N, N//8], [num_groups, N//8], [num_groups, K]
-            # logger.info("Using alternative format dequantization")
-            dequantized_weight = GPTQTritonFusion.dequantize_gptq_weight_alternative(
-                qweight, qzeros, scales, groupsize
-            )
-            # 确保数据类型匹配
-            if dequantized_weight.dtype != input.dtype:
-                dequantized_weight = dequantized_weight.to(input.dtype)
-            result = torch.matmul(input, dequantized_weight.T)
-        elif qweight.shape[1] == input_K // 8 and qzeros.shape[1] == input_K // 8 and scales.shape[1] == N:
-            # 特殊格式: [N, K//8], [num_groups, K//8], [num_groups, N] - scales的第二维是N而不是K
-            # logger.info("Using special format dequantization (scales second dim = N)")
-            # logger.info(f"Calling dequantize_gptq_weight_special with K={input_K}, dtype={input.dtype}")
-            dequantized_weight = GPTQTritonFusion.dequantize_gptq_weight_special(
-                qweight, qzeros, scales, groupsize, input_K, input.dtype
-            )
-            # logger.info(f"Special dequantization result shape: {dequantized_weight.shape}")
-            # 确保数据类型匹配
-            if dequantized_weight.dtype != input.dtype:
-                dequantized_weight = dequantized_weight.to(input.dtype)
-            result = torch.matmul(input, dequantized_weight.T)
-        elif qweight.shape[1] == input_K and qzeros.shape[1] == N and scales.shape[1] == input_K:
-            # Qwen7B输出投影格式: [N, K], [num_groups, N], [num_groups, K]
-            # qweight=[512, 4096], qzeros=[32, 512], scales=[32, 4096]
-            # logger.info("Using Qwen7B output projection format dequantization")
-            # logger.info(f"Calling dequantize_gptq_weight_generic_with_k with K={input_K}, dtype={input.dtype}")
-            dequantized_weight = GPTQTritonFusion.dequantize_gptq_weight_generic_with_k(
-                qweight, qzeros, scales, groupsize, input_K, input.dtype
-            )
-            # logger.info(f"Qwen7B output projection dequantization result shape: {dequantized_weight.shape}")
-            # 确保数据类型匹配
-            if dequantized_weight.dtype != input.dtype:
-                dequantized_weight = dequantized_weight.to(input.dtype)
-            result = torch.matmul(input, dequantized_weight.T)
-        else:
-            # 自定义格式: 尝试通用处理
-            # logger.warning(f"Using generic dequantization for custom format: input{input_K}x{N}, qweight{qweight.shape}, qzeros{qzeros.shape}, scales{scales.shape}")
-            # logger.info(f"Calling dequantize_gptq_weight_generic with input_K={input_K}, dtype={input.dtype}")
-            dequantized_weight = GPTQTritonFusion.dequantize_gptq_weight_generic_with_k(
-                qweight, qzeros, scales, groupsize, input_K, input.dtype
-            )
-            # logger.info(f"Generic dequantization result shape: {dequantized_weight.shape}")
-            # 确保数据类型匹配
-            if dequantized_weight.dtype != input.dtype:
-                dequantized_weight = dequantized_weight.to(input.dtype)
-            result = torch.matmul(input, dequantized_weight.T)
-
-        return result
+        logger.info(f"Triton融合内核完成: 输出形状 {output.shape}")
+        return output
 
     def _handle_qwen7b_qkv_format(self, input, qweight, qzeros, scales, input_dim, output_dim):
         """处理Qwen7B QKV投影格式，使用优化的Triton内核"""
+        logger.info("处理Qwen7B QKV投影格式")
+        
         # Qwen7B QKV格式: qweight=[512, 12288], qzeros=[32, 1536], scales=[32, 12288]
         # 我们需要将其转换为标准格式以使用Triton内核
         
@@ -953,6 +206,8 @@ class GPTQTritonFusion:
 
     def _handle_qwen7b_output_format(self, input, qweight, qzeros, scales, N, K):
         """处理Qwen7B输出投影格式，使用优化的Triton内核"""
+        logger.info("处理Qwen7B输出投影格式")
+        
         # Qwen7B输出格式: qweight=[512, 4096], qzeros=[32, 512], scales=[32, 4096]
         # 我们需要将其转换为标准格式以使用Triton内核
         
@@ -965,270 +220,109 @@ class GPTQTritonFusion:
         # 现在使用标准Triton内核
         return self.fused_gptq_gemm_4bit(input, qweight_transposed, qzeros, scales)
 
-    def debug_dequantization(self, qweight, qzeros, scales, groupsize, num_samples=10):
-        """调试反量化过程，比较Triton和Python实现的结果"""
-        logger.info("Debugging dequantization process...")
-        
-        # 打印输入参数信息
-        logger.info(f"Input shapes: qweight={qweight.shape}, qzeros={qzeros.shape}, scales={scales.shape}")
-        logger.info(f"qweight dtype: {qweight.dtype}, qzeros dtype: {qzeros.dtype}, scales dtype: {scales.dtype}")
-        logger.info(f"qweight range: [{qweight.min().item()}, {qweight.max().item()}]")
-        logger.info(f"qzeros range: [{qzeros.min().item()}, {qzeros.max().item()}]")
-        logger.info(f"scales range: [{scales.min().item():.6f}, {scales.max().item():.6f}]")
-
-        # 使用Python实现反量化
-        python_weight = self.dequantize_gptq_weight(qweight, qzeros, scales, groupsize)
-        logger.info(f"Python weight shape: {python_weight.shape}, range: [{python_weight.min().item():.6f}, {python_weight.max().item():.6f}]")
-
-        # 使用Triton实现反量化（通过矩阵乘法）：使用单位矩阵作为输入，这样输出就是权重矩阵
-        K, N = qweight.shape[0], scales.shape[1]
-        input = torch.eye(K, dtype=torch.float16, device='cuda')  # 形状为[K, K]
-        logger.info(f"Input matrix shape: {input.shape}")
-        
-        try:
-            triton_result = self.fused_gptq_gemm_4bit(input, qweight, qzeros, scales)
-            logger.info(f"Triton result shape: {triton_result.shape}, range: [{triton_result.min().item():.6f}, {triton_result.max().item():.6f}]")
-        except Exception as e:
-            logger.error(f"Triton kernel failed: {e}")
-            return python_weight, None
-
-        # 输出形状应该是[K, N]
-        triton_weight = triton_result  # 因为输入是[K, K]，输出是[K, N]
-
-        # 比较结果
-        diff = torch.abs(python_weight - triton_weight)
-        max_diff = torch.max(diff).item()
-        avg_diff = torch.mean(diff).item()
-
-        logger.info(f"Dequantization max difference: {max_diff:.6f}")
-        logger.info(f"Dequantization average difference: {avg_diff:.6f}")
-
-        # 打印前几个样本 - 向量化优化
-        logger.info("First 10 samples comparison:")
-        sample_size = min(num_samples, min(K, N))
-        for i in range(sample_size):
-            for j in range(sample_size):
-                logger.info(f"  Python[{i},{j}]: {python_weight[i, j].item():.6f}, "
-                           f"Triton[{i},{j}]: {triton_weight[i, j].item():.6f}, "
-                           f"Diff: {abs(python_weight[i, j] - triton_weight[i, j]).item():.6f}")
-
-        return python_weight, triton_weight
-
-    def test_correctness(
-            self,
-            M: int = 32,
-            N: int = 64,
-            K: int = 128,
-            tolerance: float = 10.0  # 放宽误差容忍度
-    ) -> bool:
+    def process_qwen7b_format(self, input: torch.Tensor, qweight: torch.Tensor, qzeros: torch.Tensor, scales: torch.Tensor) -> torch.Tensor:
         """
-        测试Triton融合内核的正确性
-
-        参数:
-            M: 输入矩阵行数
-            N: 输出矩阵列数
-            K: 输入矩阵列数/权重矩阵行数
-            tolerance: 误差容忍度
-
-        返回:
-            True如果测试通过，False否则
+        处理Qwen7B GPTQ格式的主入口
+        自动检测格式并使用相应的Triton内核
         """
-        logger.info("Testing correctness of Triton fused kernel...")
-        logger.info(f"Using tolerance: {tolerance}")
-
-        # 生成随机输入
-        input = torch.randn((M, K), dtype=torch.float16, device='cuda')
-        logger.info(f"Input shape: {input.shape}")
-
-        # 生成随机GPTQ量化权重 - GPTQ格式
-        num_groups = K // self.groupsize
-        qweight = torch.randint(0, 256, (N, K // 8), dtype=torch.int32, device='cuda')  # [N, K//8]
-        qzeros = torch.randint(0, 16, (num_groups, K // 8), dtype=torch.int32, device='cuda')  # [num_groups, K//8]
-        scales = torch.randn((num_groups, K), dtype=torch.float16, device='cuda')  # [num_groups, K]
-
-        logger.info(f"qweight shape: {qweight.shape}")
-        logger.info(f"qzeros shape: {qzeros.shape}")
-        logger.info(f"scales shape: {scales.shape}")
-        logger.info(f"num_groups: {num_groups}")
-
-        # 使用基线实现计算结果
-        logger.info("Running baseline implementation...")
-        baseline_result = self.baseline_gptq_gemm(input, qweight, qzeros, scales, self.groupsize)
-        logger.info(f"Baseline result shape: {baseline_result.shape}")
-
-        # 使用Triton融合内核计算结果
-        logger.info("Running Triton implementation...")
-        triton_result = self.fused_gptq_gemm_4bit(input, qweight, qzeros, scales)
-        logger.info(f"Triton result shape: {triton_result.shape}")
-
-        # 比较结果
-        diff = torch.abs(baseline_result - triton_result)
-        max_diff = torch.max(diff).item()
-        avg_diff = torch.mean(diff).item()
-
-        logger.info(f"Max difference: {max_diff:.6f}")
-        logger.info(f"Average difference: {avg_diff:.6f}")
-
-        # 检查是否在容忍范围内
-        if max_diff < tolerance:
-            logger.info("✅ Test PASSED: Results are within tolerance")
-            return True
-        else:
-            logger.error(f"❌ Test FAILED: Max difference {max_diff:.6f} exceeds tolerance {tolerance}")
-            return False
-
-    def benchmark_performance(
-            self,
-            M: int = 1024,
-            N: int = 4096,
-            K: int = 4096,
-            num_warmup: int = 5,
-            num_iterations: int = 20
-    ) -> dict:
-        """
-        性能基准测试
+        M, K = input.shape
+        N = qweight.shape[0]
         
-        参数:
-            M: 输入矩阵行数
-            N: 输出矩阵列数
-            K: 输入矩阵列数/权重矩阵行数
-            num_warmup: 预热迭代次数
-            num_iterations: 测试迭代次数
+        logger.info(f"处理Qwen7B格式: input{M}x{K}, qweight{N}x{qweight.shape[1]}, qzeros{qzeros.shape}, scales{scales.shape}")
+        
+        # 检测Qwen7B格式
+        if qweight.shape[1] == scales.shape[1] and qzeros.shape[1] == scales.shape[1] // 8:
+            # Qwen7B QKV投影格式: [input_dim//8, output_dim]
+            logger.info("检测到Qwen7B QKV投影格式")
+            input_dim_compressed = N  # 512
+            output_dim = scales.shape[1]  # 12288
+            input_dim = input_dim_compressed * 8  # 4096
             
-        返回:
-            包含性能指标的字典
-        """
-        logger.info(f"Benchmarking performance with M={M}, N={N}, K={K}")
-        
-        # 生成测试数据 - GPTQ格式
-        input = torch.randn((M, K), dtype=torch.float16, device='cuda')
-        num_groups = K // self.groupsize
-        qweight = torch.randint(0, 256, (N, K // 8), dtype=torch.int32, device='cuda')  # [N, K//8]
-        qzeros = torch.randint(0, 16, (num_groups, K // 8), dtype=torch.int32, device='cuda')  # [num_groups, K//8]
-        scales = torch.randn((num_groups, K), dtype=torch.float16, device='cuda')  # [num_groups, K]
-        
-        # 预热
-        logger.info("Warming up...")
-        for _ in range(num_warmup):
-            _ = self.fused_gptq_gemm_4bit(input, qweight, qzeros, scales)
-            _ = self.baseline_gptq_gemm(input, qweight, qzeros, scales, self.groupsize)
-        
-        torch.cuda.synchronize()
-        
-        # 测试Triton融合内核
-        logger.info("Testing Triton fused kernel...")
-        triton_times = []
-        for _ in range(num_iterations):
-            torch.cuda.synchronize()
-            start = time.time()
-            _ = self.fused_gptq_gemm_4bit(input, qweight, qzeros, scales)
-            torch.cuda.synchronize()
-            triton_times.append(time.time() - start)
-        
-        # 测试基线实现
-        logger.info("Testing baseline implementation...")
-        baseline_times = []
-        for _ in range(num_iterations):
-            torch.cuda.synchronize()
-            start = time.time()
-            _ = self.baseline_gptq_gemm(input, qweight, qzeros, scales, self.groupsize)
-            torch.cuda.synchronize()
-            baseline_times.append(time.time() - start)
-        
-        # 计算统计信息
-        triton_avg = np.mean(triton_times) * 1000  # 转换为毫秒
-        triton_std = np.std(triton_times) * 1000
-        baseline_avg = np.mean(baseline_times) * 1000
-        baseline_std = np.std(baseline_times) * 1000
-        
-        speedup = baseline_avg / triton_avg
-        
-        results = {
-            'triton_avg_ms': triton_avg,
-            'triton_std_ms': triton_std,
-            'baseline_avg_ms': baseline_avg,
-            'baseline_std_ms': baseline_std,
-            'speedup': speedup,
-            'matrix_size': f"{M}x{N}x{K}"
-        }
-        
-        logger.info(f"Results for {results['matrix_size']}:")
-        logger.info(f"  Triton: {triton_avg:.2f}±{triton_std:.2f} ms")
-        logger.info(f"  Baseline: {baseline_avg:.2f}±{baseline_std:.2f} ms")
-        logger.info(f"  Speedup: {speedup:.2f}x")
-        
-        return results
+            return self._handle_qwen7b_qkv_format(input, qweight, qzeros, scales, input_dim, output_dim)
+        elif qweight.shape[1] == K and qzeros.shape[1] == N and scales.shape[1] == K:
+            # Qwen7B输出投影格式: [output_dim//8, input_dim]
+            logger.info("检测到Qwen7B输出投影格式")
+            return self._handle_qwen7b_output_format(input, qweight, qzeros, scales, N, K)
+        else:
+            # 尝试标准格式
+            logger.info("尝试标准GPTQ格式")
+            return self.fused_gptq_gemm_4bit(input, qweight, qzeros, scales)
 
-    def benchmark_dequantization_methods(self, M=1024, N=2048, K=2048, num_iterations=10):
-        """
-        比较不同反量化方法的性能
-        """
-        logger.info(f"Benchmarking dequantization methods with M={M}, N={N}, K={K}")
+    def test_correctness(self, M=32, N=64, K=128, groupsize=128):
+        """测试Triton内核的正确性"""
+        logger.info("测试Triton内核正确性...")
         
         # 生成测试数据
-        input_tensor = torch.randn(M, K, dtype=torch.float16, device='cuda')
-        num_groups = K // self.groupsize
+        input = torch.randn(M, K, dtype=torch.float16, device='cuda')
+        
+        # 生成模拟的GPTQ参数
         qweight = torch.randint(0, 256, (N, K // 8), dtype=torch.int32, device='cuda')
-        qzeros = torch.randint(0, 16, (num_groups, K // 8), dtype=torch.int32, device='cuda')
-        scales = torch.randn(num_groups, K, dtype=torch.float16, device='cuda')
+        qzeros = torch.randint(0, 16, (K // groupsize, K // 8), dtype=torch.int32, device='cuda')
+        scales = torch.randn(K // groupsize, K, dtype=torch.float16, device='cuda')
         
-        methods = {
-            'vectorized': GPTQTritonFusion.dequantize_gptq_weight,
-            'batch_optimized': GPTQTritonFusion.dequantize_gptq_weight_batch_optimized
-        }
+        logger.info(f"测试数据: input{M}x{K}, qweight{N}x{K//8}, qzeros{K//groupsize}x{K//8}, scales{K//groupsize}x{K}")
         
-        results = {}
+        try:
+            # 使用Triton内核
+            result = self.fused_gptq_gemm_4bit(input, qweight, qzeros, scales)
+            logger.info(f"Triton内核成功: 输出形状 {result.shape}")
+            return True
+        except Exception as e:
+            logger.error(f"Triton内核失败: {e}")
+            return False
+
+    def benchmark_performance(self, M=32, N=64, K=128, groupsize=128, num_iterations=100):
+        """基准测试Triton内核性能"""
+        logger.info("基准测试Triton内核性能...")
         
-        for method_name, method_func in methods.items():
-            logger.info(f"Testing {method_name} method...")
-            
-            # 预热
-            for _ in range(3):
-                _ = method_func(qweight, qzeros, scales, self.groupsize)
+        # 生成测试数据
+        input = torch.randn(M, K, dtype=torch.float16, device='cuda')
+        qweight = torch.randint(0, 256, (N, K // 8), dtype=torch.int32, device='cuda')
+        qzeros = torch.randint(0, 16, (K // groupsize, K // 8), dtype=torch.int32, device='cuda')
+        scales = torch.randn(K // groupsize, K, dtype=torch.float16, device='cuda')
+        
+        # 预热
+        for _ in range(10):
+            _ = self.fused_gptq_gemm_4bit(input, qweight, qzeros, scales)
+        torch.cuda.synchronize()
+        
+        # 性能测试
+        times = []
+        for i in range(num_iterations):
             torch.cuda.synchronize()
+            start_time = torch.cuda.Event(enable_timing=True)
+            end_time = torch.cuda.Event(enable_timing=True)
             
-            # 测试
-            times = []
-            for _ in range(num_iterations):
-                torch.cuda.synchronize()
-                start = time.time()
-                _ = method_func(qweight, qzeros, scales, self.groupsize)
-                torch.cuda.synchronize()
-                times.append(time.time() - start)
+            start_time.record()
+            result = self.fused_gptq_gemm_4bit(input, qweight, qzeros, scales)
+            end_time.record()
             
-            avg_time = sum(times) / len(times) * 1000  # 转换为毫秒
-            results[method_name] = avg_time
-            logger.info(f"{method_name}: {avg_time:.2f} ms")
+            torch.cuda.synchronize()
+            elapsed = start_time.elapsed_time(end_time)
+            times.append(elapsed)
         
-        # 计算加速比
-        baseline_time = results['original']
-        for method_name, time_ms in results.items():
-            speedup = baseline_time / time_ms
-            logger.info(f"{method_name} speedup: {speedup:.2f}x")
+        avg_time = sum(times) / len(times)
+        min_time = min(times)
+        max_time = max(times)
         
-        return results
+        logger.info(f"性能统计: 平均 {avg_time:.2f}ms, 最小 {min_time:.2f}ms, 最大 {max_time:.2f}ms")
+        return avg_time
 
-
-# 使用示例
 if __name__ == "__main__":
-    # 创建GPTQ融合实例
-    gptq_fusion = GPTQTritonFusion(groupsize=128)
+    # 测试Triton内核
+    fusion = GPTQTritonFusion(groupsize=128)
     
-    # 先进行调试 - 使用GPTQ格式
-    print("🔍 Debugging dequantization...")
-    gptq_fusion.debug_dequantization(
-        qweight=torch.randint(0, 256, (64, 16), dtype=torch.int32, device='cuda'),  # [N, K//8]
-        qzeros=torch.randint(0, 16, (1, 16), dtype=torch.int32, device='cuda'),     # [num_groups, K//8]
-        scales=torch.randn(1, 128, dtype=torch.float16, device='cuda'),            # [num_groups, K]
-        groupsize=128
-    )
+    print("🧪 测试Triton内核正确性...")
+    if fusion.test_correctness():
+        print("✅ Triton内核正确性测试通过")
+    else:
+        print("❌ Triton内核正确性测试失败")
     
-    # 测试正确性 - 使用GPTQ格式
-    print("\nTesting correctness...")
-    success = gptq_fusion.test_correctness(M=32, N=64, K=128)
-    print(f"Correctness test: {'PASSED' if success else 'FAILED'}")
+    print("\n⚡ 基准测试Triton内核性能...")
+    avg_time = fusion.benchmark_performance()
+    print(f"平均执行时间: {avg_time:.2f}ms")
     
-    # 性能基准测试 - 使用GPTQ格式
-    print("\nBenchmarking performance...")
-    perf_results = gptq_fusion.benchmark_performance(M=512, N=2048, K=2048)
-    print(f"Performance results: {perf_results}")
+    if avg_time < 1.0:  # 小于1ms认为性能良好
+        print("🎉 Triton内核性能优秀!")
+    else:
+        print("⚠️ Triton内核性能需要进一步优化")

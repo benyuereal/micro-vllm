@@ -145,8 +145,8 @@ class OptimizedQwenModelLayerAdapter:
         batch_size, seq_len, hidden_dim = hidden_states.shape
         input_2d = hidden_states.view(-1, hidden_dim)  # [B*S, D]
         
-        # 调用融合算子
-        result = self._gptq_fusion.fused_gptq_gemm_4bit(
+        # 调用融合算子 - 使用Qwen7B格式处理
+        result = self._gptq_fusion.process_qwen7b_format(
             input=input_2d,
             qweight=qkv_weight,
             qzeros=qkv_zero,
@@ -211,8 +211,8 @@ class OptimizedQwenModelLayerAdapter:
         # 重塑输入为 [M, K] 格式
         input_2d = attn_output_reshaped.view(-1, hidden_size)  # [B*S, D]
         
-        # 调用融合算子
-        result = self._gptq_fusion.fused_gptq_gemm_4bit(
+        # 调用融合算子 - 使用Qwen7B格式处理
+        result = self._gptq_fusion.process_qwen7b_format(
             input=input_2d,
             qweight=out_weight,
             qzeros=out_zero,
