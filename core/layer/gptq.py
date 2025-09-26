@@ -524,7 +524,7 @@ class GPTQTritonFusion:
             # QKV投影: qweight=[512, 12288], scales=[32, 12288], qzeros=[32, 1536]
             # 输出投影: qweight=[512, 4096], scales=[32, 4096], qzeros=[32, 512]
             
-            if scales_cols == 12288:
+            if scales_cols > K:
                 # QKV投影格式: [input_dim//8, output_dim] = [512, 12288]
                 logger.info("Detected QKV projection format")
                 input_dim_compressed = N  # qweight的第一维是input_dim//8
