@@ -199,10 +199,11 @@ class GPTQTritonFusion:
         # 重新排列qzeros: [32, 1536] -> [32, 512] (截取前512列)
         qzeros_adjusted = qzeros[:, :input_dim // 8]  # [32, 512]
         
-        # scales已经是正确的格式: [32, 12288]
+        # 重新排列scales: [32, 12288] -> [32, 4096] (截取前4096列)
+        scales_adjusted = scales[:, :input_dim]  # [32, 4096]
         
         # 现在使用标准Triton内核
-        return self.fused_gptq_gemm_4bit(input, qweight_transposed, qzeros_adjusted, scales)
+        return self.fused_gptq_gemm_4bit(input, qweight_transposed, qzeros_adjusted, scales_adjusted)
 
     def _handle_qwen7b_output_format(self, input, qweight, qzeros, scales, N, K):
         """处理Qwen7B输出投影格式，使用优化的Triton内核"""

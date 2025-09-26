@@ -58,7 +58,7 @@ def test_triton_kernel_qwen7b_qkv():
         # 预热
         print("\n🔥 预热Triton内核...")
         for _ in range(3):
-            _ = fusion.fused_gptq_gemm_4bit(input_tensor, qweight, qzeros, scales)
+            _ = fusion.process_qwen7b_format(input_tensor, qweight, qzeros, scales)
         torch.cuda.synchronize()
         
         # 性能测试
@@ -70,7 +70,7 @@ def test_triton_kernel_qwen7b_qkv():
             torch.cuda.synchronize()
             start_time = time.time()
             
-            result = fusion.fused_gptq_gemm_4bit(input_tensor, qweight, qzeros, scales)
+            result = fusion.process_qwen7b_format(input_tensor, qweight, qzeros, scales)
             
             torch.cuda.synchronize()
             end_time = time.time()
@@ -150,7 +150,7 @@ def test_triton_kernel_qwen7b_output():
         # 预热
         print("\n🔥 预热Triton内核...")
         for _ in range(3):
-            _ = fusion.fused_gptq_gemm_4bit(input_tensor, qweight, qzeros, scales)
+            _ = fusion.process_qwen7b_format(input_tensor, qweight, qzeros, scales)
         torch.cuda.synchronize()
         
         # 性能测试
@@ -162,7 +162,7 @@ def test_triton_kernel_qwen7b_output():
             torch.cuda.synchronize()
             start_time = time.time()
             
-            result = fusion.fused_gptq_gemm_4bit(input_tensor, qweight, qzeros, scales)
+            result = fusion.process_qwen7b_format(input_tensor, qweight, qzeros, scales)
             
             torch.cuda.synchronize()
             end_time = time.time()
@@ -227,7 +227,7 @@ def test_performance_comparison():
         # Triton融合内核测试
         print("🔥 预热Triton内核...")
         for _ in range(3):
-            _ = fusion.fused_gptq_gemm_4bit(input_tensor, qweight, qzeros, scales)
+            _ = fusion.process_qwen7b_format(input_tensor, qweight, qzeros, scales)
         torch.cuda.synchronize()
         
         print("⚡ Triton融合内核性能测试...")
@@ -235,7 +235,7 @@ def test_performance_comparison():
         for i in range(10):
             torch.cuda.synchronize()
             start_time = time.time()
-            result_triton = fusion.fused_gptq_gemm_4bit(input_tensor, qweight, qzeros, scales)
+            result_triton = fusion.process_qwen7b_format(input_tensor, qweight, qzeros, scales)
             torch.cuda.synchronize()
             elapsed = (time.time() - start_time) * 1000
             triton_times.append(elapsed)
