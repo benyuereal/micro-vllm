@@ -570,13 +570,13 @@ class GPTQTritonFusion:
                         dequantized_weight[out_idx, :] = (weight_vals - zero_val) * scale_val
                 
             else:
-                # 输出投影格式: [output_dim, input_dim//8] = [4096, 512]
+                # 输出投影格式: [output_dim//8, input_dim] = [512, 4096]
                 logger.info("Detected output projection format")
-                output_dim = N  # qweight的第一维是output_dim
-                input_dim_compressed = qweight_cols  # qweight的第二维是input_dim//8
-                input_dim = input_dim_compressed * 8  # 实际输入维度
+                output_dim_compressed = N  # qweight的第一维是output_dim//8
+                input_dim = scales_cols  # scales的第二维是input_dim
+                output_dim = output_dim_compressed * 8  # 实际输出维度
                 
-                logger.info(f"Output: input_dim={input_dim_compressed}*8={input_dim}, output_dim={output_dim}")
+                logger.info(f"Output: input_dim={input_dim}, output_dim={output_dim_compressed}*8={output_dim}")
                 
                 # 重新分配输出张量 [output_dim, input_dim]
                 dequantized_weight = torch.zeros((output_dim, input_dim), dtype=output_dtype, device=qweight.device)
@@ -597,12 +597,13 @@ class GPTQTritonFusion:
                     for in_offset in range(group_size):
                         in_idx = start_idx + in_offset
                         
-                        # 计算压缩的input索引
-                        in_compressed = in_idx // 8
-                        bit_shift = (in_idx % 8) * 4
+                        # 向量化处理所有output维度
+                        # 计算压缩的output索引
+                        out_compressed_indices = torch.arange(output_dim, device=qweight.device) // 8
+                        bit_shifts = (torch.arange(output_dim, device=qweight.device) % 8) * 4
                         
                         # 向量化提取4bit权重值
-                        weight_vals = (qweight[:, in_compressed] >> bit_shift) & 0xF  # [output_dim]
+                        weight_vals = (qweight[out_compressed_indices, in_idx] >> bit_shifts) & 0xF
                         
                         # 提取零点值
                         zero_byte_idx = min(in_idx // 8, qzeros_cols - 1)
@@ -853,6 +854,9 @@ class GPTQTritonFusion:
             dequantized_weight = GPTQTritonFusion.dequantize_gptq_weight(
                 qweight, qzeros, scales, groupsize
             )
+            # 确保数据类型匹配
+            if dequantized_weight.dtype != input.dtype:
+                dequantized_weight = dequantized_weight.to(input.dtype)
             result = torch.matmul(input, dequantized_weight.T)
         elif qweight.shape[1] == N // 8 and qzeros.shape[1] == N // 8 and scales.shape[1] == input_K:
             # 替代格式: [N, N//8], [num_groups, N//8], [num_groups, K]
@@ -860,6 +864,9 @@ class GPTQTritonFusion:
             dequantized_weight = GPTQTritonFusion.dequantize_gptq_weight_alternative(
                 qweight, qzeros, scales, groupsize
             )
+            # 确保数据类型匹配
+            if dequantized_weight.dtype != input.dtype:
+                dequantized_weight = dequantized_weight.to(input.dtype)
             result = torch.matmul(input, dequantized_weight.T)
         elif qweight.shape[1] == input_K // 8 and qzeros.shape[1] == input_K // 8 and scales.shape[1] == N:
             # 特殊格式: [N, K//8], [num_groups, K//8], [num_groups, N] - scales的第二维是N而不是K
@@ -869,6 +876,9 @@ class GPTQTritonFusion:
                 qweight, qzeros, scales, groupsize, input_K, input.dtype
             )
             logger.info(f"Special dequantization result shape: {dequantized_weight.shape}")
+            # 确保数据类型匹配
+            if dequantized_weight.dtype != input.dtype:
+                dequantized_weight = dequantized_weight.to(input.dtype)
             result = torch.matmul(input, dequantized_weight.T)
         else:
             # 自定义格式: 尝试通用处理
@@ -878,6 +888,9 @@ class GPTQTritonFusion:
                 qweight, qzeros, scales, groupsize, input_K, input.dtype
             )
             logger.info(f"Generic dequantization result shape: {dequantized_weight.shape}")
+            # 确保数据类型匹配
+            if dequantized_weight.dtype != input.dtype:
+                dequantized_weight = dequantized_weight.to(input.dtype)
             result = torch.matmul(input, dequantized_weight.T)
 
         return result
