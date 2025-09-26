@@ -33,7 +33,8 @@ def compile_cuda_kernel():
         "-Xptxas=-O3",
         "--ptxas-options=-v",
         "-maxrregcount=255",
-        "-lineinfo"
+        "-lineinfo",
+        "-lcublas"
     ]
     
     # 编译内核
