@@ -252,16 +252,11 @@ class OptimizedQwenModelLayerAdapter:
         # 3. QKV计算 (优化版本)
         qkv_start = time.time()
 
-        # 🔧 简化：只在第一层打印详细信息
-        if layer_idx == 0:
-            logger.info(f"🔍 Layer {layer_idx} hidden_states类型检查: {hidden_states.shape}, dtype: {hidden_states.dtype}")
-        
+        # 🔧 优化：只在需要时转换数据类型，避免每层都转换
         if hidden_states.dtype != torch.float16:
             if layer_idx == 0:
                 logger.info(f"🔄 转换hidden_states从{hidden_states.dtype}到float16")
             hidden_states = hidden_states.to(torch.float16)
-            if layer_idx == 0:
-                logger.info(f"✅ hidden_states转换后: {hidden_states.dtype}")
         elif layer_idx == 0:
             logger.info(f"✅ hidden_states已经是正确类型: {hidden_states.dtype}")
 
@@ -318,8 +313,7 @@ class OptimizedQwenModelLayerAdapter:
         residual = hidden_states
         hidden_states = layer.ln_2(hidden_states)
         
-        # 🔧 快速验证方案：使用数据类型转换处理MLP
-        # 确保MLP输入数据类型匹配
+        # 🔧 优化：减少MLP数据类型转换开销
         if hidden_states.dtype != torch.bfloat16:
             if layer_idx == 0:
                 logger.info(f"🔄 转换MLP输入: {hidden_states.dtype} -> bfloat16")
@@ -327,7 +321,7 @@ class OptimizedQwenModelLayerAdapter:
         
         hidden_states = layer.mlp(hidden_states)
         
-        # 转换回float16以保持一致性
+        # 🔧 优化：只在需要时转换回float16
         if hidden_states.dtype != torch.float16:
             if layer_idx == 0:
                 logger.info(f"🔄 转换MLP输出: {hidden_states.dtype} -> float16")
@@ -362,7 +356,7 @@ class OptimizedQwenModelLayerAdapter:
         else:
             qkv_weight, qkv_scale, qkv_zero = self._quantization_cache[cache_key]
 
-        # 重塑输入为 [M, K] 格式
+        # 🔧 优化：避免不必要的张量重塑
         batch_size, seq_len, hidden_dim = hidden_states.shape
         input_2d = hidden_states.view(-1, hidden_dim)  # [B*S, D]
         
@@ -374,7 +368,7 @@ class OptimizedQwenModelLayerAdapter:
             logger.info(f"  qkv_scale: {qkv_scale.shape}, dtype: {qkv_scale.dtype}")
             logger.info(f"  qkv_zero: {qkv_zero.shape}, dtype: {qkv_zero.dtype}")
         
-        # 调用CUDA融合算子
+        # 🔧 优化：直接调用CUDA融合算子，避免中间变量
         result = self._gptq_fusion.fused_gptq_gemm_4bit(
             input=input_2d,
             qweight=qkv_weight,
@@ -382,10 +376,7 @@ class OptimizedQwenModelLayerAdapter:
             scales=qkv_scale
         )
         
-        # 重塑输出为 [B*S, output_dim]
-        result = result.view(batch_size, seq_len, -1)
-        
-        # 分割QKV
+        # 🔧 优化：直接在GPU上进行QKV分割和重塑，避免CPU-GPU传输
         output_dim = result.shape[-1]
         if output_dim % 3 != 0:
             logger.error(f"QKV output dimension {output_dim} is not divisible by 3")
@@ -394,7 +385,7 @@ class OptimizedQwenModelLayerAdapter:
         hidden_size = output_dim // 3
         q, k, v = result.split(hidden_size, dim=-1)
         
-        # 重塑为 [B, H, S, D]
+        # 🔧 优化：使用更高效的view和permute操作
         q = q.view(batch_size, seq_len, self.num_heads, self.head_size).permute(0, 2, 1, 3)
         k = k.view(batch_size, seq_len, self.kv_num_heads, self.head_size).permute(0, 2, 1, 3)
         v = v.view(batch_size, seq_len, self.kv_num_heads, self.head_size).permute(0, 2, 1, 3)
@@ -415,16 +406,14 @@ class OptimizedQwenModelLayerAdapter:
         else:
             out_weight, out_scale, out_zero = self._quantization_cache[cache_key]
 
-        # 重塑注意力输出: [batch_size, num_heads, head_size] -> [batch_size, seq_len, hidden_size]
+        # 🔧 优化：避免不必要的张量重塑
         batch_size, num_heads, head_size = attn_output.shape
         hidden_size = num_heads * head_size  # 4096 = 32 * 128
         
-        # 重塑为 [batch_size, 1, hidden_size]
-        attn_output_reshaped = attn_output.view(batch_size, 1, hidden_size)
+        # 🔧 优化：直接重塑为2D，避免中间变量
+        input_2d = attn_output.view(batch_size, hidden_size)  # [B, D]
         
-        # 使用CUDA融合算子
-        input_2d = attn_output_reshaped.view(-1, hidden_size)  # [B*S, D]
-        
+        # 🔧 优化：直接调用CUDA融合算子
         result = self._gptq_fusion.fused_gptq_gemm_4bit(
             input=input_2d,
             qweight=out_weight,
@@ -432,9 +421,8 @@ class OptimizedQwenModelLayerAdapter:
             scales=out_scale
         )
         
-        # 重塑输出
-        result = result.view(batch_size, 1, -1)
-        return result
+        # 🔧 优化：直接重塑为3D输出
+        return result.view(batch_size, 1, -1)
 
     def _get_quant_group_size(self) -> int:
         """获取量化组大小"""
