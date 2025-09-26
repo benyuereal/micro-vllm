@@ -391,8 +391,12 @@ class GPTQTritonFusion:
         scales_cols = scales.shape[1]
         
         # 尝试推断K值 - 更灵活的方法
-        # 根据qweight和qzeros的维度推断K
-        if qweight_cols == qzeros_cols:
+        # 检查是否是转置的GPTQ格式（qweight的第二维是K而不是K//8）
+        if qweight_cols == scales_cols:
+            # qweight和scales的列数相同，说明qweight的第二维是K（转置格式）
+            K = qweight_cols
+            logger.info(f"Detected transposed GPTQ format: qweight second dim is K={K}")
+        elif qweight_cols == qzeros_cols:
             # qweight和qzeros的列数相同，说明K = qweight_cols * 8
             K = qweight_cols * 8
         else:
@@ -404,36 +408,69 @@ class GPTQTritonFusion:
         # 反量化权重
         dequantized_weight = torch.zeros((N, K), dtype=torch.float16, device=qweight.device)
 
-        # 使用向量化操作优化
-        for group_idx in range(num_groups):
-            start_idx = group_idx * groupsize
-            end_idx = min(start_idx + groupsize, K)
-            group_size = end_idx - start_idx
-            
-            if group_size <= 0:
-                continue
+        # 检查是否是转置的GPTQ格式
+        is_transposed_format = (qweight_cols == scales_cols)
+        
+        if is_transposed_format:
+            # 转置格式：qweight的第二维是K，直接使用
+            logger.info("Using transposed GPTQ format dequantization")
+            for group_idx in range(num_groups):
+                start_idx = group_idx * groupsize
+                end_idx = min(start_idx + groupsize, K)
+                group_size = end_idx - start_idx
                 
-            # 获取当前组的参数
-            group_scales = scales[group_idx, start_idx:end_idx]  # [group_size]
-            
-            # 向量化处理每个k值
-            for k_offset in range(group_size):
-                k = start_idx + k_offset
+                if group_size <= 0:
+                    continue
+                    
+                # 获取当前组的参数
+                group_scales = scales[group_idx, start_idx:end_idx]  # [group_size]
                 
-                # 计算字节索引和位偏移
-                byte_idx = min(k // 8, qweight_cols - 1)
-                bit_shift = (k % 8) * 4
+                # 向量化处理每个k值
+                for k_offset in range(group_size):
+                    k = start_idx + k_offset
+                    
+                    # 转置格式：qweight的第二维是K，直接索引
+                    weight_vals = qweight[:, k]  # [N] - 直接获取权重值
+                    
+                    # 提取零点值
+                    zero_byte_idx = min(k // 8, qzeros_cols - 1)
+                    zero_val = (qzeros[group_idx, zero_byte_idx] >> ((k % 8) * 4)) & 0xF
+                    
+                    # 向量化反量化
+                    scale_val = group_scales[k_offset]
+                    dequantized_weight[:, k] = (weight_vals - zero_val) * scale_val
+        else:
+            # 标准格式：qweight的第二维是K//8
+            logger.info("Using standard GPTQ format dequantization")
+            for group_idx in range(num_groups):
+                start_idx = group_idx * groupsize
+                end_idx = min(start_idx + groupsize, K)
+                group_size = end_idx - start_idx
                 
-                # 向量化提取所有N维度的4bit权重值
-                weight_vals = (qweight[:, byte_idx] >> bit_shift) & 0xF  # [N]
+                if group_size <= 0:
+                    continue
+                    
+                # 获取当前组的参数
+                group_scales = scales[group_idx, start_idx:end_idx]  # [group_size]
                 
-                # 提取零点值
-                zero_byte_idx = min(k // 8, qzeros_cols - 1)
-                zero_val = (qzeros[group_idx, zero_byte_idx] >> bit_shift) & 0xF
-                
-                # 向量化反量化
-                scale_val = group_scales[k_offset]
-                dequantized_weight[:, k] = (weight_vals - zero_val) * scale_val
+                # 向量化处理每个k值
+                for k_offset in range(group_size):
+                    k = start_idx + k_offset
+                    
+                    # 计算字节索引和位偏移
+                    byte_idx = min(k // 8, qweight_cols - 1)
+                    bit_shift = (k % 8) * 4
+                    
+                    # 向量化提取所有N维度的4bit权重值
+                    weight_vals = (qweight[:, byte_idx] >> bit_shift) & 0xF  # [N]
+                    
+                    # 提取零点值
+                    zero_byte_idx = min(k // 8, qzeros_cols - 1)
+                    zero_val = (qzeros[group_idx, zero_byte_idx] >> bit_shift) & 0xF
+                    
+                    # 向量化反量化
+                    scale_val = group_scales[k_offset]
+                    dequantized_weight[:, k] = (weight_vals - zero_val) * scale_val
 
         return dequantized_weight
 
