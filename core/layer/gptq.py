@@ -163,7 +163,9 @@ class GPTQTritonFusion:
             raise ValueError(f"K ({K}) must be divisible by groupsize ({self.groupsize})")
         
         if num_groups != K // self.groupsize:
-            raise ValueError(f"Number of groups ({num_groups}) must equal K//groupsize ({K//self.groupsize})")
+            logger.warning(f"Number of groups ({num_groups}) does not equal K//groupsize ({K//self.groupsize}), using custom format handling")
+            # 对于非标准分组，直接使用基线实现
+            return self.baseline_gptq_gemm(input, qweight, qzeros, scales, self.groupsize)
         
         if qzeros.shape[0] != num_groups:
             raise ValueError(f"qzeros first dimension ({qzeros.shape[0]}) must equal num_groups ({num_groups})")

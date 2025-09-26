@@ -192,6 +192,13 @@ class OptimizedQwenModelLayerAdapter:
         else:
             out_weight, out_scale, out_zero = self._quantization_cache[cache_key]
 
+        # 调试信息
+        logger.info(f"Output projection GPTQ parameters:")
+        logger.info(f"  out_weight shape: {out_weight.shape}")
+        logger.info(f"  out_scale shape: {out_scale.shape}")
+        logger.info(f"  out_zero shape: {out_zero.shape}")
+        logger.info(f"  attn_output shape: {attn_output.shape}")
+
         # 使用GPTQ融合算子
         # 重塑输入为 [M, K] 格式
         batch_size, seq_len, hidden_dim = attn_output.shape
