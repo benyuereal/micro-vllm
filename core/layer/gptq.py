@@ -153,31 +153,68 @@ class GPTQTritonFusion:
         # 分配输出矩阵 - 使用更高效的内存分配
         output = torch.empty((M, N), dtype=input.dtype, device=input.device)
         
-        # 分块参数 - 更激进的分块以提高性能
-        BLOCK_SIZE_M = 256
-        BLOCK_SIZE_N = 256
-        BLOCK_SIZE_K = 256
+        # 分块参数 - 根据硬件限制动态调整
+        # 共享内存限制: 166912 bytes
+        # 根据矩阵大小动态调整分块大小
+        if M <= 64 and N <= 64 and K <= 64:
+            BLOCK_SIZE_M = 64
+            BLOCK_SIZE_N = 64
+            BLOCK_SIZE_K = 64
+        elif M <= 128 and N <= 128 and K <= 128:
+            BLOCK_SIZE_M = 128
+            BLOCK_SIZE_N = 128
+            BLOCK_SIZE_K = 128
+        else:
+            # 对于大矩阵，使用较小的分块
+            BLOCK_SIZE_M = 64
+            BLOCK_SIZE_N = 64
+            BLOCK_SIZE_K = 64
         
         # 计算网格大小
         grid = (triton.cdiv(M, BLOCK_SIZE_M) * triton.cdiv(N, BLOCK_SIZE_N),)
         
         # 启动Triton内核
-        self.fused_gptq_gemm_kernel_4bit[grid](
-            # 输入矩阵
-            input, input.stride(0), input.stride(1),
-            # GPTQ参数
-            qweight, qzeros, scales,
-            # 输出矩阵
-            output, output.stride(0), output.stride(1),
-            # 矩阵维度
-            M, N, K,
-            # GPTQ参数
-            groupsize=self.groupsize,
-            # 分块参数
-            BLOCK_SIZE_M=BLOCK_SIZE_M,
-            BLOCK_SIZE_N=BLOCK_SIZE_N,
-            BLOCK_SIZE_K=BLOCK_SIZE_K
-        )
+        try:
+            self.fused_gptq_gemm_kernel_4bit[grid](
+                # 输入矩阵
+                input, input.stride(0), input.stride(1),
+                # GPTQ参数
+                qweight, qzeros, scales,
+                # 输出矩阵
+                output, output.stride(0), output.stride(1),
+                # 矩阵维度
+                M, N, K,
+                # GPTQ参数
+                groupsize=self.groupsize,
+                # 分块参数
+                BLOCK_SIZE_M=BLOCK_SIZE_M,
+                BLOCK_SIZE_N=BLOCK_SIZE_N,
+                BLOCK_SIZE_K=BLOCK_SIZE_K
+            )
+        except Exception as e:
+            # 如果Triton内核失败，尝试更小的分块
+            logger.warning(f"Triton内核失败，尝试更小的分块: {e}")
+            BLOCK_SIZE_M = 32
+            BLOCK_SIZE_N = 32
+            BLOCK_SIZE_K = 32
+            grid = (triton.cdiv(M, BLOCK_SIZE_M) * triton.cdiv(N, BLOCK_SIZE_N),)
+            
+            self.fused_gptq_gemm_kernel_4bit[grid](
+                # 输入矩阵
+                input, input.stride(0), input.stride(1),
+                # GPTQ参数
+                qweight, qzeros, scales,
+                # 输出矩阵
+                output, output.stride(0), output.stride(1),
+                # 矩阵维度
+                M, N, K,
+                # GPTQ参数
+                groupsize=self.groupsize,
+                # 分块参数
+                BLOCK_SIZE_M=BLOCK_SIZE_M,
+                BLOCK_SIZE_N=BLOCK_SIZE_N,
+                BLOCK_SIZE_K=BLOCK_SIZE_K
+            )
         
         # 转换输出数据类型以匹配输入 - 优化：直接使用输入类型
         # if output.dtype != input.dtype:
