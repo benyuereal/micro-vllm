@@ -209,9 +209,27 @@ class GPTQTritonFusion:
             N = qweight.shape[0]
             logger.info(f"Using custom format: N={N} from qweight.shape[0]")
             
-            # 对于自定义格式，跳过严格的格式验证，直接使用基线实现
-            logger.warning(f"Custom format detected, using baseline implementation")
-            return self.baseline_gptq_gemm(input, qweight, qzeros, scales, self.groupsize)
+            # 对于Qwen7B格式，我们需要特殊处理而不是回退到基线实现
+            # 检查是否是Qwen7B的QKV投影格式: qweight=[512, 12288], qzeros=[32, 1536], scales=[32, 12288]
+            if qweight.shape[1] == scales.shape[1] and qzeros.shape[1] == scales.shape[1] // 8:
+                # Qwen7B QKV投影格式: [input_dim//8, output_dim]
+                logger.info("Detected Qwen7B QKV projection format, using optimized Triton kernel")
+                # 重新计算维度
+                input_dim_compressed = N  # 512
+                output_dim = scales.shape[1]  # 12288
+                input_dim = input_dim_compressed * 8  # 4096
+                
+                # 调整参数以匹配Triton内核期望的格式
+                # 我们需要重新排列数据以匹配标准格式
+                return self._handle_qwen7b_qkv_format(input, qweight, qzeros, scales, input_dim, output_dim)
+            elif qweight.shape[1] == K and qzeros.shape[1] == N and scales.shape[1] == K:
+                # Qwen7B输出投影格式: qweight=[512, 4096], qzeros=[32, 512], scales=[32, 4096]
+                logger.info("Detected Qwen7B output projection format, using optimized Triton kernel")
+                return self._handle_qwen7b_output_format(input, qweight, qzeros, scales, N, K)
+            else:
+                # 其他自定义格式，使用基线实现
+                logger.warning(f"Custom format detected, using baseline implementation")
+                return self.baseline_gptq_gemm(input, qweight, qzeros, scales, self.groupsize)
         
         # 更灵活的scales验证 - 支持不同的GPTQ格式
         if scales.shape[1] != K:
@@ -916,6 +934,36 @@ class GPTQTritonFusion:
             result = torch.matmul(input, dequantized_weight.T)
 
         return result
+
+    def _handle_qwen7b_qkv_format(self, input, qweight, qzeros, scales, input_dim, output_dim):
+        """处理Qwen7B QKV投影格式，使用优化的Triton内核"""
+        # Qwen7B QKV格式: qweight=[512, 12288], qzeros=[32, 1536], scales=[32, 12288]
+        # 我们需要将其转换为标准格式以使用Triton内核
+        
+        # 重新排列qweight: [512, 12288] -> [12288, 512] (转置)
+        qweight_transposed = qweight.T  # [12288, 512]
+        
+        # 重新排列qzeros: [32, 1536] -> [32, 512] (截取前512列)
+        qzeros_adjusted = qzeros[:, :input_dim // 8]  # [32, 512]
+        
+        # scales已经是正确的格式: [32, 12288]
+        
+        # 现在使用标准Triton内核
+        return self.fused_gptq_gemm_4bit(input, qweight_transposed, qzeros_adjusted, scales)
+
+    def _handle_qwen7b_output_format(self, input, qweight, qzeros, scales, N, K):
+        """处理Qwen7B输出投影格式，使用优化的Triton内核"""
+        # Qwen7B输出格式: qweight=[512, 4096], qzeros=[32, 512], scales=[32, 4096]
+        # 我们需要将其转换为标准格式以使用Triton内核
+        
+        # 重新排列qweight: [512, 4096] -> [4096, 512] (转置)
+        qweight_transposed = qweight.T  # [4096, 512]
+        
+        # qzeros已经是正确的格式: [32, 512]
+        # scales已经是正确的格式: [32, 4096]
+        
+        # 现在使用标准Triton内核
+        return self.fused_gptq_gemm_4bit(input, qweight_transposed, qzeros, scales)
 
     def debug_dequantization(self, qweight, qzeros, scales, groupsize, num_samples=10):
         """调试反量化过程，比较Triton和Python实现的结果"""
