@@ -522,6 +522,7 @@ class GPTQTritonFusion:
         qzeros_cols = qzeros.shape[1]
         
         logger.info(f"Special dequantization: qweight{N}x{qweight_cols}, qzeros{num_groups}x{qzeros_cols}, scales{num_groups}x{N}, K={K}")
+        logger.info(f"Expected output shape: {N}x{K}")
 
         dequantized_weight = torch.zeros((N, K), dtype=torch.float16, device=qweight.device)
 
@@ -555,6 +556,7 @@ class GPTQTritonFusion:
                 # 向量化反量化 - 每个N维度使用对应的scale
                 dequantized_weight[:, k] = (weight_vals - zero_val) * group_scales
 
+        logger.info(f"Actual output shape: {dequantized_weight.shape}")
         return dequantized_weight
 
     @staticmethod
