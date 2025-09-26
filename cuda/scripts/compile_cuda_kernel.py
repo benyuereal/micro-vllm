@@ -19,7 +19,7 @@ def compile_cuda_kernel():
     print(f"检测到CUDA版本: {cuda_version}")
     
     # 检查CUDA文件是否存在
-    cuda_file = "core/layer/gptq_cuda_kernel.cu"
+    cuda_file = "src/gptq_cuda_kernel.cu"
     if not os.path.exists(cuda_file):
         print(f"❌ CUDA文件不存在: {cuda_file}")
         return None

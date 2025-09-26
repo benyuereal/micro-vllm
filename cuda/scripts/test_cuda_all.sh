@@ -7,25 +7,25 @@ echo "🚀 CUDA内核一键测试开始..."
 echo "=========================================="
 echo "🔍 步骤1: 检查CUDA环境"
 echo "=========================================="
-bash check_cuda_env.sh
+bash scripts/check_cuda_env.sh
 
 # 2. 编译CUDA内核
 echo "=========================================="
 echo "🔨 步骤2: 编译CUDA内核"
 echo "=========================================="
-python compile_cuda_kernel.py
+python scripts/compile_cuda_kernel.py
 
-# 4. 测试CUDA内核
+# 3. 测试CUDA内核
 echo "=========================================="
 echo "🧪 步骤3: 测试CUDA内核"
 echo "=========================================="
-python test_cuda_simple.py
+python tests/test_cuda_simple.py
 
-# 5. 测试Triton内核性能
+# 4. 测试CUDA性能
 echo "=========================================="
-echo "⚡ 步骤4: 测试Triton内核性能"
+echo "⚡ 步骤4: 测试CUDA性能"
 echo "=========================================="
-cd test && python test_triton_kernel_performance.py
+python tests/test_cuda_performance.py
 
 echo "=========================================="
 echo "🎉 CUDA内核测试完成!"
