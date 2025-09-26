@@ -512,14 +512,22 @@ class GPTQTritonFusion:
         logger.info(f"Using output dtype: {output_dtype}")
         dequantized_weight = torch.zeros((N, K), dtype=output_dtype, device=qweight.device)
 
-        # 检查是否是混合格式
-        is_mixed_format = (qweight_cols == scales_cols and qweight_cols != K)
-        
-        if is_mixed_format:
-            # 混合格式：qweight和scales的第二维都是输出维度，不是输入维度
-            logger.info("Using mixed GPTQ format dequantization")
-            # 在这种情况下，qweight和scales都是按输出维度组织的
-            # 我们需要重新映射到输入维度
+        # 检查是否是Qwen7B的特殊格式
+        # qweight=[512, 12288], qzeros=[32, 1536], scales=[32, 12288]
+        # 这可能是 [N//8, K] 格式，其中 N=4096, K=12288
+        if qweight_cols == scales_cols and qzeros_cols == K // 8:
+            logger.info("Using Qwen7B special format dequantization")
+            # 在这种情况下，qweight的第二维是K，scales的第二维也是K
+            # 但N维度被压缩了，需要重新映射
+            
+            # 计算实际的N维度
+            actual_N = N * 8  # 假设N被压缩了8倍
+            logger.info(f"Detected compressed N: {N} -> actual N: {actual_N}")
+            
+            # 重新分配输出张量
+            dequantized_weight = torch.zeros((actual_N, K), dtype=output_dtype, device=qweight.device)
+            
+            # 处理每个组
             for group_idx in range(num_groups):
                 start_idx = group_idx * groupsize
                 end_idx = min(start_idx + groupsize, K)
@@ -528,18 +536,56 @@ class GPTQTritonFusion:
                 if group_size <= 0:
                     continue
                     
-                # 对于混合格式，scales是按输出维度分布的
-                # 我们需要为每个输入维度k找到对应的scale
+                # 获取当前组的参数
+                group_scales = scales[group_idx, start_idx:end_idx]  # [group_size]
+                
+                # 处理每个k值
+                for k_offset in range(group_size):
+                    k = start_idx + k_offset
+                    
+                    # 计算字节索引和位偏移
+                    byte_idx = min(k // 8, qweight_cols - 1)
+                    bit_shift = (k % 8) * 4
+                    
+                    # 提取所有N维度的4bit权重值
+                    weight_vals = (qweight[:, byte_idx] >> bit_shift) & 0xF  # [N]
+                    
+                    # 提取零点值
+                    zero_byte_idx = min(k // 8, qzeros_cols - 1)
+                    zero_val = (qzeros[group_idx, zero_byte_idx] >> bit_shift) & 0xF
+                    
+                    # 向量化反量化
+                    scale_val = group_scales[k_offset]
+                    dequantized_weight[:, k] = (weight_vals - zero_val) * scale_val
+            
+            logger.info(f"Qwen7B special dequantization result shape: {dequantized_weight.shape}")
+            return dequantized_weight
+        
+        # 检查是否是混合格式
+        is_mixed_format = (qweight_cols == scales_cols and qweight_cols != K)
+        
+        if is_mixed_format:
+            # 混合格式：qweight和scales的第二维都是输出维度，不是输入维度
+            logger.info("Using mixed GPTQ format dequantization")
+            # 在这种情况下，我们需要重新映射scales
+            for group_idx in range(num_groups):
+                start_idx = group_idx * groupsize
+                end_idx = min(start_idx + groupsize, K)
+                group_size = end_idx - start_idx
+                
+                if group_size <= 0:
+                    continue
+                    
+                # 对于混合格式，scales需要重新映射到输入维度
+                # 这里我们假设scales是按组分布的
                 for k_offset in range(group_size):
                     k = start_idx + k_offset
                     
                     # 计算在scales中的索引（假设scales是按输出维度分布的）
-                    # 对于混合格式，我们需要为每个输入维度k找到对应的scale
                     scale_idx = k % scales_cols
                     scale_val = scales[group_idx, scale_idx]
                     
                     # 计算在qweight中的索引
-                    # 对于混合格式，qweight也是按输出维度组织的
                     weight_idx = k % qweight_cols
                     weight_vals = qweight[:, weight_idx]  # [N]
                     
@@ -768,15 +814,6 @@ class GPTQTritonFusion:
                 qweight, qzeros, scales, groupsize, input_K, input.dtype
             )
             logger.info(f"Special dequantization result shape: {dequantized_weight.shape}")
-            result = torch.matmul(input, dequantized_weight.T)
-        elif qweight.shape[1] == scales.shape[1] and scales.shape[1] == N:
-            # 混合格式: [N, N], [num_groups, qzeros_cols], [num_groups, N] - qweight和scales都是N维度
-            logger.info("Using mixed format dequantization (qweight and scales both N-dim)")
-            logger.info(f"Calling dequantize_gptq_weight_generic_with_k with K={input_K}, dtype={input.dtype}")
-            dequantized_weight = GPTQTritonFusion.dequantize_gptq_weight_generic_with_k(
-                qweight, qzeros, scales, groupsize, input_K, input.dtype
-            )
-            logger.info(f"Mixed dequantization result shape: {dequantized_weight.shape}")
             result = torch.matmul(input, dequantized_weight.T)
         else:
             # 自定义格式: 尝试通用处理
