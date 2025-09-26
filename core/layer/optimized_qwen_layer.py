@@ -429,7 +429,27 @@ class OptimizedQwenModelLayerAdapter:
     def _get_quant_params(self, module):
         """获取量化参数"""
         if hasattr(module, "qweight"):
-            return module.qweight, module.scales, module.qzeros
+            # 🔧 确保参数类型正确
+            qweight = module.qweight
+            scales = module.scales
+            qzeros = module.qzeros
+            
+            # 转换scales为float16
+            if scales.dtype != torch.float16:
+                logger.info(f"🔄 _get_quant_params转换scales: {scales.dtype} -> float16")
+                scales = scales.to(torch.float16)
+            
+            # 转换qweight为uint32
+            if qweight.dtype != torch.uint32:
+                logger.info(f"🔄 _get_quant_params转换qweight: {qweight.dtype} -> uint32")
+                qweight = qweight.to(torch.uint32)
+            
+            # 转换qzeros为uint32
+            if qzeros.dtype != torch.uint32:
+                logger.info(f"🔄 _get_quant_params转换qzeros: {qzeros.dtype} -> uint32")
+                qzeros = qzeros.to(torch.uint32)
+            
+            return qweight, scales, qzeros
         
         if hasattr(module, "weight") and hasattr(module, "scales"):
             weight = module.weight
@@ -437,6 +457,12 @@ class OptimizedQwenModelLayerAdapter:
             zero = getattr(module, "zeros", getattr(module, "qzeros", None))
             if zero is None:
                 zero = torch.zeros_like(scale)
+            
+            # 转换scales为float16
+            if scale.dtype != torch.float16:
+                logger.info(f"🔄 _get_quant_params转换scales: {scale.dtype} -> float16")
+                scale = scale.to(torch.float16)
+            
             return weight, scale, zero
 
         raise AttributeError(f"无法获取量化参数: {module.__class__.__name__}")
