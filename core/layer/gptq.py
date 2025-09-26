@@ -136,16 +136,11 @@ class GPTQCUDAFusion:
             logger.debug("使用特殊scales格式验证")
         
         # 验证组数 - 使用实际的groupsize
-        if format_key in self._format_cache:
-            actual_groupsize = self._format_cache[format_key]
-            # 对于特殊格式，直接使用qzeros的第一维作为组数
-            if qzeros.shape[1] == 1536 and scales.shape[1] == 12288:
-                num_groups = qzeros.shape[0]  # 直接使用32
-                # logger.info(f"特殊格式使用直接组数: {num_groups}")
-            else:
-                num_groups = K // actual_groupsize
+        if qzeros.shape[1] == 1536 and scales.shape[1] == 12288:
+            num_groups = qzeros.shape[0]  # 直接使用32
+            # logger.info(f"特殊格式使用直接组数: {num_groups}")
         else:
-            num_groups = K // self.groupsize
+            num_groups = K // actual_groupsize
         
         if qzeros.shape[0] != num_groups:
             raise ValueError(f"qzeros第一维必须是num_groups={num_groups}，得到{qzeros.shape[0]}")
