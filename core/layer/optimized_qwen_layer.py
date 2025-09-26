@@ -356,6 +356,11 @@ class OptimizedQwenModelLayerAdapter:
         # 重塑输出为 [B*S, output_dim]
         result = result.view(batch_size, seq_len, -1)
         
+        # 🔧 确保输出数据类型为float16
+        if result.dtype != torch.float16:
+            logger.info(f"🔄 转换QKV输出: {result.dtype} -> float16")
+            result = result.to(torch.float16)
+        
         # 分割QKV
         output_dim = result.shape[-1]
         if output_dim % 3 != 0:
@@ -365,10 +370,18 @@ class OptimizedQwenModelLayerAdapter:
         hidden_size = output_dim // 3
         q, k, v = result.split(hidden_size, dim=-1)
         
+        # 🔧 确保q, k, v都是float16
+        q = q.to(torch.float16)
+        k = k.to(torch.float16)
+        v = v.to(torch.float16)
+        
         # 重塑为 [B, H, S, D]
         q = q.view(batch_size, seq_len, self.num_heads, self.head_size).permute(0, 2, 1, 3)
         k = k.view(batch_size, seq_len, self.kv_num_heads, self.head_size).permute(0, 2, 1, 3)
         v = v.view(batch_size, seq_len, self.kv_num_heads, self.head_size).permute(0, 2, 1, 3)
+        
+        # 🔧 最终检查数据类型
+        logger.info(f"🔍 QKV输出类型检查: q={q.dtype}, k={k.dtype}, v={v.dtype}")
         
         return q, k, v
 
