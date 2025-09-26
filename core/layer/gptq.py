@@ -86,9 +86,8 @@ class GPTQTritonFusion:
             a = tl.load(a_ptrs, mask=a_mask, other=0.0)
 
             # 加载量化权重并反量化 (GPTQ格式)
-            # 计算权重指针: qweight存储为int32，每8个4bit值打包为一个int32
-            weight_ptrs = qweight_ptr + ((k_offs + offs_k[:, None]) // 8 * (N // 8) +
-                                         offs_n[None, :] // 8)
+            # qweight格式: [K, N//8]，每8个4bit值打包为一个int32
+            weight_ptrs = qweight_ptr + (k_offs + offs_k[:, None]) * (N // 8) + offs_n[None, :] // 8
             weight_mask = ((k_offs + offs_k[:, None]) < K) & (offs_n[None, :] < N)
             qweight = tl.load(weight_ptrs, mask=weight_mask, other=0)
 
@@ -100,8 +99,22 @@ class GPTQTritonFusion:
             scales = tl.load(scale_ptrs, mask=offs_n[None, :] < N, other=0.0)
             zeros = tl.load(zero_ptrs, mask=offs_n[None, :] < N, other=0)
 
-            # 反量化4bit权重 (GPTQ格式)
-            weight = dequantize_gptq_4bit(qweight, zeros, scales, offs_k, offs_n)
+            # 反量化4bit权重 (GPTQ格式) - 内联实现
+            # 计算每个元素在32位整数中的位置
+            elem_per_int = 8
+            k_idx = offs_k[:, None] % elem_per_int
+            n_idx = offs_n[None, :] % elem_per_int
+            
+            # 提取4bit值 (GPTQ格式)
+            shift = k_idx * 4
+            weight_val = (qweight >> shift) & 0xF
+            
+            # 提取对应的零点值 (GPTQ格式)
+            zero_shift = n_idx * 4
+            zero_val = (zeros >> zero_shift) & 0xF
+            
+            # GPTQ反量化公式: (weight_val - zero_val) * scale
+            weight = (weight_val - zero_val) * scales
 
             # 矩阵乘法累加
             accumulator += tl.dot(a, weight)
@@ -237,7 +250,7 @@ class GPTQTritonFusion:
                     # 提取缩放因子
                     scale_val = scales[group_idx, n]
 
-                    # 反量化
+                    # 反量化 - 确保与Triton内核逻辑一致
                     dequantized_weight[k, n] = (weight_val - zero_val) * scale_val
 
         return dequantized_weight
@@ -277,14 +290,29 @@ class GPTQTritonFusion:
     def debug_dequantization(self, qweight, qzeros, scales, groupsize, num_samples=10):
         """调试反量化过程，比较Triton和Python实现的结果"""
         logger.info("Debugging dequantization process...")
+        
+        # 打印输入参数信息
+        logger.info(f"Input shapes: qweight={qweight.shape}, qzeros={qzeros.shape}, scales={scales.shape}")
+        logger.info(f"qweight dtype: {qweight.dtype}, qzeros dtype: {qzeros.dtype}, scales dtype: {scales.dtype}")
+        logger.info(f"qweight range: [{qweight.min().item()}, {qweight.max().item()}]")
+        logger.info(f"qzeros range: [{qzeros.min().item()}, {qzeros.max().item()}]")
+        logger.info(f"scales range: [{scales.min().item():.6f}, {scales.max().item():.6f}]")
 
         # 使用Python实现反量化
         python_weight = self.dequantize_gptq_weight(qweight, qzeros, scales, groupsize)
+        logger.info(f"Python weight shape: {python_weight.shape}, range: [{python_weight.min().item():.6f}, {python_weight.max().item():.6f}]")
 
         # 使用Triton实现反量化（通过矩阵乘法）：使用单位矩阵作为输入，这样输出就是权重矩阵
         K, N = qweight.shape[0], scales.shape[1]
         input = torch.eye(K, dtype=torch.float16, device='cuda')  # 形状为[K, K]
-        triton_result = self.fused_gptq_gemm_4bit(input, qweight, qzeros, scales)
+        logger.info(f"Input matrix shape: {input.shape}")
+        
+        try:
+            triton_result = self.fused_gptq_gemm_4bit(input, qweight, qzeros, scales)
+            logger.info(f"Triton result shape: {triton_result.shape}, range: [{triton_result.min().item():.6f}, {triton_result.max().item():.6f}]")
+        except Exception as e:
+            logger.error(f"Triton kernel failed: {e}")
+            return python_weight, None
 
         # 输出形状应该是[K, N]
         triton_weight = triton_result  # 因为输入是[K, K]，输出是[K, N]
@@ -458,8 +486,17 @@ if __name__ == "__main__":
     # 创建GPTQ融合实例
     gptq_fusion = GPTQTritonFusion(groupsize=128)
     
+    # 先进行调试
+    print("🔍 Debugging dequantization...")
+    gptq_fusion.debug_dequantization(
+        qweight=torch.randint(0, 256, (128, 8), dtype=torch.int32, device='cuda'),
+        qzeros=torch.randint(0, 16, (1, 8), dtype=torch.int32, device='cuda'),
+        scales=torch.randn(1, 64, dtype=torch.float16, device='cuda'),
+        groupsize=128
+    )
+    
     # 测试正确性
-    print("Testing correctness...")
+    print("\nTesting correctness...")
     success = gptq_fusion.test_correctness(M=32, N=64, K=128)
     print(f"Correctness test: {'PASSED' if success else 'FAILED'}")
     
