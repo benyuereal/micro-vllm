@@ -16,6 +16,7 @@ class GPTQCUDAFusion:
     def __init__(self, groupsize=128):
         self.groupsize = groupsize
         self._cuda_kernel = None
+        self._format_cache = {}  # 缓存格式检测结果
         self._load_cuda_kernel()
 
     def _load_cuda_kernel(self):
@@ -77,25 +78,39 @@ class GPTQCUDAFusion:
         logger.info(f"CUDA融合内核: input{M}x{K}, qweight{N}x{qweight.shape[1]}, qzeros{qzeros.shape}, scales{scales.shape}")
         
         # 检测GPTQ格式并自动转换
-        if qweight.shape[1] == K // 8:
-            # 标准格式: [N, K//8]
-            logger.debug("使用标准GPTQ格式")
-        elif qweight.shape[0] == K // 8 and qweight.shape[1] == N:
-            # 转置格式: [K//8, N] -> [N, K//8]
-            logger.debug("检测到转置格式，自动转换")
-            qweight = qweight.t()
+        format_key = f"{qweight.shape}_{qzeros.shape}_{scales.shape}"
+        if format_key in self._format_cache:
+            # 使用缓存的格式信息
+            qweight, actual_groupsize = self._format_cache[format_key]
+            logger.debug(f"使用缓存的格式信息: groupsize={actual_groupsize}")
         else:
-            # 尝试更灵活的检测
-            logger.debug(f"尝试灵活检测: qweight{qweight.shape}, K={K}, N={N}")
-            if qweight.shape[0] == K // 8:
-                # [K//8, N] 格式
-                logger.debug("检测到 [K//8, N] 格式，自动转换")
+            # 首次检测格式
+            if qweight.shape[1] == K // 8:
+                # 标准格式: [N, K//8]
+                logger.debug("使用标准GPTQ格式")
+                actual_groupsize = self.groupsize
+            elif qweight.shape[0] == K // 8 and qweight.shape[1] == N:
+                # 转置格式: [K//8, N] -> [N, K//8]
+                logger.debug("检测到转置格式，自动转换")
                 qweight = qweight.t()
-            elif qweight.shape[1] == K // 8:
-                # [N, K//8] 格式
-                logger.debug("检测到 [N, K//8] 格式")
+                actual_groupsize = self.groupsize
             else:
-                raise ValueError(f"无法识别的qweight格式: {qweight.shape}，期望 [N, K//8] 或 [K//8, N]")
+                # 尝试更灵活的检测
+                logger.debug(f"尝试灵活检测: qweight{qweight.shape}, K={K}, N={N}")
+                if qweight.shape[0] == K // 8:
+                    # [K//8, N] 格式
+                    logger.debug("检测到 [K//8, N] 格式，自动转换")
+                    qweight = qweight.t()
+                    actual_groupsize = self.groupsize
+                elif qweight.shape[1] == K // 8:
+                    # [N, K//8] 格式
+                    logger.debug("检测到 [N, K//8] 格式")
+                    actual_groupsize = self.groupsize
+                else:
+                    raise ValueError(f"无法识别的qweight格式: {qweight.shape}，期望 [N, K//8] 或 [K//8, N]")
+            
+            # 缓存格式信息
+            self._format_cache[format_key] = (qweight, actual_groupsize)
         
         # 验证转换后的格式
         if qweight.shape[1] != K // 8:
@@ -121,6 +136,10 @@ class GPTQCUDAFusion:
                     logger.info(f"推断的groupsize: {actual_groupsize}")
                 else:
                     raise ValueError(f"无法识别的qzeros格式: {qzeros.shape}，期望 [num_groups, K//8] 或 [num_groups, groupsize//8]")
+            
+            # 更新缓存中的groupsize
+            if format_key in self._format_cache:
+                self._format_cache[format_key] = (qweight, actual_groupsize)
         
         if scales.shape[1] != K:
             raise ValueError(f"scales第二维必须是K={K}，得到{scales.shape[1]}")
@@ -138,19 +157,16 @@ class GPTQCUDAFusion:
             raise RuntimeError("CUDA内核不可用，无法执行")
         
         try:
-            # 根据qzeros格式调整groupsize
-            if qzeros.shape[1] != K // 8:
-                # qzeros是[num_groups, groupsize//8]格式
-                actual_groupsize = qzeros.shape[1] * 8
-                logger.info(f"使用推断的groupsize: {actual_groupsize}")
-                output = self._cuda_kernel.fused_gptq_gemm_4bit_cuda(
-                    input, qweight, qzeros, scales, actual_groupsize
-                )
+            # 使用缓存的groupsize
+            if format_key in self._format_cache:
+                _, actual_groupsize = self._format_cache[format_key]
+                logger.debug(f"使用缓存的groupsize: {actual_groupsize}")
             else:
-                # 标准格式
-                output = self._cuda_kernel.fused_gptq_gemm_4bit_cuda(
-                    input, qweight, qzeros, scales, self.groupsize
-                )
+                actual_groupsize = self.groupsize
+            
+            output = self._cuda_kernel.fused_gptq_gemm_4bit_cuda(
+                input, qweight, qzeros, scales, actual_groupsize
+            )
             logger.info(f"✅ CUDA内核执行成功，输出形状: {output.shape}")
             return output
         except Exception as e:

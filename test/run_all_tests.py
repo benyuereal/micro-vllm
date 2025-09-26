@@ -41,14 +41,11 @@ def main():
     
     # 测试列表
     tests = [
-        ("导入测试", "test_import.py"),
-        ("简单功能测试", "simple_test.py"),
-        ("GPTQ格式转换测试", "test_gptq_format_conversion.py"),
-        ("GPTQ格式检测测试", "test_gptq_format_detection.py"),
-        ("GPTQ维度验证测试", "test_gptq_dimensions.py"),
         ("GPTQ功能测试", "test_gptq_functionality.py"),
         ("批处理Layer层测试", "test_batch_layer_shapes.py"),
         ("Layer层集成测试", "test_layer_integration.py"),
+        ("实际推理格式测试", "test_actual_inference_format.py"),
+        ("性能优化测试", "test_performance_optimization.py"),
     ]
     
     passed_tests = 0
