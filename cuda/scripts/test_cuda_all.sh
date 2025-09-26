@@ -13,7 +13,7 @@ bash scripts/check_cuda_env.sh
 echo "=========================================="
 echo "🔨 步骤2: 编译CUDA内核"
 echo "=========================================="
-python scripts/compile_cuda_kernel.py
+python scripts/compile_cuda_kernel_smart.py
 
 # 3. 测试CUDA内核
 echo "=========================================="

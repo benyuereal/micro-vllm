@@ -1,11 +1,27 @@
 #!/usr/bin/env python3
 """
-CUDA C++内核编译脚本
+CUDA内核编译脚本 - 智能路径检测版本
 """
 
 import os
 import torch
+import sys
 from torch.utils.cpp_extension import load
+
+def find_cuda_file():
+    """智能查找CUDA文件"""
+    possible_paths = [
+        "src/gptq_cuda_kernel.cu",           # 从cuda目录运行
+        "../src/gptq_cuda_kernel.cu",        # 从scripts目录运行
+        "../../src/gptq_cuda_kernel.cu",     # 从tests目录运行
+        "core/layer/gptq_cuda_kernel.cu",    # 从根目录运行
+    ]
+    
+    for path in possible_paths:
+        if os.path.exists(path):
+            return path
+    
+    return None
 
 def compile_cuda_kernel():
     """编译CUDA C++内核"""
@@ -18,10 +34,15 @@ def compile_cuda_kernel():
     cuda_version = torch.version.cuda
     print(f"检测到CUDA版本: {cuda_version}")
     
-    # 检查CUDA文件是否存在
-    cuda_file = "../src/gptq_cuda_kernel.cu"
-    if not os.path.exists(cuda_file):
-        print(f"❌ CUDA文件不存在: {cuda_file}")
+    # 智能查找CUDA文件
+    cuda_file = find_cuda_file()
+    if cuda_file is None:
+        print("❌ 找不到CUDA文件，请检查文件位置")
+        print("📋 查找的路径:")
+        print("  - src/gptq_cuda_kernel.cu")
+        print("  - ../src/gptq_cuda_kernel.cu")
+        print("  - ../../src/gptq_cuda_kernel.cu")
+        print("  - core/layer/gptq_cuda_kernel.cu")
         return None
     
     print(f"✅ CUDA文件存在: {cuda_file}")

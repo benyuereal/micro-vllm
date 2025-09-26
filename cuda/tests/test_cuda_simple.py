@@ -30,7 +30,7 @@ def test_cuda_kernel_compilation():
     
     try:
         # 检查CUDA文件是否存在
-        cuda_file = "src/gptq_cuda_kernel.cu"
+        cuda_file = "../src/gptq_cuda_kernel.cu"
         if not os.path.exists(cuda_file):
             print(f"❌ CUDA文件不存在: {cuda_file}")
             return None
