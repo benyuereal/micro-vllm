@@ -166,6 +166,7 @@ class GPTQCUDAFusion:
             if qzeros.shape[1] == 1536 and scales.shape[1] == 12288:
                 # logger.info("检测到特殊格式: qzeros[32, 1536], scales[32, 12288]")
                 # 这是实际推理中的特殊格式，允许通过
+                pass
             else:
                 raise ValueError(f"scales第二维必须是K={K}或N={N}，得到{scales.shape[1]}")
         
