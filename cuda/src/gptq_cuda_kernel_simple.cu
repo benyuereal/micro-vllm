@@ -82,11 +82,11 @@ torch::Tensor fused_gptq_gemm_4bit_cuda(
     
     // 启动内核
     simple_gptq_gemm_kernel<<<grid_size, block_size>>>(
-        input.data_ptr<at::Half>(),
+        reinterpret_cast<const half*>(input.data_ptr<at::Half>()),
         qweight.data_ptr<uint32_t>(),
         qzeros.data_ptr<uint32_t>(),
-        scales.data_ptr<at::Half>(),
-        output.data_ptr<at::Half>(),
+        reinterpret_cast<const half*>(scales.data_ptr<at::Half>()),
+        reinterpret_cast<half*>(output.data_ptr<at::Half>()),
         M, N, K, groupsize
     );
     
