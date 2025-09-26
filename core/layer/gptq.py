@@ -101,8 +101,26 @@ class GPTQCUDAFusion:
         if qweight.shape[1] != K // 8:
             raise ValueError(f"qweight第二维必须是K//8={K//8}，得到{qweight.shape[1]}")
         
+        # 更灵活的qzeros维度检测
         if qzeros.shape[1] != K // 8:
-            raise ValueError(f"qzeros第二维必须是K//8={K//8}，得到{qzeros.shape[1]}")
+            # 尝试检测实际的groupsize
+            actual_groupsize = qzeros.shape[1] * 8  # 假设qzeros第二维是实际groupsize//8
+            if actual_groupsize == K:
+                # 这是标准格式，但qzeros第二维是groupsize//8
+                logger.debug(f"检测到qzeros格式: [num_groups, groupsize//8] = [{qzeros.shape[0]}, {qzeros.shape[1]}]")
+            else:
+                # 尝试其他可能的格式
+                logger.warning(f"qzeros维度不匹配: 期望K//8={K//8}，得到{qzeros.shape[1]}")
+                logger.warning(f"尝试检测实际格式: qzeros{qzeros.shape}, scales{scales.shape}")
+                
+                # 如果scales第二维是K，那么qzeros可能是[num_groups, groupsize//8]格式
+                if scales.shape[1] == K:
+                    logger.info("检测到可能的GPTQ格式: qzeros[num_groups, groupsize//8], scales[num_groups, K]")
+                    # 这种情况下，我们需要重新计算groupsize
+                    actual_groupsize = qzeros.shape[1] * 8
+                    logger.info(f"推断的groupsize: {actual_groupsize}")
+                else:
+                    raise ValueError(f"无法识别的qzeros格式: {qzeros.shape}，期望 [num_groups, K//8] 或 [num_groups, groupsize//8]")
         
         if scales.shape[1] != K:
             raise ValueError(f"scales第二维必须是K={K}，得到{scales.shape[1]}")
@@ -120,9 +138,19 @@ class GPTQCUDAFusion:
             raise RuntimeError("CUDA内核不可用，无法执行")
         
         try:
-            output = self._cuda_kernel.fused_gptq_gemm_4bit_cuda(
-                input, qweight, qzeros, scales, self.groupsize
-            )
+            # 根据qzeros格式调整groupsize
+            if qzeros.shape[1] != K // 8:
+                # qzeros是[num_groups, groupsize//8]格式
+                actual_groupsize = qzeros.shape[1] * 8
+                logger.info(f"使用推断的groupsize: {actual_groupsize}")
+                output = self._cuda_kernel.fused_gptq_gemm_4bit_cuda(
+                    input, qweight, qzeros, scales, actual_groupsize
+                )
+            else:
+                # 标准格式
+                output = self._cuda_kernel.fused_gptq_gemm_4bit_cuda(
+                    input, qweight, qzeros, scales, self.groupsize
+                )
             logger.info(f"✅ CUDA内核执行成功，输出形状: {output.shape}")
             return output
         except Exception as e:
