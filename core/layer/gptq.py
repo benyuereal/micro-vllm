@@ -587,6 +587,13 @@ class GPTQTritonFusion:
         
         logger.info(f"baseline_gptq_gemm: input{input_K}x{N}, qweight{qweight.shape}, qzeros{qzeros.shape}, scales{scales.shape}")
         
+        # 详细的格式检测日志
+        logger.info(f"Format detection:")
+        logger.info(f"  qweight.shape[1] == input_K // 8: {qweight.shape[1]} == {input_K // 8} = {qweight.shape[1] == input_K // 8}")
+        logger.info(f"  qzeros.shape[1] == input_K // 8: {qzeros.shape[1]} == {input_K // 8} = {qzeros.shape[1] == input_K // 8}")
+        logger.info(f"  scales.shape[1] == input_K: {scales.shape[1]} == {input_K} = {scales.shape[1] == input_K}")
+        logger.info(f"  scales.shape[1] == N: {scales.shape[1]} == {N} = {scales.shape[1] == N}")
+        
         # 判断格式类型并使用最优化的函数
         if qweight.shape[1] == input_K // 8 and qzeros.shape[1] == input_K // 8 and scales.shape[1] == input_K:
             # 标准格式: [N, K//8], [num_groups, K//8], [num_groups, K]
@@ -605,16 +612,20 @@ class GPTQTritonFusion:
         elif qweight.shape[1] == input_K // 8 and qzeros.shape[1] == input_K // 8 and scales.shape[1] == N:
             # 特殊格式: [N, K//8], [num_groups, K//8], [num_groups, N] - scales的第二维是N而不是K
             logger.info("Using special format dequantization (scales second dim = N)")
+            logger.info(f"Calling dequantize_gptq_weight_special with K={input_K}")
             dequantized_weight = GPTQTritonFusion.dequantize_gptq_weight_special(
                 qweight, qzeros, scales, groupsize, input_K
             )
+            logger.info(f"Special dequantization result shape: {dequantized_weight.shape}")
             result = torch.matmul(input, dequantized_weight.T)
         else:
             # 自定义格式: 尝试通用处理
             logger.warning(f"Using generic dequantization for custom format: input{input_K}x{N}, qweight{qweight.shape}, qzeros{qzeros.shape}, scales{scales.shape}")
+            logger.info(f"Calling dequantize_gptq_weight_generic")
             dequantized_weight = GPTQTritonFusion.dequantize_gptq_weight_generic(
                 qweight, qzeros, scales, groupsize
             )
+            logger.info(f"Generic dequantization result shape: {dequantized_weight.shape}")
             result = torch.matmul(input, dequantized_weight.T)
 
         return result
