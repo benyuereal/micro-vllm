@@ -79,10 +79,14 @@ class GPTQCUDAFusion:
         
         # 检测GPTQ格式并自动转换
         format_key = f"{qweight.shape}_{qzeros.shape}_{scales.shape}"
+        actual_groupsize = self.groupsize  # 默认值
+        
         if format_key in self._format_cache:
             # 使用缓存的格式信息
-            qweight, actual_groupsize = self._format_cache[format_key]
-            logger.debug(f"使用缓存的格式信息: groupsize={actual_groupsize}")
+            cached_qweight, cached_groupsize = self._format_cache[format_key]
+            qweight = cached_qweight
+            actual_groupsize = cached_groupsize
+            # logger.debug(f"使用缓存的格式信息: groupsize={actual_groupsize}")
         else:
             # 首次检测格式
             if qweight.shape[1] == K // 8:
@@ -153,15 +157,14 @@ class GPTQCUDAFusion:
                         else:
                             raise ValueError(f"无法识别的qzeros格式: {qzeros.shape}，期望 [num_groups, K//8] 或 [num_groups, groupsize//8]")
             
-            # 更新缓存中的groupsize
-            if format_key in self._format_cache:
-                self._format_cache[format_key] = (qweight, actual_groupsize)
+            # 缓存格式信息
+            self._format_cache[format_key] = (qweight, actual_groupsize)
         
         # 验证scales维度 - 更宽松的验证
         if scales.shape[1] != K and scales.shape[1] != N:
             # 检查是否是特殊格式
             if qzeros.shape[1] == 1536 and scales.shape[1] == 12288:
-                logger.info("检测到特殊格式: qzeros[32, 1536], scales[32, 12288]")
+                # logger.info("检测到特殊格式: qzeros[32, 1536], scales[32, 12288]")
                 # 这是实际推理中的特殊格式，允许通过
             else:
                 raise ValueError(f"scales第二维必须是K={K}或N={N}，得到{scales.shape[1]}")
@@ -183,7 +186,7 @@ class GPTQCUDAFusion:
             # 对于特殊格式，直接使用qzeros的第一维作为组数
             if qzeros.shape[1] == 1536 and scales.shape[1] == 12288:
                 num_groups = qzeros.shape[0]  # 直接使用32
-                logger.info(f"特殊格式使用直接组数: {num_groups}")
+                # logger.info(f"特殊格式使用直接组数: {num_groups}")
             else:
                 num_groups = K // actual_groupsize
         else:
