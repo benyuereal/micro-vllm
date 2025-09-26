@@ -130,7 +130,7 @@ class GPTQTritonFusion:
         M, K = input.shape
         N = qweight.shape[0]
         
-        logger.info(f"Triton融合内核: input{M}x{K}, qweight{N}x{qweight.shape[1]}, qzeros{qzeros.shape}, scales{scales.shape}")
+        # logger.info(f"Triton融合内核: input{M}x{K}, qweight{N}x{qweight.shape[1]}, qzeros{qzeros.shape}, scales{scales.shape}")
         
         # 验证GPTQ格式
         if qweight.shape[1] != K // 8:
@@ -153,10 +153,10 @@ class GPTQTritonFusion:
         # 分配输出矩阵
         output = torch.empty((M, N), dtype=torch.float32, device=input.device)
         
-        # 分块参数
-        BLOCK_SIZE_M = 64
-        BLOCK_SIZE_N = 64
-        BLOCK_SIZE_K = 64
+        # 分块参数 - 优化为更大的块以提高性能
+        BLOCK_SIZE_M = 128
+        BLOCK_SIZE_N = 128
+        BLOCK_SIZE_K = 128
         
         # 计算网格大小
         grid = (triton.cdiv(M, BLOCK_SIZE_M) * triton.cdiv(N, BLOCK_SIZE_N),)
@@ -183,12 +183,12 @@ class GPTQTritonFusion:
         if output.dtype != input.dtype:
             output = output.to(input.dtype)
         
-        logger.info(f"Triton融合内核完成: 输出形状 {output.shape}")
+        # logger.info(f"Triton融合内核完成: 输出形状 {output.shape}")
         return output
 
     def _handle_qwen7b_qkv_format(self, input, qweight, qzeros, scales, input_dim, output_dim):
         """处理Qwen7B QKV投影格式，使用优化的Triton内核"""
-        logger.info("处理Qwen7B QKV投影格式")
+        # logger.info("处理Qwen7B QKV投影格式")
         
         # Qwen7B QKV格式: qweight=[512, 12288], qzeros=[32, 1536], scales=[32, 12288]
         # 我们需要将其转换为标准格式以使用Triton内核
@@ -207,7 +207,7 @@ class GPTQTritonFusion:
 
     def _handle_qwen7b_output_format(self, input, qweight, qzeros, scales, N, K):
         """处理Qwen7B输出投影格式，使用优化的Triton内核"""
-        logger.info("处理Qwen7B输出投影格式")
+        # logger.info("处理Qwen7B输出投影格式")
         
         # Qwen7B输出格式: qweight=[512, 4096], qzeros=[32, 512], scales=[32, 4096]
         # 我们需要将其转换为标准格式以使用Triton内核
@@ -229,12 +229,12 @@ class GPTQTritonFusion:
         M, K = input.shape
         N = qweight.shape[0]
         
-        logger.info(f"处理Qwen7B格式: input{M}x{K}, qweight{N}x{qweight.shape[1]}, qzeros{qzeros.shape}, scales{scales.shape}")
+        # logger.info(f"处理Qwen7B格式: input{M}x{K}, qweight{N}x{qweight.shape[1]}, qzeros{qzeros.shape}, scales{scales.shape}")
         
         # 检测Qwen7B格式
         if qweight.shape[1] == scales.shape[1] and qzeros.shape[1] == scales.shape[1] // 8:
             # Qwen7B QKV投影格式: [input_dim//8, output_dim]
-            logger.info("检测到Qwen7B QKV投影格式")
+            # logger.info("检测到Qwen7B QKV投影格式")
             input_dim_compressed = N  # 512
             output_dim = scales.shape[1]  # 12288
             input_dim = input_dim_compressed * 8  # 4096
@@ -242,11 +242,11 @@ class GPTQTritonFusion:
             return self._handle_qwen7b_qkv_format(input, qweight, qzeros, scales, input_dim, output_dim)
         elif qweight.shape[1] == K and qzeros.shape[1] == N and scales.shape[1] == K:
             # Qwen7B输出投影格式: [output_dim//8, input_dim]
-            logger.info("检测到Qwen7B输出投影格式")
+            # logger.info("检测到Qwen7B输出投影格式")
             return self._handle_qwen7b_output_format(input, qweight, qzeros, scales, N, K)
         else:
             # 尝试标准格式
-            logger.info("尝试标准GPTQ格式")
+            # logger.info("尝试标准GPTQ格式")
             return self.fused_gptq_gemm_4bit(input, qweight, qzeros, scales)
 
     def test_correctness(self, M=32, N=64, K=128, groupsize=128):
