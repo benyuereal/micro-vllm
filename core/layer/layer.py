@@ -125,7 +125,7 @@ class ModelLayerAdapter:
             key=k.squeeze(2),  # [B, H, D]
             value=v.squeeze(2)  # [B, H, D]
         )
-
+        logger.info("attn_output.shape", attn_output.shape)
         attn_time = time.time() - attn_start
         logger.debug(f"Layer {layer_idx}: 注意力计算耗时 {attn_time * 1000:.2f}ms")
 
