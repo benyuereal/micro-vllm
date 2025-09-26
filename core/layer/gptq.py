@@ -115,19 +115,13 @@ class GPTQCUDAFusion:
             # 缓存格式信息
             self._format_cache[format_key] = actual_groupsize
         
-        # 验证转换后的格式 - 更宽松的验证
+        # 验证转换后的格式 - 简单修复
         if qweight.shape[1] != K // 8:
-            # 检查是否是特殊格式
+            # 如果是 [K//8, N] 格式，转置为 [N, K//8]
             if qweight.shape[0] == K // 8 and qweight.shape[1] == N:
-                # 这是 [K//8, N] 格式，需要转置
-                logger.debug(f"检测到转置格式: qweight{qweight.shape} -> [N, K//8]")
                 qweight = qweight.t()
-            elif qweight.shape[1] == N:
-                # 这是 [N, N] 格式，可能是特殊格式
-                logger.debug(f"检测到特殊格式: qweight{qweight.shape}")
-                # 允许通过，不进行转置
             else:
-                raise ValueError(f"qweight第二维必须是K//8={K//8}或N={N}，得到{qweight.shape[1]}")
+                raise ValueError(f"qweight第二维必须是K//8={K//8}，得到{qweight.shape[1]}")
         
         # 更灵活的qzeros维度检测 - 只在未缓存时执行
         if format_key not in self._format_cache:
