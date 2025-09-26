@@ -16,6 +16,7 @@ class GPTQCUDAFusion:
     def __init__(self, groupsize=128):
         self.groupsize = groupsize
         self._cuda_kernel = None
+        self._qweight_cache = {}  # 缓存转换后的qweight
         self._load_cuda_kernel()
 
     def _load_cuda_kernel(self):
@@ -76,15 +77,27 @@ class GPTQCUDAFusion:
         
         # logger.info(f"CUDA融合内核: input{M}x{K}, qweight{N}x{qweight.shape[1]}, qzeros{qzeros.shape}, scales{scales.shape}")
         
-        # 处理qweight格式转换 - 使用原地操作避免创建新tensor
-        if qweight.shape[1] != K // 8:
-            # 如果是 [K//8, N] 格式，转置为 [N, K//8]
-            if qweight.shape[0] == K // 8 and qweight.shape[1] == N:
-                logger.info(f"转换qweight格式: {qweight.shape} -> {qweight.t().shape}")
-                qweight = qweight.t().contiguous()  # 确保内存连续
+        # 处理qweight格式转换 - 使用缓存避免重复转换
+        qweight_id = id(qweight)  # 使用tensor的id作为缓存键
+        if qweight_id in self._qweight_cache:
+            # 使用缓存的转换后的qweight
+            qweight = self._qweight_cache[qweight_id]
+            logger.debug(f"使用缓存的qweight: {qweight.shape}")
+        else:
+            # 首次转换，缓存结果
+            if qweight.shape[1] != K // 8:
+                # 如果是 [K//8, N] 格式，转置为 [N, K//8]
+                if qweight.shape[0] == K // 8 and qweight.shape[1] == N:
+                    logger.info(f"转换qweight格式: {qweight.shape} -> {qweight.t().shape}")
+                    qweight = qweight.t().contiguous()  # 确保内存连续
+                    # 缓存转换后的qweight
+                    self._qweight_cache[qweight_id] = qweight
+                else:
+                    logger.error(f"qweight格式不匹配: shape={qweight.shape}, K//8={K//8}, N={N}")
+                    raise ValueError(f"qweight第二维必须是K//8={K//8}，得到{qweight.shape[1]}")
             else:
-                logger.error(f"qweight格式不匹配: shape={qweight.shape}, K//8={K//8}, N={N}")
-                raise ValueError(f"qweight第二维必须是K//8={K//8}，得到{qweight.shape[1]}")
+                # 不需要转换，直接缓存原始qweight
+                self._qweight_cache[qweight_id] = qweight
         
         # 检测GPTQ格式
         actual_groupsize = self.groupsize  # 默认值
