@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-性能测试脚本 - 比较原始实现和优化实现
+性能测试脚本 - 比较GPTQ融合算子和原始实现
 """
 import torch
 import time
@@ -8,6 +8,7 @@ import numpy as np
 import logging
 from core.layer.qwen_layer import QwenModelLayerAdapter
 from core.layer.optimized_qwen_layer import OptimizedQwenModelLayerAdapter
+from core.layer.gptq import GPTQTritonFusion
 
 # 设置日志
 logging.basicConfig(level=logging.INFO)
@@ -161,6 +162,83 @@ def benchmark_layer_processing():
     }
 
 
+def benchmark_gptq_fusion():
+    """测试GPTQ融合算子性能"""
+    print("\n🔥 测试GPTQ融合算子性能...")
+    
+    # 测试参数
+    M, N, K = 512, 2048, 2048
+    groupsize = 128
+    num_warmup = 5
+    num_iterations = 20
+    
+    # 创建测试数据
+    input = torch.randn((M, K), dtype=torch.float16, device='cuda')
+    num_groups = K // groupsize
+    qweight = torch.randint(0, 256, (K, N // 8), dtype=torch.int32, device='cuda')
+    qzeros = torch.randint(0, 16, (num_groups, N // 8), dtype=torch.int32, device='cuda')
+    scales = torch.randn((num_groups, N), dtype=torch.float16, device='cuda')
+    
+    # 创建GPTQ融合实例
+    gptq_fusion = GPTQTritonFusion(groupsize=groupsize)
+    
+    # 预热
+    print("🔥 预热GPTQ融合算子...")
+    for _ in range(num_warmup):
+        with torch.no_grad():
+            _ = gptq_fusion.fused_gptq_gemm_4bit(input, qweight, qzeros, scales)
+            _ = gptq_fusion.baseline_gptq_gemm(input, qweight, qzeros, scales, groupsize)
+    
+    torch.cuda.synchronize()
+    
+    # 测试GPTQ融合算子
+    print("📊 测试GPTQ融合算子...")
+    gptq_times = []
+    for i in range(num_iterations):
+        torch.cuda.synchronize()
+        start = time.time()
+        
+        with torch.no_grad():
+            result = gptq_fusion.fused_gptq_gemm_4bit(input, qweight, qzeros, scales)
+        
+        torch.cuda.synchronize()
+        gptq_times.append(time.time() - start)
+    
+    # 测试基线实现
+    print("📊 测试基线实现...")
+    baseline_times = []
+    for i in range(num_iterations):
+        torch.cuda.synchronize()
+        start = time.time()
+        
+        with torch.no_grad():
+            result = gptq_fusion.baseline_gptq_gemm(input, qweight, qzeros, scales, groupsize)
+        
+        torch.cuda.synchronize()
+        baseline_times.append(time.time() - start)
+    
+    # 计算统计信息
+    gptq_avg = np.mean(gptq_times) * 1000
+    gptq_std = np.std(gptq_times) * 1000
+    baseline_avg = np.mean(baseline_times) * 1000
+    baseline_std = np.std(baseline_times) * 1000
+    
+    speedup = baseline_avg / gptq_avg
+    
+    print(f"\n📈 GPTQ融合算子性能结果:")
+    print(f"   矩阵大小: {M}x{N}x{K}")
+    print(f"   GPTQ融合: {gptq_avg:.2f}±{gptq_std:.2f} ms")
+    print(f"   基线实现: {baseline_avg:.2f}±{baseline_std:.2f} ms")
+    print(f"   加速比: {speedup:.2f}x")
+    print(f"   性能提升: {(speedup - 1) * 100:.1f}%")
+    
+    return {
+        'gptq_avg': gptq_avg,
+        'baseline_avg': baseline_avg,
+        'speedup': speedup
+    }
+
+
 def analyze_bottlenecks():
     """分析性能瓶颈"""
     print("\n🔍 性能瓶颈分析...")
@@ -204,17 +282,25 @@ def main():
         # 分析瓶颈
         analyze_bottlenecks()
         
-        # 运行基准测试
-        results = benchmark_layer_processing()
+        # 测试GPTQ融合算子
+        gptq_results = benchmark_gptq_fusion()
+        
+        # 运行层处理基准测试
+        layer_results = benchmark_layer_processing()
         
         # 总结
         print(f"\n🎉 测试完成！")
-        if results['speedup'] > 1.5:
-            print(f"✅ 优化效果显著：{results['speedup']:.2f}x加速")
-        elif results['speedup'] > 1.1:
-            print(f"✅ 优化有效果：{results['speedup']:.2f}x加速")
+        print("="*60)
+        print("📊 性能测试总结:")
+        print(f"   GPTQ融合算子: {gptq_results['speedup']:.2f}x加速")
+        print(f"   层处理优化: {layer_results['speedup']:.2f}x加速")
+        
+        if gptq_results['speedup'] > 1.5:
+            print(f"✅ GPTQ融合算子效果显著：{gptq_results['speedup']:.2f}x加速")
+        elif gptq_results['speedup'] > 1.1:
+            print(f"✅ GPTQ融合算子有效果：{gptq_results['speedup']:.2f}x加速")
         else:
-            print(f"⚠️  优化效果有限：{results['speedup']:.2f}x加速")
+            print(f"⚠️  GPTQ融合算子效果有限：{gptq_results['speedup']:.2f}x加速")
             
     except Exception as e:
         print(f"❌ 测试失败: {e}")
