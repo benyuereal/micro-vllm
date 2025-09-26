@@ -302,12 +302,18 @@ class OptimizedQwenModelLayerAdapter:
         residual = hidden_states
         hidden_states = layer.ln_2(hidden_states)
         
-        if self._is_quantized:
-            # 使用优化的MLP计算
-            hidden_states = self._optimized_quantized_mlp(layer, hidden_states, layer_idx)
-        else:
-            # 标准MLP计算
-            hidden_states = layer.mlp(hidden_states)
+        # 🔧 快速验证方案：使用数据类型转换处理MLP
+        # 确保MLP输入数据类型匹配
+        if hidden_states.dtype != torch.bfloat16:
+            logger.info(f"🔄 转换MLP输入: {hidden_states.dtype} -> bfloat16")
+            hidden_states = hidden_states.to(torch.bfloat16)
+        
+        hidden_states = layer.mlp(hidden_states)
+        
+        # 转换回float16以保持一致性
+        if hidden_states.dtype != torch.float16:
+            logger.info(f"🔄 转换MLP输出: {hidden_states.dtype} -> float16")
+            hidden_states = hidden_states.to(torch.float16)
         
         hidden_states = residual + hidden_states
         logger.info(f"mlp  hidden_states shape {hidden_states.shape}")
