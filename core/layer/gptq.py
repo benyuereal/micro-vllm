@@ -96,7 +96,7 @@ class GPTQTritonFusion:
             a = a.to(tl.float32)
             
             weight = (weight_val - zero_val) * scales
-            
+
             # 矩阵乘法累加
             accumulator += tl.dot(a, weight)
 
@@ -115,7 +115,7 @@ class GPTQTritonFusion:
     ) -> torch.Tensor:
         """
         融合GPTQ 4bit反量化与矩阵乘法的优化实现
-        
+
         参数:
             input: 输入矩阵 [M, K]
             qweight: 量化权重 [N, K//8] (int32) - GPTQ格式
@@ -156,23 +156,24 @@ class GPTQTritonFusion:
         # 避免不必要的类型转换
         output = torch.empty((M, N), dtype=input.dtype, device=input.device)
         
-        # 分块参数 - 针对极致性能优化
-        # 使用更大的分块以获得更好的GPU利用率
+        # 分块参数 - 针对共享内存限制优化
+        # 硬件限制: 166912 bytes
+        # 使用更小的分块以适应硬件限制
         if M == 1 and K == 4096:  # Qwen7B典型输入
             if N <= 4096:  # 输出投影 - 目标0.17ms
-                BLOCK_SIZE_M = 128
-                BLOCK_SIZE_N = 128
-                BLOCK_SIZE_K = 128
+                BLOCK_SIZE_M = 8
+                BLOCK_SIZE_N = 8
+                BLOCK_SIZE_K = 8
             else:  # QKV投影 (N=12288) - 目标0.1ms
-                BLOCK_SIZE_M = 128
-                BLOCK_SIZE_N = 256
-                BLOCK_SIZE_K = 128
+                BLOCK_SIZE_M = 8
+                BLOCK_SIZE_N = 16
+                BLOCK_SIZE_K = 8
         else:
             # 默认分块大小
-            BLOCK_SIZE_M = 128
-            BLOCK_SIZE_N = 128
-            BLOCK_SIZE_K = 128
-        
+            BLOCK_SIZE_M = 8
+            BLOCK_SIZE_N = 8
+            BLOCK_SIZE_K = 8
+
         # 计算网格大小
         grid = (triton.cdiv(M, BLOCK_SIZE_M) * triton.cdiv(N, BLOCK_SIZE_N),)
         
@@ -197,27 +198,38 @@ class GPTQTritonFusion:
         except Exception as e:
             # 如果Triton内核失败，尝试更小的分块
             logger.warning(f"Triton内核失败，尝试更小的分块: {e}")
-            BLOCK_SIZE_M = 32
-            BLOCK_SIZE_N = 32
-            BLOCK_SIZE_K = 32
-            grid = (triton.cdiv(M, BLOCK_SIZE_M) * triton.cdiv(N, BLOCK_SIZE_N),)
             
-            self.fused_gptq_gemm_kernel_4bit[grid](
-                # 输入矩阵
-                input, input.stride(0), input.stride(1),
-                # GPTQ参数
-                qweight, qzeros, scales,
-                # 输出矩阵
-                output, output.stride(0), output.stride(1),
-                # 矩阵维度
-                M, N, K,
-                # GPTQ参数
-                groupsize=self.groupsize,
-                # 分块参数
-                BLOCK_SIZE_M=BLOCK_SIZE_M,
-                BLOCK_SIZE_N=BLOCK_SIZE_N,
-                BLOCK_SIZE_K=BLOCK_SIZE_K
-            )
+            # 尝试多种分块大小
+            block_sizes = [(8, 8, 8), (4, 4, 4), (2, 2, 2)]
+            
+            for BLOCK_SIZE_M, BLOCK_SIZE_N, BLOCK_SIZE_K in block_sizes:
+                try:
+                    grid = (triton.cdiv(M, BLOCK_SIZE_M) * triton.cdiv(N, BLOCK_SIZE_N),)
+                    
+                    self.fused_gptq_gemm_kernel_4bit[grid](
+                        # 输入矩阵
+                        input, input.stride(0), input.stride(1),
+                        # GPTQ参数
+                        qweight, qzeros, scales,
+                        # 输出矩阵
+                        output, output.stride(0), output.stride(1),
+                        # 矩阵维度
+                        M, N, K,
+                        # GPTQ参数
+                        groupsize=self.groupsize,
+                        # 分块参数
+                        BLOCK_SIZE_M=BLOCK_SIZE_M,
+                        BLOCK_SIZE_N=BLOCK_SIZE_N,
+                        BLOCK_SIZE_K=BLOCK_SIZE_K
+                    )
+                    logger.info(f"✅ 使用分块大小 {BLOCK_SIZE_M}x{BLOCK_SIZE_N}x{BLOCK_SIZE_K} 成功")
+                    break
+                except Exception as retry_e:
+                    logger.warning(f"分块大小 {BLOCK_SIZE_M}x{BLOCK_SIZE_N}x{BLOCK_SIZE_K} 失败: {retry_e}")
+                    continue
+            else:
+                # 所有分块大小都失败
+                raise RuntimeError(f"所有分块大小都失败，无法运行Triton内核: {e}")
         
         # 输出已经是正确的数据类型，无需转换
         # if output.dtype != input.dtype:
