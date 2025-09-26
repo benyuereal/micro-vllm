@@ -1,77 +1,72 @@
-# 测试目录
+# Test目录说明
 
-本目录包含GPTQ融合算子的各种测试脚本。
+## 目录结构
+```
+test/
+├── test_gptq_functionality.py    # GPTQ功能测试
+├── test_batch_layer_shapes.py    # 批处理Layer层测试
+├── test_layer_integration.py     # Layer层集成测试
+├── run_all_tests.py              # 一键测试脚本
+└── README.md                     # 测试说明
+```
 
-## 📁 测试文件说明
+## 测试说明
 
-### 🚀 核心功能测试
-- **`test_qwen7b_gptq_fast.py`** - 快速测试Qwen7B GPTQ格式修复
-  - 使用小矩阵快速验证逻辑
-  - 包含QKV投影和注意力结构测试
-  - 运行时间短，适合快速验证
+### 1. GPTQ功能测试 (`test_gptq_functionality.py`)
+- 测试CUDA融合内核的基本功能
+- 验证QKV投影、注意力输出投影、输出投影、MLP投影
+- 性能基准测试
+- 目标：0.10ms延迟
 
-- **`test_qwen7b_structure.py`** - 完整Qwen7B模型结构测试
-  - 测试完整的Qwen7B模型结构
-  - 验证QKV投影和注意力机制
-  - 确保所有维度正确
+### 2. 批处理Layer层测试 (`test_batch_layer_shapes.py`)
+- 专门测试批处理layer层形状
+- 验证3D到2D形状转换
+- 完整的layer层数据流测试
+- 基于实际layer层数据形状
 
-### 🔧 专门功能测试
-- **`test_output_projection_gptq_fix.py`** - 输出投影GPTQ格式修复测试
-  - 专门测试输出投影的GPTQ格式
-  - 验证两种不同格式的处理
-  - 确保输出投影正确工作
+### 3. Layer层集成测试 (`test_layer_integration.py`)
+- 测试optimized_qwen_layer.py与CUDA融合内核的集成
+- 验证实际layer层数据形状
+- 测试前向传播
 
-- **`test_output_projection_shape.py`** - 输出投影形状处理测试
-  - 测试注意力输出形状重塑
-  - 验证数据一致性
-  - 确保形状转换正确
+### 4. 一键测试脚本 (`run_all_tests.py`)
+- 运行所有测试
+- 测试结果汇总
 
-### ⚡ 性能测试
-- **`test_large_matrix.py`** - 大矩阵性能测试
-  - 测试GPTQ性能与大型矩阵
-  - 验证内存使用和计算效率
-  - 适合性能基准测试
+## 使用方法
 
-- **`test_optimization.py`** - 优化方法测试
-  - 比较不同反量化优化方法
-  - 验证性能提升效果
-  - 确保优化正确性
+### 运行单个测试
+```bash
+cd test
+python test_gptq_functionality.py
+python test_batch_layer_shapes.py
+python test_layer_integration.py
+```
 
-## 🎯 推荐测试顺序
+### 运行所有测试
+```bash
+cd test
+python run_all_tests.py
+```
 
-1. **快速功能验证**:
-   ```bash
-   cd test && python test_qwen7b_gptq_fast.py
-   ```
+## 测试数据形状
 
-2. **输出投影测试**:
-   ```bash
-   cd test && python test_output_projection_gptq_fix.py
-   ```
+基于实际layer层数据形状：
+- **QKV投影**: input[1,4096] -> output[1,12288]
+- **注意力输出投影**: input[32,128] -> output[32,128]
+- **输出投影**: input[1,4096] -> output[1,4096]
+- **MLP投影1**: input[1,4096] -> output[1,11008]
+- **MLP投影2**: input[1,11008] -> output[1,4096]
 
-3. **完整结构测试**:
-   ```bash
-   cd test && python test_qwen7b_structure.py
-   ```
+## 性能目标
 
-4. **性能测试** (可选):
-   ```bash
-   cd test && python test_large_matrix.py
-   cd test && python test_optimization.py
-   ```
+- **目标延迟**: 0.10ms
+- **当前性能**: 0.11ms (已接近目标)
+- **优化策略**: 无回退，只有向前优化
 
-## 📊 测试结果
+## 注意事项
 
-所有测试通过后，你应该看到：
-- ✅ QKV投影输出维度: 12288
-- ✅ 输出投影输出维度: 4096
-- ✅ 所有形状转换正确
-- ✅ GPTQ格式处理正确
-
-## 🔧 故障排除
-
-如果测试失败，请检查：
-1. CUDA是否可用
-2. GPTQ参数格式是否正确
-3. 输入输出维度是否匹配
-4. 日志中的错误信息
+1. 需要CUDA环境
+2. 需要编译CUDA内核
+3. 测试前确保gptq.py已更新
+4. 如果测试失败，检查CUDA内核编译状态

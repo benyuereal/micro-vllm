@@ -43,7 +43,6 @@ python test.py
 
 # 测试vLLM版本
 python compile_vllm.py
-python test_vllm_only.py
 
 # 性能对比测试
 python test_vllm_comparison.py
