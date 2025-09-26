@@ -1,19 +1,19 @@
 #!/usr/bin/env python3
 """
-测试GPTQ格式修复
+测试特殊GPTQ格式修复
 """
 import torch
 import sys
 import os
 
 # 添加项目根目录到Python路径
-sys.path.append(os.path.dirname(os.path.abspath(__file__)))
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from core.layer.gptq import GPTQTritonFusion
 
-def test_gptq_format_fix():
-    """测试GPTQ格式修复"""
-    print("🧪 测试GPTQ格式修复...")
+def test_special_format():
+    """测试特殊格式修复"""
+    print("🧪 测试特殊GPTQ格式修复...")
     
     if not torch.cuda.is_available():
         print("❌ CUDA不可用，跳过测试")
@@ -31,8 +31,8 @@ def test_gptq_format_fix():
     qweight = torch.randint(0, 256, (N, K // 8), dtype=torch.int32, device='cuda')
     qzeros = torch.randint(0, 16, (num_groups, K // 8), dtype=torch.int32, device='cuda')
     
-    # 这里模拟scales的第二维是12288而不是4096的情况
-    scales = torch.randn(num_groups, N, dtype=torch.float16, device='cuda')  # [num_groups, N] 而不是 [num_groups, K]
+    # 特殊格式：scales的第二维是N而不是K
+    scales = torch.randn(num_groups, N, dtype=torch.float16, device='cuda')  # [num_groups, N]
     
     print(f"测试矩阵大小: {M}x{K}x{N}")
     print(f"qweight形状: {qweight.shape}")
@@ -114,5 +114,5 @@ def test_standard_format():
         print(f"❌ 标准格式失败: {e}")
 
 if __name__ == "__main__":
-    test_gptq_format_fix()
+    test_special_format()
     test_standard_format()

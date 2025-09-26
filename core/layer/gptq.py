@@ -391,8 +391,13 @@ class GPTQTritonFusion:
         scales_cols = scales.shape[1]
         
         # 尝试推断K值 - 更灵活的方法
-        # 方法1: 从scales推断
-        K = scales_cols
+        # 根据qweight和qzeros的维度推断K
+        if qweight_cols == qzeros_cols:
+            # qweight和qzeros的列数相同，说明K = qweight_cols * 8
+            K = qweight_cols * 8
+        else:
+            # 如果不同，使用scales的列数作为K（但需要验证）
+            K = scales_cols
             
         logger.info(f"Generic dequantization: qweight{N}x{qweight_cols}, qzeros{num_groups}x{qzeros_cols}, scales{num_groups}x{scales_cols}, inferred K={K}")
 
@@ -492,6 +497,67 @@ class GPTQTritonFusion:
         return dequantized_weight
 
     @staticmethod
+    def dequantize_gptq_weight_special(
+            qweight: torch.Tensor,
+            qzeros: torch.Tensor,
+            scales: torch.Tensor,
+            groupsize: int,
+            K: int
+    ) -> torch.Tensor:
+        """
+        特殊格式反量化GPTQ权重 - scales的第二维是N而不是K
+        
+        参数:
+            qweight: 量化权重 [N, K//8] (int32)
+            qzeros: 零点值 [num_groups, K//8] (int32)
+            scales: 缩放因子 [num_groups, N] (float16) - 注意：第二维是N
+            groupsize: 分组大小
+            K: 输入维度（需要显式指定）
+
+        返回:
+            反量化后的权重 [N, K] (float16)
+        """
+        N, qweight_cols = qweight.shape
+        num_groups = scales.shape[0]
+        qzeros_cols = qzeros.shape[1]
+        
+        logger.info(f"Special dequantization: qweight{N}x{qweight_cols}, qzeros{num_groups}x{qzeros_cols}, scales{num_groups}x{N}, K={K}")
+
+        dequantized_weight = torch.zeros((N, K), dtype=torch.float16, device=qweight.device)
+
+        # 使用向量化操作优化
+        for group_idx in range(num_groups):
+            start_idx = group_idx * groupsize
+            end_idx = min(start_idx + groupsize, K)
+            group_size = end_idx - start_idx
+            
+            if group_size <= 0:
+                continue
+                
+            # 获取当前组的参数 - scales的第二维是N，所以需要转置
+            group_scales = scales[group_idx, :]  # [N] - 每个输出维度对应一个scale
+            
+            # 向量化处理每个k值
+            for k_offset in range(group_size):
+                k = start_idx + k_offset
+                
+                # 计算字节索引和位偏移
+                byte_idx = min(k // 8, qweight_cols - 1)
+                bit_shift = (k % 8) * 4
+                
+                # 向量化提取所有N维度的4bit权重值
+                weight_vals = (qweight[:, byte_idx] >> bit_shift) & 0xF  # [N]
+                
+                # 提取零点值
+                zero_byte_idx = min(k // 8, qzeros_cols - 1)
+                zero_val = (qzeros[group_idx, zero_byte_idx] >> bit_shift) & 0xF
+                
+                # 向量化反量化 - 每个N维度使用对应的scale
+                dequantized_weight[:, k] = (weight_vals - zero_val) * group_scales
+
+        return dequantized_weight
+
+    @staticmethod
     def baseline_gptq_gemm(
             input: torch.Tensor,
             qweight: torch.Tensor,
@@ -532,6 +598,13 @@ class GPTQTritonFusion:
             logger.info("Using alternative format dequantization")
             dequantized_weight = GPTQTritonFusion.dequantize_gptq_weight_alternative(
                 qweight, qzeros, scales, groupsize
+            )
+            result = torch.matmul(input, dequantized_weight.T)
+        elif qweight.shape[1] == input_K // 8 and qzeros.shape[1] == input_K // 8 and scales.shape[1] == N:
+            # 特殊格式: [N, K//8], [num_groups, K//8], [num_groups, N] - scales的第二维是N而不是K
+            logger.info("Using special format dequantization (scales second dim = N)")
+            dequantized_weight = GPTQTritonFusion.dequantize_gptq_weight_special(
+                qweight, qzeros, scales, groupsize, input_K
             )
             result = torch.matmul(input, dequantized_weight.T)
         else:
