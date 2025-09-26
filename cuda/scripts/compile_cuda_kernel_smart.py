@@ -11,10 +11,10 @@ from torch.utils.cpp_extension import load
 def find_cuda_file():
     """智能查找CUDA文件"""
     possible_paths = [
-        "src/gptq_cuda_kernel.cu",           # 从cuda目录运行
-        "../src/gptq_cuda_kernel.cu",        # 从scripts目录运行
-        "../../src/gptq_cuda_kernel.cu",     # 从tests目录运行
-        "core/layer/gptq_cuda_kernel.cu",    # 从根目录运行
+        "src/gptq_cuda_kernel_simple.cu",    # 简化版本
+        "../src/gptq_cuda_kernel_simple.cu", # 从scripts目录运行
+        "../../src/gptq_cuda_kernel_simple.cu", # 从tests目录运行
+        "core/layer/gptq_cuda_kernel_simple.cu", # 从根目录运行
     ]
     
     for path in possible_paths:
@@ -39,10 +39,10 @@ def compile_cuda_kernel():
     if cuda_file is None:
         print("❌ 找不到CUDA文件，请检查文件位置")
         print("📋 查找的路径:")
-        print("  - src/gptq_cuda_kernel.cu")
-        print("  - ../src/gptq_cuda_kernel.cu")
-        print("  - ../../src/gptq_cuda_kernel.cu")
-        print("  - core/layer/gptq_cuda_kernel.cu")
+        print("  - src/gptq_cuda_kernel_simple.cu")
+        print("  - ../src/gptq_cuda_kernel_simple.cu")
+        print("  - ../../src/gptq_cuda_kernel_simple.cu")
+        print("  - core/layer/gptq_cuda_kernel_simple.cu")
         return None
     
     print(f"✅ CUDA文件存在: {cuda_file}")
