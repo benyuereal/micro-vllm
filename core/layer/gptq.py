@@ -30,7 +30,9 @@ class GPTQTritonFusion:
             # 分块参数
             BLOCK_SIZE_M: tl.constexpr,
             BLOCK_SIZE_N: tl.constexpr,
-            BLOCK_SIZE_K: tl.constexpr
+            BLOCK_SIZE_K: tl.constexpr,
+            # Tensor Core优化
+            USE_TENSOR_CORE: tl.constexpr = True
     ):
         """
         融合GPTQ 4bit反量化与矩阵乘法的优化内核
@@ -46,7 +48,7 @@ class GPTQTritonFusion:
         offs_n = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
         offs_k = tl.arange(0, BLOCK_SIZE_K)
 
-        # 初始化累加器
+        # 初始化累加器 - 使用float32以获得最佳精度
         accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
 
         # 主循环
@@ -150,25 +152,26 @@ class GPTQTritonFusion:
         if num_groups != K // self.groupsize:
             raise ValueError(f"分组数量 ({num_groups}) 必须等于 K//groupsize ({K // self.groupsize})")
         
-        # 分配输出矩阵 - 使用更高效的内存分配
+        # 分配输出矩阵 - 使用输入数据类型以获得最佳性能
+        # 避免不必要的类型转换
         output = torch.empty((M, N), dtype=input.dtype, device=input.device)
         
-        # 分块参数 - 根据硬件限制动态调整
-        # 共享内存限制: 166912 bytes
-        # 根据矩阵大小动态调整分块大小
-        if M <= 64 and N <= 64 and K <= 64:
-            BLOCK_SIZE_M = 64
-            BLOCK_SIZE_N = 64
-            BLOCK_SIZE_K = 64
-        elif M <= 128 and N <= 128 and K <= 128:
+        # 分块参数 - 针对极致性能优化
+        # 使用更大的分块以获得更好的GPU利用率
+        if M == 1 and K == 4096:  # Qwen7B典型输入
+            if N <= 4096:  # 输出投影 - 目标0.17ms
+                BLOCK_SIZE_M = 128
+                BLOCK_SIZE_N = 128
+                BLOCK_SIZE_K = 128
+            else:  # QKV投影 (N=12288) - 目标0.1ms
+                BLOCK_SIZE_M = 128
+                BLOCK_SIZE_N = 256
+                BLOCK_SIZE_K = 128
+        else:
+            # 默认分块大小
             BLOCK_SIZE_M = 128
             BLOCK_SIZE_N = 128
             BLOCK_SIZE_K = 128
-        else:
-            # 对于大矩阵，使用较小的分块
-            BLOCK_SIZE_M = 64
-            BLOCK_SIZE_N = 64
-            BLOCK_SIZE_K = 64
         
         # 计算网格大小
         grid = (triton.cdiv(M, BLOCK_SIZE_M) * triton.cdiv(N, BLOCK_SIZE_N),)
@@ -216,7 +219,7 @@ class GPTQTritonFusion:
                 BLOCK_SIZE_K=BLOCK_SIZE_K
             )
         
-        # 转换输出数据类型以匹配输入 - 优化：直接使用输入类型
+        # 输出已经是正确的数据类型，无需转换
         # if output.dtype != input.dtype:
         #     output = output.to(input.dtype)
         
@@ -260,18 +263,21 @@ class GPTQTritonFusion:
 
     def process_qwen7b_format(self, input: torch.Tensor, qweight: torch.Tensor, qzeros: torch.Tensor, scales: torch.Tensor) -> torch.Tensor:
         """
-        处理Qwen7B GPTQ格式的主入口
+        处理Qwen7B GPTQ格式的主入口 - 极致性能版本
         自动检测格式并使用相应的Triton内核
         """
         M, K = input.shape
         N = qweight.shape[0]
         
-        # logger.info(f"处理Qwen7B格式: input{M}x{K}, qweight{N}x{qweight.shape[1]}, qzeros{qzeros.shape}, scales{scales.shape}")
+        # 调试信息：打印实际的数据格式
+        logger.info(f"GPTQ格式检测: input{M}x{K}, qweight{N}x{qweight.shape[1]}, qzeros{qzeros.shape}, scales{scales.shape}")
+        logger.info(f"数据类型: input={input.dtype}, qweight={qweight.dtype}, qzeros={qzeros.dtype}, scales={scales.dtype}")
         
         # 检测Qwen7B格式
         if qweight.shape[1] == scales.shape[1] and qzeros.shape[1] == scales.shape[1] // 8:
             # Qwen7B QKV投影格式: [input_dim//8, output_dim]
-            # logger.info("检测到Qwen7B QKV投影格式")
+            # 目标性能: 0.1ms
+            logger.info("检测到Qwen7B QKV投影格式")
             input_dim_compressed = N  # 512
             output_dim = scales.shape[1]  # 12288
             input_dim = input_dim_compressed * 8  # 4096
@@ -279,24 +285,58 @@ class GPTQTritonFusion:
             return self._handle_qwen7b_qkv_format(input, qweight, qzeros, scales, input_dim, output_dim)
         elif qweight.shape[1] == K and qzeros.shape[1] == N and scales.shape[1] == K:
             # Qwen7B输出投影格式: [output_dim//8, input_dim]
-            # logger.info("检测到Qwen7B输出投影格式")
+            # 目标性能: 0.17ms
+            logger.info("检测到Qwen7B输出投影格式")
             return self._handle_qwen7b_output_format(input, qweight, qzeros, scales, N, K)
         else:
             # 尝试标准格式
-            # logger.info("尝试标准GPTQ格式")
+            logger.info("尝试标准GPTQ格式")
             return self.fused_gptq_gemm_4bit(input, qweight, qzeros, scales)
+
+    def check_gptq_compatibility(self, qweight: torch.Tensor, qzeros: torch.Tensor, scales: torch.Tensor) -> bool:
+        """
+        检查GPTQ格式兼容性
+        """
+        # 检查数据类型
+        if qweight.dtype != torch.int32:
+            logger.warning(f"qweight数据类型不匹配: 期望int32, 实际{qweight.dtype}")
+            return False
+        
+        if qzeros.dtype != torch.int32:
+            logger.warning(f"qzeros数据类型不匹配: 期望int32, 实际{qzeros.dtype}")
+            return False
+        
+        if scales.dtype not in [torch.float16, torch.bfloat16]:
+            logger.warning(f"scales数据类型不匹配: 期望float16/bfloat16, 实际{scales.dtype}")
+            return False
+        
+        # 检查维度
+        if qweight.dim() != 2:
+            logger.warning(f"qweight维度不匹配: 期望2D, 实际{qweight.dim()}D")
+            return False
+        
+        if qzeros.dim() != 2:
+            logger.warning(f"qzeros维度不匹配: 期望2D, 实际{qzeros.dim()}D")
+            return False
+        
+        if scales.dim() != 2:
+            logger.warning(f"scales维度不匹配: 期望2D, 实际{scales.dim()}D")
+            return False
+        
+        logger.info("✅ GPTQ格式兼容性检查通过")
+        return True
 
     def test_correctness(self, M=32, N=64, K=128, groupsize=128):
         """测试Triton内核的正确性"""
         logger.info("测试Triton内核正确性...")
         
-        # 生成测试数据
-        input = torch.randn(M, K, dtype=torch.float16, device='cuda')
+        # 生成测试数据 - 使用bfloat16以匹配实际使用
+        input = torch.randn(M, K, dtype=torch.bfloat16, device='cuda')
         
         # 生成模拟的GPTQ参数
         qweight = torch.randint(0, 256, (N, K // 8), dtype=torch.int32, device='cuda')
         qzeros = torch.randint(0, 16, (K // groupsize, K // 8), dtype=torch.int32, device='cuda')
-        scales = torch.randn(K // groupsize, K, dtype=torch.float16, device='cuda')
+        scales = torch.randn(K // groupsize, K, dtype=torch.bfloat16, device='cuda')
         
         logger.info(f"测试数据: input{M}x{K}, qweight{N}x{K//8}, qzeros{K//groupsize}x{K//8}, scales{K//groupsize}x{K}")
         
@@ -313,11 +353,11 @@ class GPTQTritonFusion:
         """基准测试Triton内核性能"""
         logger.info("基准测试Triton内核性能...")
         
-        # 生成测试数据
-        input = torch.randn(M, K, dtype=torch.float16, device='cuda')
+        # 生成测试数据 - 使用bfloat16以匹配实际使用
+        input = torch.randn(M, K, dtype=torch.bfloat16, device='cuda')
         qweight = torch.randint(0, 256, (N, K // 8), dtype=torch.int32, device='cuda')
         qzeros = torch.randint(0, 16, (K // groupsize, K // 8), dtype=torch.int32, device='cuda')
-        scales = torch.randn(K // groupsize, K, dtype=torch.float16, device='cuda')
+        scales = torch.randn(K // groupsize, K, dtype=torch.bfloat16, device='cuda')
         
         # 预热
         for _ in range(10):

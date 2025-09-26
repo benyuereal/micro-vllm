@@ -43,7 +43,7 @@ def test_triton_kernel_qwen7b_qkv():
     # 模拟Qwen7B QKV投影的GPTQ格式: [input_dim//8, output_dim]
     qweight = torch.randint(0, 256, (input_dim // 8, output_dim), dtype=torch.int32, device='cuda')
     qzeros = torch.randint(0, 16, (num_groups, output_dim // 8), dtype=torch.int32, device='cuda')
-    scales = torch.randn(num_groups, output_dim, dtype=torch.float16, device='cuda')
+    scales = torch.randn(num_groups, output_dim, dtype=torch.bfloat16, device='cuda')
     
     print(f"测试参数:")
     print(f"  输入形状: {input_tensor.shape}")
@@ -135,7 +135,7 @@ def test_triton_kernel_qwen7b_output():
     # 模拟Qwen7B输出投影的GPTQ格式: [output_dim//8, input_dim]
     qweight = torch.randint(0, 256, (output_dim // 8, input_dim), dtype=torch.int32, device='cuda')
     qzeros = torch.randint(0, 16, (num_groups, output_dim // 8), dtype=torch.int32, device='cuda')
-    scales = torch.randn(num_groups, input_dim, dtype=torch.float16, device='cuda')
+    scales = torch.randn(num_groups, input_dim, dtype=torch.bfloat16, device='cuda')
     
     print(f"测试参数:")
     print(f"  输入形状: {input_tensor.shape}")
@@ -219,7 +219,7 @@ def test_performance_comparison():
     input_tensor = torch.randn(1, input_dim, dtype=torch.bfloat16, device='cuda')
     qweight = torch.randint(0, 256, (input_dim // 8, output_dim), dtype=torch.int32, device='cuda')
     qzeros = torch.randint(0, 16, (num_groups, output_dim // 8), dtype=torch.int32, device='cuda')
-    scales = torch.randn(num_groups, output_dim, dtype=torch.float16, device='cuda')
+    scales = torch.randn(num_groups, output_dim, dtype=torch.bfloat16, device='cuda')
     
     fusion = GPTQTritonFusion(groupsize=groupsize)
     
