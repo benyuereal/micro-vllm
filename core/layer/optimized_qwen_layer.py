@@ -81,13 +81,13 @@ class OptimizedQwenModelLayerAdapter:
         # 4. 注意力计算
         attn_start = time.time()
         attn_output = self.attention(
-            query=q,
-            key=k,
-            value=v,
+            query=q.squeeze(2),  # [B, H, D]
             cache_manager=cache_manager,
             seq_ids=seq_ids,
             context_lens=context_lens,
-            layer_idx=layer_idx
+            layer_idx=layer_idx,
+            key=k.squeeze(2),  # [B, H, D]
+            value=v.squeeze(2)  # [B, H, D]
         )
         attn_time = time.time() - attn_start
 
