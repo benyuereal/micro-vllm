@@ -881,8 +881,8 @@ class GPTQTritonFusion:
             if dequantized_weight.dtype != input.dtype:
                 dequantized_weight = dequantized_weight.to(input.dtype)
             result = torch.matmul(input, dequantized_weight.T)
-        elif qweight.shape[1] == input_K and qzeros.shape[1] == N // 8 and scales.shape[1] == input_K:
-            # Qwen7B输出投影格式: [N, K], [num_groups, N//8], [num_groups, K]
+        elif qweight.shape[1] == input_K and qzeros.shape[1] == N and scales.shape[1] == input_K:
+            # Qwen7B输出投影格式: [N, K], [num_groups, N], [num_groups, K]
             # qweight=[512, 4096], qzeros=[32, 512], scales=[32, 4096]
             logger.info("Using Qwen7B output projection format dequantization")
             logger.info(f"Calling dequantize_gptq_weight_generic_with_k with K={input_K}, dtype={input.dtype}")

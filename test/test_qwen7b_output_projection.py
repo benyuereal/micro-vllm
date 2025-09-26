@@ -65,11 +65,11 @@ def test_qwen7b_output_projection_format():
     print(f"  scales_cols: {scales_cols}")
     
     # 检查Qwen7B输出投影格式条件
-    condition1 = qweight_cols == input_K and qzeros_cols == N // 8 and scales_cols == input_K
+    condition1 = qweight_cols == input_K and qzeros_cols == N and scales_cols == input_K
     
     print(f"Qwen7B输出投影格式条件:")
     print(f"  qweight_cols == input_K: {qweight_cols} == {input_K} = {qweight_cols == input_K}")
-    print(f"  qzeros_cols == N // 8: {qzeros_cols} == {N // 8} = {qzeros_cols == N // 8}")
+    print(f"  qzeros_cols == N: {qzeros_cols} == {N} = {qzeros_cols == N}")
     print(f"  scales_cols == input_K: {scales_cols} == {input_K} = {scales_cols == input_K}")
     print(f"  满足条件: {condition1}")
     
