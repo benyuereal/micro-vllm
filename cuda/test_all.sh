@@ -41,7 +41,7 @@ try:
     vllm_kernel = load(
         name='fused_gptq_gemm_cuda_vllm',
         sources=['gptq_cuda_kernel_vllm.cu'],
-        extra_cuda_cflags=['-O3', '-use_fast_math', '-Xptxas=-O3', '-lcublas'],
+        extra_cuda_cflags=['-O3', '-use_fast_math', '-Xptxas=-O3'],
         verbose=False
     )
     print('✅ vLLM版本CUDA内核编译成功!')

@@ -15,12 +15,14 @@
 ## 文件结构
 ```
 cuda/
-├── gptq_cuda_kernel.cu    # CUDA内核源码
-├── gptq_cuda.py          # Python接口
-├── compile.py             # 编译脚本
-├── test.py               # 性能测试
-├── test_all.sh           # 一键测试
-└── README.md             # 说明文档
+├── gptq_cuda_kernel.cu        # 当前版本CUDA内核
+├── gptq_cuda_kernel_vllm.cu   # vLLM风格CUDA内核
+├── gptq_cuda.py              # Python接口
+├── compile.py                 # 编译脚本
+├── test.py                   # 性能测试
+├── test_vllm_comparison.py   # 性能对比测试
+├── test_all.sh               # 一键测试
+└── README.md                 # 说明文档
 ```
 
 ## 使用方法

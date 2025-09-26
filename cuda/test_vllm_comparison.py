@@ -83,20 +83,20 @@ def test_performance_comparison():
         print(f"❌ 当前版本测试失败: {e}")
         return
     
-    # 测试vLLM风格版本
-    print("\n⚡ 测试vLLM风格版本")
+    # 测试vLLM版本
+    print("\n⚡ 测试vLLM版本")
     print("==========================================")
     try:
-        print("🔨 编译vLLM风格版本...")
+        print("🔨 编译vLLM版本...")
         vllm_kernel = load(
             name="fused_gptq_gemm_cuda_vllm",
             sources=["gptq_cuda_kernel_vllm.cu"],
-            extra_cuda_cflags=["-O3", "-use_fast_math", "-Xptxas=-O3", "-lcublas"],
+            extra_cuda_cflags=["-O3", "-use_fast_math", "-Xptxas=-O3"],
             verbose=False
         )
-        print("✅ vLLM风格版本编译成功!")
+        print("✅ vLLM版本编译成功!")
         
-        # 测试vLLM风格版本性能
+        # 测试vLLM版本性能
         times_vllm = []
         for i in range(20):
             torch.cuda.synchronize()
@@ -120,20 +120,20 @@ def test_performance_comparison():
         min_vllm = min(times_vllm)
         max_vllm = max(times_vllm)
         
-        print(f"📊 vLLM风格版本性能统计:")
+        print(f"📊 vLLM版本性能统计:")
         print(f"  平均时间: {avg_vllm:.2f}ms")
         print(f"  最小时间: {min_vllm:.2f}ms")
         print(f"  最大时间: {max_vllm:.2f}ms")
         
     except Exception as e:
-        print(f"❌ vLLM风格版本测试失败: {e}")
+        print(f"❌ vLLM版本测试失败: {e}")
         avg_vllm = float('inf')
     
     # 性能对比
     print(f"\n📊 性能对比结果:")
     print(f"  当前版本: {avg_current:.2f}ms")
     if avg_vllm != float('inf'):
-        print(f"  vLLM风格版本: {avg_vllm:.2f}ms")
+        print(f"  vLLM版本: {avg_vllm:.2f}ms")
         print(f"  性能提升: {avg_current/avg_vllm:.2f}x")
     
     # 目标评估
