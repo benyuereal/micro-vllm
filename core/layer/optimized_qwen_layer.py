@@ -141,37 +141,31 @@ class OptimizedQwenModelLayerAdapter:
             qkv_weight, qkv_scale, qkv_zero = self._quantization_cache[cache_key]
 
         # 使用GPTQ融合算子
-        try:
-            # 重塑输入为 [M, K] 格式
-            batch_size, seq_len, hidden_dim = hidden_states.shape
-            input_2d = hidden_states.view(-1, hidden_dim)  # [B*S, D]
-            
-            # 调用融合算子
-            result = self._gptq_fusion.fused_gptq_gemm_4bit(
-                input=input_2d,
-                qweight=qkv_weight,
-                qzeros=qkv_zero,
-                scales=qkv_scale
-            )
-            
-            # 重塑输出为 [B*S, 3*D]
-            result = result.view(batch_size, seq_len, -1)
-            
-            # 分割QKV
-            hidden_size = result.shape[-1] // 3
-            q, k, v = result.split(hidden_size, dim=-1)
-            
-            # 重塑为 [B, H, S, D]
-            q = q.view(batch_size, seq_len, self.num_heads, self.head_size).permute(0, 2, 1, 3)
-            k = k.view(batch_size, seq_len, self.kv_num_heads, self.head_size).permute(0, 2, 1, 3)
-            v = v.view(batch_size, seq_len, self.kv_num_heads, self.head_size).permute(0, 2, 1, 3)
-            
-            return q, k, v
-            
-        except Exception as e:
-            logger.warning(f"GPTQ融合算子失败，回退到原始实现: {e}")
-            # 回退到原始实现
-            return self._fallback_quantized_qkv_proj(layer, hidden_states)
+        # 重塑输入为 [M, K] 格式
+        batch_size, seq_len, hidden_dim = hidden_states.shape
+        input_2d = hidden_states.view(-1, hidden_dim)  # [B*S, D]
+        
+        # 调用融合算子
+        result = self._gptq_fusion.fused_gptq_gemm_4bit(
+            input=input_2d,
+            qweight=qkv_weight,
+            qzeros=qkv_zero,
+            scales=qkv_scale
+        )
+        
+        # 重塑输出为 [B*S, 3*D]
+        result = result.view(batch_size, seq_len, -1)
+        
+        # 分割QKV
+        hidden_size = result.shape[-1] // 3
+        q, k, v = result.split(hidden_size, dim=-1)
+        
+        # 重塑为 [B, H, S, D]
+        q = q.view(batch_size, seq_len, self.num_heads, self.head_size).permute(0, 2, 1, 3)
+        k = k.view(batch_size, seq_len, self.kv_num_heads, self.head_size).permute(0, 2, 1, 3)
+        v = v.view(batch_size, seq_len, self.kv_num_heads, self.head_size).permute(0, 2, 1, 3)
+        
+        return q, k, v
 
     def _optimized_quantized_out_proj(self, layer, attn_output: torch.Tensor, layer_idx: int):
         """
@@ -188,43 +182,22 @@ class OptimizedQwenModelLayerAdapter:
             out_weight, out_scale, out_zero = self._quantization_cache[cache_key]
 
         # 使用GPTQ融合算子
-        try:
-            # 重塑输入为 [M, K] 格式
-            batch_size, seq_len, hidden_dim = attn_output.shape
-            input_2d = attn_output.view(-1, hidden_dim)  # [B*S, D]
-            
-            # 调用融合算子
-            result = self._gptq_fusion.fused_gptq_gemm_4bit(
-                input=input_2d,
-                qweight=out_weight,
-                qzeros=out_zero,
-                scales=out_scale
-            )
-            
-            # 重塑输出
-            result = result.view(batch_size, seq_len, -1)
-            return result
-            
-        except Exception as e:
-            logger.warning(f"GPTQ融合算子失败，回退到原始实现: {e}")
-            # 回退到原始实现
-            return self._fallback_quantized_out_proj(layer, attn_output)
+        # 重塑输入为 [M, K] 格式
+        batch_size, seq_len, hidden_dim = attn_output.shape
+        input_2d = attn_output.view(-1, hidden_dim)  # [B*S, D]
+        
+        # 调用融合算子
+        result = self._gptq_fusion.fused_gptq_gemm_4bit(
+            input=input_2d,
+            qweight=out_weight,
+            qzeros=out_zero,
+            scales=out_scale
+        )
+        
+        # 重塑输出
+        result = result.view(batch_size, seq_len, -1)
+        return result
 
-    def _fallback_quantized_qkv_proj(self, layer, hidden_states: torch.Tensor):
-        """
-        回退的量化QKV投影实现
-        """
-        # 这里实现原始的反量化+矩阵乘法逻辑
-        # 作为GPTQ融合算子的备选方案
-        pass
-
-    def _fallback_quantized_out_proj(self, layer, attn_output: torch.Tensor):
-        """
-        回退的量化输出投影实现
-        """
-        # 这里实现原始的反量化+矩阵乘法逻辑
-        # 作为GPTQ融合算子的备选方案
-        pass
 
     def _get_quant_group_size(self) -> int:
         """获取量化组大小"""
