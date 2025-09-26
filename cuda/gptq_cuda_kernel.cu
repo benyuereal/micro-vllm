@@ -4,7 +4,7 @@
 #include <cuda_fp16.h>
 #include <ATen/cuda/CUDAContext.h>
 
-// 向量化的CUDA内核实现
+// 向量化的CUDA内核实现 - 支持BFloat16
 __global__ void vectorized_gptq_gemm_kernel(
     const half* __restrict__ input,
     const uint32_t* __restrict__ qweight,
