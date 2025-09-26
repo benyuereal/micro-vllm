@@ -46,7 +46,7 @@ class GPTQTritonFusion:
             a_ptr, a_row_stride, a_col_stride,
             # GPTQ量化权重参数
             qweight_ptr, qzeros_ptr, scales_ptr,
-            # 输出矩阵C
+            # 输出矩阵
             c_ptr, c_row_stride, c_col_stride,
             # 矩阵维度
             M, N, K,
@@ -86,6 +86,7 @@ class GPTQTritonFusion:
             a = tl.load(a_ptrs, mask=a_mask, other=0.0)
 
             # 加载量化权重并反量化 (GPTQ格式)
+            # 计算权重指针: qweight存储为int32，每8个4bit值打包为一个int32
             weight_ptrs = qweight_ptr + ((k_offs + offs_k[:, None]) // 8 * (N // 8) +
                                          offs_n[None, :] // 8)
             weight_mask = ((k_offs + offs_k[:, None]) < K) & (offs_n[None, :] < N)
@@ -136,16 +137,35 @@ class GPTQTritonFusion:
         返回:
             输出矩阵 [M, N]
         """
+        # 输入验证
+        if input.dim() != 2:
+            raise ValueError(f"Input must be 2D tensor, got {input.dim()}D")
+        
         M, K = input.shape
         N = scales.shape[1]
         num_groups = scales.shape[0]
 
         # 验证参数
-        assert num_groups == K // self.groupsize
-        assert qzeros.shape[0] == num_groups
-        assert qzeros.shape[1] == N // 8
-        assert qweight.shape[0] == K
-        assert qweight.shape[1] == N // 8
+        if K % self.groupsize != 0:
+            raise ValueError(f"K ({K}) must be divisible by groupsize ({self.groupsize})")
+        
+        if num_groups != K // self.groupsize:
+            raise ValueError(f"Number of groups ({num_groups}) must equal K//groupsize ({K//self.groupsize})")
+        
+        if qzeros.shape[0] != num_groups:
+            raise ValueError(f"qzeros first dimension ({qzeros.shape[0]}) must equal num_groups ({num_groups})")
+        
+        if qzeros.shape[1] != N // 8:
+            raise ValueError(f"qzeros second dimension ({qzeros.shape[1]}) must equal N//8 ({N//8})")
+        
+        if qweight.shape[0] != K:
+            raise ValueError(f"qweight first dimension ({qweight.shape[0]}) must equal K ({K})")
+        
+        if qweight.shape[1] != N // 8:
+            raise ValueError(f"qweight second dimension ({qweight.shape[1]}) must equal N//8 ({N//8})")
+        
+        if N % 8 != 0:
+            raise ValueError(f"N ({N}) must be divisible by 8 for 4-bit quantization")
 
         # 分配输出张量
         result = torch.empty((M, N), dtype=input.dtype, device=input.device)
@@ -176,6 +196,7 @@ class GPTQTritonFusion:
             scales: torch.Tensor,
             groupsize: int
     ) -> torch.Tensor:
+
         """
         反量化GPTQ权重（参考实现，用于验证）
 
@@ -188,6 +209,7 @@ class GPTQTritonFusion:
         返回:
             反量化后的权重 [K, N] (float16)
         """
+
         K, _ = qweight.shape
         N = scales.shape[1]
         num_groups = scales.shape[0]
@@ -220,6 +242,7 @@ class GPTQTritonFusion:
 
         return dequantized_weight
 
+
     @staticmethod
     def baseline_gptq_gemm(
             input: torch.Tensor,
@@ -241,7 +264,7 @@ class GPTQTritonFusion:
         返回:
             输出矩阵 [M, N]
         """
-        # 先反量化权重
+        # 先极简反量化权重
         dequantized_weight = GPTQTritonFusion.dequantize_gptq_weight(
             qweight, qzeros, scales, groupsize
         )
@@ -258,13 +281,16 @@ class GPTQTritonFusion:
         # 使用Python实现反量化
         python_weight = self.dequantize_gptq_weight(qweight, qzeros, scales, groupsize)
 
-        # 使用Triton实现反量化（通过矩阵乘法）
-        M, K, N = 1, qweight.shape[0], scales.shape[1]
-        input = torch.ones((M, K), dtype=torch.float16, device='cuda')
+        # 使用Triton实现反量化（通过矩阵乘法）：使用单位矩阵作为输入，这样输出就是权重矩阵
+        K, N = qweight.shape[0], scales.shape[1]
+        input = torch.eye(K, dtype=torch.float16, device='cuda')  # 形状为[K, K]
         triton_result = self.fused_gptq_gemm_4bit(input, qweight, qzeros, scales)
 
+        # 输出形状应该是[K, N]
+        triton_weight = triton_result  # 因为输入是[K, K]，输出是[K, N]
+
         # 比较结果
-        diff = torch.abs(python_weight - triton_result[0])
+        diff = torch.abs(python_weight - triton_weight)
         max_diff = torch.max(diff).item()
         avg_diff = torch.mean(diff).item()
 
@@ -276,10 +302,10 @@ class GPTQTritonFusion:
         for i in range(min(num_samples, K)):
             for j in range(min(num_samples, N)):
                 logger.info(f"  Python[{i},{j}]: {python_weight[i, j].item():.6f}, "
-                            f"Triton[{i},{j}]: {triton_result[0, i, j].item():.6f}, "
-                            f"Diff: {abs(python_weight[i, j] - triton_result[0, i, j]).item():.6f}")
+                            f"Triton[{i},{j}]: {triton_weight[i, j].item():.6f}, "
+                            f"Diff: {abs(python_weight[i, j] - triton_weight[i, j]).item():.6f}")
 
-        return python_weight, triton_result[0]
+        return python_weight, triton_weight
 
     def test_correctness(
             self,
@@ -336,161 +362,108 @@ class GPTQTritonFusion:
         logger.info(f"Max difference: {max_diff:.6f}")
         logger.info(f"Average difference: {avg_diff:.6f}")
 
-        # 打印一些统计信息
-        logger.info(f"Baseline result range: [{torch.min(baseline_result).item():.6f}, "
-                    f"{torch.max(baseline_result).item():.6f}]")
-        logger.info(f"Triton result range: [{torch.min(triton_result).item():.6f}, "
-                    f"{torch.max(triton_result).item():.6f}]")
-
-        # 找出差异最大的前10个位置
-        if max_diff > tolerance:
-            logger.info("Top 10 largest differences:")
-            flat_diff = diff.flatten()
-            flat_indices = torch.argsort(flat_diff, descending=True)[:10]
-
-            for i, idx in enumerate(flat_indices):
-                idx = idx.item()
-                row = idx // N
-                col = idx % N
-                logger.info(f"  Position ({row}, {col}): Baseline={baseline_result[row, col].item():.6f}, "
-                            f"Triton={triton_result[row, col].item():.6f}, Diff={diff[row, col].item():.6f}")
-
-        # 调试反量化过程
-        if max_diff > tolerance:
-            logger.info("Debugging dequantization process due to large differences...")
-            self.debug_dequantization(qweight, qzeros, scales, self.groupsize)
-
-        # 检查结果
+        # 检查是否在容忍范围内
         if max_diff < tolerance:
-            logger.info("✓ Correctness test passed!")
+            logger.info("✅ Test PASSED: Results are within tolerance")
             return True
         else:
-            logger.error("✗ Correctness test failed!")
+            logger.error(f"❌ Test FAILED: Max difference {max_diff:.6f} exceeds tolerance {tolerance}")
             return False
 
-    def test_performance(
+    def benchmark_performance(
             self,
-            M: int = 256,
-            N: int = 512,
-            K: int = 1024,
-            warmup: int = 5,
-            repeats: int = 20
-    ):
+            M: int = 1024,
+            N: int = 4096,
+            K: int = 4096,
+            num_warmup: int = 5,
+            num_iterations: int = 20
+    ) -> dict:
         """
-        测试Triton融合内核的性能
-
+        性能基准测试
+        
         参数:
             M: 输入矩阵行数
             N: 输出矩阵列数
             K: 输入矩阵列数/权重矩阵行数
-            warmup: 预热次数
-            repeats: 测试次数
+            num_warmup: 预热迭代次数
+            num_iterations: 测试迭代次数
+            
+        返回:
+            包含性能指标的字典
         """
-        logger.info("Testing performance of Triton fused kernel...")
-
-        # 生成随机输入
+        logger.info(f"Benchmarking performance with M={M}, N={N}, K={K}")
+        
+        # 生成测试数据
         input = torch.randn((M, K), dtype=torch.float16, device='cuda')
-
-        # 生成随机GPTQ量化权重
         num_groups = K // self.groupsize
         qweight = torch.randint(0, 256, (K, N // 8), dtype=torch.int32, device='cuda')
         qzeros = torch.randint(0, 16, (num_groups, N // 8), dtype=torch.int32, device='cuda')
         scales = torch.randn((num_groups, N), dtype=torch.float16, device='cuda')
-
+        
         # 预热
-        for _ in range(warmup):
-            self.fused_gptq_gemm_4bit(input, qweight, qzeros, scales)
-
-        # 测试Triton融合内核性能
+        logger.info("Warming up...")
+        for _ in range(num_warmup):
+            _ = self.fused_gptq_gemm_4bit(input, qweight, qzeros, scales)
+            _ = self.baseline_gptq_gemm(input, qweight, qzeros, scales, self.groupsize)
+        
         torch.cuda.synchronize()
-        start_time = time.time()
-
-        for _ in range(repeats):
-            triton_result = self.fused_gptq_gemm_4bit(input, qweight, qzeros, scales)
-
-        torch.cuda.synchronize()
-        triton_time = (time.time() - start_time) / repeats * 1000  # ms
-
-        # 测试基线实现性能
-        torch.cuda.synchronize()
-        start_time = time.time()
-
-        for _ in range(repeats):
-            baseline_result = self.baseline_gptq_gemm(input, qweight, qzeros, scales, self.groupsize)
-
-        torch.cuda.synchronize()
-        baseline_time = (time.time() - start_time) / repeats * 1000  # ms
-
-        # 计算加速比
-        speedup = baseline_time / triton_time
-
-        logger.info(f"Baseline time: {baseline_time:.3f} ms")
-        logger.info(f"Triton time: {triton_time:.3f} ms")
-        logger.info(f"Speedup: {speedup:.2f}x")
-
-        return triton_time, baseline_time, speedup
-
-    def run_comprehensive_test(self):
-        """运行全面的测试"""
-        logger.info("Running comprehensive tests for GPTQ Triton fusion...")
-
-        # 测试正确性（放宽容忍度）
-        correctness_passed = self.test_correctness(tolerance=10.0)
-
-        if not correctness_passed:
-            logger.error("Correctness test failed! Aborting performance test.")
-            return False
-
-        # 测试性能
-        logger.info("")
-        performance_results = []
-
-        # 测试不同矩阵大小
-        test_cases = [
-            (32, 64, 128),  # 小矩阵
-            (256, 512, 1024),  # 中等矩阵
-        ]
-
-        for M, N, K in test_cases:
-            logger.info(f"Testing performance for M={M}, N={N}, K={K}")
-            triton_time, baseline_time, speedup = self.test_performance(M, N, K)
-            performance_results.append({
-                'M': M, 'N': N, 'K': K,
-                'triton_time': triton_time,
-                'baseline_time': baseline_time,
-                'speedup': speedup
-            })
-            logger.info("")
-
-        # 打印汇总结果
-        logger.info("=== Test Results Summary ===")
-        for result in performance_results:
-            logger.info(f"M={result['M']}, N={result['N']}, K={result['K']}: "
-                        f"Triton={result['triton_time']:.2f}ms, "
-                        f"Baseline={result['baseline_time']:.2f}ms, "
-                        f"Speedup={result['speedup']:.2f}x")
-
-        return True
+        
+        # 测试Triton融合内核
+        logger.info("Testing Triton fused kernel...")
+        triton_times = []
+        for _ in range(num_iterations):
+            torch.cuda.synchronize()
+            start = time.time()
+            _ = self.fused_gptq_gemm_4bit(input, qweight, qzeros, scales)
+            torch.cuda.synchronize()
+            triton_times.append(time.time() - start)
+        
+        # 测试基线实现
+        logger.info("Testing baseline implementation...")
+        baseline_times = []
+        for _ in range(num_iterations):
+            torch.cuda.synchronize()
+            start = time.time()
+            _ = self.baseline_gptq_gemm(input, qweight, qzeros, scales, self.groupsize)
+            torch.cuda.synchronize()
+            baseline_times.append(time.time() - start)
+        
+        # 计算统计信息
+        triton_avg = np.mean(triton_times) * 1000  # 转换为毫秒
+        triton_std = np.std(triton_times) * 1000
+        baseline_avg = np.mean(baseline_times) * 1000
+        baseline_std = np.std(baseline_times) * 1000
+        
+        speedup = baseline_avg / triton_avg
+        
+        results = {
+            'triton_avg_ms': triton_avg,
+            'triton_std_ms': triton_std,
+            'baseline_avg_ms': baseline_avg,
+            'baseline_std_ms': baseline_std,
+            'speedup': speedup,
+            'matrix_size': f"{M}x{N}x{K}"
+        }
+        
+        logger.info(f"Results for {results['matrix_size']}:")
+        logger.info(f"  Triton: {triton_avg:.2f}±{triton_std:.2f} ms")
+        logger.info(f"  Baseline: {baseline_avg:.2f}±{baseline_std:.2f} ms")
+        logger.info(f"  Speedup: {speedup:.2f}x")
+        
+        return results
 
 
-def main():
-    """主函数：运行测试"""
-    logger.info("Starting GPTQ Triton fusion tests...")
-
-    # 创建测试实例
-    gptq_fusion = GPTQTritonFusion(groupsize=128)
-
-    # 运行全面测试
-    success = gptq_fusion.run_comprehensive_test()
-
-    if success:
-        logger.info("✓ All tests passed! Triton fusion is ready for integration.")
-    else:
-        logger.error("✗ Tests failed! Please check the implementation.")
-
-    return success
-
-
+# 使用示例
 if __name__ == "__main__":
-    # 运行测试
-    main()
+    # 创建GPTQ融合实例
+    gptq_fusion = GPTQTritonFusion(groupsize=128)
+    
+    # 测试正确性
+    print("Testing correctness...")
+    success = gptq_fusion.test_correctness(M=32, N=64, K=128)
+    print(f"Correctness test: {'PASSED' if success else 'FAILED'}")
+    
+    # 性能基准测试
+    print("\nBenchmarking performance...")
+    perf_results = gptq_fusion.benchmark_performance(M=512, N=2048, K=2048)
+    print(f"Performance results: {perf_results}")
