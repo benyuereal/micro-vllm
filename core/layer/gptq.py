@@ -391,11 +391,15 @@ class GPTQTritonFusion:
         scales_cols = scales.shape[1]
         
         # 尝试推断K值 - 更灵活的方法
-        # 检查是否是转置的GPTQ格式（qweight的第二维是K而不是K//8）
+        # 检查是否是混合格式（qweight和scales的第二维都是输出维度）
         if qweight_cols == scales_cols:
-            # qweight和scales的列数相同，说明qweight的第二维是K（转置格式）
-            K = qweight_cols
-            logger.info(f"Detected transposed GPTQ format: qweight second dim is K={K}")
+            # qweight和scales的列数相同，但这可能是输出维度而不是输入维度
+            # 需要检查是否与输入维度匹配
+            logger.info(f"Detected potential mixed GPTQ format: qweight and scales both have {qweight_cols} columns")
+            # 对于混合格式，我们需要使用实际的输入维度
+            # 这里我们需要从外部传入正确的K值
+            K = qweight_cols  # 临时设置，后面会被修正
+            logger.info(f"Initial K inference: {K}")
         elif qweight_cols == qzeros_cols:
             # qweight和qzeros的列数相同，说明K = qweight_cols * 8
             K = qweight_cols * 8
@@ -441,6 +445,106 @@ class GPTQTritonFusion:
                     dequantized_weight[:, k] = (weight_vals - zero_val) * scale_val
         else:
             # 标准格式：qweight的第二维是K//8
+            logger.info("Using standard GPTQ format dequantization")
+            for group_idx in range(num_groups):
+                start_idx = group_idx * groupsize
+                end_idx = min(start_idx + groupsize, K)
+                group_size = end_idx - start_idx
+                
+                if group_size <= 0:
+                    continue
+                    
+                # 获取当前组的参数
+                group_scales = scales[group_idx, start_idx:end_idx]  # [group_size]
+                
+                # 向量化处理每个k值
+                for k_offset in range(group_size):
+                    k = start_idx + k_offset
+                    
+                    # 计算字节索引和位偏移
+                    byte_idx = min(k // 8, qweight_cols - 1)
+                    bit_shift = (k % 8) * 4
+                    
+                    # 向量化提取所有N维度的4bit权重值
+                    weight_vals = (qweight[:, byte_idx] >> bit_shift) & 0xF  # [N]
+                    
+                    # 提取零点值
+                    zero_byte_idx = min(k // 8, qzeros_cols - 1)
+                    zero_val = (qzeros[group_idx, zero_byte_idx] >> bit_shift) & 0xF
+                    
+                    # 向量化反量化
+                    scale_val = group_scales[k_offset]
+                    dequantized_weight[:, k] = (weight_vals - zero_val) * scale_val
+
+        return dequantized_weight
+
+    @staticmethod
+    def dequantize_gptq_weight_generic_with_k(
+            qweight: torch.Tensor,
+            qzeros: torch.Tensor,
+            scales: torch.Tensor,
+            groupsize: int,
+            K: int
+    ) -> torch.Tensor:
+        """
+        通用反量化GPTQ权重（处理自定义格式）- 带K参数版本
+        
+        参数:
+            qweight: 量化权重 [N, qweight_cols] (int32)
+            qzeros: 零点值 [num_groups, qzeros_cols] (int32)
+            scales: 缩放因子 [num_groups, scales_cols] (float16)
+            groupsize: 分组大小
+            K: 输入维度（显式指定）
+
+        返回:
+            反量化后的权重 [N, K] (float16)
+        """
+        N, qweight_cols = qweight.shape
+        num_groups = scales.shape[0]
+        qzeros_cols = qzeros.shape[1]
+        scales_cols = scales.shape[1]
+        
+        logger.info(f"Generic dequantization with K: qweight{N}x{qweight_cols}, qzeros{num_groups}x{qzeros_cols}, scales{num_groups}x{scales_cols}, K={K}")
+
+        # 反量化权重
+        dequantized_weight = torch.zeros((N, K), dtype=torch.float16, device=qweight.device)
+
+        # 检查是否是混合格式
+        is_mixed_format = (qweight_cols == scales_cols and qweight_cols != K)
+        
+        if is_mixed_format:
+            # 混合格式：qweight和scales的第二维都是输出维度，不是输入维度
+            logger.info("Using mixed GPTQ format dequantization")
+            # 在这种情况下，我们需要重新映射scales
+            for group_idx in range(num_groups):
+                start_idx = group_idx * groupsize
+                end_idx = min(start_idx + groupsize, K)
+                group_size = end_idx - start_idx
+                
+                if group_size <= 0:
+                    continue
+                    
+                # 对于混合格式，scales需要重新映射到输入维度
+                # 这里我们假设scales是按组分布的
+                for k_offset in range(group_size):
+                    k = start_idx + k_offset
+                    
+                    # 计算在scales中的索引（假设scales是按输出维度分布的）
+                    scale_idx = k % scales_cols
+                    scale_val = scales[group_idx, scale_idx]
+                    
+                    # 计算在qweight中的索引
+                    weight_idx = k % qweight_cols
+                    weight_vals = qweight[:, weight_idx]  # [N]
+                    
+                    # 提取零点值
+                    zero_byte_idx = min(k // 8, qzeros_cols - 1)
+                    zero_val = (qzeros[group_idx, zero_byte_idx] >> ((k % 8) * 4)) & 0xF
+                    
+                    # 向量化反量化
+                    dequantized_weight[:, k] = (weight_vals - zero_val) * scale_val
+        else:
+            # 标准格式处理
             logger.info("Using standard GPTQ format dequantization")
             for group_idx in range(num_groups):
                 start_idx = group_idx * groupsize
@@ -658,9 +762,9 @@ class GPTQTritonFusion:
         else:
             # 自定义格式: 尝试通用处理
             logger.warning(f"Using generic dequantization for custom format: input{input_K}x{N}, qweight{qweight.shape}, qzeros{qzeros.shape}, scales{scales.shape}")
-            logger.info(f"Calling dequantize_gptq_weight_generic")
-            dequantized_weight = GPTQTritonFusion.dequantize_gptq_weight_generic(
-                qweight, qzeros, scales, groupsize
+            logger.info(f"Calling dequantize_gptq_weight_generic with input_K={input_K}")
+            dequantized_weight = GPTQTritonFusion.dequantize_gptq_weight_generic_with_k(
+                qweight, qzeros, scales, groupsize, input_K
             )
             logger.info(f"Generic dequantization result shape: {dequantized_weight.shape}")
             result = torch.matmul(input, dequantized_weight.T)
