@@ -11,6 +11,7 @@
 #define THREADS_Y 32
 #define DIVIDE(x, size) (((x) + (size) - 1) / (size))
 
+
 // vLLM风格的向量化点积
 __forceinline__ __device__ half2 dot22_8(half2 (&dq)[4], const half* a_ptr,
                                          const half2 g_result) {
