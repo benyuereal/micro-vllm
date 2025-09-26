@@ -163,23 +163,21 @@ class GPTQTritonFusion:
         torch.cuda.empty_cache()
         
         # 分块参数 - 极致性能优化
-        # 针对Qwen7B特定维度进行优化
+        # 使用更大的分块以获得更好的GPU利用率
         if M == 1 and K == 4096:  # Qwen7B典型输入
             if N <= 4096:  # 输出投影 - 目标0.20ms
-                # 使用更大的分块以获得更好的GPU利用率
                 BLOCK_SIZE_M = 64
                 BLOCK_SIZE_N = 64
                 BLOCK_SIZE_K = 64
             else:  # QKV投影 (N=12288) - 目标0.10ms
-                # 针对大输出维度优化
                 BLOCK_SIZE_M = 64
                 BLOCK_SIZE_N = 128
                 BLOCK_SIZE_K = 64
         else:
-            # 默认分块大小 - 平衡性能和内存
-            BLOCK_SIZE_M = 32
-            BLOCK_SIZE_N = 32
-            BLOCK_SIZE_K = 32
+            # 默认分块大小
+            BLOCK_SIZE_M = 64
+            BLOCK_SIZE_N = 64
+            BLOCK_SIZE_K = 64
 
         # 计算网格大小
         grid = (triton.cdiv(M, BLOCK_SIZE_M) * triton.cdiv(N, BLOCK_SIZE_N),)
@@ -211,10 +209,12 @@ class GPTQTritonFusion:
             
             # 尝试多种分块大小 - 从大到小，优先保持性能
             block_sizes = [
-                (32, 32, 32),  # 平衡性能
-                (16, 32, 16),  # 针对N维度优化
-                (16, 16, 16),  # 保守分块
-                (32, 16, 16),  # 针对M维度优化
+                (64, 64, 64),   # 极致性能
+                (32, 64, 32),   # 针对N维度优化
+                (32, 32, 32),   # 平衡性能
+                (16, 64, 16),   # 针对N维度优化
+                (16, 32, 16),   # 保守分块
+                (16, 16, 16),   # 最小分块
             ]
             
             for BLOCK_SIZE_M, BLOCK_SIZE_N, BLOCK_SIZE_K in block_sizes:
