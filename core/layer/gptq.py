@@ -77,17 +77,7 @@ class GPTQCUDAFusion:
         
         # logger.info(f"CUDA融合内核: input{M}x{K}, qweight{N}x{qweight.shape[1]}, qzeros{qzeros.shape}, scales{scales.shape}")
         
-        # 首先处理qweight格式转换
-        if qweight.shape[1] != K // 8:
-            # 如果是 [K//8, N] 格式，转置为 [N, K//8]
-            if qweight.shape[0] == K // 8 and qweight.shape[1] == N:
-                logger.info(f"转换qweight格式: {qweight.shape} -> {qweight.t().shape}")
-                qweight = qweight.t()
-            else:
-                logger.error(f"qweight格式不匹配: shape={qweight.shape}, K//8={K//8}, N={N}")
-                raise ValueError(f"qweight第二维必须是K//8={K//8}，得到{qweight.shape[1]}")
-        
-        # 检测GPTQ格式并自动转换（基于转换后的qweight）
+        # 检测GPTQ格式并自动转换（基于原始qweight）
         format_key = f"{qweight.shape}_{qzeros.shape}_{scales.shape}"
         actual_groupsize = self.groupsize  # 默认值
         
@@ -125,6 +115,16 @@ class GPTQCUDAFusion:
             
             # 缓存格式信息
             self._format_cache[format_key] = actual_groupsize
+        
+        # 现在处理qweight格式转换（基于缓存的groupsize）
+        if qweight.shape[1] != K // 8:
+            # 如果是 [K//8, N] 格式，转置为 [N, K//8]
+            if qweight.shape[0] == K // 8 and qweight.shape[1] == N:
+                logger.info(f"转换qweight格式: {qweight.shape} -> {qweight.t().shape}")
+                qweight = qweight.t()
+            else:
+                logger.error(f"qweight格式不匹配: shape={qweight.shape}, K//8={K//8}, N={N}")
+                raise ValueError(f"qweight第二维必须是K//8={K//8}，得到{qweight.shape[1]}")
         
         # 更灵活的qzeros维度检测 - 只在未缓存时执行
         if format_key not in self._format_cache:
