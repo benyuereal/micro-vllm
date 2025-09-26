@@ -173,15 +173,21 @@ def test_layer_integration():
     try:
         from core.layer.optimized_qwen_layer import OptimizedQwenLayer
         
+        # 创建模拟的模型配置
+        class MockConfig:
+            def __init__(self):
+                self.model_type = "qwen"
+                self.group_size = 128
+        
+        mock_config = MockConfig()
+        
         # 创建优化层实例
         layer = OptimizedQwenLayer(
-            hidden_size=4096,
-            intermediate_size=11008,
-            num_attention_heads=32,
-            head_dim=128,
-            max_position_embeddings=32768,
-            rope_theta=10000.0,
-            layer_idx=0
+            model_config=mock_config,
+            device='cuda',
+            num_heads=32,
+            head_size=128,
+            kv_num_heads=32
         )
         print("✅ OptimizedQwenLayer实例创建成功")
         

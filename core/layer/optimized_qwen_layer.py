@@ -4,7 +4,7 @@ from typing import Tuple, List, Optional
 from core.paged_attention import PagedAttention
 import logging
 import time
-from .gptq import GPTQTritonFusion
+from .gptq import GPTQCUDAFusion
 
 logger = logging.getLogger(__name__)
 
@@ -12,7 +12,7 @@ logger = logging.getLogger(__name__)
 class OptimizedQwenModelLayerAdapter:
     """
     优化的Qwen7B INT4量化模型适配器
-    解决量化模型性能瓶颈
+    基于layer.py的高效实现，使用CUDA融合内核
     """
 
     def __init__(self, model_config, device: str, num_heads: int, head_size: int, kv_num_heads: int = None):
@@ -30,10 +30,10 @@ class OptimizedQwenModelLayerAdapter:
             device=device
         )
 
-        # 量化相关初始化 - 预计算避免重复检测
+        # 量化相关初始化
         self._quantization_cache = {}
         self._gptq_fusion = None
-        self._is_quantized = None  # 缓存量化状态
+        self._is_quantized = None
         self._quant_group_size = self._get_quant_group_size()
 
     def process_layer(self,
@@ -49,17 +49,23 @@ class OptimizedQwenModelLayerAdapter:
 
         start_time = time.time()
 
-        # 1. 一次性检测量化状态（避免重复检测）
+        # 1. 检测量化状态
         if self._is_quantized is None:
             self._is_quantized = self._detect_qwen_quantized_model(layer)
             if self._is_quantized:
-                self._gptq_fusion = GPTQTritonFusion(groupsize=self._quant_group_size)
-                logger.info(f"Layer {layer_idx}: 检测到量化模型，启用GPTQ融合优化")
+                self._gptq_fusion = GPTQCUDAFusion(groupsize=self._quant_group_size)
+                logger.info(f"Layer {layer_idx}: 检测到量化模型，启用CUDA融合优化")
+
+        # 记录LayerNorm前的时间
+        norm_start = time.time()
+        logger.info(f"hidden_states start shape {hidden_states.shape}")
 
         # 2. LayerNorm + 残差
         residual = hidden_states
         hidden_states = layer.ln_1(hidden_states)
-        norm_time = time.time() - start_time
+
+        logger.info(f"hidden_states norm_fn shape {hidden_states.shape}")
+        norm_time = time.time() - norm_start
 
         # 3. QKV计算 (优化版本)
         qkv_start = time.time()
@@ -69,6 +75,7 @@ class OptimizedQwenModelLayerAdapter:
         else:
             # 标准QKV计算
             qkv = layer.attn.c_attn(hidden_states)
+            logger.info(f"qkv   shape {qkv.shape}")
             hidden_size = qkv.shape[-1] // 3
             q, k, v = qkv.split(hidden_size, dim=-1)
             batch_size, seq_len, _ = hidden_states.shape
@@ -89,6 +96,7 @@ class OptimizedQwenModelLayerAdapter:
             key=k.squeeze(2),  # [B, H, D]
             value=v.squeeze(2)  # [B, H, D]
         )
+        logger.info(f"attn  attn_output shape {attn_output.shape}")
         attn_time = time.time() - attn_start
 
         # 5. 输出投影 (优化版本)
@@ -99,40 +107,39 @@ class OptimizedQwenModelLayerAdapter:
             batch_size, seq_len, _ = hidden_states.shape
             attn_output = attn_output.view(batch_size, seq_len, -1)
         else:
-            attn_output = layer.attn.c_proj(attn_output)
+            attn_output = layer.attn.c_proj(attn_output.reshape(hidden_states.shape[0], -1)).unsqueeze(1)
 
+        logger.info(f"proj_fn  attn_output shape {attn_output.shape}")
+        hidden_states = residual + attn_output
+        logger.info(f"proj  hidden_states shape {hidden_states.shape}")
         proj_time = time.time() - proj_start
 
-        # 6. 残差连接
-        hidden_states = residual + attn_output
-
-        # 7. MLP
+        # 6. MLP + 残差
         mlp_start = time.time()
         residual = hidden_states
         hidden_states = layer.ln_2(hidden_states)
         hidden_states = layer.mlp(hidden_states)
         hidden_states = residual + hidden_states
+        logger.info(f"mlp  hidden_states shape {hidden_states.shape}")
         mlp_time = time.time() - mlp_start
 
-        # 记录耗时
+        # 记录总耗时
+        total_time = time.time() - start_time
         if layer_idx == 0:
-            total_time = time.time() - start_time
-            logger.info(
-                f"Layer {layer_idx}: 总耗时 {total_time * 1000:.2f}ms | "
-                f"LN1({norm_time * 1000:.2f}ms)+QKV({qkv_time * 1000:.2f}ms)+"
-                f"Attn({attn_time * 1000:.2f}ms)+Proj({proj_time * 1000:.2f}ms)+MLP({mlp_time * 1000:.2f}ms) | "
-                f"Quant: {self._is_quantized}"
-            )
+            logger.info(f"Layer {layer_idx}: 总处理耗时 {total_time * 1000:.2f}ms, "
+                       f"分布: LN({norm_time * 1000:.2f}ms)+QKV({qkv_time * 1000:.2f}ms)+"
+                       f"Attn({attn_time * 1000:.2f}ms)+Proj({proj_time * 1000:.2f}ms)+MLP({mlp_time * 1000:.2f}ms) | "
+                       f"Quant: {self._is_quantized}")
 
-        return hidden_states, (k, v)
+        return hidden_states, (k.squeeze(2), v.squeeze(2))
 
     def _optimized_quantized_qkv_proj(self, layer, hidden_states: torch.Tensor, layer_idx: int):
         """
-        优化的量化QKV投影 - 使用GPTQ融合算子
+        优化的量化QKV投影 - 使用CUDA融合算子
         """
         c_attn = layer.attn.c_attn
 
-        # 缓存量化参数（避免重复获取）
+        # 缓存量化参数
         cache_key = f"qkv_{id(c_attn)}"
         if cache_key not in self._quantization_cache:
             qkv_weight, qkv_scale, qkv_zero = self._get_quant_params(c_attn)
@@ -140,13 +147,12 @@ class OptimizedQwenModelLayerAdapter:
         else:
             qkv_weight, qkv_scale, qkv_zero = self._quantization_cache[cache_key]
 
-        # 使用GPTQ融合算子
         # 重塑输入为 [M, K] 格式
         batch_size, seq_len, hidden_dim = hidden_states.shape
         input_2d = hidden_states.view(-1, hidden_dim)  # [B*S, D]
         
-        # 调用融合算子 - 使用Qwen7B格式处理
-        result = self._gptq_fusion.process_qwen7b_format(
+        # 调用CUDA融合算子
+        result = self._gptq_fusion.fused_gptq_gemm_4bit(
             input=input_2d,
             qweight=qkv_weight,
             qzeros=qkv_zero,
@@ -156,19 +162,13 @@ class OptimizedQwenModelLayerAdapter:
         # 重塑输出为 [B*S, output_dim]
         result = result.view(batch_size, seq_len, -1)
         
-        # 调试信息
-        # logger.info(f"QKV projection result shape: {result.shape}")
-        # logger.info(f"Expected hidden_size: {hidden_dim}")
-        
-        # 分割QKV - 检查输出维度
+        # 分割QKV
         output_dim = result.shape[-1]
         if output_dim % 3 != 0:
             logger.error(f"QKV output dimension {output_dim} is not divisible by 3")
             raise ValueError(f"QKV output dimension {output_dim} is not divisible by 3")
         
         hidden_size = output_dim // 3
-        # logger.info(f"Calculated hidden_size: {hidden_size}")
-        
         q, k, v = result.split(hidden_size, dim=-1)
         
         # 重塑为 [B, H, S, D]
@@ -180,7 +180,7 @@ class OptimizedQwenModelLayerAdapter:
 
     def _optimized_quantized_out_proj(self, layer, attn_output: torch.Tensor, layer_idx: int):
         """
-        优化的量化输出投影 - 使用GPTQ融合算子
+        优化的量化输出投影 - 使用CUDA融合算子
         """
         c_proj = layer.attn.c_proj
 
@@ -192,27 +192,17 @@ class OptimizedQwenModelLayerAdapter:
         else:
             out_weight, out_scale, out_zero = self._quantization_cache[cache_key]
 
-        # 调试信息 - 仅在调试时启用
-        # logger.info(f"Output projection GPTQ parameters:")
-        # logger.info(f"  out_weight shape: {out_weight.shape}")
-        # logger.info(f"  out_scale shape: {out_scale.shape}")
-        # logger.info(f"  out_zero shape: {out_zero.shape}")
-        # logger.info(f"  attn_output shape: {attn_output.shape}")
-
         # 重塑注意力输出: [batch_size, num_heads, head_size] -> [batch_size, seq_len, hidden_size]
         batch_size, num_heads, head_size = attn_output.shape
         hidden_size = num_heads * head_size  # 4096 = 32 * 128
         
         # 重塑为 [batch_size, 1, hidden_size]
         attn_output_reshaped = attn_output.view(batch_size, 1, hidden_size)
-        # logger.info(f"Reshaped attn_output: {attn_output_reshaped.shape}")
         
-        # 使用GPTQ融合算子
-        # 重塑输入为 [M, K] 格式
+        # 使用CUDA融合算子
         input_2d = attn_output_reshaped.view(-1, hidden_size)  # [B*S, D]
         
-        # 调用融合算子 - 使用Qwen7B格式处理
-        result = self._gptq_fusion.process_qwen7b_format(
+        result = self._gptq_fusion.fused_gptq_gemm_4bit(
             input=input_2d,
             qweight=out_weight,
             qzeros=out_zero,
@@ -221,9 +211,7 @@ class OptimizedQwenModelLayerAdapter:
         
         # 重塑输出
         result = result.view(batch_size, 1, -1)
-        # logger.info(f"Output projection result: {result.shape}")
         return result
-
 
     def _get_quant_group_size(self) -> int:
         """获取量化组大小"""
@@ -236,18 +224,16 @@ class OptimizedQwenModelLayerAdapter:
         return 128
 
     def _detect_qwen_quantized_model(self, layer) -> bool:
-        """检测是否为量化模型（优化版本）"""
+        """检测是否为量化模型"""
         if not hasattr(layer, "attn") or not hasattr(layer.attn, "c_attn"):
             return False
 
         c_attn = layer.attn.c_attn
-        # 简化检测逻辑，只检查最可能的属性
         return (hasattr(c_attn, "qweight") or 
                 (hasattr(c_attn, "weight") and c_attn.weight.dtype == torch.int8))
 
     def _get_quant_params(self, module):
-        """获取量化参数（优化版本）"""
-        # 简化参数获取逻辑，优先检查最常见的格式
+        """获取量化参数"""
         if hasattr(module, "qweight"):
             return module.qweight, module.scales, module.qzeros
         
@@ -265,3 +251,7 @@ class OptimizedQwenModelLayerAdapter:
         """清理缓存"""
         self._quantization_cache.clear()
         self._is_quantized = None
+
+
+# 添加别名以便导入
+OptimizedQwenLayer = OptimizedQwenModelLayerAdapter
