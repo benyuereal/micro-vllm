@@ -515,56 +515,104 @@ class GPTQTritonFusion:
         dequantized_weight = torch.zeros((N, K), dtype=output_dtype, device=qweight.device)
 
         # 检查是否是Qwen7B的特殊格式
-        # qweight=[512, 12288], qzeros=[32, 1536], scales=[32, 12288]
-        # 这是 [input_dim//8, output_dim] 格式，其中 input_dim=4096, output_dim=12288
+        # 格式1: qweight=[512, 12288], qzeros=[32, 1536], scales=[32, 12288] (QKV投影)
+        # 格式2: qweight=[512, 4096], qzeros=[32, 512], scales=[32, 4096] (输出投影)
         if qweight_cols == scales_cols and qzeros_cols == scales_cols // 8:
             logger.info("Using Qwen7B special format dequantization")
-            # 在这种情况下，qweight的格式是 [input_dim//8, output_dim]
-            # scales的格式是 [num_groups, output_dim]
             
-            # 计算实际的输入和输出维度
-            input_dim_compressed = N  # qweight的第一维是input_dim//8
-            output_dim = scales_cols  # scales的第二维是output_dim
-            input_dim = input_dim_compressed * 8  # 实际输入维度
+            # 判断是QKV投影还是输出投影
+            # QKV投影: qweight=[512, 12288], scales=[32, 12288], qzeros=[32, 1536]
+            # 输出投影: qweight=[512, 4096], scales=[32, 4096], qzeros=[32, 512]
             
-            logger.info(f"Detected input_dim: {input_dim_compressed} * 8 = {input_dim}")
-            logger.info(f"Detected output_dim: {output_dim}")
-            
-            # 重新分配输出张量 [output_dim, input_dim]
-            dequantized_weight = torch.zeros((output_dim, input_dim), dtype=output_dtype, device=qweight.device)
-            
-            # 向量化处理每个组 (按output_dim分组)
-            for group_idx in range(num_groups):
-                start_idx = group_idx * groupsize
-                end_idx = min(start_idx + groupsize, output_dim)
-                group_size = end_idx - start_idx
+            if scales_cols == 12288:
+                # QKV投影格式: [input_dim//8, output_dim] = [512, 12288]
+                logger.info("Detected QKV projection format")
+                input_dim_compressed = N  # qweight的第一维是input_dim//8
+                output_dim = scales_cols  # scales的第二维是output_dim
+                input_dim = input_dim_compressed * 8  # 实际输入维度
                 
-                if group_size <= 0:
-                    continue
-                    
-                # 获取当前组的参数
-                group_scales = scales[group_idx, start_idx:end_idx]  # [group_size]
+                logger.info(f"QKV: input_dim={input_dim_compressed}*8={input_dim}, output_dim={output_dim}")
                 
-                # 向量化处理每个output维度
-                for out_offset in range(group_size):
-                    out_idx = start_idx + out_offset
+                # 重新分配输出张量 [output_dim, input_dim]
+                dequantized_weight = torch.zeros((output_dim, input_dim), dtype=output_dtype, device=qweight.device)
+                
+                # 向量化处理每个组 (按output_dim分组)
+                for group_idx in range(num_groups):
+                    start_idx = group_idx * groupsize
+                    end_idx = min(start_idx + groupsize, output_dim)
+                    group_size = end_idx - start_idx
                     
-                    # 向量化处理所有input维度
-                    # 计算压缩的input索引
-                    in_compressed_indices = torch.arange(input_dim, device=qweight.device) // 8
-                    bit_shifts = (torch.arange(input_dim, device=qweight.device) % 8) * 4
+                    if group_size <= 0:
+                        continue
+                        
+                    # 获取当前组的参数
+                    group_scales = scales[group_idx, start_idx:end_idx]  # [group_size]
                     
-                    # 向量化提取4bit权重值
-                    weight_vals = (qweight[in_compressed_indices, out_idx] >> bit_shifts) & 0xF
+                    # 向量化处理每个output维度
+                    for out_offset in range(group_size):
+                        out_idx = start_idx + out_offset
+                        
+                        # 向量化处理所有input维度
+                        # 计算压缩的input索引
+                        in_compressed_indices = torch.arange(input_dim, device=qweight.device) // 8
+                        bit_shifts = (torch.arange(input_dim, device=qweight.device) % 8) * 4
+                        
+                        # 向量化提取4bit权重值
+                        weight_vals = (qweight[in_compressed_indices, out_idx] >> bit_shifts) & 0xF
+                        
+                        # 提取零点值
+                        zero_byte_idx = min(out_idx // 8, qzeros_cols - 1)
+                        zero_bit_shift = (out_idx % 8) * 4
+                        zero_val = (qzeros[group_idx, zero_byte_idx] >> zero_bit_shift) & 0xF
+                        
+                        # 向量化反量化
+                        scale_val = group_scales[out_offset]
+                        dequantized_weight[out_idx, :] = (weight_vals - zero_val) * scale_val
+                
+            else:
+                # 输出投影格式: [output_dim//8, input_dim] = [512, 4096]
+                logger.info("Detected output projection format")
+                output_dim_compressed = N  # qweight的第一维是output_dim//8
+                input_dim = scales_cols  # scales的第二维是input_dim
+                output_dim = output_dim_compressed * 8  # 实际输出维度
+                
+                logger.info(f"Output: input_dim={input_dim}, output_dim={output_dim_compressed}*8={output_dim}")
+                
+                # 重新分配输出张量 [output_dim, input_dim]
+                dequantized_weight = torch.zeros((output_dim, input_dim), dtype=output_dtype, device=qweight.device)
+                
+                # 向量化处理每个组 (按input_dim分组)
+                for group_idx in range(num_groups):
+                    start_idx = group_idx * groupsize
+                    end_idx = min(start_idx + groupsize, input_dim)
+                    group_size = end_idx - start_idx
                     
-                    # 提取零点值
-                    zero_byte_idx = min(out_idx // 8, qzeros_cols - 1)
-                    zero_bit_shift = (out_idx % 8) * 4
-                    zero_val = (qzeros[group_idx, zero_byte_idx] >> zero_bit_shift) & 0xF
+                    if group_size <= 0:
+                        continue
+                        
+                    # 获取当前组的参数
+                    group_scales = scales[group_idx, start_idx:end_idx]  # [group_size]
                     
-                    # 向量化反量化
-                    scale_val = group_scales[out_offset]
-                    dequantized_weight[out_idx, :] = (weight_vals - zero_val) * scale_val
+                    # 向量化处理每个input维度
+                    for in_offset in range(group_size):
+                        in_idx = start_idx + in_offset
+                        
+                        # 向量化处理所有output维度
+                        # 计算压缩的output索引
+                        out_compressed_indices = torch.arange(output_dim, device=qweight.device) // 8
+                        bit_shifts = (torch.arange(output_dim, device=qweight.device) % 8) * 4
+                        
+                        # 向量化提取4bit权重值
+                        weight_vals = (qweight[out_compressed_indices, in_idx] >> bit_shifts) & 0xF
+                        
+                        # 提取零点值
+                        zero_byte_idx = min(in_idx // 8, qzeros_cols - 1)
+                        zero_bit_shift = (in_idx % 8) * 4
+                        zero_val = (qzeros[group_idx, zero_byte_idx] >> zero_bit_shift) & 0xF
+                        
+                        # 向量化反量化
+                        scale_val = group_scales[in_offset]
+                        dequantized_weight[:, in_idx] = (weight_vals - zero_val) * scale_val
             
             logger.info(f"Qwen7B special dequantization result shape: {dequantized_weight.shape}")
             return dequantized_weight
