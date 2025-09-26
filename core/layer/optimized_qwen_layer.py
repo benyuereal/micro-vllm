@@ -301,7 +301,14 @@ class OptimizedQwenModelLayerAdapter:
         mlp_start = time.time()
         residual = hidden_states
         hidden_states = layer.ln_2(hidden_states)
-        hidden_states = layer.mlp(hidden_states)
+        
+        if self._is_quantized:
+            # 使用优化的MLP计算
+            hidden_states = self._optimized_quantized_mlp(layer, hidden_states, layer_idx)
+        else:
+            # 标准MLP计算
+            hidden_states = layer.mlp(hidden_states)
+        
         hidden_states = residual + hidden_states
         logger.info(f"mlp  hidden_states shape {hidden_states.shape}")
         mlp_time = time.time() - mlp_start
@@ -412,6 +419,76 @@ class OptimizedQwenModelLayerAdapter:
         if hasattr(self.config, "group_size"):
             return self.config.group_size
         return 128
+
+    def _optimized_quantized_mlp(self, layer, hidden_states: torch.Tensor, layer_idx: int):
+        """
+        优化的量化MLP计算 - 使用CUDA融合算子
+        MLP包含三个投影层：gate_proj, up_proj, down_proj
+        """
+        mlp_layer = layer.mlp
+        
+        # 1. Gate投影 (gate_proj)
+        gate_proj = mlp_layer.gate_proj
+        gate_cache_key = f"gate_{id(gate_proj)}"
+        if gate_cache_key not in self._quantization_cache:
+            gate_weight, gate_scale, gate_zero = self._get_quant_params(gate_proj)
+            self._quantization_cache[gate_cache_key] = (gate_weight, gate_scale, gate_zero)
+        else:
+            gate_weight, gate_scale, gate_zero = self._quantization_cache[gate_cache_key]
+        
+        # 2. Up投影 (up_proj)
+        up_proj = mlp_layer.up_proj
+        up_cache_key = f"up_{id(up_proj)}"
+        if up_cache_key not in self._quantization_cache:
+            up_weight, up_scale, up_zero = self._get_quant_params(up_proj)
+            self._quantization_cache[up_cache_key] = (up_weight, up_scale, up_zero)
+        else:
+            up_weight, up_scale, up_zero = self._quantization_cache[up_cache_key]
+        
+        # 3. Down投影 (down_proj)
+        down_proj = mlp_layer.down_proj
+        down_cache_key = f"down_{id(down_proj)}"
+        if down_cache_key not in self._quantization_cache:
+            down_weight, down_scale, down_zero = self._get_quant_params(down_proj)
+            self._quantization_cache[down_cache_key] = (down_weight, down_scale, down_zero)
+        else:
+            down_weight, down_scale, down_zero = self._quantization_cache[down_cache_key]
+        
+        # 重塑输入为 [M, K] 格式
+        batch_size, seq_len, hidden_dim = hidden_states.shape
+        input_2d = hidden_states.view(-1, hidden_dim)  # [B*S, D]
+        
+        # 计算gate和up投影
+        gate_output = self._gptq_fusion.fused_gptq_gemm_4bit(
+            input=input_2d,
+            qweight=gate_weight,
+            qzeros=gate_zero,
+            scales=gate_scale
+        )
+        
+        up_output = self._gptq_fusion.fused_gptq_gemm_4bit(
+            input=input_2d,
+            qweight=up_weight,
+            qzeros=up_zero,
+            scales=up_scale
+        )
+        
+        # 应用SiLU激活函数
+        gate_output = torch.nn.functional.silu(gate_output)
+        
+        # 计算down投影
+        down_input = gate_output * up_output
+        down_output = self._gptq_fusion.fused_gptq_gemm_4bit(
+            input=down_input,
+            qweight=down_weight,
+            qzeros=down_zero,
+            scales=down_scale
+        )
+        
+        # 重塑输出为 [B, S, D]
+        result = down_output.view(batch_size, seq_len, -1)
+        
+        return result
 
     def _detect_qwen_quantized_model(self, layer) -> bool:
         """检测是否为量化模型"""
