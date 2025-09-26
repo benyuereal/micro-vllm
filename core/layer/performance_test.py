@@ -12,7 +12,7 @@ import os
 # 添加项目根目录到Python路径
 sys.path.append(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 
-from core.layer.qwen_layer import QwenModelLayerAdapter
+from core.layer.layer import ModelLayerAdapter
 from core.layer.optimized_qwen_layer import OptimizedQwenModelLayerAdapter
 from core.layer.gptq import GPTQTritonFusion
 
@@ -72,7 +72,7 @@ def benchmark_layer_processing():
     model_config = type('Config', (), {'group_size': 128})()
     
     # 原始适配器
-    original_adapter = QwenModelLayerAdapter(
+    original_adapter = ModelLayerAdapter(
         model_config=model_config,
         device='cuda',
         num_heads=num_heads,

@@ -9,6 +9,7 @@ from models.qwen_adapter import QwenModelAdapter
 from . import Scheduler
 from .layer.layer import ModelLayerAdapter
 from .cache_manager import KVCacheManager, store_kvcache
+from .layer.optimized_qwen_layer import OptimizedQwenModelLayerAdapter
 from .layer.qwen_layer import QwenModelLayerAdapter
 from .sequence import Sequence
 from .model_loader import load_model
@@ -76,7 +77,7 @@ class InferenceEngine:
         )
 
         # 6. 初始化层适配器
-        self.layer_adapter = QwenModelLayerAdapter(
+        self.layer_adapter = OptimizedQwenModelLayerAdapter(
             model_config=self.config,
             device=self.device,
             num_heads=self.num_heads,

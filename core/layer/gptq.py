@@ -266,6 +266,7 @@ class GPTQTritonFusion:
     ) -> torch.Tensor:
         """
         基线实现：先反量化权重，再进行矩阵乘法
+        使用Python循环实现，代表未优化的实现
 
         参数:
             input: 输入矩阵 [M, K]
@@ -277,7 +278,7 @@ class GPTQTritonFusion:
         返回:
             输出矩阵 [M, N]
         """
-        # 先极简反量化权重
+        # 先反量化权重
         dequantized_weight = GPTQTritonFusion.dequantize_gptq_weight(
             qweight, qzeros, scales, groupsize
         )
