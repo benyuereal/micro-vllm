@@ -266,6 +266,23 @@ class PagedAttention(nn.Module):
         logger.info(f"  rotary_cos: {rotary_cos.shape}, dtype: {rotary_cos.dtype}")
         logger.info(f"  rotary_sin: {rotary_sin.shape}, dtype: {rotary_sin.dtype}")
         
+        # 🔧 转换所有参数为float16
+        if k_cache.dtype != torch.float16:
+            logger.info(f"🔄 转换k_cache: {k_cache.dtype} -> float16")
+            k_cache = k_cache.to(torch.float16)
+        
+        if v_cache.dtype != torch.float16:
+            logger.info(f"🔄 转换v_cache: {v_cache.dtype} -> float16")
+            v_cache = v_cache.to(torch.float16)
+        
+        if rotary_cos.dtype != torch.float16:
+            logger.info(f"🔄 转换rotary_cos: {rotary_cos.dtype} -> float16")
+            rotary_cos = rotary_cos.to(torch.float16)
+        
+        if rotary_sin.dtype != torch.float16:
+            logger.info(f"🔄 转换rotary_sin: {rotary_sin.dtype} -> float16")
+            rotary_sin = rotary_sin.to(torch.float16)
+        
         # 检查数据类型一致性
         if query.dtype != k_cache.dtype:
             logger.error(f"❌ query和k_cache数据类型不一致: {query.dtype} vs {k_cache.dtype}")
