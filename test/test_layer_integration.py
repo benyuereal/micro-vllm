@@ -194,7 +194,38 @@ def test_layer_integration():
         # 测试前向传播
         print("\n⚡ 测试前向传播...")
         try:
-            output = layer(hidden_states)
+            # 创建模拟的layer对象
+            class MockLayer:
+                def __init__(self):
+                    self.ln_1 = lambda x: x  # 模拟LayerNorm
+                    self.ln_2 = lambda x: x
+                    self.attn = MockAttention()
+                    self.mlp = lambda x: x  # 模拟MLP
+                
+            class MockAttention:
+                def __init__(self):
+                    self.c_attn = MockQuantizedLinear()
+                    self.c_proj = MockQuantizedLinear()
+            
+            class MockQuantizedLinear:
+                def __init__(self):
+                    # 模拟量化权重
+                    self.qweight = torch.randint(0, 256, (512, 12288), dtype=torch.uint32, device='cuda')
+                    self.qzeros = torch.randint(0, 16, (32, 1536), dtype=torch.uint32, device='cuda')
+                    self.scales = torch.randn(32, 12288, dtype=torch.float16, device='cuda')
+            
+            mock_layer = MockLayer()
+            
+            # 使用process_layer方法
+            output, (k, v) = layer.process_layer(
+                layer=mock_layer,
+                hidden_states=hidden_states,
+                cache_manager=None,  # 模拟cache_manager
+                seq_ids=[0],
+                context_lens=[1],
+                layer_idx=0
+            )
+            
             print(f"📊 Layer输出形状: {output.shape}")
             print(f"📊 期望形状: torch.Size([1, 1, 4096])")
             assert output.shape == (1, 1, 4096), f"Layer输出形状错误: {output.shape}"

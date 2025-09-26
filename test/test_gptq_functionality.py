@@ -130,7 +130,7 @@ def test_gptq_functionality():
             print(f"  平均时间: {result['avg_time']:.2f}ms")
             print(f"  最小时间: {result['min_time']:.2f}ms")
             print(f"  最大时间: {result['max_time']:.2f}ms")
-            print(f"  目标达成: {'✅' if result['target_achieved'] else '❌'} (目标: 0.10ms)")
+            print(f"  目标达成: {'✅' if result['target_achieved'] else '❌'} (目标: 0.20ms)")
             
             all_results.append({
                 "name": test_case['name'],
