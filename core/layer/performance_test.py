@@ -6,9 +6,9 @@ import torch
 import time
 import numpy as np
 import logging
-from core.layer.qwen_layer import QwenModelLayerAdapter
-from core.layer.optimized_qwen_layer import OptimizedQwenModelLayerAdapter
-from core.layer.gptq import GPTQTritonFusion
+from .qwen_layer import QwenModelLayerAdapter
+from .optimized_qwen_layer import OptimizedQwenModelLayerAdapter
+from .gptq import GPTQTritonFusion
 
 # 设置日志
 logging.basicConfig(level=logging.INFO)
