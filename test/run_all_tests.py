@@ -1,81 +1,88 @@
 #!/usr/bin/env python3
 """
-一键测试脚本
-测试CUDA融合内核功能和性能
+主测试脚本 - 运行所有融合内核测试
 """
 
-import sys
 import os
+import sys
 import subprocess
+import logging
+from pathlib import Path
 
-def run_test(test_name, test_file):
+# 设置日志
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
+
+def run_test(test_dir, test_script):
     """运行单个测试"""
-    print(f"\n🚀 运行 {test_name}")
-    print("=" * 50)
+    test_path = Path(__file__).parent / test_dir / test_script
+    
+    if not test_path.exists():
+        logger.error(f"❌ 测试脚本不存在: {test_path}")
+        return False
+    
+    logger.info(f"🚀 运行测试: {test_dir}/{test_script}")
     
     try:
-        result = subprocess.run([sys.executable, test_file], 
-                              capture_output=True, text=True, timeout=300)
+        result = subprocess.run(
+            [sys.executable, str(test_path)],
+            cwd=Path(__file__).parent,
+            capture_output=True,
+            text=True,
+            timeout=300  # 5分钟超时
+        )
         
         if result.returncode == 0:
-            print(f"✅ {test_name} 测试通过!")
-            print(result.stdout)
+            logger.info(f"✅ 测试通过: {test_dir}/{test_script}")
+            return True
         else:
-            print(f"❌ {test_name} 测试失败!")
-            print(f"错误输出: {result.stderr}")
+            logger.error(f"❌ 测试失败: {test_dir}/{test_script}")
+            logger.error(f"错误输出: {result.stderr}")
             return False
             
     except subprocess.TimeoutExpired:
-        print(f"⏰ {test_name} 测试超时!")
+        logger.error(f"⏰ 测试超时: {test_dir}/{test_script}")
         return False
     except Exception as e:
-        print(f"❌ {test_name} 测试异常: {e}")
+        logger.error(f"❌ 测试异常: {test_dir}/{test_script} - {e}")
         return False
-    
-    return True
 
 def main():
-    """主测试函数"""
-    print("🚀 CUDA融合内核一键测试")
-    print("=" * 60)
+    """主函数"""
+    logger.info("🚀 开始运行所有融合内核测试...")
     
     # 测试列表
     tests = [
-        ("GPTQ功能测试", "test_gptq_functionality.py"),
-        ("批处理Layer层测试", "test_batch_layer_shapes.py"),
-        ("Layer层集成测试", "test_layer_integration.py"),
-        ("性能优化测试", "test_performance_optimized.py"),
-        ("方案1+2测试", "test_scheme_1_2.py"),
-        ("快速验证测试", "quick_test.py"),
+        ("vllm_fusion", "test_vllm_fusion.py"),
+        ("ln_qkv_fusion", "test_ln_qkv_fusion.py"),
     ]
     
-    passed_tests = 0
-    total_tests = len(tests)
+    # 运行测试
+    results = []
+    for test_dir, test_script in tests:
+        success = run_test(test_dir, test_script)
+        results.append((test_dir, test_script, success))
     
-    for test_name, test_file in tests:
-        test_path = os.path.join(os.path.dirname(__file__), test_file)
-        
-        if not os.path.exists(test_path):
-            print(f"⚠️ 测试文件不存在: {test_path}")
-            continue
-        
-        if run_test(test_name, test_path):
-            passed_tests += 1
+    # 输出结果
+    logger.info("\n📊 测试结果汇总:")
+    logger.info("=" * 50)
     
-    # 测试结果汇总
-    print(f"\n📊 测试结果汇总")
-    print("=" * 60)
-    print(f"通过测试: {passed_tests}/{total_tests}")
-    print(f"通过率: {passed_tests/total_tests*100:.1f}%")
+    all_passed = True
+    for test_dir, test_script, success in results:
+        status = "✅ 通过" if success else "❌ 失败"
+        logger.info(f"{test_dir}/{test_script}: {status}")
+        if not success:
+            all_passed = False
     
-    if passed_tests == total_tests:
-        print("🎉 所有测试都通过!")
-    elif passed_tests > 0:
-        print("✅ 部分测试通过")
+    logger.info("=" * 50)
+    
+    if all_passed:
+        logger.info("🎉 所有测试通过!")
     else:
-        print("❌ 所有测试都失败")
+        logger.error("❌ 部分测试失败")
     
-    print("\n🎉 一键测试完成!")
+    return all_passed
 
 if __name__ == "__main__":
-    main()
+    success = main()
+    sys.exit(0 if success else 1)
