@@ -114,19 +114,7 @@ __global__ void fused_ln_qkv_gptq_kernel(
   __shared__ float shared_mean[m_count];
   __shared__ float shared_var[m_count];
   
-  // 1. 加载输入数据到共享内存
-  if (offset_k + t < end_k) {
-    for (int m = 0; m < m_count; ++m) {
-      int seq_idx = offset_m + m;
-      if (seq_idx < batch_size * seq_len) {
-        block_a[m][t] = input[seq_idx * hidden_dim + offset_k + t];
-      }
-    }
-  }
-  
-  __syncthreads();
-  
-  // 2. 计算LayerNorm的均值和方差（优化：协作计算）
+  // 1. 计算LayerNorm的均值和方差（全局计算）
   if (t == 0) {
     for (int m = 0; m < m_count; ++m) {
       int seq_idx = offset_m + m;
@@ -141,15 +129,16 @@ __global__ void fused_ln_qkv_gptq_kernel(
   
   __syncthreads();
   
-  // 3. 应用LayerNorm归一化（优化：向量化 + 减少分支）
+  // 2. 加载输入数据到共享内存并应用LayerNorm
   if (offset_k + t < end_k) {
     for (int m = 0; m < m_count; ++m) {
-      if (offset_m + m < batch_size * seq_len) {
+      int seq_idx = offset_m + m;
+      if (seq_idx < batch_size * seq_len) {
         // 预计算sqrt，避免重复计算
         float sqrt_var = sqrtf(shared_var[m]);
         
-        // 向量化归一化计算
-        float val = __half2float(block_a[m][t]);
+        // 直接应用LayerNorm归一化
+        float val = __half2float(input[seq_idx * hidden_dim + offset_k + t]);
         float normalized = (val - shared_mean[m]) / sqrt_var;
         
         // 应用LayerNorm权重和偏置
