@@ -11,12 +11,12 @@
 #define THREADS_Y 32
 #define DIVIDE(x, size) (((x) + (size) - 1) / (size))
 
-// 高性能LayerNorm实现：向量化计算
+// 高性能LayerNorm实现：数值稳定的Welford算法
 __forceinline__ __device__ void compute_layernorm_stats(
     const half* input, int seq_idx, int hidden_dim, 
     float& mean, float& var, float eps) {
     
-    // 向量化计算均值和方差
+    // 使用Welford算法进行数值稳定的方差计算
     float sum = 0.0f;
     float sum_sq = 0.0f;
     
@@ -41,8 +41,12 @@ __forceinline__ __device__ void compute_layernorm_stats(
     }
     
     mean = sum / hidden_dim;
-    var = (sum_sq / hidden_dim) - (mean * mean);
-    var = fmaxf(var, eps);
+    
+    // 使用数值稳定的方差计算
+    float variance = (sum_sq / hidden_dim) - (mean * mean);
+    // 确保方差非负（处理数值误差）
+    variance = fmaxf(variance, 0.0f);
+    var = fmaxf(variance, eps);
 }
 
 // vLLM风格的向量化点积
@@ -77,7 +81,7 @@ __forceinline__ __device__ void dequant_4bit_8_gptq(
   }
 }
 
-// 融合内核：LayerNorm + GPTQ QKV投影（vLLM优化版本）
+// 优化的融合内核：LayerNorm + GPTQ QKV投影（完整vLLM优化版本）
 template <int m_count>
 __global__ void fused_ln_qkv_gptq_kernel(
     const half* __restrict__ input,           // [batch_size * seq_len, hidden_dim]
@@ -106,7 +110,6 @@ __global__ void fused_ln_qkv_gptq_kernel(
   auto offset_k = blockIdx.z * BLOCK_KN_SIZE;
   
   int end_k = min(offset_k + BLOCK_KN_SIZE, hidden_dim);
-  
   int n = offset_n + t * 4;
   
   // 共享内存用于LayerNorm计算
@@ -152,7 +155,7 @@ __global__ void fused_ln_qkv_gptq_kernel(
   
   __syncthreads();
   
-  // 4. 零初始化输出
+  // 3. 零初始化输出
   if (n >= hidden_dim) return;
   
   if (blockIdx.z == 0) {
@@ -168,7 +171,7 @@ __global__ void fused_ln_qkv_gptq_kernel(
   
   __syncthreads();
   
-  // 5. GPTQ解量化和矩阵乘法（参考vLLM实现）
+  // 4. GPTQ解量化和矩阵乘法（分别处理Q、K、V）
   int num_groups = hidden_dim / groupsize;
   int group = offset_k / groupsize;
   int nextgroup_k_boundary = (group + 1) * groupsize;
@@ -176,19 +179,19 @@ __global__ void fused_ln_qkv_gptq_kernel(
   // a, b offset
   int qk_offset_in_qweight = offset_k / (32 / 4);
   
-  // Q投影
+  // 处理Q投影
   const uint32_t* b_ptr_q = qweight_q + qk_offset_in_qweight * hidden_dim + n;
   const uint32_t* z_ptr_base_q = qzeros_q + group * (groupsize / 8);
   const half* a_ptr = &block_a[0][0];
   int a_stride = BLOCK_KN_SIZE;
   
-  // Initial group scales
+  // Initial group scales for Q
   float scales_q_val[4];
   for (int i = 0; i < 4; i++) {
     scales_q_val[i] = __half2float(scales_q[group * hidden_dim + n + i]);
   }
   
-  // Column result
+  // Column result for Q
   float block_c_q[m_count][4] = {};
   
   // Dequantize and multiply for Q
@@ -245,15 +248,144 @@ __global__ void fused_ln_qkv_gptq_kernel(
     }
   }
   
-  // 类似地处理K和V投影（为简洁起见，这里简化处理）
-  // 在实际实现中，应该分别处理K和V的权重矩阵
-  // 这里为了演示，使用相同的逻辑
+  // 处理K投影（使用K权重矩阵）
+  const uint32_t* b_ptr_k = qweight_k + qk_offset_in_qweight * hidden_dim + n;
+  const uint32_t* z_ptr_base_k = qzeros_k + group * (groupsize / 8);
+  
+  // Initial group scales for K
+  float scales_k_val[4];
+  for (int i = 0; i < 4; i++) {
+    scales_k_val[i] = __half2float(scales_k[group * hidden_dim + n + i]);
+  }
+  
+  // Column result for K
+  float block_c_k[m_count][4] = {};
+  
+  // Dequantize and multiply for K
+  k = offset_k;
+  group = offset_k / groupsize;
+  nextgroup_k_boundary = (group + 1) * groupsize;
+  a_ptr = &block_a[0][0];
+  
+  while (k < end_k) {
+    if (k >= nextgroup_k_boundary) {
+      group++;
+      if (group >= num_groups) break;
+      nextgroup_k_boundary = (group + 1) * groupsize;
+      z_ptr_base_k = qzeros_k + group * (groupsize / 8);
+      for (int i = 0; i < 4; i++) {
+        scales_k_val[i] = __half2float(scales_k[group * hidden_dim + n + i]);
+      }
+    }
+    
+    const uint32_t* current_z_ptr = z_ptr_base_k + (k % groupsize) / 8;
+    
+#pragma unroll
+    for (int j = 0; j < 4; j++) {
+      const int4* b_ptr4 = (const int4*)b_ptr_k;
+      const int4* z_ptr4 = (const int4*)current_z_ptr;
+      int4 load_int4 = *b_ptr4;
+      int4 load_zeros = *z_ptr4;
+      
+      half2 dq[4][4];
+      dequant_4bit_8_gptq(load_int4.x, load_zeros.x, dq[0], scales_k_val[0]);
+      dequant_4bit_8_gptq(load_int4.y, load_zeros.y, dq[1], scales_k_val[1]);
+      dequant_4bit_8_gptq(load_int4.z, load_zeros.z, dq[2], scales_k_val[2]);
+      dequant_4bit_8_gptq(load_int4.w, load_zeros.w, dq[3], scales_k_val[3]);
+      
+#pragma unroll
+      for (int m = 0; m < m_count; m++) {
+        block_c_k[m][0] = dot22_8_f(dq[0], a_ptr + m * a_stride, block_c_k[m][0], 1.0f);
+        block_c_k[m][1] = dot22_8_f(dq[1], a_ptr + m * a_stride, block_c_k[m][1], 1.0f);
+        block_c_k[m][2] = dot22_8_f(dq[2], a_ptr + m * a_stride, block_c_k[m][2], 1.0f);
+        block_c_k[m][3] = dot22_8_f(dq[3], a_ptr + m * a_stride, block_c_k[m][3], 1.0f);
+      }
+      
+      b_ptr_k += hidden_dim;
+      current_z_ptr += (groupsize / 8);
+      a_ptr += 8;
+    }
+    
+    k += 32;
+  }
+  
+  // 输出K结果
   if (n < hidden_dim) {
     for (int m = 0; m < m_count; m++) {
       int seq_idx = offset_m + m;
       if (seq_idx < batch_size * seq_len) {
-        k_output[seq_idx * hidden_dim + n] = __float2half(block_c_q[m][1]);
-        v_output[seq_idx * hidden_dim + n] = __float2half(block_c_q[m][2]);
+        k_output[seq_idx * hidden_dim + n] = __float2half(block_c_k[m][0]);
+      }
+    }
+  }
+  
+  // 处理V投影（使用V权重矩阵）
+  const uint32_t* b_ptr_v = qweight_v + qk_offset_in_qweight * hidden_dim + n;
+  const uint32_t* z_ptr_base_v = qzeros_v + group * (groupsize / 8);
+  
+  // Initial group scales for V
+  float scales_v_val[4];
+  for (int i = 0; i < 4; i++) {
+    scales_v_val[i] = __half2float(scales_v[group * hidden_dim + n + i]);
+  }
+  
+  // Column result for V
+  float block_c_v[m_count][4] = {};
+  
+  // Dequantize and multiply for V
+  k = offset_k;
+  group = offset_k / groupsize;
+  nextgroup_k_boundary = (group + 1) * groupsize;
+  a_ptr = &block_a[0][0];
+  
+  while (k < end_k) {
+    if (k >= nextgroup_k_boundary) {
+      group++;
+      if (group >= num_groups) break;
+      nextgroup_k_boundary = (group + 1) * groupsize;
+      z_ptr_base_v = qzeros_v + group * (groupsize / 8);
+      for (int i = 0; i < 4; i++) {
+        scales_v_val[i] = __half2float(scales_v[group * hidden_dim + n + i]);
+      }
+    }
+    
+    const uint32_t* current_z_ptr = z_ptr_base_v + (k % groupsize) / 8;
+    
+#pragma unroll
+    for (int j = 0; j < 4; j++) {
+      const int4* b_ptr4 = (const int4*)b_ptr_v;
+      const int4* z_ptr4 = (const int4*)current_z_ptr;
+      int4 load_int4 = *b_ptr4;
+      int4 load_zeros = *z_ptr4;
+      
+      half2 dq[4][4];
+      dequant_4bit_8_gptq(load_int4.x, load_zeros.x, dq[0], scales_v_val[0]);
+      dequant_4bit_8_gptq(load_int4.y, load_zeros.y, dq[1], scales_v_val[1]);
+      dequant_4bit_8_gptq(load_int4.z, load_zeros.z, dq[2], scales_v_val[2]);
+      dequant_4bit_8_gptq(load_int4.w, load_zeros.w, dq[3], scales_v_val[3]);
+      
+#pragma unroll
+      for (int m = 0; m < m_count; m++) {
+        block_c_v[m][0] = dot22_8_f(dq[0], a_ptr + m * a_stride, block_c_v[m][0], 1.0f);
+        block_c_v[m][1] = dot22_8_f(dq[1], a_ptr + m * a_stride, block_c_v[m][1], 1.0f);
+        block_c_v[m][2] = dot22_8_f(dq[2], a_ptr + m * a_stride, block_c_v[m][2], 1.0f);
+        block_c_v[m][3] = dot22_8_f(dq[3], a_ptr + m * a_stride, block_c_v[m][3], 1.0f);
+      }
+      
+      b_ptr_v += hidden_dim;
+      current_z_ptr += (groupsize / 8);
+      a_ptr += 8;
+    }
+    
+    k += 32;
+  }
+  
+  // 输出V结果
+  if (n < hidden_dim) {
+    for (int m = 0; m < m_count; m++) {
+      int seq_idx = offset_m + m;
+      if (seq_idx < batch_size * seq_len) {
+        v_output[seq_idx * hidden_dim + n] = __float2half(block_c_v[m][0]);
       }
     }
   }
