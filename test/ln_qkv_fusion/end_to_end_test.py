@@ -60,13 +60,13 @@ class EndToEndTester:
         for i in range(hidden_dim):
             byte_idx = i // 8
             bit_idx = i % 8
-            # 设置值为8（在4bit中表示0，通过scales=1.0调整为1.0）
+            # 设置值为1（在4bit中表示1，通过scales=1.0保持1.0）
             # 使用位操作设置4bit值
             shift = bit_idx * 4
             if shift < 32:  # 确保不溢出
-                qweight_q[byte_idx, i] = 8 << shift
-                qweight_k[byte_idx, i] = 8 << shift
-                qweight_v[byte_idx, i] = 8 << shift
+                qweight_q[byte_idx, i] = 1 << shift
+                qweight_k[byte_idx, i] = 1 << shift
+                qweight_v[byte_idx, i] = 1 << shift
         
         qzeros_q = torch.zeros(hidden_dim // groupsize, groupsize // 8, dtype=torch.uint32, device=device)
         qzeros_k = torch.zeros(hidden_dim // groupsize, groupsize // 8, dtype=torch.uint32, device=device)
