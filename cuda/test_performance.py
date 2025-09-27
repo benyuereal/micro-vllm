@@ -1,12 +1,14 @@
 #!/usr/bin/env python3
 """
 融合内核性能测试 - 目标0.25ms延迟
-假设内核已经编译完成
+自动编译内核（如果未编译）
 """
 
 import torch
+from torch.utils.cpp_extension import load
 import time
 import numpy as np
+import os
 
 def test_functionality(kernel_module, input_tensor, qweight, qzeros, scales, ln_weight, ln_bias, 
                       batch_size, seq_len, hidden_dim, groupsize, eps):
@@ -92,7 +94,7 @@ def test_performance(kernel_module, input_tensor, qweight, qzeros, scales, ln_we
 def main():
     print("🚀 开始融合内核性能测试...")
     print("🎯 目标延迟: < 0.25ms")
-    print("📝 注意: 请先运行 compile_fusion.py 编译内核")
+    print("📝 注意: 如果内核未编译，将自动编译")
     
     if not torch.cuda.is_available():
         print("❌ CUDA不可用")
@@ -102,10 +104,20 @@ def main():
     print(f"📊 PyTorch版本: {torch.__version__}")
     
     try:
-        # 导入已编译的内核
-        import fused_ln_qkv_gptq_cuda
-        kernel_module = fused_ln_qkv_gptq_cuda
-        print("✅ 内核导入成功!")
+        # 尝试导入已编译的内核，如果失败则自动编译
+        try:
+            import fused_ln_qkv_gptq_cuda
+            kernel_module = fused_ln_qkv_gptq_cuda
+            print("✅ 内核导入成功!")
+        except ImportError:
+            print("📦 内核未编译，开始自动编译...")
+            kernel_module = load(
+                name="fused_ln_qkv_gptq_cuda",
+                sources=["gptq_ln_qkv_fusion_kernel.cu"],
+                extra_cuda_cflags=["-O3", "-use_fast_math"],
+                verbose=True
+            )
+            print("✅ 内核编译成功!")
         
         # 性能测试数据
         batch_size, seq_len, hidden_dim = 1, 1, 4096

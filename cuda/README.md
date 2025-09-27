@@ -7,12 +7,10 @@
 ```
 cuda/
 ├── gptq_ln_qkv_fusion_kernel.cu # 主要的GPTQ LN+QKV融合内核实现
-├── gptq_cuda_kernel_vllm.cu     # vLLM GPTQ内核参考实现
+├── gptq_cuda_kernel_vllm.cu     # vLLM GPTQ内核参考实现（已修复）
 ├── compile_fusion.py            # GPTQ LN+QKV融合内核编译脚本
-├── test_fusion.py               # 融合内核测试脚本（编译+功能+性能）
-├── test_performance.py          # 性能测试脚本（目标0.25ms，包含功能验证）
-├── test_functionality.py        # 功能完整性验证脚本
 ├── compile_vllm.py              # vLLM内核编译脚本
+├── test_performance.py          # 融合内核性能测试脚本（目标0.25ms）
 ├── test_vllm_gptq.py            # vLLM内核测试脚本
 └── README.md                    # 本文件
 ```
@@ -35,25 +33,19 @@ cd cuda
 python compile_fusion.py
 ```
 
-### 测试融合内核
-
-```bash
-python test_fusion.py
-```
-
-### 性能测试（目标0.25ms，包含功能验证）
+### 2. 性能测试（目标0.25ms，自动编译）
 
 ```bash
 python test_performance.py
 ```
 
-### 功能完整性验证
+### 3. 编译vLLM内核（可选）
 
 ```bash
-python test_functionality.py
+python compile_vllm.py
 ```
 
-### 测试vLLM内核
+### 4. 测试vLLM内核（可选）
 
 ```bash
 python test_vllm_gptq.py
@@ -61,12 +53,7 @@ python test_vllm_gptq.py
 
 ## 测试内容
 
-### 融合内核测试 (`test_fusion.py`)
-- **编译测试**：验证内核能够正常编译
-- **功能测试**：验证基本功能正确性
-- **性能测试**：测量执行时间
-
-### 性能测试 (`test_performance.py`)
+### 融合内核性能测试 (`test_performance.py`)
 - **目标延迟**：< 0.25ms
 - **功能验证**：输出形状、数值稳定性、非零检查
 - **详细统计**：平均、最小、最大延迟和标准差
@@ -74,8 +61,9 @@ python test_vllm_gptq.py
 - **目标评估**：验证是否达到0.25ms目标
 
 ### vLLM内核测试 (`test_vllm_gptq.py`)
-- **功能测试**：验证vLLM GPTQ内核功能
+- **功能测试**：验证vLLM GPTQ内核功能（已修复qzeros问题）
 - **性能测试**：测量vLLM内核执行时间
+- **对比分析**：与融合内核性能对比
 
 ## 内核参数
 
