@@ -21,7 +21,7 @@ def compile_fusion_kernel():
         
         kernel_module = load(
             name="fused_ln_qkv_gptq_cuda",
-            sources=["/Users/Zhuanz/PycharmProjects/micro-vllm/cuda/gptq_ln_qkv_fusion_kernel.cu"],
+            sources=["../../cuda/gptq_ln_qkv_fusion_kernel.cu"],
             verbose=False
         )
         logger.info("✅ 融合内核编译成功!")
