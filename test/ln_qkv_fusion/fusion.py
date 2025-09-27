@@ -74,17 +74,28 @@ class LnQkvFusionTester:
             ln_weight = torch.ones(hidden_dim, dtype=torch.float16, device='cuda')
             ln_bias = torch.zeros(hidden_dim, dtype=torch.float16, device='cuda')
             
-            # GPTQ参数
-            qweight = torch.randint(0, 256, (hidden_dim // 8, hidden_dim * 3), dtype=torch.uint32, device='cuda')
-            qzeros = torch.randint(0, 16, (hidden_dim // groupsize, groupsize // 8), dtype=torch.uint32, device='cuda')
-            scales = torch.randn(hidden_dim // groupsize, hidden_dim * 3, dtype=torch.float16, device='cuda')
+            # GPTQ参数（分别创建Q、K、V）
+            qweight_q = torch.randint(0, 256, (hidden_dim // 8, hidden_dim), dtype=torch.uint32, device='cuda')
+            qweight_k = torch.randint(0, 256, (hidden_dim // 8, hidden_dim), dtype=torch.uint32, device='cuda')
+            qweight_v = torch.randint(0, 256, (hidden_dim // 8, hidden_dim), dtype=torch.uint32, device='cuda')
+            
+            qzeros_q = torch.randint(0, 16, (hidden_dim // groupsize, groupsize // 8), dtype=torch.uint32, device='cuda')
+            qzeros_k = torch.randint(0, 16, (hidden_dim // groupsize, groupsize // 8), dtype=torch.uint32, device='cuda')
+            qzeros_v = torch.randint(0, 16, (hidden_dim // groupsize, groupsize // 8), dtype=torch.uint32, device='cuda')
+            
+            scales_q = torch.randn(hidden_dim // groupsize, hidden_dim, dtype=torch.float16, device='cuda')
+            scales_k = torch.randn(hidden_dim // groupsize, hidden_dim, dtype=torch.float16, device='cuda')
+            scales_v = torch.randn(hidden_dim // groupsize, hidden_dim, dtype=torch.float16, device='cuda')
             
             logger.info(f"📊 测试数据: input{batch_size}x{seq_len}x{hidden_dim}")
-            logger.info(f"📊 GPTQ参数: qweight{qweight.shape}, qzeros{qzeros.shape}, scales{scales.shape}")
+            logger.info(f"📊 GPTQ参数: qweight_q{qweight_q.shape}, qweight_k{qweight_k.shape}, qweight_v{qweight_v.shape}")
             
             # 调用融合内核（返回QKV元组）
             qkv_output = self.kernel_module.fused_ln_qkv_gptq_cuda(
-                input_tensor, qweight, qzeros, scales, ln_weight, ln_bias,
+                input_tensor, qweight_q, qweight_k, qweight_v,
+                qzeros_q, qzeros_k, qzeros_v,
+                scales_q, scales_k, scales_v,
+                ln_weight, ln_bias,
                 batch_size, seq_len, hidden_dim, groupsize, eps
             )
             
@@ -128,19 +139,25 @@ class LnQkvFusionTester:
             ln_weight = torch.ones(hidden_dim, dtype=torch.float16, device='cuda')
             ln_bias = torch.zeros(hidden_dim, dtype=torch.float16, device='cuda')
             
-            # GPTQ参数（使用单位矩阵）
-            qweight = torch.zeros(hidden_dim // 8, hidden_dim * 3, dtype=torch.uint32, device='cuda')
-            qzeros = torch.zeros(hidden_dim // groupsize, groupsize // 8, dtype=torch.uint32, device='cuda')
-            scales = torch.ones(hidden_dim // groupsize, hidden_dim * 3, dtype=torch.float16, device='cuda')
+            # GPTQ参数（分别创建Q、K、V）
+            qweight_q = torch.zeros(hidden_dim // 8, hidden_dim, dtype=torch.uint32, device='cuda')
+            qweight_k = torch.zeros(hidden_dim // 8, hidden_dim, dtype=torch.uint32, device='cuda')
+            qweight_v = torch.zeros(hidden_dim // 8, hidden_dim, dtype=torch.uint32, device='cuda')
             
-            # 输出张量
-            q_output = torch.zeros(batch_size, num_heads, seq_len, head_size, dtype=torch.float16, device='cuda')
-            k_output = torch.zeros(batch_size, kv_num_heads, seq_len, head_size, dtype=torch.float16, device='cuda')
-            v_output = torch.zeros(batch_size, kv_num_heads, seq_len, head_size, dtype=torch.float16, device='cuda')
+            qzeros_q = torch.zeros(hidden_dim // groupsize, groupsize // 8, dtype=torch.uint32, device='cuda')
+            qzeros_k = torch.zeros(hidden_dim // groupsize, groupsize // 8, dtype=torch.uint32, device='cuda')
+            qzeros_v = torch.zeros(hidden_dim // groupsize, groupsize // 8, dtype=torch.uint32, device='cuda')
+            
+            scales_q = torch.ones(hidden_dim // groupsize, hidden_dim, dtype=torch.float16, device='cuda')
+            scales_k = torch.ones(hidden_dim // groupsize, hidden_dim, dtype=torch.float16, device='cuda')
+            scales_v = torch.ones(hidden_dim // groupsize, hidden_dim, dtype=torch.float16, device='cuda')
             
             # 使用融合内核（返回QKV元组）
             qkv_output = self.kernel_module.fused_ln_qkv_gptq_cuda(
-                input_tensor, qweight, qzeros, scales, ln_weight, ln_bias,
+                input_tensor, qweight_q, qweight_k, qweight_v,
+                qzeros_q, qzeros_k, qzeros_v,
+                scales_q, scales_k, scales_v,
+                ln_weight, ln_bias,
                 batch_size, seq_len, hidden_dim, groupsize, eps
             )
             
