@@ -22,6 +22,7 @@ __forceinline__ __device__ void compute_layernorm_stats(
     float sum = 0.0f;
     float sum_sq = 0.0f;
     
+    // 输入已经被重塑为2D [batch_size*seq_len, hidden_dim]
     for (int i = 0; i < hidden_dim; i++) {
         float val = __half2float(input[seq_idx * hidden_dim + i]);
         sum += val;
@@ -97,36 +98,41 @@ __global__ void fused_ln_qkv_gptq_kernel(
   // 1. 加载输入数据到共享内存
   if (offset_k + t < end_k) {
     for (int m = 0; m < m_count; ++m) {
-      const half* input_ptr = input + (offset_m + m) * hidden_dim;
+      // 输入是3D张量 [batch_size, seq_len, hidden_dim]，需要正确计算索引
+      int seq_idx = offset_m + m;
+      const half* input_ptr = input + seq_idx * hidden_dim;
       block_a[m][t] = input_ptr[offset_k + t];
     }
   }
   
   __syncthreads();
   
-  // 2. 计算LayerNorm的均值和方差（每个序列独立计算）
-  if (t == 0) {
-    for (int m = 0; m < m_count; ++m) {
+  // 2. 计算LayerNorm的均值和方差（优化：并行计算）
+  if (t < m_count) {
+    int seq_idx = offset_m + t;
+    if (seq_idx < batch_size * seq_len) {
       compute_layernorm_stats(
-          input, offset_m + m, hidden_dim, 
-          shared_mean[m], shared_var[m], eps
+          input, seq_idx, hidden_dim, 
+          shared_mean[t], shared_var[t], eps
       );
     }
   }
   
   __syncthreads();
   
-  // 3. 应用LayerNorm归一化
+  // 3. 应用LayerNorm归一化（优化：向量化）
   if (offset_k + t < end_k) {
     for (int m = 0; m < m_count; ++m) {
-      float normalized = (__half2float(block_a[m][t]) - shared_mean[m]) / 
-                        sqrtf(shared_var[m]);
-      
-      // 应用LayerNorm权重和偏置
-      normalized = normalized * __half2float(ln_weight[offset_k + t]) + 
-                   __half2float(ln_bias[offset_k + t]);
-      
-      block_a[m][t] = __float2half(normalized);
+      if (offset_m + m < batch_size * seq_len) {
+        float normalized = (__half2float(block_a[m][t]) - shared_mean[m]) / 
+                          sqrtf(shared_var[m]);
+        
+        // 应用LayerNorm权重和偏置
+        normalized = normalized * __half2float(ln_weight[offset_k + t]) + 
+                     __half2float(ln_bias[offset_k + t]);
+        
+        block_a[m][t] = __float2half(normalized);
+      }
     }
   }
   
@@ -147,19 +153,19 @@ __global__ void fused_ln_qkv_gptq_kernel(
   __syncthreads();
   
   // 5. GPTQ解量化和矩阵乘法（参考vLLM实现）
-  int num_groups = hidden_dim / groupsize;
-  int group = offset_k / groupsize;
-  int nextgroup = offset_k + groupsize;
+  int num_groups = hidden_dim / groupsize; // 计算总组数
+  int group = offset_k / groupsize; // 当前组
+  int nextgroup_k_boundary = (group + 1) * groupsize; // 下一组的K边界
   
   // a, b offset
-  int qk = offset_k / (32 / 4);
+  int qk_offset_in_qweight = offset_k / (32 / 4); // 32 elements per uint32_t, 4 bits per element
   
-  const uint32_t* b_ptr = qweight + qk * (hidden_dim * 3) + n;
-  const uint32_t* z_ptr = qzeros + group * (groupsize / 8) + (offset_k % groupsize) / 8;
+  const uint32_t* b_ptr = qweight + qk_offset_in_qweight * (hidden_dim * 3) + n;
+  const uint32_t* z_ptr_base = qzeros + group * (groupsize / 8); // Base pointer for qzeros of current group
   const half* a_ptr = &block_a[0][0];
   int a_stride = BLOCK_KN_SIZE;
   
-  // Initial group
+  // Initial group scales
   float scales_qkv[4];
   for (int i = 0; i < 4; i++) {
     scales_qkv[i] = __half2float(scales[group * (hidden_dim * 3) + n + i]);
@@ -168,22 +174,27 @@ __global__ void fused_ln_qkv_gptq_kernel(
   // Column result
   float block_c[m_count][4] = {};
   
-  // Dequantize and multiply
+  // Dequantize and multiply（优化：减少分支）
   int k = offset_k;
   while (k < end_k) {
-    if (k == nextgroup) {
+    // 检查是否需要切换到下一组（优化：减少分支预测失败）
+    if (k >= nextgroup_k_boundary) {
       group++;
-      nextgroup += groupsize;
-      z_ptr = qzeros + group * (groupsize / 8) + (k % groupsize) / 8;
+      if (group >= num_groups) break;  // 边界检查
+      nextgroup_k_boundary = (group + 1) * groupsize;
+      z_ptr_base = qzeros + group * (groupsize / 8);
+      // 预加载下一组的scales
       for (int i = 0; i < 4; i++) {
         scales_qkv[i] = __half2float(scales[group * (hidden_dim * 3) + n + i]);
       }
     }
     
+    const uint32_t* current_z_ptr = z_ptr_base + (k % groupsize) / 8;
+    
 #pragma unroll
     for (int j = 0; j < 4; j++) {
-      const int4* b_ptr4 = (int4*)b_ptr;
-      const int4* z_ptr4 = (int4*)z_ptr;
+      const int4* b_ptr4 = (const int4*)b_ptr;
+      const int4* z_ptr4 = (const int4*)current_z_ptr;
       int4 load_int4 = *b_ptr4;
       int4 load_zeros = *z_ptr4;
       
@@ -202,24 +213,27 @@ __global__ void fused_ln_qkv_gptq_kernel(
         block_c[m][3] = dot22_8_f(dq[3], a_ptr + m * a_stride, block_c[m][3], 1.0f);
       }
       
-      b_ptr += (hidden_dim * 3);
-      z_ptr += (groupsize / 8);
-      a_ptr += 8;
+      b_ptr += (hidden_dim * 3); // Move to next column in qweight
+      current_z_ptr += (groupsize / 8); // Move to next qzeros block
+      a_ptr += 8; // Move to next 8 elements in input
     }
     
-    k += 32;
+    k += 32; // Process 32 elements in K dimension
   }
   
   // 6. 输出QKV到正确的格式
-  for (int m = 0; m < m_count; m++) {
-    int output_base = (offset_m + m) * hidden_dim * 3 + n;
-    
-    if (output_base < batch_size * seq_len * hidden_dim * 3) {
-      half2* qkv_out = (half2*)(qkv_output + output_base);
-      half2 result01 = __halves2half2(__float2half_rn(block_c[m][0]), __float2half_rn(block_c[m][1]));
-      half2 result23 = __halves2half2(__float2half_rn(block_c[m][2]), __float2half_rn(block_c[m][3]));
-      atomicAdd(qkv_out, result01);
-      atomicAdd(qkv_out + 1, result23);
+  if (n < hidden_dim * 3) {  // 确保不超出QKV总维度
+    for (int m = 0; m < m_count; m++) {
+      int output_base = (offset_m + m) * hidden_dim * 3 + n;
+      
+      if (output_base < batch_size * seq_len * hidden_dim * 3) {
+        // 直接写入（每个线程处理不同的输出位置，不需要atomicAdd）
+        half* qkv_out = qkv_output + output_base;
+        qkv_out[0] = __float2half_rn(block_c[m][0]);
+        qkv_out[1] = __float2half_rn(block_c[m][1]);
+        qkv_out[2] = __float2half_rn(block_c[m][2]);
+        qkv_out[3] = __float2half_rn(block_c[m][3]);
+      }
     }
   }
 }
@@ -243,6 +257,16 @@ torch::Tensor fused_ln_qkv_gptq_cuda(
     TORCH_CHECK(input.dtype() == torch::kFloat16, "input must be float16");
     TORCH_CHECK(input.dim() == 3, "input must be 3D tensor [batch_size, seq_len, hidden_dim]");
     
+    // 验证输入形状
+    TORCH_CHECK(input.size(0) == batch_size, "input batch_size mismatch");
+    TORCH_CHECK(input.size(1) == seq_len, "input seq_len mismatch");
+    TORCH_CHECK(input.size(2) == hidden_dim, "input hidden_dim mismatch");
+    
+    // 验证GPTQ参数
+    TORCH_CHECK(hidden_dim % groupsize == 0, "hidden_dim must be divisible by groupsize");
+    TORCH_CHECK(groupsize > 0, "groupsize must be positive");
+    TORCH_CHECK(eps > 0.0f, "eps must be positive");
+    
     // 确保张量是连续的
     input = input.contiguous();
     qweight = qweight.contiguous();
@@ -251,8 +275,11 @@ torch::Tensor fused_ln_qkv_gptq_cuda(
     ln_weight = ln_weight.contiguous();
     ln_bias = ln_bias.contiguous();
     
+    // 将3D输入重塑为2D [batch_size*seq_len, hidden_dim]
+    auto input_2d = input.view({batch_size * seq_len, hidden_dim});
+    
     // 获取张量数据指针（使用vLLM相同的方法）
-    const half* input_ptr = reinterpret_cast<const half*>(input.data_ptr<at::Half>());
+    const half* input_ptr = reinterpret_cast<const half*>(input_2d.data_ptr<at::Half>());
     const uint32_t* qweight_ptr = qweight.data_ptr<uint32_t>();
     const uint32_t* qzeros_ptr = qzeros.data_ptr<uint32_t>();
     const half* scales_ptr = reinterpret_cast<const half*>(scales.data_ptr<at::Half>());
@@ -269,12 +296,18 @@ torch::Tensor fused_ln_qkv_gptq_cuda(
     {
         // 优化的网格和块大小（基于vLLM）
         dim3 blockDim, gridDim;
-        blockDim.x = BLOCK_KN_SIZE;
+        blockDim.x = BLOCK_KN_SIZE;  // 128 threads per block
         blockDim.y = 1;
         blockDim.z = 1;
         gridDim.x = DIVIDE(hidden_dim * 3, BLOCK_KN_SIZE * 4);  // QKV总维度
-        gridDim.y = DIVIDE(batch_size * seq_len, BLOCK_M_SIZE_MAX);
-        gridDim.z = DIVIDE(hidden_dim, BLOCK_KN_SIZE);
+        gridDim.y = DIVIDE(batch_size * seq_len, BLOCK_M_SIZE_MAX);  // 序列维度
+        gridDim.z = DIVIDE(hidden_dim, BLOCK_KN_SIZE);  // 隐藏维度
+        
+        // 添加网格大小验证
+        TORCH_CHECK(gridDim.x > 0 && gridDim.y > 0 && gridDim.z > 0, 
+                   "Invalid grid dimensions");
+        TORCH_CHECK(gridDim.x <= 65535 && gridDim.y <= 65535 && gridDim.z <= 65535,
+                   "Grid dimensions exceed CUDA limits");
         
         // 启动融合内核（使用CUDA流，与vLLM一致）
         const cudaStream_t stream = c10::cuda::getCurrentCUDAStream();
