@@ -77,14 +77,25 @@ def test_layer_integration():
         ln_weight = torch.ones(hidden_size, dtype=torch.float16, device='cuda')
         ln_bias = torch.zeros(hidden_size, dtype=torch.float16, device='cuda')
         
-        # 创建GPTQ参数
-        qkv_qweight = torch.randint(0, 256, (hidden_size // 8, hidden_size * 3), dtype=torch.uint32, device='cuda')
-        qkv_qzeros = torch.randint(0, 16, (hidden_size // groupsize, groupsize // 8), dtype=torch.uint32, device='cuda')
-        qkv_scales = torch.randn(hidden_size // groupsize, hidden_size * 3, dtype=torch.float16, device='cuda')
+        # 创建分离的Q、K、V GPTQ参数
+        qweight_q = torch.randint(0, 256, (hidden_size // 8, hidden_size), dtype=torch.uint32, device='cuda')
+        qweight_k = torch.randint(0, 256, (hidden_size // 8, hidden_size), dtype=torch.uint32, device='cuda')
+        qweight_v = torch.randint(0, 256, (hidden_size // 8, hidden_size), dtype=torch.uint32, device='cuda')
+        
+        qzeros_q = torch.randint(0, 16, (hidden_size // groupsize, groupsize // 8), dtype=torch.uint32, device='cuda')
+        qzeros_k = torch.randint(0, 16, (hidden_size // groupsize, groupsize // 8), dtype=torch.uint32, device='cuda')
+        qzeros_v = torch.randint(0, 16, (hidden_size // groupsize, groupsize // 8), dtype=torch.uint32, device='cuda')
+        
+        scales_q = torch.randn(hidden_size // groupsize, hidden_size, dtype=torch.float16, device='cuda')
+        scales_k = torch.randn(hidden_size // groupsize, hidden_size, dtype=torch.float16, device='cuda')
+        scales_v = torch.randn(hidden_size // groupsize, hidden_size, dtype=torch.float16, device='cuda')
         
         # 执行融合内核
         qkv_output = kernel_module.fused_ln_qkv_gptq_cuda(
-            hidden_states, qkv_qweight, qkv_qzeros, qkv_scales, ln_weight, ln_bias,
+            hidden_states, ln_weight, ln_bias,
+            qweight_q, qweight_k, qweight_v,
+            qzeros_q, qzeros_k, qzeros_v,
+            scales_q, scales_k, scales_v,
             batch_size, seq_len, hidden_size, groupsize, eps
         )
         
