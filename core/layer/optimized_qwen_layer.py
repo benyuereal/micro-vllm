@@ -397,9 +397,8 @@ class OptimizedQwenModelLayerAdapter:
         qzeros_k = qkv_zero  # 通常Q、K、V使用相同的zeros
         qzeros_v = qkv_zero
         
-        # 获取LayerNorm参数
-        ln_weight = layer.ln_1.weight.to(torch.float16)
-        ln_bias = layer.ln_1.bias.to(torch.float16)
+        # 获取RMSNorm参数 (Qwen使用RMSNorm，没有bias)
+        rms_weight = layer.ln_1.weight.to(torch.float16)
         
         # 调用融合内核
         batch_size, seq_len, _ = hidden_states.shape
@@ -410,7 +409,7 @@ class OptimizedQwenModelLayerAdapter:
             hidden_states, qweight_q, qweight_k, qweight_v,
             qzeros_q, qzeros_k, qzeros_v,
             qscales_q, qscales_k, qscales_v,
-            ln_weight, ln_bias,
+            rms_weight,
             batch_size, seq_len, qkv_hidden_dim, groupsize, eps
         )
         
