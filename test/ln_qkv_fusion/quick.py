@@ -67,17 +67,16 @@ def test_functionality(kernel_module):
         qzeros = torch.randint(0, 16, (hidden_dim // groupsize, groupsize // 8), dtype=torch.uint32, device='cuda')
         scales = torch.randn(hidden_dim // groupsize, hidden_dim * 3, dtype=torch.float16, device='cuda')
         
-        # 输出张量
-        q_output = torch.zeros(batch_size, num_heads, seq_len, head_size, dtype=torch.float16, device='cuda')
-        k_output = torch.zeros(batch_size, kv_num_heads, seq_len, head_size, dtype=torch.float16, device='cuda')
-        v_output = torch.zeros(batch_size, kv_num_heads, seq_len, head_size, dtype=torch.float16, device='cuda')
-        
-        # 调用内核
-        kernel_module.fused_ln_qkv_gptq_cuda(
+        # 调用融合内核（返回QKV元组）
+        qkv_output = kernel_module.fused_ln_qkv_gptq_cuda(
             input_tensor, qweight, qzeros, scales, ln_weight, ln_bias,
-            q_output, k_output, v_output,
-            batch_size, seq_len, hidden_dim, num_heads, kv_num_heads, head_size, groupsize, eps
+            batch_size, seq_len, hidden_dim, groupsize, eps
         )
+        
+        # 解包QKV输出
+        q_output = qkv_output[0]
+        k_output = qkv_output[1]
+        v_output = qkv_output[2]
         
         logger.info("✅ 功能测试成功!")
         logger.info(f"📊 Q输出形状: {q_output.shape}")
@@ -116,17 +115,11 @@ def test_performance(kernel_module):
         qzeros = torch.randint(0, 16, (hidden_dim // groupsize, groupsize // 8), dtype=torch.uint32, device='cuda')
         scales = torch.randn(hidden_dim // groupsize, hidden_dim * 3, dtype=torch.float16, device='cuda')
         
-        # 输出张量
-        q_output = torch.zeros(batch_size, num_heads, seq_len, head_size, dtype=torch.float16, device='cuda')
-        k_output = torch.zeros(batch_size, kv_num_heads, seq_len, head_size, dtype=torch.float16, device='cuda')
-        v_output = torch.zeros(batch_size, kv_num_heads, seq_len, head_size, dtype=torch.float16, device='cuda')
-        
         # 预热
         for _ in range(5):
-            kernel_module.fused_ln_qkv_gptq_cuda(
+            qkv_output = kernel_module.fused_ln_qkv_gptq_cuda(
                 input_tensor, qweight, qzeros, scales, ln_weight, ln_bias,
-                q_output, k_output, v_output,
-                batch_size, seq_len, hidden_dim, num_heads, kv_num_heads, head_size, groupsize, eps
+                batch_size, seq_len, hidden_dim, groupsize, eps
             )
         
         torch.cuda.synchronize()
@@ -134,10 +127,9 @@ def test_performance(kernel_module):
         # 性能测试
         start_time = time.time()
         for _ in range(num_iterations):
-            kernel_module.fused_ln_qkv_gptq_cuda(
+            qkv_output = kernel_module.fused_ln_qkv_gptq_cuda(
                 input_tensor, qweight, qzeros, scales, ln_weight, ln_bias,
-                q_output, k_output, v_output,
-                batch_size, seq_len, hidden_dim, num_heads, kv_num_heads, head_size, groupsize, eps
+                batch_size, seq_len, hidden_dim, groupsize, eps
             )
         
         torch.cuda.synchronize()
