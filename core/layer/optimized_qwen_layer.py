@@ -427,6 +427,23 @@ class OptimizedQwenModelLayerAdapter:
             logger.info(f"  期望形状: [{batch_size}, {seq_len}, {qkv_hidden_dim}]")
             logger.info(f"  num_heads: {self.num_heads}, head_size: {self.head_size}")
             logger.info(f"  kv_num_heads: {self.kv_num_heads}")
+            
+            # 检查数据质量
+            q_nan = torch.isnan(q_output).any()
+            q_inf = torch.isinf(q_output).any()
+            k_nan = torch.isnan(k_output).any()
+            k_inf = torch.isinf(k_output).any()
+            v_nan = torch.isnan(v_output).any()
+            v_inf = torch.isinf(v_output).any()
+            
+            logger.info(f"🔍 数据质量检查:")
+            logger.info(f"  Q: NaN={q_nan}, Inf={q_inf}, 范围=[{q_output.min():.4f}, {q_output.max():.4f}]")
+            logger.info(f"  K: NaN={k_nan}, Inf={k_inf}, 范围=[{k_output.min():.4f}, {k_output.max():.4f}]")
+            logger.info(f"  V: NaN={v_nan}, Inf={v_inf}, 范围=[{v_output.min():.4f}, {v_output.max():.4f}]")
+            
+            if q_nan or q_inf or k_nan or k_inf or v_nan or v_inf:
+                logger.error("❌ 融合内核输出包含NaN或Inf值!")
+                raise ValueError("融合内核输出包含无效值")
         
         # 检查输出形状
         expected_shape = (batch_size, seq_len, qkv_hidden_dim)
