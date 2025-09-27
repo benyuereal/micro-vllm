@@ -92,10 +92,10 @@ def test_layer_integration():
         
         # 执行融合内核
         qkv_output = kernel_module.fused_ln_qkv_gptq_cuda(
-            hidden_states, ln_weight, ln_bias,
-            qweight_q, qweight_k, qweight_v,
+            hidden_states, qweight_q, qweight_k, qweight_v,
             qzeros_q, qzeros_k, qzeros_v,
             scales_q, scales_k, scales_v,
+            ln_weight, ln_bias,
             batch_size, seq_len, hidden_size, groupsize, eps
         )
         
