@@ -97,12 +97,33 @@ class EndToEndTester:
         normalized = ln(input_tensor)  # [batch_size, seq_len, hidden_dim]
         
         # 2. QKV投影（使用GPTQ解量化）
-        # 这里我们需要实现GPTQ解量化
         def gptq_dequantize(qweight, qzeros, scales, groupsize):
-            """GPTQ解量化"""
-            # 简化的解量化实现
-            # 对于单位矩阵，我们直接返回单位矩阵
-            return torch.eye(hidden_dim, dtype=torch.float16, device=input_tensor.device)
+            """GPTQ解量化 - 与CUDA内核一致的实现"""
+            num_groups = hidden_dim // groupsize
+            weight = torch.zeros(hidden_dim, hidden_dim, dtype=torch.float16, device=input_tensor.device)
+            
+            for group in range(num_groups):
+                start_k = group * groupsize
+                end_k = min(start_k + groupsize, hidden_dim)
+                
+                for k in range(start_k, end_k):
+                    for n in range(hidden_dim):
+                        # 提取4bit值
+                        byte_idx = k // 8
+                        bit_idx = k % 8
+                        shift = bit_idx * 4
+                        
+                        if shift < 32:
+                            # 从qweight中提取4bit值
+                            qw_val = (qweight[byte_idx, n] >> shift) & 0xF
+                            # 从qzeros中提取4bit值
+                            qz_val = (qzeros[group, (k % groupsize) // 8] >> ((k % groupsize) % 8) * 4) & 0xF
+                            
+                            # GPTQ解量化：weight = (qweight - qzeros) * scale
+                            dequant_val = (qw_val - qz_val) * scales[group, n]
+                            weight[n, k] = dequant_val
+            
+            return weight
         
         # 解量化权重
         weight_q = gptq_dequantize(qweight_q, qzeros_q, scales_q, groupsize)
