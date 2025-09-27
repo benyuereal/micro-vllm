@@ -221,15 +221,26 @@ class LnQkvFusionTester:
             ln_weight = torch.ones(hidden_dim, dtype=torch.float16, device='cuda')
             ln_bias = torch.zeros(hidden_dim, dtype=torch.float16, device='cuda')
             
-            # GPTQ参数
-            qweight = torch.randint(0, 256, (hidden_dim // 8, hidden_dim * 3), dtype=torch.uint32, device='cuda')
-            qzeros = torch.randint(0, 16, (hidden_dim // groupsize, groupsize // 8), dtype=torch.uint32, device='cuda')
-            scales = torch.randn(hidden_dim // groupsize, hidden_dim * 3, dtype=torch.float16, device='cuda')
+            # GPTQ参数（分别创建Q、K、V）
+            qweight_q = torch.randint(0, 256, (hidden_dim // 8, hidden_dim), dtype=torch.uint32, device='cuda')
+            qweight_k = torch.randint(0, 256, (hidden_dim // 8, hidden_dim), dtype=torch.uint32, device='cuda')
+            qweight_v = torch.randint(0, 256, (hidden_dim // 8, hidden_dim), dtype=torch.uint32, device='cuda')
+            
+            qzeros_q = torch.randint(0, 16, (hidden_dim // groupsize, groupsize // 8), dtype=torch.uint32, device='cuda')
+            qzeros_k = torch.randint(0, 16, (hidden_dim // groupsize, groupsize // 8), dtype=torch.uint32, device='cuda')
+            qzeros_v = torch.randint(0, 16, (hidden_dim // groupsize, groupsize // 8), dtype=torch.uint32, device='cuda')
+            
+            scales_q = torch.randn(hidden_dim // groupsize, hidden_dim, dtype=torch.float16, device='cuda')
+            scales_k = torch.randn(hidden_dim // groupsize, hidden_dim, dtype=torch.float16, device='cuda')
+            scales_v = torch.randn(hidden_dim // groupsize, hidden_dim, dtype=torch.float16, device='cuda')
             
             # 预热
             for _ in range(10):
                 qkv_output = self.kernel_module.fused_ln_qkv_gptq_cuda(
-                    input_tensor, qweight, qzeros, scales, ln_weight, ln_bias,
+                    input_tensor, qweight_q, qweight_k, qweight_v,
+                    qzeros_q, qzeros_k, qzeros_v,
+                    scales_q, scales_k, scales_v,
+                    ln_weight, ln_bias,
                     batch_size, seq_len, hidden_dim, groupsize, eps
                 )
             
@@ -239,7 +250,10 @@ class LnQkvFusionTester:
             start_time = time.time()
             for _ in range(num_iterations):
                 qkv_output = self.kernel_module.fused_ln_qkv_gptq_cuda(
-                    input_tensor, qweight, qzeros, scales, ln_weight, ln_bias,
+                    input_tensor, qweight_q, qweight_k, qweight_v,
+                    qzeros_q, qzeros_k, qzeros_v,
+                    scales_q, scales_k, scales_v,
+                    ln_weight, ln_bias,
                     batch_size, seq_len, hidden_dim, groupsize, eps
                 )
             
