@@ -313,12 +313,12 @@ torch::Tensor fused_ln_qkv_gptq_cuda(
     
     fused_ln_qkv_gptq_kernel<BLOCK_M_SIZE_MAX><<<gridDim, blockDim, 0, stream>>>(
         input_ptr, 
-        reinterpret_cast<const uint32_t*>(qweight_q.data_ptr<at::Half>()),
-        reinterpret_cast<const uint32_t*>(qweight_k.data_ptr<at::Half>()),
-        reinterpret_cast<const uint32_t*>(qweight_v.data_ptr<at::Half>()),
-        reinterpret_cast<const uint32_t*>(qzeros_q.data_ptr<at::Half>()),
-        reinterpret_cast<const uint32_t*>(qzeros_k.data_ptr<at::Half>()),
-        reinterpret_cast<const uint32_t*>(qzeros_v.data_ptr<at::Half>()),
+        qweight_q.data_ptr<uint32_t>(),
+        qweight_k.data_ptr<uint32_t>(),
+        qweight_v.data_ptr<uint32_t>(),
+        qzeros_q.data_ptr<uint32_t>(),
+        qzeros_k.data_ptr<uint32_t>(),
+        qzeros_v.data_ptr<uint32_t>(),
         reinterpret_cast<const half*>(scales_q.data_ptr<at::Half>()),
         reinterpret_cast<const half*>(scales_k.data_ptr<at::Half>()),
         reinterpret_cast<const half*>(scales_v.data_ptr<at::Half>()),
