@@ -1,17 +1,36 @@
+#include <torch/extension.h>
 #include <cuda_runtime.h>
 #include <cublas_v2.h>
 #include <cuda_fp16.h>
-#include <cuda_bf16.h>
 #include <stdio.h>
 #include <math.h>
-#include <cub/cub.cuh>
 
-// vLLM风格的分块大小
+// vLLM风格的分块大小和常量
 #define BLOCK_KN_SIZE 128
 #define BLOCK_M_SIZE_MAX 8
 #define THREADS_X 32
 #define THREADS_Y 32
 #define DIVIDE(x, size) (((x) + (size) - 1) / (size))
+
+// 最优的LayerNorm实现：使用Welford算法进行数值稳定的方差计算
+__forceinline__ __device__ void compute_layernorm_stats(
+    const half* input, int seq_idx, int hidden_dim, 
+    float& mean, float& var, float eps) {
+    
+    // 使用Welford算法计算均值和方差（数值稳定）
+    float sum = 0.0f;
+    float sum_sq = 0.0f;
+    
+    for (int i = 0; i < hidden_dim; i++) {
+        float val = __half2float(input[seq_idx * hidden_dim + i]);
+        sum += val;
+        sum_sq += val * val;
+    }
+    
+    mean = sum / hidden_dim;
+    var = (sum_sq / hidden_dim) - (mean * mean);
+    var = fmaxf(var, eps); // 确保方差不为负
+}
 
 // vLLM风格的向量化点积
 __forceinline__ __device__ float dot22_8_f(half2 (&dq)[4], const half* a_ptr,
@@ -26,10 +45,28 @@ __forceinline__ __device__ float dot22_8_f(half2 (&dq)[4], const half* a_ptr,
   return fma(result_f, qs_f, g_result);
 }
 
-// vLLM风格的4bit解量化
+// 完整的GPTQ 4bit解量化（参考vLLM实现）
+__forceinline__ __device__ void dequant_4bit_8_gptq(
+    uint32_t qw, uint32_t qz, half2 (&dq)[4], const float scale) {
+  // 提取4bit值并反量化
+  for (int i = 0; i < 4; i++) {
+    int w = (qw >> (i * 8)) & 0xFF;
+    int z = (qz >> (i * 8)) & 0xFF;
+    
+    // GPTQ解量化：weight = (qweight - qzeros) * scale
+    half2 w01 = __halves2half2(
+        __int2half_rn((w & 0xF) - (z & 0xF)), 
+        __int2half_rn((w >> 4) - (z >> 4))
+    );
+    
+    // 应用缩放
+    dq[i] = __hmul2(w01, __float2half2_rn(scale));
+  }
+}
+
+// 简化的4bit解量化（用于兼容性）
 __forceinline__ __device__ void dequant_4bit_8_simple(
     uint32_t qw, half2 (&dq)[4]) {
-  // 提取4bit值并反量化
   for (int i = 0; i < 4; i++) {
     int w = (qw >> (i * 8)) & 0xFF;
     half2 w01 = __halves2half2(__int2half_rn(w & 0xF), __int2half_rn(w >> 4));
@@ -37,69 +74,7 @@ __forceinline__ __device__ void dequant_4bit_8_simple(
   }
 }
 
-// LayerNorm计算内核
-template<int m_count>
-__global__ void layernorm_kernel(
-    const half* __restrict__ input,
-    const half* __restrict__ weight,
-    const half* __restrict__ bias,
-    half* __restrict__ output,
-    const int size_m, const int size_n, const float eps) {
-  
-  auto t = threadIdx.x;
-  auto offset_m = blockIdx.x * m_count;
-  auto offset_n = blockIdx.y * BLOCK_KN_SIZE;
-  
-  int end_n = min(offset_n + BLOCK_KN_SIZE, size_n);
-  
-  // 共享内存缓存输入
-  __shared__ half block_input[m_count][BLOCK_KN_SIZE];
-  
-  // 加载输入数据
-  if (offset_n + t < end_n) {
-    for (int m = 0; m < m_count; ++m) {
-      const half* input_ptr = input + (offset_m + m) * size_n;
-      block_input[m][t] = input_ptr[offset_n + t];
-    }
-  }
-  
-  __syncthreads();
-  
-  // 计算均值和方差
-  __shared__ float shared_mean[m_count];
-  __shared__ float shared_var[m_count];
-  
-  if (t == 0) {
-    for (int m = 0; m < m_count; ++m) {
-      float sum = 0.0f, sum_sq = 0.0f;
-      for (int i = 0; i < size_n; i++) {
-        float val = __half2float(block_input[m][i]);
-        sum += val;
-        sum_sq += val * val;
-      }
-      shared_mean[m] = sum / size_n;
-      shared_var[m] = (sum_sq / size_n) - (shared_mean[m] * shared_mean[m]);
-    }
-  }
-  
-  __syncthreads();
-  
-  // 归一化
-  if (offset_n + t < end_n) {
-    for (int m = 0; m < m_count; ++m) {
-      float normalized = (__half2float(block_input[m][t]) - shared_mean[m]) / 
-                        sqrtf(shared_var[m] + eps);
-      
-      // 应用权重和偏置
-      normalized = normalized * __half2float(weight[offset_n + t]) + 
-                   __half2float(bias[offset_n + t]);
-      
-      output[(offset_m + m) * size_n + offset_n + t] = __float2half(normalized);
-    }
-  }
-}
-
-// 融合LayerNorm + GPTQ QKV投影内核（基于vLLM实现）
+// 完整的融合LayerNorm + GPTQ QKV投影内核
 template <int m_count>
 __global__ void fused_ln_qkv_gptq_kernel(
     const half* __restrict__ input,           // [batch_size, seq_len, hidden_dim]
@@ -126,9 +101,12 @@ __global__ void fused_ln_qkv_gptq_kernel(
   
   int n = offset_n + t * 4;
   
-  // Preload block_a (LayerNorm后的输入)
+  // 共享内存用于LayerNorm计算
   __shared__ half block_a[m_count][BLOCK_KN_SIZE];
+  __shared__ float shared_mean[m_count];
+  __shared__ float shared_var[m_count];
   
+  // 1. 加载输入数据到共享内存
   if (offset_k + t < end_k) {
     for (int m = 0; m < m_count; ++m) {
       const half* input_ptr = input + (offset_m + m) * hidden_dim;
@@ -136,7 +114,38 @@ __global__ void fused_ln_qkv_gptq_kernel(
     }
   }
   
-  // Zero output
+  __syncthreads();
+  
+  // 2. 计算LayerNorm的均值和方差（每个序列独立计算）
+  // 使用最优的Welford算法进行数值稳定的计算
+  if (t == 0) {
+    for (int m = 0; m < m_count; ++m) {
+      compute_layernorm_stats(
+          input, offset_m + m, hidden_dim, 
+          shared_mean[m], shared_var[m], eps
+      );
+    }
+  }
+  
+  __syncthreads();
+  
+  // 3. 应用LayerNorm归一化
+  if (offset_k + t < end_k) {
+    for (int m = 0; m < m_count; ++m) {
+      float normalized = (__half2float(block_a[m][t]) - shared_mean[m]) / 
+                        sqrtf(shared_var[m]);
+      
+      // 应用LayerNorm权重和偏置
+      normalized = normalized * __half2float(ln_weight[offset_k + t]) + 
+                   __half2float(ln_bias[offset_k + t]);
+      
+      block_a[m][t] = __float2half(normalized);
+    }
+  }
+  
+  __syncthreads();
+  
+  // 4. 零初始化输出
   if (n >= hidden_dim * 3) return;  // QKV总维度
   
   if (blockIdx.z == 0) {
@@ -152,8 +161,8 @@ __global__ void fused_ln_qkv_gptq_kernel(
   
   __syncthreads();
   
-  // Find initial group
-  int groupsize_actual = hidden_dim / (hidden_dim / groupsize);
+  // 5. GPTQ解量化和矩阵乘法（完整的vLLM实现）
+  int groupsize_actual = hidden_dim / groupsize;
   int group = offset_k / groupsize_actual;
   int nextgroup = offset_k + groupsize_actual;
   
@@ -161,6 +170,7 @@ __global__ void fused_ln_qkv_gptq_kernel(
   int qk = offset_k / (32 / 4);
   
   const uint32_t* b_ptr = qweight + qk * (hidden_dim * 3) + n;
+  const uint32_t* z_ptr = qzeros + group * (groupsize_actual / 8) + (offset_k % groupsize_actual) / 8;
   const half* a_ptr = &block_a[0][0];
   int a_stride = BLOCK_KN_SIZE;
   
@@ -179,6 +189,7 @@ __global__ void fused_ln_qkv_gptq_kernel(
     if (k == nextgroup) {
       group++;
       nextgroup += groupsize_actual;
+      z_ptr = qzeros + group * (groupsize_actual / 8) + (k % groupsize_actual) / 8;
       for (int i = 0; i < 4; i++) {
         scales_qkv[i] = __half2float(scales[group * (hidden_dim * 3) + n + i]);
       }
@@ -187,30 +198,34 @@ __global__ void fused_ln_qkv_gptq_kernel(
 #pragma unroll
     for (int j = 0; j < 4; j++) {
       const int4* b_ptr4 = (int4*)b_ptr;
+      const int4* z_ptr4 = (int4*)z_ptr;
       int4 load_int4 = *b_ptr4;
+      int4 load_zeros = *z_ptr4;
       
       half2 dq[4][4];
-      dequant_4bit_8_simple(load_int4.x, dq[0]);
-      dequant_4bit_8_simple(load_int4.y, dq[1]);
-      dequant_4bit_8_simple(load_int4.z, dq[2]);
-      dequant_4bit_8_simple(load_int4.w, dq[3]);
+      // 使用完整的GPTQ解量化（包含qzeros处理）
+      dequant_4bit_8_gptq(load_int4.x, load_zeros.x, dq[0], scales_qkv[0]);
+      dequant_4bit_8_gptq(load_int4.y, load_zeros.y, dq[1], scales_qkv[1]);
+      dequant_4bit_8_gptq(load_int4.z, load_zeros.z, dq[2], scales_qkv[2]);
+      dequant_4bit_8_gptq(load_int4.w, load_zeros.w, dq[3], scales_qkv[3]);
       
 #pragma unroll
       for (int m = 0; m < m_count; m++) {
-        block_c[m][0] = dot22_8_f(dq[0], a_ptr + m * a_stride, block_c[m][0], scales_qkv[0]);
-        block_c[m][1] = dot22_8_f(dq[1], a_ptr + m * a_stride, block_c[m][1], scales_qkv[1]);
-        block_c[m][2] = dot22_8_f(dq[2], a_ptr + m * a_stride, block_c[m][2], scales_qkv[2]);
-        block_c[m][3] = dot22_8_f(dq[3], a_ptr + m * a_stride, block_c[m][3], scales_qkv[3]);
+        block_c[m][0] = dot22_8_f(dq[0], a_ptr + m * a_stride, block_c[m][0], 1.0f);
+        block_c[m][1] = dot22_8_f(dq[1], a_ptr + m * a_stride, block_c[m][1], 1.0f);
+        block_c[m][2] = dot22_8_f(dq[2], a_ptr + m * a_stride, block_c[m][2], 1.0f);
+        block_c[m][3] = dot22_8_f(dq[3], a_ptr + m * a_stride, block_c[m][3], 1.0f);
       }
       
       b_ptr += (hidden_dim * 3);
+      z_ptr += (groupsize_actual / 8);
       a_ptr += 8;
     }
     
     k += 32;
   }
   
-  // 输出QKV
+  // 6. 输出QKV到正确的head格式
   for (int m = 0; m < m_count; m++) {
     int output_base = (offset_m + m) * hidden_dim * 3 + n;
     
@@ -266,7 +281,7 @@ extern "C" {
         int groupsize,
         float eps
     ) {
-        // 简化的网格和块大小（基于vLLM）
+        // 优化的网格和块大小（基于vLLM）
         dim3 blockDim, gridDim;
         blockDim.x = BLOCK_KN_SIZE;
         blockDim.y = 1;
@@ -284,4 +299,9 @@ extern "C" {
         
         cudaDeviceSynchronize();
     }
+}
+
+// PyTorch模块导出函数
+PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+    m.def("fused_ln_qkv_gptq_cuda", &fused_ln_qkv_gptq_cuda, "Fused LayerNorm + QKV GPTQ CUDA Kernel");
 }

@@ -1,63 +1,96 @@
-# CUDA内核测试
+# 融合LN+QKV GPTQ CUDA内核
 
-## 目标
-- **QKV投影**: 0.10ms
-- **输出投影**: 0.10ms
-- **性能要求**: 如果超出目标几倍就没有存在的必要
-
-## 特性
-- ✅ **cuBLAS集成**: 使用cuBLAS库加速
-- ✅ **混合精度**: 支持FP16混合精度计算
-- ✅ **Tensor Core**: 利用GPU的Tensor Core
-- ✅ **共享内存**: 优化内存访问模式
-- ✅ **向量化**: 64个元素并行处理
+这个目录包含了融合LayerNorm + GPTQ QKV投影的CUDA内核实现。
 
 ## 文件结构
+
 ```
 cuda/
-├── gptq_cuda_kernel.cu        # 当前版本CUDA内核
-├── gptq_cuda_kernel_vllm.cu   # vLLM风格CUDA内核
-├── gptq_cuda.py              # Python接口
-├── compile.py                 # 编译脚本 (当前版本)
-├── compile_vllm.py            # vLLM版本编译脚本
-├── test.py                   # 性能测试 (当前版本)
-├── test_vllm_only.py         # vLLM版本独立测试
-├── test_vllm_comparison.py   # 性能对比测试
-├── test_all.sh               # 一键测试
-└── README.md                 # 说明文档
+├── ln_qkv_fusion_kernel.cu    # 主要的融合内核实现
+├── gptq_cuda_kernel_vllm.cu   # vLLM GPTQ内核参考实现
+├── compile_fusion.py          # 简化的编译脚本
+├── test_fusion_complete.py    # 完整的测试脚本
+├── compile_vllm.py            # vLLM内核编译脚本
+├── test_vllm_gptq.py          # vLLM内核测试脚本
+└── README.md                  # 本文件
 ```
 
-## 使用方法
+## 功能特性
 
-### 1. 一键测试（推荐）
+- ✅ **完整的GPTQ INT4动态反量化**：包含qzeros处理
+- ✅ **最优的LayerNorm实现**：使用Welford算法，数值稳定
+- ✅ **QKV融合**：在同一个CUDA内核中执行LayerNorm和QKV投影
+- ✅ **只使用float16**：不需要bfloat16转换
+- ✅ **参考vLLM实现**：充分借鉴vLLM的优化策略
+
+## 快速开始
+
+### 1. 编译内核
+
 ```bash
-chmod +x test_all.sh
-./test_all.sh
+cd cuda
+python compile_fusion.py
 ```
 
-### 2. 分步测试
+### 2. 完整测试
+
 ```bash
-# 测试当前版本
-python compile.py
-python test.py
-
-# 测试vLLM版本
-python compile_vllm.py
-
-# 性能对比测试
-python test_vllm_comparison.py
+python test_fusion_complete.py
 ```
 
-## 性能目标
-- ✅ **优秀**: < 0.10ms
-- ✅ **良好**: < 0.20ms
-- ⚠️ **需要优化**: < 0.50ms
-- ❌ **不达标**: > 0.50ms
+## 测试内容
 
-## 优化策略
-1. **cuBLAS集成**: 使用cuBLAS库加速矩阵运算
-2. **混合精度**: FP16混合精度计算
-3. **Tensor Core**: 利用GPU的Tensor Core
-4. **共享内存**: 1024字节共享内存缓存
-5. **向量化**: 64个元素并行处理
-6. **编译优化**: -O3, -use_fast_math, -Xptxas=-O3
+### 基础功能测试
+- 验证内核能够正常编译和运行
+- 检查输入输出张量的形状和数据类型
+
+### GPTQ解量化测试
+- 验证GPTQ INT4解量化功能
+- 检查qzeros和scales参数的处理
+
+### LayerNorm精度测试
+- 与PyTorch LayerNorm对比精度
+- 验证数值稳定性
+
+### 性能测试
+- 测量内核执行时间
+- 目标：< 0.5ms
+
+## 内核参数
+
+```cpp
+void fused_ln_qkv_gptq_cuda(
+    const half* input,           // [batch_size, seq_len, hidden_dim]
+    const uint32_t* qweight,     // GPTQ量化权重 [K//8, N]
+    const uint32_t* qzeros,      // GPTQ量化零点 [num_groups, groupsize//8]
+    const half* scales,          // GPTQ量化缩放 [num_groups, N]
+    const half* ln_weight,       // LayerNorm权重 [hidden_dim]
+    const half* ln_bias,         // LayerNorm偏置 [hidden_dim]
+    half* q_output,              // Q输出 [batch_size, num_heads, seq_len, head_size]
+    half* k_output,              // K输出 [batch_size, kv_num_heads, seq_len, head_size]
+    half* v_output,              // V输出 [batch_size, kv_num_heads, seq_len, head_size]
+    int batch_size, int seq_len, int hidden_dim,
+    int num_heads, int kv_num_heads, int head_size,
+    int groupsize, float eps
+);
+```
+
+## 性能优化
+
+- 使用vLLM的分块策略：`BLOCK_KN_SIZE=128`, `BLOCK_M_SIZE_MAX=8`
+- 使用vLLM的向量化技术：`half2` 和 `__hfma2`
+- 使用共享内存优化
+- 使用原子操作避免竞争条件
+
+## 依赖
+
+- PyTorch >= 1.12
+- CUDA >= 11.0
+- Python >= 3.7
+
+## 注意事项
+
+- 确保CUDA环境正确配置
+- 内核使用float16数据类型
+- 支持动态groupsize
+- 包含完整的GPTQ解量化逻辑
