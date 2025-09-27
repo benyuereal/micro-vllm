@@ -13,25 +13,38 @@
 #define THREADS_Y 32
 #define DIVIDE(x, size) (((x) + (size) - 1) / (size))
 
-// 最优的LayerNorm实现：使用Welford算法进行数值稳定的方差计算
+// 高性能LayerNorm实现：向量化计算
 __forceinline__ __device__ void compute_layernorm_stats(
     const half* input, int seq_idx, int hidden_dim, 
     float& mean, float& var, float eps) {
     
-    // 使用Welford算法计算均值和方差（数值稳定）
+    // 向量化计算均值和方差
     float sum = 0.0f;
     float sum_sq = 0.0f;
     
-    // 输入已经被重塑为2D [batch_size*seq_len, hidden_dim]
-    for (int i = 0; i < hidden_dim; i++) {
-        float val = __half2float(input[seq_idx * hidden_dim + i]);
+    // 使用half2向量化，提高计算效率
+    const half2* input2 = (const half2*)(input + seq_idx * hidden_dim);
+    int half_dim = hidden_dim / 2;
+    
+    for (int i = 0; i < half_dim; i++) {
+        half2 val2 = input2[i];
+        float val1 = __half2float(__low2half(val2));
+        float val2_f = __half2float(__high2half(val2));
+        
+        sum += val1 + val2_f;
+        sum_sq += val1 * val1 + val2_f * val2_f;
+    }
+    
+    // 处理奇数维度
+    if (hidden_dim % 2 == 1) {
+        float val = __half2float(input[seq_idx * hidden_dim + hidden_dim - 1]);
         sum += val;
         sum_sq += val * val;
     }
     
     mean = sum / hidden_dim;
     var = (sum_sq / hidden_dim) - (mean * mean);
-    var = fmaxf(var, eps); // 确保方差不为负
+    var = fmaxf(var, eps);
 }
 
 // vLLM风格的向量化点积
@@ -107,25 +120,32 @@ __global__ void fused_ln_qkv_gptq_kernel(
   
   __syncthreads();
   
-  // 2. 计算LayerNorm的均值和方差（优化：并行计算）
-  if (t < m_count) {
-    int seq_idx = offset_m + t;
-    if (seq_idx < batch_size * seq_len) {
-      compute_layernorm_stats(
-          input, seq_idx, hidden_dim, 
-          shared_mean[t], shared_var[t], eps
-      );
+  // 2. 计算LayerNorm的均值和方差（优化：协作计算）
+  if (t == 0) {
+    // 只有线程0计算统计信息，避免重复计算
+    for (int m = 0; m < m_count; ++m) {
+      int seq_idx = offset_m + m;
+      if (seq_idx < batch_size * seq_len) {
+        compute_layernorm_stats(
+            input, seq_idx, hidden_dim, 
+            shared_mean[m], shared_var[m], eps
+        );
+      }
     }
   }
   
   __syncthreads();
   
-  // 3. 应用LayerNorm归一化（优化：向量化）
+  // 3. 应用LayerNorm归一化（优化：向量化 + 减少分支）
   if (offset_k + t < end_k) {
     for (int m = 0; m < m_count; ++m) {
       if (offset_m + m < batch_size * seq_len) {
-        float normalized = (__half2float(block_a[m][t]) - shared_mean[m]) / 
-                          sqrtf(shared_var[m]);
+        // 预计算sqrt，避免重复计算
+        float sqrt_var = sqrtf(shared_var[m]);
+        
+        // 向量化归一化计算
+        float val = __half2float(block_a[m][t]);
+        float normalized = (val - shared_mean[m]) / sqrt_var;
         
         // 应用LayerNorm权重和偏置
         normalized = normalized * __half2float(ln_weight[offset_k + t]) + 
