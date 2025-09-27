@@ -5,6 +5,7 @@ from core.paged_attention import PagedAttention
 import logging
 import time
 from .gptq import GPTQCUDAFusion
+import os
 
 logger = logging.getLogger(__name__)
 
@@ -12,6 +13,7 @@ logger = logging.getLogger(__name__)
 class OptimizedQwenModelLayerAdapter:
     """
     优化的Qwen7B INT4量化模型适配器
+    专门用于Qwen7B INT4量化模型，强制使用LayerNorm+QKV融合内核
     基于layer.py的高效实现，使用CUDA融合内核
     """
 
@@ -38,6 +40,33 @@ class OptimizedQwenModelLayerAdapter:
         
         # 🔧 方案1+2: 初始化时转换数据类型
         self._converted_layers = set()  # 记录已转换的层
+        
+        # 融合内核初始化 - 必须成功
+        self._fusion_kernel = None
+        self._init_fusion_kernel()
+        if self._fusion_kernel is None:
+            raise RuntimeError("❌ 融合内核初始化失败，无法继续")
+
+    def _init_fusion_kernel(self):
+        """初始化融合内核 - 必须成功"""
+        from torch.utils.cpp_extension import load
+        
+        # 获取CUDA内核文件路径
+        current_dir = os.path.dirname(os.path.abspath(__file__))
+        cuda_dir = os.path.join(current_dir, '..', '..', 'cuda')
+        kernel_file = os.path.join(cuda_dir, 'gptq_ln_qkv_fusion_kernel.cu')
+        
+        if not os.path.exists(kernel_file):
+            raise FileNotFoundError(f"融合内核文件不存在: {kernel_file}")
+        
+        # 编译融合内核
+        self._fusion_kernel = load(
+            name="fused_ln_qkv_gptq_cuda",
+            sources=[kernel_file],
+            extra_cuda_cflags=["-O3", "-use_fast_math"],
+            verbose=False
+        )
+        logger.info("✅ 融合内核加载成功")
 
     def _convert_layer_dtypes_to_float16(self, layer, layer_idx: int):
         """
@@ -240,16 +269,10 @@ class OptimizedQwenModelLayerAdapter:
         if layer_idx == 0:
             logger.info(f"hidden_states start shape {hidden_states.shape}")
 
-        # 2. LayerNorm + 残差
+        # 2. 残差连接准备
         residual = hidden_states
-        hidden_states = layer.ln_1(hidden_states)
 
-        # 只在第一层打印形状信息
-        if layer_idx == 0:
-            logger.info(f"hidden_states norm_fn shape {hidden_states.shape}")
-        norm_time = time.time() - norm_start
-
-        # 3. QKV计算 (优化版本)
+        # 3. 融合的LayerNorm + QKV计算
         qkv_start = time.time()
 
         # 🔧 优化：只在需要时转换数据类型，避免每层都转换
@@ -260,21 +283,13 @@ class OptimizedQwenModelLayerAdapter:
         elif layer_idx == 0:
             logger.info(f"✅ hidden_states已经是正确类型: {hidden_states.dtype}")
 
-        if self._is_quantized:
-            q, k, v = self._optimized_quantized_qkv_proj(layer, hidden_states, layer_idx)
-        else:
-            # 标准QKV计算
-            qkv = layer.attn.c_attn(hidden_states)
-            if layer_idx == 0:
-                logger.info(f"qkv   shape {qkv.shape}")
-            hidden_size = qkv.shape[-1] // 3
-            q, k, v = qkv.split(hidden_size, dim=-1)
-            batch_size, seq_len, _ = hidden_states.shape
-            q = q.view(batch_size, seq_len, self.num_heads, self.head_size).permute(0, 2, 1, 3)
-            k = k.view(batch_size, seq_len, self.kv_num_heads, self.head_size).permute(0, 2, 1, 3)
-            v = v.view(batch_size, seq_len, self.kv_num_heads, self.head_size).permute(0, 2, 1, 3)
+        # 强制使用融合内核：LayerNorm + QKV投影
+        q, k, v = self._fused_ln_qkv_proj(layer, hidden_states, layer_idx)
+        if layer_idx == 0:
+            logger.info(f"🚀 使用融合内核进行LayerNorm+QKV投影")
 
         qkv_time = time.time() - qkv_start
+        norm_time = 0  # 融合内核中LayerNorm时间包含在QKV时间中
 
         # 4. 注意力计算
         attn_start = time.time()
@@ -342,53 +357,72 @@ class OptimizedQwenModelLayerAdapter:
 
         return hidden_states, (k.squeeze(2), v.squeeze(2))
 
-    def _optimized_quantized_qkv_proj(self, layer, hidden_states: torch.Tensor, layer_idx: int):
-        """
-        优化的量化QKV投影 - 使用CUDA融合算子
-        """
-        c_attn = layer.attn.c_attn
 
-        # 缓存量化参数
+    def _fused_ln_qkv_proj(self, layer, hidden_states: torch.Tensor, layer_idx: int):
+        """
+        融合的LayerNorm + QKV投影 - 使用CUDA融合内核
+        """
+        
+        c_attn = layer.attn.c_attn
+        
+        # 获取量化参数
         cache_key = f"qkv_{id(c_attn)}"
         if cache_key not in self._quantization_cache:
             qkv_weight, qkv_scale, qkv_zero = self._get_quant_params(c_attn)
             self._quantization_cache[cache_key] = (qkv_weight, qkv_scale, qkv_zero)
         else:
             qkv_weight, qkv_scale, qkv_zero = self._quantization_cache[cache_key]
-
-        # 🔧 优化：避免不必要的张量重塑
-        batch_size, seq_len, hidden_dim = hidden_states.shape
-        input_2d = hidden_states.view(-1, hidden_dim)  # [B*S, D]
         
-        # 🔧 简化：只在第一层打印详细信息
-        if layer_idx == 0:
-            logger.info(f"🔍 QKV投影参数类型检查:")
-            logger.info(f"  input_2d: {input_2d.shape}, dtype: {input_2d.dtype}")
-            logger.info(f"  qkv_weight: {qkv_weight.shape}, dtype: {qkv_weight.dtype}")
-            logger.info(f"  qkv_scale: {qkv_scale.shape}, dtype: {qkv_scale.dtype}")
-            logger.info(f"  qkv_zero: {qkv_zero.shape}, dtype: {qkv_zero.dtype}")
-        
-        # 🔧 优化：直接调用CUDA融合算子，避免中间变量
-        result = self._gptq_fusion.fused_gptq_gemm_4bit(
-            input=input_2d,
-            qweight=qkv_weight,
-            qzeros=qkv_zero,
-            scales=qkv_scale
-        )
-        
-        # 🔧 优化：直接在GPU上进行QKV分割和重塑，避免CPU-GPU传输
-        output_dim = result.shape[-1]
+        # 分离Q、K、V权重
+        hidden_dim = hidden_states.shape[-1]
+        output_dim = qkv_weight.shape[1]  # 应该是 hidden_dim * 3
         if output_dim % 3 != 0:
             logger.error(f"QKV output dimension {output_dim} is not divisible by 3")
             raise ValueError(f"QKV output dimension {output_dim} is not divisible by 3")
         
-        hidden_size = output_dim // 3
-        q, k, v = result.split(hidden_size, dim=-1)
+        qkv_hidden_dim = output_dim // 3
         
-        # 🔧 优化：使用更高效的view和permute操作
-        q = q.view(batch_size, seq_len, self.num_heads, self.head_size).permute(0, 2, 1, 3)
-        k = k.view(batch_size, seq_len, self.kv_num_heads, self.head_size).permute(0, 2, 1, 3)
-        v = v.view(batch_size, seq_len, self.kv_num_heads, self.head_size).permute(0, 2, 1, 3)
+        # 分离权重
+        qweight_q = qkv_weight[:, :qkv_hidden_dim]
+        qweight_k = qkv_weight[:, qkv_hidden_dim:2*qkv_hidden_dim]
+        qweight_v = qkv_weight[:, 2*qkv_hidden_dim:]
+        
+        # 分离scales和zeros
+        num_groups = qkv_scale.shape[0]
+        qscales_q = qkv_scale[:, :qkv_hidden_dim]
+        qscales_k = qkv_scale[:, qkv_hidden_dim:2*qkv_hidden_dim]
+        qscales_v = qkv_scale[:, 2*qkv_hidden_dim:]
+        
+        qzeros_q = qkv_zero
+        qzeros_k = qkv_zero  # 通常Q、K、V使用相同的zeros
+        qzeros_v = qkv_zero
+        
+        # 获取LayerNorm参数
+        ln_weight = layer.ln_1.weight.to(torch.float16)
+        ln_bias = layer.ln_1.bias.to(torch.float16)
+        
+        # 调用融合内核
+        batch_size, seq_len, _ = hidden_states.shape
+        groupsize = self._quant_group_size
+        eps = 1e-5
+        
+        qkv_output = self._fusion_kernel.fused_ln_qkv_gptq_cuda(
+            hidden_states, qweight_q, qweight_k, qweight_v,
+            qzeros_q, qzeros_k, qzeros_v,
+            qscales_q, qscales_k, qscales_v,
+            ln_weight, ln_bias,
+            batch_size, seq_len, qkv_hidden_dim, groupsize, eps
+        )
+        
+        # 解包QKV输出
+        q_output = qkv_output[0]
+        k_output = qkv_output[1]
+        v_output = qkv_output[2]
+        
+        # 重塑为注意力格式
+        q = q_output.view(batch_size, seq_len, self.num_heads, self.head_size).permute(0, 2, 1, 3)
+        k = k_output.view(batch_size, seq_len, self.kv_num_heads, self.head_size).permute(0, 2, 1, 3)
+        v = v_output.view(batch_size, seq_len, self.kv_num_heads, self.head_size).permute(0, 2, 1, 3)
         
         return q, k, v
 
