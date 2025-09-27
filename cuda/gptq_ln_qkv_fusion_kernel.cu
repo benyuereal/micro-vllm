@@ -260,27 +260,50 @@ __global__ void fused_ln_qkv_gptq_kernel(
   }
 }
 
-// 包装函数
-extern "C" {
-    void fused_ln_qkv_gptq_cuda(
-        const half* input,
-        const uint32_t* qweight,
-        const uint32_t* qzeros,
-        const half* scales,
-        const half* ln_weight,
-        const half* ln_bias,
-        half* q_output,
-        half* k_output,
-        half* v_output,
-        int batch_size,
-        int seq_len,
-        int hidden_dim,
-        int num_heads,
-        int kv_num_heads,
-        int head_size,
-        int groupsize,
-        float eps
-    ) {
+// PyTorch包装函数
+torch::Tensor fused_ln_qkv_gptq_cuda(
+    torch::Tensor input,
+    torch::Tensor qweight,
+    torch::Tensor qzeros,
+    torch::Tensor scales,
+    torch::Tensor ln_weight,
+    torch::Tensor ln_bias,
+    int batch_size,
+    int seq_len,
+    int hidden_dim,
+    int num_heads,
+    int kv_num_heads,
+    int head_size,
+    int groupsize,
+    float eps
+) {
+    // 检查输入张量
+    TORCH_CHECK(input.device().is_cuda(), "input must be a CUDA tensor");
+    TORCH_CHECK(input.dtype() == torch::kFloat16, "input must be float16");
+    TORCH_CHECK(input.dim() == 3, "input must be 3D tensor [batch_size, seq_len, hidden_dim]");
+    
+    // 获取张量数据指针
+    const half* input_ptr = input.data_ptr<half>();
+    const uint32_t* qweight_ptr = qweight.data_ptr<uint32_t>();
+    const uint32_t* qzeros_ptr = qzeros.data_ptr<uint32_t>();
+    const half* scales_ptr = scales.data_ptr<half>();
+    const half* ln_weight_ptr = ln_weight.data_ptr<half>();
+    const half* ln_bias_ptr = ln_bias.data_ptr<half>();
+    
+    // 创建输出张量
+    auto q_output = torch::zeros({batch_size, num_heads, seq_len, head_size}, 
+                                torch::TensorOptions().dtype(torch::kFloat16).device(input.device()));
+    auto k_output = torch::zeros({batch_size, kv_num_heads, seq_len, head_size}, 
+                                torch::TensorOptions().dtype(torch::kFloat16).device(input.device()));
+    auto v_output = torch::zeros({batch_size, kv_num_heads, seq_len, head_size}, 
+                                torch::TensorOptions().dtype(torch::kFloat16).device(input.device()));
+    
+    half* q_output_ptr = q_output.data_ptr<half>();
+    half* k_output_ptr = k_output.data_ptr<half>();
+    half* v_output_ptr = v_output.data_ptr<half>();
+    
+    // 调用原始C函数
+    {
         // 优化的网格和块大小（基于vLLM）
         dim3 blockDim, gridDim;
         blockDim.x = BLOCK_KN_SIZE;
@@ -292,13 +315,16 @@ extern "C" {
         
         // 启动融合内核
         fused_ln_qkv_gptq_kernel<1><<<gridDim, blockDim>>>(
-            input, qweight, qzeros, scales, ln_weight, ln_bias,
-            q_output, k_output, v_output,
+            input_ptr, qweight_ptr, qzeros_ptr, scales_ptr, ln_weight_ptr, ln_bias_ptr,
+            q_output_ptr, k_output_ptr, v_output_ptr,
             batch_size, seq_len, hidden_dim, num_heads, kv_num_heads, head_size, groupsize, eps
         );
         
         cudaDeviceSynchronize();
     }
+    
+    // 返回QKV张量的元组
+    return torch::stack({q_output, k_output, v_output}, 0);
 }
 
 // PyTorch模块导出函数

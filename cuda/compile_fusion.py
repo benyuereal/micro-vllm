@@ -66,17 +66,16 @@ def test_compile():
         qzeros = torch.randint(0, 16, (hidden_dim // groupsize, groupsize // 8), dtype=torch.uint32, device='cuda')
         scales = torch.randn(hidden_dim // groupsize, hidden_dim * 3, dtype=torch.float16, device='cuda')
         
-        # 输出张量
-        q_output = torch.zeros(batch_size, num_heads, seq_len, head_size, dtype=torch.float16, device='cuda')
-        k_output = torch.zeros(batch_size, kv_num_heads, seq_len, head_size, dtype=torch.float16, device='cuda')
-        v_output = torch.zeros(batch_size, kv_num_heads, seq_len, head_size, dtype=torch.float16, device='cuda')
-        
-        # 调用内核
-        kernel_module.fused_ln_qkv_gptq_cuda(
+        # 调用内核（现在返回QKV张量的元组）
+        qkv_output = kernel_module.fused_ln_qkv_gptq_cuda(
             input_tensor, qweight, qzeros, scales, ln_weight, ln_bias,
-            q_output, k_output, v_output,
             batch_size, seq_len, hidden_dim, num_heads, kv_num_heads, head_size, groupsize, eps
         )
+        
+        # 解包QKV输出
+        q_output = qkv_output[0]
+        k_output = qkv_output[1] 
+        v_output = qkv_output[2]
         
         print("✅ 简单功能测试成功!")
         print(f"📊 Q输出形状: {q_output.shape}")

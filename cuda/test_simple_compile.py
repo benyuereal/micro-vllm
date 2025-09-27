@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-最简单的编译测试
+简化的编译测试
 """
 
 import torch
@@ -21,7 +21,7 @@ def main():
             name="fused_ln_qkv_gptq_cuda",
             sources=["gptq_ln_qkv_fusion_kernel.cu"],
             extra_cuda_cflags=["-O3", "-use_fast_math"],
-            verbose=False
+            verbose=True
         )
         
         print("✅ 编译成功!")
@@ -47,11 +47,18 @@ def main():
         qzeros = torch.randint(0, 16, (hidden_dim // groupsize, groupsize // 8), dtype=torch.uint32, device='cuda')
         scales = torch.randn(hidden_dim // groupsize, hidden_dim * 3, dtype=torch.float16, device='cuda')
         
+        print(f"📊 输入形状: {input_tensor.shape}")
+        print(f"📊 qweight形状: {qweight.shape}")
+        print(f"📊 qzeros形状: {qzeros.shape}")
+        print(f"📊 scales形状: {scales.shape}")
+        
         # 调用内核（现在返回QKV张量的元组）
         qkv_output = kernel_module.fused_ln_qkv_gptq_cuda(
             input_tensor, qweight, qzeros, scales, ln_weight, ln_bias,
             batch_size, seq_len, hidden_dim, num_heads, kv_num_heads, head_size, groupsize, eps
         )
+        
+        print(f"📊 QKV输出形状: {qkv_output.shape}")
         
         # 解包QKV输出
         q_output = qkv_output[0]
