@@ -1,6 +1,6 @@
 # 融合LN+QKV GPTQ CUDA内核
 
-这个目录包含了融合LayerNorm + GPTQ QKV投影的CUDA内核实现。
+这个目录包含了融合LayerNorm + GPTQ QKV投影的CUDA内核实现，目标是在0.3ms内完成完整的LayerNorm + GPTQ + QKV融合操作。
 
 ## 文件结构
 
@@ -10,6 +10,8 @@ cuda/
 ├── gptq_cuda_kernel_vllm.cu     # vLLM GPTQ内核参考实现
 ├── compile_fusion.py            # GPTQ LN+QKV融合内核编译脚本
 ├── test_fusion.py               # 融合内核测试脚本（编译+功能+性能）
+├── test_performance.py          # 性能测试脚本（目标0.25ms，包含功能验证）
+├── test_functionality.py        # 功能完整性验证脚本
 ├── compile_vllm.py              # vLLM内核编译脚本
 ├── test_vllm_gptq.py            # vLLM内核测试脚本
 └── README.md                    # 本文件
@@ -17,11 +19,12 @@ cuda/
 
 ## 功能特性
 
-- ✅ **完整的GPTQ INT4动态反量化**：包含qzeros处理
-- ✅ **最优的LayerNorm实现**：使用Welford算法，数值稳定
+- ✅ **完整的GPTQ INT4动态反量化**：包含qzeros处理，支持动态groupsize
+- ✅ **最优的LayerNorm实现**：使用Welford算法，数值稳定，支持权重和偏置
 - ✅ **QKV融合**：在同一个CUDA内核中执行LayerNorm和QKV投影
-- ✅ **只使用float16**：不需要bfloat16转换
-- ✅ **参考vLLM实现**：充分借鉴vLLM的优化策略
+- ✅ **只使用float16**：不需要bfloat16转换，完全兼容
+- ✅ **参考vLLM实现**：充分借鉴vLLM的优化策略和向量化技术
+- ✅ **高性能优化**：目标延迟 < 0.3ms
 
 ## 快速开始
 
@@ -38,6 +41,18 @@ python compile_fusion.py
 python test_fusion.py
 ```
 
+### 性能测试（目标0.25ms，包含功能验证）
+
+```bash
+python test_performance.py
+```
+
+### 功能完整性验证
+
+```bash
+python test_functionality.py
+```
+
 ### 测试vLLM内核
 
 ```bash
@@ -49,7 +64,14 @@ python test_vllm_gptq.py
 ### 融合内核测试 (`test_fusion.py`)
 - **编译测试**：验证内核能够正常编译
 - **功能测试**：验证基本功能正确性
-- **性能测试**：测量执行时间（目标：< 0.5ms）
+- **性能测试**：测量执行时间
+
+### 性能测试 (`test_performance.py`)
+- **目标延迟**：< 0.25ms
+- **功能验证**：输出形状、数值稳定性、非零检查
+- **详细统计**：平均、最小、最大延迟和标准差
+- **百分位数分析**：P50、P90、P95、P99延迟
+- **目标评估**：验证是否达到0.25ms目标
 
 ### vLLM内核测试 (`test_vllm_gptq.py`)
 - **功能测试**：验证vLLM GPTQ内核功能
@@ -58,28 +80,42 @@ python test_vllm_gptq.py
 ## 内核参数
 
 ```cpp
-void fused_ln_qkv_gptq_cuda(
-    const half* input,           // [batch_size, seq_len, hidden_dim]
-    const uint32_t* qweight,     // GPTQ量化权重 [K//8, N]
-    const uint32_t* qzeros,      // GPTQ量化零点 [num_groups, groupsize//8]
-    const half* scales,          // GPTQ量化缩放 [num_groups, N]
-    const half* ln_weight,       // LayerNorm权重 [hidden_dim]
-    const half* ln_bias,         // LayerNorm偏置 [hidden_dim]
-    half* q_output,              // Q输出 [batch_size, num_heads, seq_len, head_size]
-    half* k_output,              // K输出 [batch_size, kv_num_heads, seq_len, head_size]
-    half* v_output,              // V输出 [batch_size, kv_num_heads, seq_len, head_size]
+torch::Tensor fused_ln_qkv_gptq_cuda(
+    torch::Tensor input,           // [batch_size, seq_len, hidden_dim]
+    torch::Tensor qweight,         // [hidden_dim//8, hidden_dim*3]
+    torch::Tensor qzeros,          // [num_groups, groupsize//8]
+    torch::Tensor scales,          // [num_groups, hidden_dim*3]
+    torch::Tensor ln_weight,       // [hidden_dim]
+    torch::Tensor ln_bias,         // [hidden_dim]
     int batch_size, int seq_len, int hidden_dim,
-    int num_heads, int kv_num_heads, int head_size,
     int groupsize, float eps
-);
+) -> torch::Tensor  // 返回 [3, batch_size, seq_len, hidden_dim] 的QKV元组
 ```
 
 ## 性能优化
 
-- 使用vLLM的分块策略：`BLOCK_KN_SIZE=128`, `BLOCK_M_SIZE_MAX=8`
-- 使用vLLM的向量化技术：`half2` 和 `__hfma2`
-- 使用共享内存优化
-- 使用原子操作避免竞争条件
+### 1. vLLM风格优化
+- **分块策略**：`BLOCK_KN_SIZE=128`, `BLOCK_M_SIZE_MAX=8`
+- **向量化技术**：`half2` 和 `__hfma2` 指令
+- **共享内存**：`__shared__ half block_a[m_count][BLOCK_KN_SIZE]`
+- **CUDA流**：`c10::cuda::getCurrentCUDAStream()`
+
+### 2. 融合优化
+- **单内核融合**：LayerNorm + GPTQ + QKV 在同一个内核中完成
+- **内存优化**：减少中间张量创建和内存传输
+- **计算优化**：使用原子操作避免竞争条件
+
+### 3. 数值稳定性
+- **Welford算法**：数值稳定的方差计算
+- **GPTQ解量化**：`weight = (qweight - qzeros) * scale`
+- **LayerNorm归一化**：`(x - mean) / sqrt(var + eps)`
+
+## 性能目标
+
+- **目标延迟**：< 0.25ms（相比0.5ms提升50%）
+- **内存效率**：减少中间张量创建
+- **数值精度**：与PyTorch实现完全一致
+- **兼容性**：完全兼容现有PyTorch代码
 
 ## 依赖
 
@@ -93,3 +129,11 @@ void fused_ln_qkv_gptq_cuda(
 - 内核使用float16数据类型
 - 支持动态groupsize
 - 包含完整的GPTQ解量化逻辑
+- 使用vLLM的PyTorch兼容性方法
+
+## 使用建议
+
+1. **首次使用**：先运行 `python compile_fusion.py` 验证编译
+2. **性能测试**：运行 `python test_performance.py` 验证0.3ms目标
+3. **对比测试**：运行 `python test_benchmark.py` 与vLLM对比
+4. **集成使用**：参考 `test_fusion.py` 中的API调用方式

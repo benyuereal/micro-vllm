@@ -1,7 +1,8 @@
 #include <torch/extension.h>
 #include <cuda_runtime.h>
-#include <cublas_v2.h>
 #include <cuda_fp16.h>
+#include <cublas_v2.h>
+#include <ATen/cuda/CUDAContext.h>
 #include <stdio.h>
 #include <math.h>
 
@@ -64,30 +65,17 @@ __forceinline__ __device__ void dequant_4bit_8_gptq(
   }
 }
 
-// 简化的4bit解量化（用于兼容性）
-__forceinline__ __device__ void dequant_4bit_8_simple(
-    uint32_t qw, half2 (&dq)[4]) {
-  for (int i = 0; i < 4; i++) {
-    int w = (qw >> (i * 8)) & 0xFF;
-    half2 w01 = __halves2half2(__int2half_rn(w & 0xF), __int2half_rn(w >> 4));
-    dq[i] = w01;
-  }
-}
-
-// 完整的融合LayerNorm + GPTQ QKV投影内核
+// 优化的融合LayerNorm + GPTQ QKV投影内核
 template <int m_count>
 __global__ void fused_ln_qkv_gptq_kernel(
-    const half* __restrict__ input,           // [batch_size, seq_len, hidden_dim]
-    const uint32_t* __restrict__ qweight,     // GPTQ量化权重 [K//8, N]
+    const half* __restrict__ input,           // [batch_size * seq_len, hidden_dim]
+    const uint32_t* __restrict__ qweight,     // GPTQ量化权重 [hidden_dim//8, hidden_dim*3]
     const uint32_t* __restrict__ qzeros,      // GPTQ量化零点 [num_groups, groupsize//8]
-    const half* __restrict__ scales,          // GPTQ量化缩放 [num_groups, N]
+    const half* __restrict__ scales,          // GPTQ量化缩放 [num_groups, hidden_dim*3]
     const half* __restrict__ ln_weight,       // LayerNorm权重 [hidden_dim]
     const half* __restrict__ ln_bias,         // LayerNorm偏置 [hidden_dim]
-    half* __restrict__ q_output,              // Q输出 [batch_size, num_heads, seq_len, head_size]
-    half* __restrict__ k_output,              // K输出 [batch_size, kv_num_heads, seq_len, head_size]
-    half* __restrict__ v_output,              // V输出 [batch_size, kv_num_heads, seq_len, head_size]
+    half* __restrict__ qkv_output,            // QKV输出 [batch_size * seq_len, hidden_dim * 3]
     const int batch_size, const int seq_len, const int hidden_dim,
-    const int num_heads, const int kv_num_heads, const int head_size,
     const int groupsize, const float eps) {
   
   auto t = threadIdx.x;
@@ -117,7 +105,6 @@ __global__ void fused_ln_qkv_gptq_kernel(
   __syncthreads();
   
   // 2. 计算LayerNorm的均值和方差（每个序列独立计算）
-  // 使用最优的Welford算法进行数值稳定的计算
   if (t == 0) {
     for (int m = 0; m < m_count; ++m) {
       compute_layernorm_stats(
@@ -152,25 +139,23 @@ __global__ void fused_ln_qkv_gptq_kernel(
     for (int m = 0; m < m_count; m++) {
       int output_idx = (offset_m + m) * hidden_dim * 3 + n;
       if (output_idx < batch_size * seq_len * hidden_dim * 3) {
-        *((uint64_t*)(q_output + output_idx)) = 0;
-        *((uint64_t*)(k_output + output_idx)) = 0;
-        *((uint64_t*)(v_output + output_idx)) = 0;
+        *((uint64_t*)(qkv_output + output_idx)) = 0;
       }
     }
   }
   
   __syncthreads();
   
-  // 5. GPTQ解量化和矩阵乘法（完整的vLLM实现）
-  int groupsize_actual = hidden_dim / groupsize;
-  int group = offset_k / groupsize_actual;
-  int nextgroup = offset_k + groupsize_actual;
+  // 5. GPTQ解量化和矩阵乘法（参考vLLM实现）
+  int num_groups = hidden_dim / groupsize;
+  int group = offset_k / groupsize;
+  int nextgroup = offset_k + groupsize;
   
   // a, b offset
   int qk = offset_k / (32 / 4);
   
   const uint32_t* b_ptr = qweight + qk * (hidden_dim * 3) + n;
-  const uint32_t* z_ptr = qzeros + group * (groupsize_actual / 8) + (offset_k % groupsize_actual) / 8;
+  const uint32_t* z_ptr = qzeros + group * (groupsize / 8) + (offset_k % groupsize) / 8;
   const half* a_ptr = &block_a[0][0];
   int a_stride = BLOCK_KN_SIZE;
   
@@ -188,8 +173,8 @@ __global__ void fused_ln_qkv_gptq_kernel(
   while (k < end_k) {
     if (k == nextgroup) {
       group++;
-      nextgroup += groupsize_actual;
-      z_ptr = qzeros + group * (groupsize_actual / 8) + (k % groupsize_actual) / 8;
+      nextgroup += groupsize;
+      z_ptr = qzeros + group * (groupsize / 8) + (k % groupsize) / 8;
       for (int i = 0; i < 4; i++) {
         scales_qkv[i] = __half2float(scales[group * (hidden_dim * 3) + n + i]);
       }
@@ -218,44 +203,23 @@ __global__ void fused_ln_qkv_gptq_kernel(
       }
       
       b_ptr += (hidden_dim * 3);
-      z_ptr += (groupsize_actual / 8);
+      z_ptr += (groupsize / 8);
       a_ptr += 8;
     }
     
     k += 32;
   }
   
-  // 6. 输出QKV到正确的head格式
+  // 6. 输出QKV到正确的格式
   for (int m = 0; m < m_count; m++) {
     int output_base = (offset_m + m) * hidden_dim * 3 + n;
     
-    // Q输出
-    if (n < hidden_dim) {
-      half2* q_out = (half2*)(q_output + output_base);
+    if (output_base < batch_size * seq_len * hidden_dim * 3) {
+      half2* qkv_out = (half2*)(qkv_output + output_base);
       half2 result01 = __halves2half2(__float2half_rn(block_c[m][0]), __float2half_rn(block_c[m][1]));
       half2 result23 = __halves2half2(__float2half_rn(block_c[m][2]), __float2half_rn(block_c[m][3]));
-      atomicAdd(q_out, result01);
-      atomicAdd(q_out + 1, result23);
-    }
-    
-    // K输出
-    if (n >= hidden_dim && n < hidden_dim * 2) {
-      int k_idx = n - hidden_dim;
-      half2* k_out = (half2*)(k_output + (offset_m + m) * hidden_dim + k_idx);
-      half2 result01 = __halves2half2(__float2half_rn(block_c[m][0]), __float2half_rn(block_c[m][1]));
-      half2 result23 = __halves2half2(__float2half_rn(block_c[m][2]), __float2half_rn(block_c[m][3]));
-      atomicAdd(k_out, result01);
-      atomicAdd(k_out + 1, result23);
-    }
-    
-    // V输出
-    if (n >= hidden_dim * 2 && n < hidden_dim * 3) {
-      int v_idx = n - hidden_dim * 2;
-      half2* v_out = (half2*)(v_output + (offset_m + m) * hidden_dim + v_idx);
-      half2 result01 = __halves2half2(__float2half_rn(block_c[m][0]), __float2half_rn(block_c[m][1]));
-      half2 result23 = __halves2half2(__float2half_rn(block_c[m][2]), __float2half_rn(block_c[m][3]));
-      atomicAdd(v_out, result01);
-      atomicAdd(v_out + 1, result23);
+      atomicAdd(qkv_out, result01);
+      atomicAdd(qkv_out + 1, result23);
     }
   }
 }
@@ -271,9 +235,6 @@ torch::Tensor fused_ln_qkv_gptq_cuda(
     int batch_size,
     int seq_len,
     int hidden_dim,
-    int num_heads,
-    int kv_num_heads,
-    int head_size,
     int groupsize,
     float eps
 ) {
@@ -282,25 +243,27 @@ torch::Tensor fused_ln_qkv_gptq_cuda(
     TORCH_CHECK(input.dtype() == torch::kFloat16, "input must be float16");
     TORCH_CHECK(input.dim() == 3, "input must be 3D tensor [batch_size, seq_len, hidden_dim]");
     
-    // 获取张量数据指针
-    const half* input_ptr = input.data_ptr<half>();
+    // 确保张量是连续的
+    input = input.contiguous();
+    qweight = qweight.contiguous();
+    qzeros = qzeros.contiguous();
+    scales = scales.contiguous();
+    ln_weight = ln_weight.contiguous();
+    ln_bias = ln_bias.contiguous();
+    
+    // 获取张量数据指针（使用vLLM相同的方法）
+    const half* input_ptr = reinterpret_cast<const half*>(input.data_ptr<at::Half>());
     const uint32_t* qweight_ptr = qweight.data_ptr<uint32_t>();
     const uint32_t* qzeros_ptr = qzeros.data_ptr<uint32_t>();
-    const half* scales_ptr = scales.data_ptr<half>();
-    const half* ln_weight_ptr = ln_weight.data_ptr<half>();
-    const half* ln_bias_ptr = ln_bias.data_ptr<half>();
+    const half* scales_ptr = reinterpret_cast<const half*>(scales.data_ptr<at::Half>());
+    const half* ln_weight_ptr = reinterpret_cast<const half*>(ln_weight.data_ptr<at::Half>());
+    const half* ln_bias_ptr = reinterpret_cast<const half*>(ln_bias.data_ptr<at::Half>());
     
-    // 创建输出张量
-    auto q_output = torch::zeros({batch_size, num_heads, seq_len, head_size}, 
-                                torch::TensorOptions().dtype(torch::kFloat16).device(input.device()));
-    auto k_output = torch::zeros({batch_size, kv_num_heads, seq_len, head_size}, 
-                                torch::TensorOptions().dtype(torch::kFloat16).device(input.device()));
-    auto v_output = torch::zeros({batch_size, kv_num_heads, seq_len, head_size}, 
-                                torch::TensorOptions().dtype(torch::kFloat16).device(input.device()));
+    // 创建输出张量 [batch_size * seq_len, hidden_dim * 3]
+    auto qkv_output = torch::zeros({batch_size * seq_len, hidden_dim * 3}, 
+                                  torch::TensorOptions().dtype(torch::kFloat16).device(input.device()));
     
-    half* q_output_ptr = q_output.data_ptr<half>();
-    half* k_output_ptr = k_output.data_ptr<half>();
-    half* v_output_ptr = v_output.data_ptr<half>();
+    half* qkv_output_ptr = reinterpret_cast<half*>(qkv_output.data_ptr<at::Half>());
     
     // 调用原始C函数
     {
@@ -313,18 +276,23 @@ torch::Tensor fused_ln_qkv_gptq_cuda(
         gridDim.y = DIVIDE(batch_size * seq_len, BLOCK_M_SIZE_MAX);
         gridDim.z = DIVIDE(hidden_dim, BLOCK_KN_SIZE);
         
-        // 启动融合内核
-        fused_ln_qkv_gptq_kernel<1><<<gridDim, blockDim>>>(
+        // 启动融合内核（使用CUDA流，与vLLM一致）
+        const cudaStream_t stream = c10::cuda::getCurrentCUDAStream();
+        fused_ln_qkv_gptq_kernel<1><<<gridDim, blockDim, 0, stream>>>(
             input_ptr, qweight_ptr, qzeros_ptr, scales_ptr, ln_weight_ptr, ln_bias_ptr,
-            q_output_ptr, k_output_ptr, v_output_ptr,
-            batch_size, seq_len, hidden_dim, num_heads, kv_num_heads, head_size, groupsize, eps
+            qkv_output_ptr, batch_size, seq_len, hidden_dim, groupsize, eps
         );
         
         cudaDeviceSynchronize();
     }
     
+    // 分割QKV并重塑为正确的格式
+    auto q = qkv_output.slice(1, 0, hidden_dim).view({batch_size, seq_len, hidden_dim});
+    auto k = qkv_output.slice(1, hidden_dim, hidden_dim*2).view({batch_size, seq_len, hidden_dim});
+    auto v = qkv_output.slice(1, hidden_dim*2).view({batch_size, seq_len, hidden_dim});
+    
     // 返回QKV张量的元组
-    return torch::stack({q_output, k_output, v_output}, 0);
+    return torch::stack({q, k, v}, 0);
 }
 
 // PyTorch模块导出函数

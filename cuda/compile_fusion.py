@@ -50,7 +50,6 @@ def test_compile():
         
         # 测试数据
         batch_size, seq_len, hidden_dim = 1, 1, 512
-        num_heads, kv_num_heads, head_size = 8, 8, 64
         groupsize = 128
         eps = 1e-5
         
@@ -69,7 +68,7 @@ def test_compile():
         # 调用内核（现在返回QKV张量的元组）
         qkv_output = kernel_module.fused_ln_qkv_gptq_cuda(
             input_tensor, qweight, qzeros, scales, ln_weight, ln_bias,
-            batch_size, seq_len, hidden_dim, num_heads, kv_num_heads, head_size, groupsize, eps
+            batch_size, seq_len, hidden_dim, groupsize, eps
         )
         
         # 解包QKV输出
