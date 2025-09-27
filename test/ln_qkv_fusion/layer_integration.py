@@ -54,7 +54,7 @@ def test_layer_integration():
         from torch.utils.cpp_extension import load
         
         # 切换到cuda目录
-        cuda_dir = os.path.join(project_root, "cuda")
+        cuda_dir = os.path.join(project_root, "..", "cuda")
         original_cwd = os.getcwd()
         os.chdir(cuda_dir)
         
