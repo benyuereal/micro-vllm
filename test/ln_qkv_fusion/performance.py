@@ -12,43 +12,65 @@ import time
 project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, project_root)
 
-from core.layer.gptq import GPTQCUDAFusion
-
 def test_performance_optimized():
-    """测试性能优化后的CUDA内核"""
-    print("🚀 测试性能优化后的CUDA内核")
+    """测试性能优化后的融合内核"""
+    print("🚀 测试性能优化后的融合内核")
     
     if not torch.cuda.is_available():
         print("❌ CUDA不可用")
         return False
     
-    # 创建GPTQ融合实例
-    gptq_fusion = GPTQCUDAFusion(groupsize=128)
+    # 编译融合内核
+    print("📦 编译融合内核...")
+    from torch.utils.cpp_extension import load
+    
+    # 切换到cuda目录
+    cuda_dir = os.path.join(project_root, "cuda")
+    original_cwd = os.getcwd()
+    os.chdir(cuda_dir)
+    
+    kernel_module = load(
+        name="fused_ln_qkv_gptq_cuda",
+        sources=["gptq_ln_qkv_fusion_kernel.cu"],
+        extra_cuda_cflags=["-O3", "-use_fast_math"],
+        verbose=False
+    )
+    
+    os.chdir(original_cwd)
+    print("✅ 融合内核编译成功")
     
     # 模拟实际数据
-    M, K, N = 1, 4096, 12288
-    input_tensor = torch.randn(M, K, dtype=torch.float16, device='cuda')
+    batch_size, seq_len, hidden_dim = 1, 1, 4096
+    groupsize = 128
+    eps = 1e-5
     
-    # 使用错误日志中的确切格式
-    qzeros = torch.randint(0, 16, (32, 1536), dtype=torch.uint32, device='cuda')
-    scales = torch.randn(32, 12288, dtype=torch.float16, device='cuda')
-    qweight = torch.randint(0, 256, (512, 12288), dtype=torch.uint32, device='cuda')
+    # 输入数据
+    input_tensor = torch.randn(batch_size, seq_len, hidden_dim, dtype=torch.float16, device='cuda')
+    
+    # LayerNorm参数
+    ln_weight = torch.ones(hidden_dim, dtype=torch.float16, device='cuda')
+    ln_bias = torch.zeros(hidden_dim, dtype=torch.float16, device='cuda')
+    
+    # GPTQ参数
+    qweight = torch.randint(0, 256, (hidden_dim // 8, hidden_dim * 3), dtype=torch.uint32, device='cuda')
+    qzeros = torch.randint(0, 16, (hidden_dim // groupsize, groupsize // 8), dtype=torch.uint32, device='cuda')
+    scales = torch.randn(hidden_dim // groupsize, hidden_dim * 3, dtype=torch.float16, device='cuda')
     
     print(f"📊 测试数据:")
     print(f"  input: {input_tensor.shape}, dtype: {input_tensor.dtype}")
-    print(f"  scales: {scales.shape}, dtype: {scales.dtype}")
-    print(f"  qzeros: {qzeros.shape}, dtype: {qzeros.dtype}")
+    print(f"  ln_weight: {ln_weight.shape}, dtype: {ln_weight.dtype}")
+    print(f"  ln_bias: {ln_bias.shape}, dtype: {ln_bias.dtype}")
     print(f"  qweight: {qweight.shape}, dtype: {qweight.dtype}")
+    print(f"  qzeros: {qzeros.shape}, dtype: {qzeros.dtype}")
+    print(f"  scales: {scales.shape}, dtype: {scales.dtype}")
     
     try:
         # 预热
         print("🔥 预热中...")
         for _ in range(10):
-            gptq_fusion.fused_gptq_gemm_4bit(
-                input=input_tensor,
-                qweight=qweight,
-                qzeros=qzeros,
-                scales=scales
+            qkv_output = kernel_module.fused_ln_qkv_gptq_cuda(
+                input_tensor, qweight, qzeros, scales, ln_weight, ln_bias,
+                batch_size, seq_len, hidden_dim, groupsize, eps
             )
         
         torch.cuda.synchronize()
@@ -61,11 +83,9 @@ def test_performance_optimized():
             end_event = torch.cuda.Event(enable_timing=True)
             
             start_event.record()
-            output = gptq_fusion.fused_gptq_gemm_4bit(
-                input=input_tensor,
-                qweight=qweight,
-                qzeros=qzeros,
-                scales=scales
+            qkv_output = kernel_module.fused_ln_qkv_gptq_cuda(
+                input_tensor, qweight, qzeros, scales, ln_weight, ln_bias,
+                batch_size, seq_len, hidden_dim, groupsize, eps
             )
             end_event.record()
             
@@ -76,19 +96,26 @@ def test_performance_optimized():
         min_time = min(timings)
         max_time = max(timings)
         
+        # 解包QKV输出
+        q_output = qkv_output[0]
+        k_output = qkv_output[1]
+        v_output = qkv_output[2]
+        
         print(f"✅ 性能测试完成!")
         print(f"📊 性能统计:")
         print(f"  平均时间: {avg_time:.2f}ms")
         print(f"  最小时间: {min_time:.2f}ms")
         print(f"  最大时间: {max_time:.2f}ms")
-        print(f"  输出形状: {output.shape}, dtype: {output.dtype}")
+        print(f"  Q输出形状: {q_output.shape}, dtype: {q_output.dtype}")
+        print(f"  K输出形状: {k_output.shape}, dtype: {k_output.dtype}")
+        print(f"  V输出形状: {v_output.shape}, dtype: {v_output.dtype}")
         
         # 检查是否达到目标
-        if avg_time <= 0.20:  # 目标延迟
-            print(f"🎯 达到性能目标: {avg_time:.2f}ms <= 0.20ms")
+        if avg_time <= 0.25:  # 目标延迟
+            print(f"🎯 达到性能目标: {avg_time:.2f}ms <= 0.25ms")
             return True
         else:
-            print(f"⚠️ 未达到性能目标: {avg_time:.2f}ms > 0.20ms")
+            print(f"⚠️ 未达到性能目标: {avg_time:.2f}ms > 0.25ms")
             return False
             
     except Exception as e:

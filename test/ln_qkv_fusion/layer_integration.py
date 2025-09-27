@@ -46,36 +46,63 @@ def test_layer_integration():
     attn_output = torch.randn(batch_size, num_heads, head_size, dtype=torch.float16, device='cuda')
     print(f"📊 attn_output形状: {attn_output.shape}")
     
-    # 测试GPTQ融合内核
-    print("\n🔨 测试GPTQ融合内核...")
+    # 测试融合内核（LayerNorm + GPTQ + QKV）
+    print("\n🔨 测试融合内核...")
     try:
-        from core.layer.gptq import GPTQCUDAFusion
+        # 编译融合内核
+        print("📦 编译融合内核...")
+        from torch.utils.cpp_extension import load
         
-        # 创建GPTQ融合实例
-        gptq_fusion = GPTQCUDAFusion(groupsize=128)
-        print("✅ GPTQ融合实例创建成功")
+        # 切换到cuda目录
+        cuda_dir = os.path.join(project_root, "cuda")
+        original_cwd = os.getcwd()
+        os.chdir(cuda_dir)
         
-        # 测试QKV投影
-        print("\n⚡ 测试QKV投影...")
-        M, K, N = 1, 4096, 12288
-        groupsize = 128
-        num_groups = K // groupsize
-        
-        # 创建QKV投影的量化权重
-        qkv_qweight = torch.randint(0, 256, (N, K // 8), dtype=torch.uint32, device='cuda')
-        qkv_qzeros = torch.randint(0, 16, (num_groups, K // 8), dtype=torch.uint32, device='cuda')
-        qkv_scales = torch.randn(num_groups, K, dtype=torch.float16, device='cuda')
-        
-        # 执行QKV投影
-        input_2d = hidden_states.view(-1, hidden_size)  # [1, 4096]
-        qkv_output = gptq_fusion.fused_gptq_gemm_4bit(
-            input_2d, qkv_qweight, qkv_qzeros, qkv_scales
+        kernel_module = load(
+            name="fused_ln_qkv_gptq_cuda",
+            sources=["gptq_ln_qkv_fusion_kernel.cu"],
+            extra_cuda_cflags=["-O3", "-use_fast_math"],
+            verbose=False
         )
         
-        print(f"📊 QKV输出形状: {qkv_output.shape}")
-        print(f"📊 期望形状: torch.Size([1, 12288])")
-        assert qkv_output.shape == (1, 12288), f"QKV输出形状错误: {qkv_output.shape}"
-        print("✅ QKV投影测试通过!")
+        os.chdir(original_cwd)
+        print("✅ 融合内核编译成功")
+        
+        # 测试融合内核
+        print("\n⚡ 测试融合内核...")
+        groupsize = 128
+        eps = 1e-5
+        
+        # 创建LayerNorm参数
+        ln_weight = torch.ones(hidden_size, dtype=torch.float16, device='cuda')
+        ln_bias = torch.zeros(hidden_size, dtype=torch.float16, device='cuda')
+        
+        # 创建GPTQ参数
+        qkv_qweight = torch.randint(0, 256, (hidden_size // 8, hidden_size * 3), dtype=torch.uint32, device='cuda')
+        qkv_qzeros = torch.randint(0, 16, (hidden_size // groupsize, groupsize // 8), dtype=torch.uint32, device='cuda')
+        qkv_scales = torch.randn(hidden_size // groupsize, hidden_size * 3, dtype=torch.float16, device='cuda')
+        
+        # 执行融合内核
+        qkv_output = kernel_module.fused_ln_qkv_gptq_cuda(
+            hidden_states, qkv_qweight, qkv_qzeros, qkv_scales, ln_weight, ln_bias,
+            batch_size, seq_len, hidden_size, groupsize, eps
+        )
+        
+        # 解包QKV输出
+        q_output = qkv_output[0]
+        k_output = qkv_output[1]
+        v_output = qkv_output[2]
+        
+        print(f"📊 Q输出形状: {q_output.shape}")
+        print(f"📊 K输出形状: {k_output.shape}")
+        print(f"📊 V输出形状: {v_output.shape}")
+        print(f"📊 期望形状: torch.Size([1, 1, 4096])")
+        
+        expected_shape = (batch_size, seq_len, hidden_size)
+        assert q_output.shape == expected_shape, f"Q输出形状错误: {q_output.shape}"
+        assert k_output.shape == expected_shape, f"K输出形状错误: {k_output.shape}"
+        assert v_output.shape == expected_shape, f"V输出形状错误: {v_output.shape}"
+        print("✅ 融合内核测试通过!")
         
         # 测试注意力输出投影 (attn_output -> proj_fn)
         print("\n⚡ 测试注意力输出投影...")

@@ -53,8 +53,8 @@ def main():
     
     # 测试列表
     tests = [
-        ("vllm_fusion", "vllm_fusion.py"),
-        ("ln_qkv_fusion", "ln_qkv_fusion.py"),
+        ("vllm_fusion", "fusion.py"),
+        ("ln_qkv_fusion", "fusion.py"),
     ]
     
     # 运行测试

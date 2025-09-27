@@ -7,20 +7,19 @@
 ```
 test/
 ├── vllm_fusion/              # vLLM融合内核测试
-│   ├── vllm_fusion.py        # 主要的vLLM融合内核测试脚本
-│   ├── quick_gptq.py         # 快速GPTQ测试
-│   ├── gptq_functionality.py # GPTQ功能测试
+│   ├── fusion.py             # 主要的vLLM融合内核功能测试脚本
+│   ├── quick.py              # 快速测试
+│   ├── performance.py        # 性能测试
+│   ├── integration.py        # 集成测试
 │   └── README.md             # vLLM融合测试说明
 ├── ln_qkv_fusion/            # LN+QKV融合内核测试
-│   ├── ln_qkv_fusion.py      # 主要的LN+QKV融合内核测试脚本
+│   ├── fusion.py             # 主要的LN+QKV融合内核测试脚本
 │   ├── quick.py              # 快速融合测试
 │   ├── layer_integration.py  # 层集成测试
-│   ├── performance_optimized.py # 性能优化测试
+│   ├── performance.py        # 性能优化测试
 │   └── README.md             # LN+QKV融合测试说明
 ├── run_all_tests.py          # 主测试脚本 - 运行所有测试
-├── analyze_performance.py    # 性能分析脚本
 ├── quick.py                  # 快速测试脚本
-├── batch_layer_shapes.py     # 批处理层形状测试
 └── README.md                 # 本文件
 ```
 
@@ -44,7 +43,7 @@ python vllm_fusion.py
 
 ```bash
 cd test/ln_qkv_fusion
-python ln_qkv_fusion.py
+python fusion.py
 ```
 
 ## 测试分类
@@ -108,5 +107,5 @@ python ln_qkv_fusion.py
 
 1. **首次运行**：建议先运行 `run_all_tests.py` 来验证所有功能
 2. **开发调试**：使用对应目录下的具体测试脚本
-3. **性能分析**：使用 `analyze_performance.py` 进行详细分析
+3. **性能分析**：使用各子目录下的 `performance.py` 进行详细分析
 4. **快速验证**：使用 `quick.py` 进行快速功能验证

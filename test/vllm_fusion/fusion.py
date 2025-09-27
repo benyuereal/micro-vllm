@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """
-vLLM融合内核测试套件
+vLLM融合内核功能测试套件
+包含完整的功能测试、精度测试和性能测试
 """
 
 import os

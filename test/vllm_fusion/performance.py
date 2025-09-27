@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-CUDA融合内核功能测试
-测试gptq.py的功能和性能
+vLLM融合内核性能测试
+专注于性能分析和基准测试
 """
 
 import torch

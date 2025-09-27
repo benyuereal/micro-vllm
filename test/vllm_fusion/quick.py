@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """
-快速GPTQ测试 - 使用小矩阵尺寸
+vLLM融合内核快速测试
+使用小矩阵尺寸进行快速验证
 """
 import torch
 import sys
