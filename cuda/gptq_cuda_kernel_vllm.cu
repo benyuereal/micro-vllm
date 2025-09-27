@@ -24,14 +24,22 @@ __forceinline__ __device__ float dot22_8_f(half2 (&dq)[4], const half* a_ptr,
   return fma(result_f, qs_f, g_result);
 }
 
-// 简化的4bit反量化
-__forceinline__ __device__ void dequant_4bit_8_simple(
-    uint32_t qw, half2 (&dq)[4]) {
+// 完整的GPTQ 4bit解量化（修复版本）
+__forceinline__ __device__ void dequant_4bit_8_gptq(
+    uint32_t qw, uint32_t qz, half2 (&dq)[4], const float scale) {
   // 提取4bit值并反量化
   for (int i = 0; i < 4; i++) {
     int w = (qw >> (i * 8)) & 0xFF;
-    half2 w01 = __halves2half2(__int2half_rn(w & 0xF), __int2half_rn(w >> 4));
-    dq[i] = w01;
+    int z = (qz >> (i * 8)) & 0xFF;
+    
+    // GPTQ解量化：weight = (qweight - qzeros) * scale
+    half2 w01 = __halves2half2(
+        __int2half_rn((w & 0xF) - (z & 0xF)), 
+        __int2half_rn((w >> 4) - (z >> 4))
+    );
+    
+    // 应用缩放
+    dq[i] = __hmul2(w01, __float2half2_rn(scale));
   }
 }
 
@@ -110,20 +118,23 @@ __global__ void gemm_half_q_half_gptq_4bit_kernel(
 #pragma unroll
     for (int j = 0; j < 4; j++) {
       const int4* b_ptr4 = (int4*)b_ptr;
+      const int4* z_ptr4 = (int4*)(b_gptq_qzeros + group * (groupsize / 8) + (k % groupsize) / 8);
       int4 load_int4 = *b_ptr4;
+      int4 load_zeros = *z_ptr4;
       
       half2 dq[4][4];
-      dequant_4bit_8_simple(load_int4.x, dq[0]);
-      dequant_4bit_8_simple(load_int4.y, dq[1]);
-      dequant_4bit_8_simple(load_int4.z, dq[2]);
-      dequant_4bit_8_simple(load_int4.w, dq[3]);
+      // 使用完整的GPTQ解量化（包含qzeros处理）
+      dequant_4bit_8_gptq(load_int4.x, load_zeros.x, dq[0], scales[0]);
+      dequant_4bit_8_gptq(load_int4.y, load_zeros.y, dq[1], scales[1]);
+      dequant_4bit_8_gptq(load_int4.z, load_zeros.z, dq[2], scales[2]);
+      dequant_4bit_8_gptq(load_int4.w, load_zeros.w, dq[3], scales[3]);
       
 #pragma unroll
       for (int m = 0; m < m_count; m++) {
-        block_c[m][0] = dot22_8_f(dq[0], a_ptr + m * a_stride, block_c[m][0], scales[0]);
-        block_c[m][1] = dot22_8_f(dq[1], a_ptr + m * a_stride, block_c[m][1], scales[1]);
-        block_c[m][2] = dot22_8_f(dq[2], a_ptr + m * a_stride, block_c[m][2], scales[2]);
-        block_c[m][3] = dot22_8_f(dq[3], a_ptr + m * a_stride, block_c[m][3], scales[3]);
+        block_c[m][0] = dot22_8_f(dq[0], a_ptr + m * a_stride, block_c[m][0], 1.0f);
+        block_c[m][1] = dot22_8_f(dq[1], a_ptr + m * a_stride, block_c[m][1], 1.0f);
+        block_c[m][2] = dot22_8_f(dq[2], a_ptr + m * a_stride, block_c[m][2], 1.0f);
+        block_c[m][3] = dot22_8_f(dq[3], a_ptr + m * a_stride, block_c[m][3], 1.0f);
       }
       
       b_ptr += size_n;
