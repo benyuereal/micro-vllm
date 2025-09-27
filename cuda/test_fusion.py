@@ -19,7 +19,7 @@ def main():
         # 编译内核
         kernel_module = load(
             name="fused_ln_qkv_gptq_cuda",
-            sources=["ln_qkv_fusion_kernel.cu"],
+            sources=["gptq_ln_qkv_fusion_kernel.cu"],
             extra_cuda_cflags=["-O3", "-use_fast_math"],
             verbose=False
         )

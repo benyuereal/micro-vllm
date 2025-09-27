@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-简化的融合LN+QKV GPTQ CUDA内核编译脚本
+GPTQ LN+QKV融合内核编译脚本
 """
 
 import os
@@ -8,8 +8,8 @@ import torch
 from torch.utils.cpp_extension import load
 
 def compile_fusion_kernel():
-    """编译融合内核"""
-    print("🚀 融合LN+QKV GPTQ CUDA内核编译开始...")
+    """编译GPTQ LN+QKV融合内核"""
+    print("🚀 GPTQ LN+QKV融合内核编译开始...")
     
     if not torch.cuda.is_available():
         raise RuntimeError("CUDA不可用，无法编译CUDA内核")
@@ -18,7 +18,7 @@ def compile_fusion_kernel():
     print(f"检测到CUDA版本: {cuda_version}")
     
     # 检查源文件
-    source_file = "ln_qkv_fusion_kernel.cu"
+    source_file = "gptq_ln_qkv_fusion_kernel.cu"
     if not os.path.exists(source_file):
         raise FileNotFoundError(f"源文件 {source_file} 不存在")
     
@@ -33,7 +33,7 @@ def compile_fusion_kernel():
             verbose=True
         )
         
-        print("✅ 融合内核编译成功!")
+        print("✅ GPTQ LN+QKV融合内核编译成功!")
         return kernel_module
         
     except Exception as e:

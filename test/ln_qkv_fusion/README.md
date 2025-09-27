@@ -6,11 +6,11 @@
 
 ```
 ln_qkv_fusion/
-├── test_ln_qkv_fusion.py     # 主要的LN+QKV融合内核测试脚本（完整测试）
-├── test_quick.py             # 快速测试脚本（编译+功能+性能）
-├── test_layer_integration.py # 层集成测试
-├── test_performance_optimized.py # 性能优化测试
-└── README.md                 # 本文件
+├── ln_qkv_fusion.py                # 主要的LN+QKV融合内核测试脚本（完整测试）
+├── quick.py                        # 快速测试脚本（编译+功能+性能）
+├── layer_integration.py            # 层集成测试
+├── performance_optimized.py        # 性能优化测试
+└── README.md                       # 本文件
 ```
 
 ## 功能特性
@@ -23,79 +23,80 @@ ln_qkv_fusion/
 
 ## 快速开始
 
-### 运行快速测试（推荐）
-
-```bash
-cd test/ln_qkv_fusion
-python test_quick.py
-```
-
 ### 运行完整测试
 
 ```bash
-python test_ln_qkv_fusion.py
+cd test/ln_qkv_fusion
+python ln_qkv_fusion.py
+```
+
+### 运行快速测试
+
+```bash
+python quick.py
 ```
 
 ### 运行层集成测试
 
 ```bash
-python test_layer_integration.py
+python layer_integration.py
 ```
 
 ### 运行性能优化测试
 
 ```bash
-python test_performance_optimized.py
+python performance_optimized.py
 ```
 
 ## 测试内容
 
-### 1. 快速测试 (`test_quick.py`)
+### 1. 功能测试 (`ln_qkv_fusion.py`)
+
 - **编译测试**：验证内核能够正常编译
 - **功能测试**：验证基本功能正确性
-- **性能测试**：测量执行时间（目标：< 0.5ms）
+- **精度测试**：与PyTorch实现对比精度
+- **性能测试**：测量执行时间，目标 < 0.5ms
 
-### 2. 完整测试 (`test_ln_qkv_fusion.py`)
-- **基础功能测试**：验证融合内核能够正常编译和运行
-- **LayerNorm精度测试**：与PyTorch LayerNorm对比精度
-- **GPTQ解量化测试**：验证GPTQ INT4解量化功能
-- **性能测试**：测量融合内核执行时间
+### 2. 快速测试 (`quick.py`)
 
-### 3. 层集成测试 (`test_layer_integration.py`)
-- 测试与现有层的集成
-- 验证端到端功能
-- 检查内存使用情况
+- **编译+功能+性能**：一站式测试
+- **快速验证**：适合开发调试
+- **性能基准**：提供性能数据
 
-### 4. 性能优化测试 (`test_performance_optimized.py`)
-- 详细的性能分析
-- 不同规模数据的性能测试
-- 优化建议
+### 3. 层集成测试 (`layer_integration.py`)
 
-## 内核参数
+- **层集成**：测试与现有层的集成
+- **端到端**：验证完整推理流程
+- **内存检查**：验证内存使用情况
 
-```cpp
-void fused_ln_qkv_gptq_cuda(
-    const half* input,           // [batch_size, seq_len, hidden_dim]
-    const uint32_t* qweight,     // GPTQ量化权重 [K//8, N]
-    const uint32_t* qzeros,      // GPTQ量化零点 [num_groups, groupsize//8]
-    const half* scales,          // GPTQ量化缩放 [num_groups, N]
-    const half* ln_weight,       // LayerNorm权重 [hidden_dim]
-    const half* ln_bias,         // LayerNorm偏置 [hidden_dim]
-    half* q_output,              // Q输出 [batch_size, num_heads, seq_len, head_size]
-    half* k_output,              // K输出 [batch_size, kv_num_heads, seq_len, head_size]
-    half* v_output,              // V输出 [batch_size, kv_num_heads, seq_len, head_size]
-    int batch_size, int seq_len, int hidden_dim,
-    int num_heads, int kv_num_heads, int head_size,
-    int groupsize, float eps
-);
-```
+### 4. 性能优化测试 (`performance_optimized.py`)
 
-## 性能优化
+- **性能分析**：详细性能分析
+- **优化验证**：验证优化效果
+- **基准对比**：与参考实现对比
 
-- 使用vLLM的分块策略：`BLOCK_KN_SIZE=128`, `BLOCK_M_SIZE_MAX=8`
-- 使用vLLM的向量化技术：`half2` 和 `__hfma2`
-- 使用共享内存优化
-- 使用原子操作避免竞争条件
+## 测试数据
+
+### 默认配置
+- **batch_size**: 1
+- **seq_len**: 1
+- **hidden_dim**: 4096
+- **num_heads**: 32
+- **kv_num_heads**: 32
+- **head_size**: 128
+- **groupsize**: 128
+
+### 数据类型
+- **输入**: `torch.float16`
+- **权重**: `torch.uint32` (GPTQ量化)
+- **缩放**: `torch.float16`
+- **输出**: `torch.float16`
+
+## 性能目标
+
+- **平均执行时间**: < 0.5ms
+- **内存使用**: 最小化
+- **数值精度**: 与PyTorch实现一致
 
 ## 依赖
 
@@ -106,13 +107,13 @@ void fused_ln_qkv_gptq_cuda(
 ## 注意事项
 
 - 确保CUDA环境正确配置
-- 内核使用float16数据类型
-- 支持动态groupsize
+- 测试使用float16数据类型
+- 支持动态groupsize测试
 - 包含完整的GPTQ解量化逻辑
 
 ## 使用建议
 
-1. **首次使用**：建议先运行 `test_quick.py` 进行快速验证
-2. **开发调试**：使用 `test_ln_qkv_fusion.py` 进行完整测试
-3. **性能分析**：使用 `test_performance_optimized.py` 进行详细分析
-4. **集成测试**：使用 `test_layer_integration.py` 验证集成功能
+1. **首次运行**：建议先运行 `ln_qkv_fusion.py` 进行完整测试
+2. **开发调试**：使用 `quick.py` 进行快速验证
+3. **集成测试**：使用 `layer_integration.py` 验证层集成
+4. **性能分析**：使用 `performance_optimized.py` 进行详细分析

@@ -6,9 +6,9 @@
 
 ```
 vllm_fusion/
-├── test_vllm_fusion.py        # 主要的vLLM融合内核测试脚本
-├── quick_gptq_test.py         # 快速GPTQ测试
-├── test_gptq_functionality.py # GPTQ功能测试
+├── vllm_fusion.py             # 主要的vLLM融合内核测试脚本
+├── quick_gptq.py              # 快速GPTQ测试
+├── gptq_functionality.py      # GPTQ功能测试
 └── README.md                  # 本文件
 ```
 
@@ -24,19 +24,19 @@ vllm_fusion/
 
 ```bash
 cd test/vllm_fusion
-python test_vllm_fusion.py
+python vllm_fusion.py
 ```
 
 ### 运行快速GPTQ测试
 
 ```bash
-python quick_gptq_test.py
+python quick_gptq.py
 ```
 
 ### 运行GPTQ功能测试
 
 ```bash
-python test_gptq_functionality.py
+python gptq_functionality.py
 ```
 
 ## 测试内容
