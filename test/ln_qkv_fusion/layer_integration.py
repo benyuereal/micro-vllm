@@ -63,9 +63,8 @@ def test_fusion_kernel_integration():
         os.chdir(original_cwd)
         print("✅ 融合内核编译成功")
         
-        # 创建LayerNorm参数
-        ln_weight = torch.ones(hidden_size, dtype=torch.float16, device='cuda')
-        ln_bias = torch.zeros(hidden_size, dtype=torch.float16, device='cuda')
+        # 创建RMSNorm参数（Qwen使用RMSNorm，没有bias）
+        rms_weight = torch.ones(hidden_size, dtype=torch.float16, device='cuda')
         
         # 创建分离的Q、K、V GPTQ参数
         qweight_q = torch.randint(0, 256, (hidden_size // 8, hidden_size), dtype=torch.uint32, device='cuda')
@@ -86,7 +85,7 @@ def test_fusion_kernel_integration():
             hidden_states, qweight_q, qweight_k, qweight_v,
             qzeros_q, qzeros_k, qzeros_v,
             scales_q, scales_k, scales_v,
-            ln_weight, ln_bias,
+            rms_weight,
             batch_size, seq_len, hidden_size, groupsize, eps
         )
         

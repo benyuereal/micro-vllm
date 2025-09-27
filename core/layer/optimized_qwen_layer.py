@@ -418,6 +418,28 @@ class OptimizedQwenModelLayerAdapter:
         k_output = qkv_output[1]
         v_output = qkv_output[2]
         
+        # 调试信息
+        if layer_idx == 0:
+            logger.info(f"🔍 融合内核输出检查:")
+            logger.info(f"  q_output: {q_output.shape}, dtype: {q_output.dtype}")
+            logger.info(f"  k_output: {k_output.shape}, dtype: {k_output.dtype}")
+            logger.info(f"  v_output: {v_output.shape}, dtype: {v_output.dtype}")
+            logger.info(f"  期望形状: [{batch_size}, {seq_len}, {qkv_hidden_dim}]")
+            logger.info(f"  num_heads: {self.num_heads}, head_size: {self.head_size}")
+            logger.info(f"  kv_num_heads: {self.kv_num_heads}")
+        
+        # 检查输出形状
+        expected_shape = (batch_size, seq_len, qkv_hidden_dim)
+        if q_output.shape != expected_shape:
+            logger.error(f"Q输出形状错误: {q_output.shape} != {expected_shape}")
+            raise ValueError(f"Q输出形状错误: {q_output.shape} != {expected_shape}")
+        if k_output.shape != expected_shape:
+            logger.error(f"K输出形状错误: {k_output.shape} != {expected_shape}")
+            raise ValueError(f"K输出形状错误: {k_output.shape} != {expected_shape}")
+        if v_output.shape != expected_shape:
+            logger.error(f"V输出形状错误: {v_output.shape} != {expected_shape}")
+            raise ValueError(f"V输出形状错误: {v_output.shape} != {expected_shape}")
+        
         # 重塑为注意力格式
         q = q_output.view(batch_size, seq_len, self.num_heads, self.head_size).permute(0, 2, 1, 3)
         k = k_output.view(batch_size, seq_len, self.kv_num_heads, self.head_size).permute(0, 2, 1, 3)
