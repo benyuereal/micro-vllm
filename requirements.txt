@@ -16,3 +16,7 @@ openai
 einops>=0.6.1
 transformers_stream_generator>=0.0.4
 tiktoken>=0.5.2
+
+# 可选性能优化库 (Phase 2)
+# xformers>=0.0.22  # MLP融合优化 (可选)
+# triton>=2.0.0     # 自定义算子融合 (可选)
