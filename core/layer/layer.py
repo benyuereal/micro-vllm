@@ -40,7 +40,6 @@ class ModelLayerAdapter:
         2. **自动适配**: 根据model_type自动选择处理逻辑
         3. **零拷贝**: 直接操作张量，无中间拷贝
         4. **生产就绪**: 支持AMP、异常处理、设备匹配
-        5. **性能优化**: 集成torch.compile自动算子融合
 
     🧪 **典型用法**:
         adapter = ModelLayerAdapter(config, device, num_heads=16, head_size=128, kv_num_heads=16)
@@ -54,18 +53,13 @@ class ModelLayerAdapter:
             layer_idx=0,                 # 层索引
             current_positions=positions  # 当前位置 (可选)
         )
-
-    ⚡ **性能特性**:
-        - torch.compile自动算子融合: 15-25%延迟降低
-        - 内存布局优化: 额外3-8%性能提升
-        - FlashAttention v2集成: 最优注意力性能
     """
 
     # 模型架构配置 (可扩展)
     MODEL_CONFIGS = {
         "qwen": {  # Qwen 7B
             "norm": "ln_1", "attn": "c_attn", "proj": "c_proj", "mlp_norm": "ln_2",
-            "qkv_split": True, "qkv_proj": False,  # ✅ 强制使用合并投影
+            "qkv_split": True, "qkv_proj": False,
             "mlp": "mlp", "residual": True,
         },
         "qwen2": {  # Qwen 1.5/2.5
@@ -121,6 +115,16 @@ class ModelLayerAdapter:
                       current_positions: Optional[torch.Tensor] = None) -> Tuple[
         torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
         """
+        📌 **三段式Layer处理** (Qwen-7B专用优化版)
+
+        分段策略：
+        1. QKV阶段：LayerNorm + QKV投影 → fullgraph编译融合
+        2. Attention阶段：FlashAttention → 不编译 (C++扩展)
+        3. MLP阶段：输出投影 + MLP → fullgraph编译融合
+
+        Qwen-7B专用路径：完全静态，无条件分支，最大化torch.compile优化
+        """
+        """
         📌 **处理单层计算** (统一接口，自动适配模型架构)
 
         🔍 **参数**:
@@ -148,65 +152,61 @@ class ModelLayerAdapter:
         # 记录开始时间
         start_time = time.time()
 
-        # 调用编译的核心函数
-        result = self._process_layer_compiled(
-            layer, hidden_states, cache_manager, seq_ids,
-            context_lens, token_positions, layer_idx, current_positions
-        )
+        # 🔧 禁用CUDA图以避免重用问题 (必须在torch.compile前调用)
+        torch.compiler.cudagraph_mark_step_begin()
+
+        # 📍 Qwen专用优化路径 (torch.compile融合，无条件分支)
+        if self.model_type == "qwen":
+            # 📍 第一阶段：QKV (torch.compile算子融合)
+            hidden_states, residual, q, k, v = self._qkv_stage(layer, hidden_states)
+
+            # 📍 第二阶段：Attention (FlashAttention v2)
+            attn_output, kv_cache = self._attn_stage(q, k, v, cache_manager, seq_ids, context_lens, layer_idx)
+
+            # 📍 第三阶段：MLP (torch.compile算子融合)
+            hidden_states = self._mlp_stage(layer, hidden_states, residual, attn_output)
+        else:
+            # 📍 通用路径 (保持兼容性)
+            hidden_states, residual, q, k, v = self._pre_attention(layer, hidden_states)
+            attn_output, kv_cache = self._attention_stage(q, k, v, cache_manager, seq_ids, context_lens, layer_idx)
+            hidden_states = self._post_attention(layer, hidden_states, residual, attn_output)
 
         # 记录总耗时
         total_time = time.time() - start_time
+        if layer_idx == 0:
+            logger.info(f"🚀 Layer {layer_idx}: 总处理耗时 {total_time * 1000:.2f}ms")
+            logger.info(f"   ⚡ torch.compile三段式融合 | QKV+MLP算子融合 | 内存优化")
 
-        # ✅ 性能监控：显示优化后的性能数据
-        if layer_idx == 0 and total_time > 0.001:  # 只在第一层显示一次
-            logger.info(f"🚀 Layer {layer_idx} 性能报告:")
-            logger.info(f"   📊 总耗时: {total_time * 1000:.2f}ms")
-            logger.info(f"   ⚡ torch.compile: 已启用 | 内存优化: 已启用")
-            logger.info(f"   🔧 QKV投影: {'合并' if self.cfg['qkv_split'] else '分开'}")
+        return hidden_states, kv_cache
 
-        # 返回结果
-        return result
+    @torch.compile(mode="reduce-overhead")
+    def _qkv_stage(self, layer, hidden_states):
+        """
+        📍 **QKV阶段** (torch.compile融合优化)
+        LayerNorm + QKV投影 + 形状重塑，算子融合
+        """
+        # 1. Qwen-7B固定LayerNorm: ln_1
+        residual = hidden_states.clone()  # 避免CUDAGraph重用问题
+        hidden_states = layer.ln_1(hidden_states)
 
-    @torch.compile(mode="reduce-overhead", fullgraph=True)
-    def _process_layer_compiled(self,
-                      layer,
-                      hidden_states: torch.Tensor,  # [B, S, D]
-                      cache_manager,
-                      seq_ids: List[int],
-                      context_lens: List[int],
-                      token_positions: Optional[torch.Tensor] = None,
-                      layer_idx: int = 0,
-                      current_positions: Optional[torch.Tensor] = None) -> Tuple[
-        torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+        # 2. Qwen-7B固定合并QKV投影: c_attn
+        qkv = layer.attn.c_attn(hidden_states)
+        hidden_size = qkv.shape[-1] // 3
+        q, k, v = qkv.split(hidden_size, dim=-1)
 
-        # 1. 自动适配模型架构
-        norm_fn = getattr(layer, self.cfg["norm"])
-        mlp_norm_fn = getattr(layer, self.cfg["mlp_norm"])
-        mlp_fn = getattr(layer, self.cfg["mlp"])
-
-        # 2. LayerNorm + 残差
-        residual = hidden_states
-        hidden_states = norm_fn(hidden_states)
-
-        # 3. QKV计算 (自动处理不同投影方式)
-        if self.cfg["qkv_split"]:
-            # Qwen 7B: 合并的c_attn投影
-            qkv = layer.attn.c_attn(hidden_states)
-            hidden_size = qkv.shape[-1] // 3
-            q, k, v = qkv.split(hidden_size, dim=-1)
-        else:
-            # Qwen 1.5: 分开的q_proj/k_proj/v_proj
-            q = layer.self_attn.q_proj(hidden_states)
-            k = layer.self_attn.k_proj(hidden_states)
-            v = layer.self_attn.v_proj(hidden_states)
-
-        # 4. 重塑形状 [B, S, D] → [B, H, D] + 内存优化
+        # 3. 固定形状重塑 [B, S, D] → [B, H, D]
         batch_size, seq_len, _ = hidden_states.shape
-        q = q.view(batch_size, seq_len, self.num_heads, self.head_size).permute(0, 2, 1, 3).contiguous()  # [B, H, S, D]
+        q = q.view(batch_size, seq_len, self.num_heads, self.head_size).permute(0, 2, 1, 3).contiguous()
         k = k.view(batch_size, seq_len, self.kv_num_heads, self.head_size).permute(0, 2, 1, 3).contiguous()
         v = v.view(batch_size, seq_len, self.kv_num_heads, self.head_size).permute(0, 2, 1, 3).contiguous()
 
-        # 5. 注意力计算 (零拷贝)
+        return hidden_states, residual, q, k, v
+
+    def _attn_stage(self, q, k, v, cache_manager, seq_ids, context_lens, layer_idx):
+        """
+        📍 **Attention阶段** (不编译)
+        调用PagedAttention，避免C++扩展编译问题
+        """
         attn_output = self.attention(
             query=q.squeeze(2),  # [B, H, D]
             cache_manager=cache_manager,
@@ -216,22 +216,24 @@ class ModelLayerAdapter:
             key=k.squeeze(2),  # [B, H, D]
             value=v.squeeze(2)  # [B, H, D]
         )
+        # 返回attention输出和kv缓存
+        return attn_output, (k.squeeze(2), v.squeeze(2))
 
-        # 6. 输出投影 + 残差
-        proj_fn = getattr(layer.self_attn if self.cfg["qkv_proj"] else layer.attn, self.cfg["proj"])
-        attn_output = proj_fn(attn_output.reshape(batch_size, -1)).unsqueeze(1)  # [B, 1, D]
+    @torch.compile(mode="reduce-overhead")
+    def _mlp_stage(self, layer, hidden_states, residual, attn_output):
+        """
+        📍 **MLP阶段** (torch.compile融合优化)
+        输出投影 + MLP，算子融合
+        """
+        # 1. Qwen-7B固定输出投影: c_proj
+        batch_size = hidden_states.shape[0]
+        attn_output = layer.attn.c_proj(attn_output.reshape(batch_size, -1)).unsqueeze(1)  # [B, 1, D]
         hidden_states = residual + attn_output
 
-        # 7. MLP + 残差 (支持MoE)
-        residual = hidden_states
-        hidden_states = mlp_norm_fn(hidden_states)
-        if self.cfg.get("moe", False):
-            # ✅ Qwen3 MoE: 使用 mlp 模块 (包含 experts 和 gate)
-            if hasattr(layer, 'mlp') and hasattr(layer.mlp, 'experts'):
-                hidden_states = layer.mlp(hidden_states)  # 直接调用mlp模块
-        else:
-            # Qwen2: 普通MLP
-            hidden_states = mlp_fn(hidden_states)
+        # 2. Qwen-7B固定MLP: ln_2 + mlp (无MoE)
+        residual = hidden_states.clone()  # 避免CUDAGraph重用问题
+        hidden_states = layer.ln_2(hidden_states)
+        hidden_states = layer.mlp(hidden_states)
         hidden_states = residual + hidden_states
 
-        return hidden_states, (k.squeeze(2), v.squeeze(2))  # [B, H, D]
+        return hidden_states
