@@ -14,7 +14,6 @@ torch>=2.0.0
 accelerate>=0.20.0
 openai
 einops>=0.6.1
-transformers_stream_generator>=0.0.4
 tiktoken>=0.5.2
 
 # 必需依赖
