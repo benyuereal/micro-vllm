@@ -110,7 +110,6 @@ class ModelLayerAdapter:
             raise ValueError(f"Unsupported model type: {self.model_type}")
         self.cfg = self.MODEL_CONFIGS[self.model_type]
 
-    @torch.compile(mode="reduce-overhead", fullgraph=True)
     def process_layer(self,
                       layer,
                       hidden_states: torch.Tensor,  # [B, S, D]
@@ -149,31 +148,47 @@ class ModelLayerAdapter:
         # 记录开始时间
         start_time = time.time()
 
+        # 调用编译的核心函数
+        result = self._process_layer_compiled(
+            layer, hidden_states, cache_manager, seq_ids,
+            context_lens, token_positions, layer_idx, current_positions
+        )
+
+        # 记录总耗时
+        total_time = time.time() - start_time
+
+        # ✅ 性能监控：显示优化后的性能数据
+        if layer_idx == 0 and total_time > 0.001:  # 只在第一层显示一次
+            logger.info(f"🚀 Layer {layer_idx} 性能报告:")
+            logger.info(f"   📊 总耗时: {total_time * 1000:.2f}ms")
+            logger.info(f"   ⚡ torch.compile: 已启用 | 内存优化: 已启用")
+            logger.info(f"   🔧 QKV投影: {'合并' if self.cfg['qkv_split'] else '分开'}")
+
+        # 返回结果
+        return result
+
+    @torch.compile(mode="reduce-overhead", fullgraph=True)
+    def _process_layer_compiled(self,
+                      layer,
+                      hidden_states: torch.Tensor,  # [B, S, D]
+                      cache_manager,
+                      seq_ids: List[int],
+                      context_lens: List[int],
+                      token_positions: Optional[torch.Tensor] = None,
+                      layer_idx: int = 0,
+                      current_positions: Optional[torch.Tensor] = None) -> Tuple[
+        torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+
         # 1. 自动适配模型架构
         norm_fn = getattr(layer, self.cfg["norm"])
         mlp_norm_fn = getattr(layer, self.cfg["mlp_norm"])
         mlp_fn = getattr(layer, self.cfg["mlp"])
 
-        # 记录LayerNorm前的时间
-        norm_start = time.time()
-
         # 2. LayerNorm + 残差
         residual = hidden_states
         hidden_states = norm_fn(hidden_states)
 
-        norm_time = time.time() - norm_start
-        logger.debug(f"Layer {layer_idx}: LayerNorm耗时 {norm_time * 1000:.2f}ms")
-
         # 3. QKV计算 (自动处理不同投影方式)
-        qkv_start = time.time()
-
-        # 🔍 调试：打印实际使用的投影方式
-        if layer_idx == 0:  # 只在第一层打印一次
-            if self.cfg["qkv_split"]:
-                logger.info("🔧 使用合并QKV投影 (c_attn)")
-            else:
-                logger.info("🔧 使用分开QKV投影 (q_proj/k_proj/v_proj)")
-
         if self.cfg["qkv_split"]:
             # Qwen 7B: 合并的c_attn投影
             qkv = layer.attn.c_attn(hidden_states)
@@ -185,23 +200,13 @@ class ModelLayerAdapter:
             k = layer.self_attn.k_proj(hidden_states)
             v = layer.self_attn.v_proj(hidden_states)
 
-        qkv_time = time.time() - qkv_start
-        logger.debug(f"Layer {layer_idx}: QKV投影耗时 {qkv_time * 1000:.2f}ms")
-
         # 4. 重塑形状 [B, S, D] → [B, H, D] + 内存优化
-        reshape_start = time.time()
-
         batch_size, seq_len, _ = hidden_states.shape
         q = q.view(batch_size, seq_len, self.num_heads, self.head_size).permute(0, 2, 1, 3).contiguous()  # [B, H, S, D]
         k = k.view(batch_size, seq_len, self.kv_num_heads, self.head_size).permute(0, 2, 1, 3).contiguous()
         v = v.view(batch_size, seq_len, self.kv_num_heads, self.head_size).permute(0, 2, 1, 3).contiguous()
 
-        reshape_time = time.time() - reshape_start
-        logger.debug(f"Layer {layer_idx}: 形状重塑耗时 {reshape_time * 1000:.2f}ms")
-
         # 5. 注意力计算 (零拷贝)
-        attn_start = time.time()
-
         attn_output = self.attention(
             query=q.squeeze(2),  # [B, H, D]
             cache_manager=cache_manager,
@@ -212,22 +217,12 @@ class ModelLayerAdapter:
             value=v.squeeze(2)  # [B, H, D]
         )
 
-        attn_time = time.time() - attn_start
-        logger.debug(f"Layer {layer_idx}: 注意力计算耗时 {attn_time * 1000:.2f}ms")
-
         # 6. 输出投影 + 残差
-        proj_start = time.time()
-
         proj_fn = getattr(layer.self_attn if self.cfg["qkv_proj"] else layer.attn, self.cfg["proj"])
         attn_output = proj_fn(attn_output.reshape(batch_size, -1)).unsqueeze(1)  # [B, 1, D]
         hidden_states = residual + attn_output
 
-        proj_time = time.time() - proj_start
-        logger.debug(f"Layer {layer_idx}: 输出投影耗时 {proj_time * 1000:.2f}ms")
-
         # 7. MLP + 残差 (支持MoE)
-        mlp_start = time.time()
-
         residual = hidden_states
         hidden_states = mlp_norm_fn(hidden_states)
         if self.cfg.get("moe", False):
@@ -238,20 +233,5 @@ class ModelLayerAdapter:
             # Qwen2: 普通MLP
             hidden_states = mlp_fn(hidden_states)
         hidden_states = residual + hidden_states
-
-        mlp_time = time.time() - mlp_start
-        logger.debug(f"Layer {layer_idx}: MLP计算耗时 {mlp_time * 1000:.2f}ms")
-
-        # 记录总耗时
-        total_time = time.time() - start_time
-
-        # ✅ 性能监控：显示优化后的性能数据
-        if layer_idx == 0 and total_time > 0.001:  # 每10层显示一次，避免日志过多
-            logger.info(f"🚀 Layer {layer_idx} 性能报告:")
-            logger.info(f"   📊 总耗时: {total_time * 1000:.2f}ms")
-            logger.info(f"   🔍 分布: LN({norm_time * 1000:.2f}ms) | QKV({qkv_time * 1000:.2f}ms) | "
-                       f"Reshape({reshape_time * 1000:.2f}ms) | Attn({attn_time * 1000:.2f}ms) | "
-                       f"Proj({proj_time * 1000:.2f}ms) | MLP({mlp_time * 1000:.2f}ms)")
-            logger.info(f"   ⚡ torch.compile: 已启用 | 内存优化: 已启用")
 
         return hidden_states, (k.squeeze(2), v.squeeze(2))  # [B, H, D]
