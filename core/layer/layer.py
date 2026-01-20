@@ -152,9 +152,6 @@ class ModelLayerAdapter:
         # 记录开始时间
         start_time = time.time()
 
-        # 🔧 禁用CUDA图以避免重用问题 (必须在torch.compile前调用)
-        torch.compiler.cudagraph_mark_step_begin()
-
         # 📍 Qwen专用优化路径 (torch.compile融合，无条件分支)
         if self.model_type == "qwen":
             # 📍 第一阶段：QKV (torch.compile算子融合)
@@ -179,14 +176,14 @@ class ModelLayerAdapter:
 
         return hidden_states, kv_cache
 
-    @torch.compile(mode="reduce-overhead")
+    @torch.compile(mode="default")
     def _qkv_stage(self, layer, hidden_states):
         """
         📍 **QKV阶段** (torch.compile融合优化)
         LayerNorm + QKV投影 + 形状重塑，算子融合
         """
         # 1. Qwen-7B固定LayerNorm: ln_1
-        residual = hidden_states.clone()  # 避免CUDAGraph重用问题
+        residual = hidden_states
         hidden_states = layer.ln_1(hidden_states)
 
         # 2. Qwen-7B固定合并QKV投影: c_attn
@@ -219,7 +216,7 @@ class ModelLayerAdapter:
         # 返回attention输出和kv缓存
         return attn_output, (k.squeeze(2), v.squeeze(2))
 
-    @torch.compile(mode="reduce-overhead")
+    @torch.compile(mode="default")
     def _mlp_stage(self, layer, hidden_states, residual, attn_output):
         """
         📍 **MLP阶段** (torch.compile融合优化)
@@ -231,7 +228,7 @@ class ModelLayerAdapter:
         hidden_states = residual + attn_output
 
         # 2. Qwen-7B固定MLP: ln_2 + mlp (无MoE)
-        residual = hidden_states.clone()  # 避免CUDAGraph重用问题
+        residual = hidden_states
         hidden_states = layer.ln_2(hidden_states)
         hidden_states = layer.mlp(hidden_states)
         hidden_states = residual + hidden_states
