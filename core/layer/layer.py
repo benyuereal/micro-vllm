@@ -153,30 +153,31 @@ class ModelLayerAdapter:
         start_time = time.time()
 
         # 📍 Qwen专用优化路径 (torch.compile融合，无条件分支)
-        if self.model_type == "qwen":
             # 📍 第一阶段：QKV (torch.compile算子融合)
-            hidden_states, residual, q, k, v = self._qkv_stage(layer, hidden_states)
+        qkv_start = time.time()
+        hidden_states, residual, q, k, v = self._qkv_stage(layer, hidden_states)
+        qkv_time = time.time() - qkv_start
 
             # 📍 第二阶段：Attention (FlashAttention v2)
-            attn_output, kv_cache = self._attn_stage(q, k, v, cache_manager, seq_ids, context_lens, layer_idx)
+        attn_start = time.time()
+        attn_output, kv_cache = self._attn_stage(q, k, v, cache_manager, seq_ids, context_lens, layer_idx)
+        attn_time = time.time() - attn_start
 
             # 📍 第三阶段：MLP (torch.compile算子融合)
-            hidden_states = self._mlp_stage(layer, hidden_states, residual, attn_output)
-        else:
-            # 📍 通用路径 (保持兼容性)
-            hidden_states, residual, q, k, v = self._pre_attention(layer, hidden_states)
-            attn_output, kv_cache = self._attention_stage(q, k, v, cache_manager, seq_ids, context_lens, layer_idx)
-            hidden_states = self._post_attention(layer, hidden_states, residual, attn_output)
+        mlp_start = time.time()
+        hidden_states = self._mlp_stage(layer, hidden_states, residual, attn_output)
+        mlp_time = time.time() - mlp_start
 
-        # 记录总耗时
+        # 记录耗时分布
         total_time = time.time() - start_time
         if layer_idx == 0:
             logger.info(f"🚀 Layer {layer_idx}: 总处理耗时 {total_time * 1000:.2f}ms")
+            logger.info(f"   📊 耗时分布: QKV={qkv_time * 1000:.2f}ms | Attn={attn_time * 1000:.2f}ms | MLP={mlp_time * 1000:.2f}ms")
             logger.info(f"   ⚡ torch.compile三段式融合 | QKV+MLP算子融合 | 内存优化")
 
         return hidden_states, kv_cache
 
-    @torch.compile(mode="default")
+    # @torch.compile(mode="default")
     def _qkv_stage(self, layer, hidden_states):
         """
         📍 **QKV阶段** (torch.compile融合优化)
@@ -216,7 +217,7 @@ class ModelLayerAdapter:
         # 返回attention输出和kv缓存
         return attn_output, (k.squeeze(2), v.squeeze(2))
 
-    @torch.compile(mode="default")
+    # @torch.compile(mode="default")
     def _mlp_stage(self, layer, hidden_states, residual, attn_output):
         """
         📍 **MLP阶段** (torch.compile融合优化)
