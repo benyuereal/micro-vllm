@@ -1,8 +1,6 @@
 # kernel/swiglu.py
 """
-SwiGLU 前向 (生产级稳定版)
-- 修复相对误差计算失真问题
-- 聚焦绝对误差（工业标准指标）
+SwiGLU 前向 (分离优化版 - 修复数值误差)
 """
 import torch
 import triton
@@ -11,68 +9,84 @@ import torch.nn.functional as F
 
 
 @triton.jit
-def _fused_silu_kernel(
-    gate, up, w_down, output,
-    M, I, H,
+def _silu_mul_kernel(
+    gate_ptr, up_ptr, hidden_ptr,
+    M, I,
     stride_gm, stride_gi,
     stride_um, stride_ui,
-    stride_wdh, stride_wdi,
-    stride_om, stride_oh,
-    BLOCK_M: tl.constexpr = 64,
-    BLOCK_N: tl.constexpr = 64,
-    BLOCK_K: tl.constexpr = 128,
+    stride_hm, stride_hi,
+    BLOCK_SIZE: tl.constexpr = 2048,
 ):
-    pid_m = tl.program_id(0)
-    pid_n = tl.program_id(1)
+    """
+    纯 element-wise kernel: hidden = up * silu(gate)
+    使用 2D 索引确保 stride 正确处理
+    """
+    pid = tl.program_id(0)
     
-    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
-    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
-    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+    # 每个线程处理 BLOCK_SIZE 个元素，展平索引
+    offs = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
     
-    for k in range(0, I, BLOCK_K):
-        offs_k = k + tl.arange(0, BLOCK_K)
-        
-        g = tl.load(gate + offs_m[:, None] * stride_gm + offs_k[None, :] * stride_gi,
-                    mask=(offs_m[:, None] < M) & (offs_k[None, :] < I), other=0.0).to(tl.float32)
-        u = tl.load(up + offs_m[:, None] * stride_um + offs_k[None, :] * stride_ui,
-                    mask=(offs_m[:, None] < M) & (offs_k[None, :] < I), other=0.0).to(tl.float32)
-        
-        g = tl.clamp(g, -20.0, 20.0)
-        g_silu = g * tl.sigmoid(g)
-        hidden = u * g_silu
-        
-        w = tl.load(w_down + offs_n[:, None] * stride_wdh + offs_k[None, :] * stride_wdi,
-                    mask=(offs_n[:, None] < H) & (offs_k[None, :] < I), other=0.0).to(tl.float32)
-        acc += tl.dot(hidden, tl.trans(w))
+    # 将 1D 展平索引转换为 2D (row, col) 以正确处理 stride
+    rows = offs // I
+    cols = offs % I
     
-    mask = (offs_m[:, None] < M) & (offs_n[None, :] < H)
-    tl.store(output + offs_m[:, None] * stride_om + offs_n[None, :] * stride_oh,
-             acc.to(tl.float16), mask=mask)
+    mask = offs < (M * I)
+    
+    # 使用 stride 正确计算内存地址（支持非连续张量）
+    g_offs = rows * stride_gm + cols * stride_gi
+    u_offs = rows * stride_um + cols * stride_ui
+    h_offs = rows * stride_hm + cols * stride_hi
+    
+    g = tl.load(gate_ptr + g_offs, mask=mask, other=0.0).to(tl.float32)
+    u = tl.load(up_ptr + u_offs, mask=mask, other=0.0).to(tl.float32)
+    
+    # SiLU: x * sigmoid(x)
+    g_silu = g * tl.sigmoid(g)
+    h = u * g_silu
+    
+    tl.store(hidden_ptr + h_offs, h.to(tl.float16), mask=mask)
 
 
 def fused_swiglu(x: torch.Tensor,
                  gate_weight: torch.Tensor,
                  up_weight: torch.Tensor,
                  down_weight: torch.Tensor) -> torch.Tensor:
+    """
+    SwiGLU 前向 (分离架构优化版)
+    """
     shape = x.shape
     x = x.view(-1, shape[-1])
     
-    gate = F.linear(x, gate_weight)
-    up = F.linear(x, up_weight)
+    # 1. cuBLAS 计算 gate 和 up
+    gate = F.linear(x, gate_weight)  # (M, I)
+    up = F.linear(x, up_weight)      # (M, I)
+    
+    # ✅ 修复：确保张量是连续的（防止 stride 异常）
+    gate = gate.contiguous()
+    up = up.contiguous()
     
     M, I = gate.shape
     H = down_weight.shape[0]
-    output = torch.empty((M, H), device=x.device, dtype=x.dtype)
     
-    grid = (triton.cdiv(M, 64), triton.cdiv(H, 64))
-    _fused_silu_kernel[grid](
-        gate, up, down_weight, output,
-        M, I, H,
+    # 2. Triton 融合 SiLU+Mul
+    hidden = torch.empty((M, I), device=x.device, dtype=x.dtype)
+    
+    total_elements = M * I
+    grid = (triton.cdiv(total_elements, 2048),)
+    
+    _silu_mul_kernel[grid](
+        gate, up, hidden,
+        M, I,
         gate.stride(0), gate.stride(1),
         up.stride(0), up.stride(1),
-        down_weight.stride(0), down_weight.stride(1),
-        output.stride(0), output.stride(1),
+        hidden.stride(0), hidden.stride(1),
+        BLOCK_SIZE=2048,
+        num_warps=4,
+        num_stages=2,
     )
+    
+    # 3. cuBLAS 计算 down_proj
+    output = F.linear(hidden, down_weight)  # (M, H)
     
     return output.view(shape)
 
@@ -81,25 +95,21 @@ def stable_silu(x: torch.Tensor) -> torch.Tensor:
     return F.silu(x.float()).half() if x.dtype == torch.float16 else F.silu(x)
 
 
-# === 修正后的验证流程（聚焦绝对误差）===
-# === 修正后的验证流程 ===
+# === 验证与性能测试 ===
 if __name__ == "__main__":
-    torch.manual_seed(42)  # 使用固定种子确保可复现
+    torch.manual_seed(42)
     torch.cuda.manual_seed_all(42)
     
     M, H, I = 256, 4096, 11008
     
     print("=" * 70)
-    print("SwiGLU 精确验证流程 (与Triton计算流程完全一致)")
+    print("SwiGLU 分离架构验证 (修复版)")
     print("=" * 70)
     
-    # 1. 生成测试数据（更接近实际分布）
     def generate_realistic_data():
-        # 输入：模拟经过LayerNorm后的激活值
         x = torch.randn((M, H), device='cuda', dtype=torch.float32)
-        x = x / (x.std() + 1e-6)  # 标准化到N(0,1)
+        x = x / (x.std() + 1e-6)
         
-        # 权重：模拟训练好的权重（更小范围）
         weight_scale = 0.02
         gate_w = torch.randn((I, H), device='cuda', dtype=torch.float32) * weight_scale
         up_w = torch.randn((I, H), device='cuda', dtype=torch.float32) * weight_scale
@@ -109,126 +119,79 @@ if __name__ == "__main__":
     
     x, gate_w, up_w, down_w = generate_realistic_data()
     
-    print("\n【1. 输入数据统计】")
-    print(f"  x: mean={x.float().mean():.3f}, std={x.float().std():.3f}, "
-          f"min={x.float().min():.3f}, max={x.float().max():.3f}")
-    print(f"  gate_w: mean={gate_w.float().mean():.3f}, std={gate_w.float().std():.3f}")
-    print(f"  up_w: mean={up_w.float().mean():.3f}, std={up_w.float().std():.3f}")
-    print(f"  down_w: mean={down_w.float().mean():.3f}, std={down_w.float().std():.3f}")
+    print(f"\n配置: M={M}, H={H}, I={I}")
+    print(f"输入 x: std={x.float().std():.3f}")
     
-    # 2. Triton实现
-    print("\n【2. Triton实现】")
-    y_triton = fused_swiglu(x, gate_w, up_w, down_w)
+    # 1. 数值验证
+    print("\n【1. 数值正确性验证】")
+    y_new = fused_swiglu(x, gate_w, up_w, down_w)
     
-    # 3. 与Triton计算流程完全一致的参考实现
-    print("\n【3. 精确参考实现 (模拟Triton计算流程)】")
+    # PyTorch 参考实现（使用相同精度路径）
     with torch.no_grad():
-        # 步骤1: gate和up的矩阵乘法（FP16，与Triton一致）
-        gate_fp16 = F.linear(x, gate_w)
-        up_fp16 = F.linear(x, up_w)
-        
-        # 步骤2: 转换到FP32计算（与Triton kernel一致）
-        gate_fp32 = gate_fp16.float()
-        up_fp32 = up_fp16.float()
-        
-        # 步骤3: 计算silu并相乘（FP32）
-        gate_fp32 = torch.clamp(gate_fp32, -20.0, 20.0)  # 与Triton一致
-        silu_gate = gate_fp32 * torch.sigmoid(gate_fp32)
-        hidden_fp32 = up_fp32 * silu_gate
-        
-        # 步骤4: 与down_w矩阵乘法（FP32累加）
-        down_w_fp32 = down_w.float()
-        y_ref_fp32 = F.linear(hidden_fp32, down_w_fp32)
-        
-        # 步骤5: 转回FP16
-        y_ref_exact = y_ref_fp32.half()
+        gate_ref = F.linear(x, gate_w)
+        up_ref = F.linear(x, up_w)
+        # 使用与 kernel 相同的计算路径：FP32 silu 然后转 FP16
+        gate_fp32 = gate_ref.float()
+        silu_gate = gate_fp32 * torch.sigmoid(gate_fp32)  # 显式 sigmoid 匹配 tl.sigmoid
+        hidden_ref = up_ref.float() * silu_gate
+        y_ref = F.linear(hidden_ref.half(), down_w)
     
-    # 4. 简化版参考实现（原始方法）
-    print("\n【4. 简化版参考实现 (原始方法)】")
-    with torch.no_grad():
-        gate_simple = F.linear(x, gate_w)
-        up_simple = F.linear(x, up_w)
-        hidden_simple = up_simple * stable_silu(gate_simple)
-        y_ref_simple = F.linear(hidden_simple, down_w)
+    err = torch.max(torch.abs(y_new - y_ref)).item()
+    mean_err = torch.mean(torch.abs(y_new - y_ref)).item()
     
-    # 5. 误差分析
-    print("\n【5. 误差分析】")
+    print(f"  Max Abs Error:  {err:.6f}")
+    print(f"  Mean Abs Error: {mean_err:.6f}")
+    print(f"  结果: {'✅ PASS' if err < 0.01 else '❌ FAIL'}")
     
-    # 误差1: Triton vs 精确参考
-    err_exact = torch.max(torch.abs(y_triton - y_ref_exact)).item()
-    err_mean_exact = torch.mean(torch.abs(y_triton - y_ref_exact)).item()
+    if err >= 0.01:
+        print(f"\n  ⚠️  误差详情:")
+        print(f"    误差位置: {torch.argmax(torch.abs(y_new - y_ref)).item()}")
+        print(f"    y_new 范围: [{y_new.min():.3f}, {y_new.max():.3f}]")
+        print(f"    y_ref 范围: [{y_ref.min():.3f}, {y_ref.max():.3f}]")
     
-    # 误差2: Triton vs 简化参考
-    err_simple = torch.max(torch.abs(y_triton - y_ref_simple)).item()
+    # 2. 性能测试
+    print("\n【2. 性能测试 (100 iterations)】")
     
-    # 误差3: 两种参考实现之间的差异
-    err_refs = torch.max(torch.abs(y_ref_exact - y_ref_simple)).item()
+    # 预热
+    for _ in range(10):
+        _ = fused_swiglu(x, gate_w, up_w, down_w)
+        _ = F.linear(F.silu(F.linear(x, gate_w).float()).half() * F.linear(x, up_w), down_w)
+    torch.cuda.synchronize()
     
-    print(f"  Triton vs 精确参考:")
-    print(f"    Max绝对误差: {err_exact:.6f}")
-    print(f"    Mean绝对误差: {err_mean_exact:.6f}")
+    # 测试分离架构
+    start = torch.cuda.Event(enable_timing=True)
+    end = torch.cuda.Event(enable_timing=True)
+    start.record()
+    for _ in range(100):
+        y_fused = fused_swiglu(x, gate_w, up_w, down_w)
+    end.record()
+    torch.cuda.synchronize()
+    time_new = start.elapsed_time(end) / 100
     
-    print(f"  Triton vs 简化参考:")
-    print(f"    Max绝对误差: {err_simple:.6f}")
+    # 测试 PyTorch 原生
+    start.record()
+    for _ in range(100):
+        gate = F.linear(x, gate_w)
+        up = F.linear(x, up_w)
+        hidden = up * F.silu(gate.float()).half()
+        y_torch = F.linear(hidden, down_w)
+    end.record()
+    torch.cuda.synchronize()
+    time_torch = start.elapsed_time(end) / 100
     
-    print(f"  两种参考实现差异:")
-    print(f"    Max绝对误差: {err_refs:.6f}")
+    print(f"  PyTorch 原生:  {time_torch:.3f} ms")
+    print(f"  分离架构:      {time_new:.3f} ms")
     
-    # 6. 数值稳定性检查
-    print("\n【6. 数值稳定性检查】")
-    triton_nan = torch.isnan(y_triton).any().item()
-    triton_inf = torch.isinf(y_triton).any().item()
-    exact_nan = torch.isnan(y_ref_exact).any().item()
-    exact_inf = torch.isinf(y_ref_exact).any().item()
-    
-    print(f"  Triton输出 - NaN: {triton_nan}, Inf: {triton_inf}")
-    print(f"  精确参考输出 - NaN: {exact_nan}, Inf: {exact_inf}")
-    
-    # 7. 输出统计
-    print("\n【7. 输出统计】")
-    output_std = y_ref_exact.float().std().item()
-    print(f"  输出标准差: {output_std:.3f}")
-    print(f"  输出范围: [{y_ref_exact.float().min():.3f}, {y_ref_exact.float().max():.3f}]")
-    
-    # 8. 判断标准
-    print("\n【8. 验证结果】")
-    
-    # 工业标准：绝对误差 < 0.01
-    if err_exact < 0.01:
-        print(f"  ✅ 通过工业标准测试！")
-        print(f"     绝对误差 {err_exact:.6f} < 0.01")
-        
-        if err_exact < 1e-4:
-            print(f"  🎉 优秀！误差极小 ({err_exact:.2e})")
-        elif err_exact < 1e-3:
-            print(f"  👍 良好！误差很小 ({err_exact:.2e})")
-        else:
-            print(f"  ⚠️  可接受！误差 ({err_exact:.2e})")
+    if time_new < time_torch:
+        speedup = time_torch / time_new
+        print(f"  ✅ 加速比:      {speedup:.2f}x (快 {(speedup-1)*100:.1f}%)")
     else:
-        print(f"  ❌ 未通过工业标准！")
-        print(f"     绝对误差 {err_exact:.6f} >= 0.01")
-    
-    # 检查是否有系统性偏差
-    bias = torch.mean(y_triton.float() - y_ref_exact.float()).item()
-    print(f"\n  系统性偏差: {bias:.8f} (理想值为0)")
-    
-    # 9. 错误分布
-    print("\n【9. 错误分布】")
-    errors = (y_triton.float() - y_ref_exact.float()).abs()
-    print(f"  误差百分位数:")
-    for p in [50, 90, 95, 99, 99.9, 100]:
-        val = torch.quantile(errors, p/100.0).item()
-        print(f"    {p}%: {val:.6f}")
+        print(f"  ⚠️   slowdown:   {time_new/time_torch:.2f}x")
     
     print("\n" + "=" * 70)
-    print("💡 最终结论")
-    print("=" * 70)
-    
-    if err_exact < 0.01 and not triton_nan and not triton_inf:
-        print("  ✅ fused_swiglu 实现正确，可安全用于生产环境")
-        print(f"     最大误差: {err_exact:.6f}")
-        print(f"     数值稳定: {not (triton_nan or triton_inf)}")
+    if err < 0.01:
+        print("✅ 分离架构验证通过，可安全用于生产环境")
+        print(f"   加速比: {time_torch/time_new:.2f}x")
     else:
-        print("  ❌ 需要进一步调试")
-    
+        print("❌ 数值误差过大，请检查实现")
     print("=" * 70)
