@@ -4,7 +4,7 @@ import triton.language as tl
 
 
 @triton.jit
-def rms_norm_fwd_kernel(
+def ln_fwd(
     X, Y, W,          # input, output, weight
     M, N,             # rows, cols (feature dim)
     stride_x, eps,
@@ -49,7 +49,7 @@ def rms_norm(x: torch.Tensor, weight: torch.Tensor, eps: float = 1e-6):
     y_flat = torch.empty_like(x_flat)  # 与输入同类型（如float16）
     BLOCK_SIZE = min(triton.next_power_of_2(N), 2048)
     
-    rms_norm_fwd_kernel[(M,)](
+    ln_fwd[(M,)](
         x_flat, y_flat, weight,
         M, N,
         x_flat.stride(0), eps,
