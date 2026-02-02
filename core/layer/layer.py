@@ -28,6 +28,7 @@ import time
 import torch
 from typing import Tuple, List, Optional
 from core.paged_attention import PagedAttention
+from kernel.rmsnorm import rms_norm
 # 设置日志记录
 logger = logging.getLogger(__name__)
 
@@ -170,7 +171,7 @@ class ModelLayerAdapter:
 
         # 记录耗时分布
         total_time = time.time() - start_time
-        if layer_idx == 0:
+        if layer_idx == 0 and False:
             logger.info(f"🚀 Layer {layer_idx}: 总处理耗时 {total_time * 1000:.2f}ms")
             logger.info(f"   📊 耗时分布: QKV={qkv_time * 1000:.2f}ms | Attn={attn_time * 1000:.2f}ms | MLP={mlp_time * 1000:.2f}ms")
             logger.info(f"   ⚡ torch.compile三段式融合 | QKV+MLP算子融合 | 内存优化")
@@ -185,7 +186,8 @@ class ModelLayerAdapter:
         """
         # 1. Qwen-7B固定LayerNorm: ln_1
         residual = hidden_states
-        hidden_states = layer.ln_1(hidden_states)
+        # hidden_states = layer.ln_1(hidden_states)
+        hidden_states = rms_norm(hidden_states, layer.ln_1.weight, layer.ln_1.eps)
 
         # 2. Qwen-7B固定合并QKV投影: c_attn
         qkv = layer.attn.c_attn(hidden_states)
@@ -230,7 +232,7 @@ class ModelLayerAdapter:
 
         # 2. Qwen-7B固定MLP: ln_2 + mlp (无MoE)
         residual = hidden_states
-        hidden_states = layer.ln_2(hidden_states)
+        hidden_states = rms_norm(hidden_states, layer.ln_2.weight, layer.ln_2.eps)
         hidden_states = layer.mlp(hidden_states)
         hidden_states = residual + hidden_states
 

@@ -1,7 +1,7 @@
 import torch
 import triton
 import triton.language as tl
-
+import torch.nn.functional as F
 
 @triton.jit
 def ln_fwd(
@@ -68,13 +68,27 @@ if __name__ == "__main__":
     
     y_triton = rms_norm(x, w, eps=1e-6)
     
-    # PyTorch 参考实现（保持float32计算，最后转为float16比较）
+    # 1. PyTorch 原生实现 (官方 Reference)
+    y_torch = F.rms_norm(x, x.shape[-1:], w, eps=1e-6)
+    
+    # 2. 手动计算 Reference (纯数学计算)
     variance = x.float().pow(2).mean(-1, keepdim=True)
     y_ref = x.float() * torch.rsqrt(variance + 1e-6) * w.float()
     
-    # 关键修复：将Triton输出转为float32再比较（避免类型错误）
-    max_err = torch.max(torch.abs(y_triton.float() - y_ref)).item()
-    is_close = torch.allclose(y_triton.float(), y_ref, rtol=1e-3, atol=1e-5)
+    # 对比 1: Triton vs PyTorch 原生
+    err_vs_torch = torch.max(torch.abs(y_triton.float() - y_torch.float())).item()
+    is_close_torch = torch.allclose(y_triton.float(), y_torch.float(), rtol=1e-3, atol=1e-5)
     
-    print(f"最大误差: {max_err:.2e}")
-    print("✅ 通过" if is_close else "❌ 失败")
+    print(f"[1] Triton vs PyTorch F.rms_norm:")
+    print(f"  Max Abs Error: {err_vs_torch:.2e}")
+    print(f"  Result: {'✅ PASS' if is_close_torch else '❌ FAIL'}")
+
+    # 对比 2: Triton vs 手动 Reference
+    err_vs_ref = torch.max(torch.abs(y_triton.float() - y_ref.float())).item()
+    is_close_ref = torch.allclose(y_triton.float(), y_ref.float(), rtol=1e-3, atol=1e-5)
+    
+    print(f"\n[2] Triton vs Manual Reference:")
+    print(f"  Max Abs Error: {err_vs_ref:.2e}")
+    print(f"  Result: {'✅ PASS' if is_close_ref else '❌ FAIL'}")
+
+    print(f"\n最终结论: {'✅ 两项测试全部通过' if is_close_torch and is_close_ref else '❌ 存在数值误差'}")
