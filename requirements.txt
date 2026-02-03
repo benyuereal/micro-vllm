@@ -1,7 +1,7 @@
 vllm
 torch>=2.0.0
 transformers>=4.56.0
-numpy>=1.21.0
+numpy>=1.21.0,<2.0.0  # 避免NumPy 2.x兼容性问题
 sentencepiece>=0.1.99
 accelerate>=0.20.0
 fastapi>=0.100.0
@@ -14,5 +14,12 @@ torch>=2.0.0
 accelerate>=0.20.0
 openai
 einops>=0.6.1
-transformers_stream_generator>=0.0.4
+transformers_stream_generator>=0.0.4  # Qwen模型必需依赖
 tiktoken>=0.5.2
+
+# 必需依赖
+flash-attn>=2.0.0  # FlashAttention v2 (必需)
+
+# 可选性能优化库 (Phase 2)
+# xformers>=0.0.22  # MLP融合优化 (可选)
+# triton>=2.0.0     # 自定义算子融合 (可选)

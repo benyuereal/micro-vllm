@@ -128,6 +128,7 @@ class InferenceEngine:
 
         # 6. 初始化层适配器
         self.layer_adapter = ModelLayerAdapter(
+            model=self.model,
             model_config=self.config,
             device=self.device,
             num_heads=self.num_heads,

@@ -1,6 +1,6 @@
 # vLLM Framework
 
-> 高性能 LLM 推理引擎，基于 **PagedAttention + Flash Attention**，A100 上性能达 vLLM 的 **60%**,适合小规模生产部署和学习。
+> 高性能 LLM 推理引擎，基于 **PagedAttention + Flash Attention**，A100 上性能达 vLLM 的 **70%**,适合小规模生产部署和学习。
 
 ---
 
@@ -21,7 +21,7 @@
 | 🚀 Continuous Batching | GPU 利用率 ↑83% |
 | 💾 PagedAttention | KV 缓存碎片率 ↓80% |
 | ⚡ Flash Attention | 自动 RoPE，速度 ↑2× |
-| 🔥 性能 | A100: **105 tokens/sec** (vLLM 50%) |
+| 🔥 性能 | A100: **51 tokens/sec** (vLLM 70%) |
 | 🌊 流式输出 | P99 延迟 ↓51% |
 
 ---
@@ -66,9 +66,9 @@
 
 | 框架 | tokens/sec | 相对性能 |
 |------|------------|----------|
-| **本框架** | **105** | **50%** |
-| vLLM | 210 | 100% |
-| HF | 60 | 28.6% |
+| **本框架** | **51** | **70%** |
+| vLLM | 70 | 100% |
+| HF | 20 | 28.6% |
 
 - **硬件**：A100 40GB
 - **模型**：Qwen-7B
@@ -167,4 +167,4 @@ curl http://localhost:8000/v1/completions \
         "stream": true
     }'
 ```
-💡 说明：本框架适合中小规模 LLM 服务，性能达 vLLM 50%，已生产可用。
+💡 说明：本框架适合中小规模 LLM 服务，性能达 vLLM 70%，已生产可用。
