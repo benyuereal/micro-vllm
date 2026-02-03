@@ -29,31 +29,13 @@ import torch
 from typing import Tuple, List, Optional
 from core.paged_attention import PagedAttention
 from kernel.rmsnorm import rms_norm
+from torch.nn import functional as F
 # 设置日志记录
 logger = logging.getLogger(__name__)
 
 class ModelLayerAdapter:
     """
     📌 **模型层适配器** - vLLM核心组件
-
-    🔍 **设计哲学**:
-        1. **统一接口**: 所有模型架构使用相同的process_layer接口
-        2. **自动适配**: 根据model_type自动选择处理逻辑
-        3. **零拷贝**: 直接操作张量，无中间拷贝
-        4. **生产就绪**: 支持AMP、异常处理、设备匹配
-
-    🧪 **典型用法**:
-        adapter = ModelLayerAdapter(config, device, num_heads=16, head_size=128, kv_num_heads=16)
-        hidden_states, (k, v) = adapter.process_layer(
-            layer=layer,
-            hidden_states=hidden_states,  # [B, S, D]
-            cache_manager=cache_manager,  # KVCacheManager实例
-            seq_ids=[0, 1, 2],          # 序列ID列表
-            context_lens=[10, 20, 30],   # 当前长度
-            token_positions=positions,   # token位置 (可选)
-            layer_idx=0,                 # 层索引
-            current_positions=positions  # 当前位置 (可选)
-        )
     """
 
     # 模型架构配置 (可扩展)
@@ -76,17 +58,19 @@ class ModelLayerAdapter:
         },
     }
 
-    def __init__(self, model_config, device: str, num_heads: int, head_size: int, kv_num_heads: int):
+    def __init__(self, model, model_config, device: str, num_heads: int, head_size: int, kv_num_heads: int):
         """
         📌 **初始化**
 
         🔍 **参数**:
+            - model: 模型
             - model_config: 模型配置
             - device: 设备 ("cuda", "mps", "cpu")
             - num_heads: 注意力头数
             - head_size: 每个头维度
             - kv_num_heads: KV头数 (GQA支持)
         """
+        self.model = model
         self.config = model_config
         self.device = device
         self.model_type = model_config.model_type
@@ -104,6 +88,25 @@ class ModelLayerAdapter:
         if self.model_type not in self.MODEL_CONFIGS:
             raise ValueError(f"Unsupported model type: {self.model_type}")
         self.cfg = self.MODEL_CONFIGS[self.model_type]
+        self._ready = False
+        self.prepare(self.model)
+
+    # 在 prepare() 中添加 debug
+    def prepare(self, model):
+        if self._ready: 
+            return
+        
+        for layer in model.transformer.h:
+            mlp = layer.mlp
+            # 检查 cat 后的结果
+            gate_up = torch.cat([mlp.w1.weight, mlp.w2.weight], dim=0)            
+            # 转置后
+            mlp._gu = gate_up.t().contiguous()            
+            mlp._d = mlp.c_proj.weight.t().contiguous()
+            layer.attn._w = layer.attn.c_proj.weight.t().contiguous()
+        logger.info("✅ 预缓存转置权重完成")
+        self._ready = True
+
 
     def process_layer(self,
                       layer,
@@ -156,17 +159,17 @@ class ModelLayerAdapter:
         # 📍 Qwen专用优化路径 (torch.compile融合，无条件分支)
             # 📍 第一阶段：QKV (torch.compile算子融合)
         qkv_start = time.time()
-        hidden_states, residual, q, k, v = self._qkv_stage(layer, hidden_states)
+        hidden_states, residual, q, k, v = self._qkv_(layer, hidden_states)
         qkv_time = time.time() - qkv_start
 
             # 📍 第二阶段：Attention (FlashAttention v2)
         attn_start = time.time()
-        attn_output, kv_cache = self._attn_stage(q, k, v, cache_manager, seq_ids, context_lens, layer_idx)
+        attn_output, kv_cache = self._attn_(q, k, v, cache_manager, seq_ids, context_lens, layer_idx)
         attn_time = time.time() - attn_start
 
             # 📍 第三阶段：MLP (torch.compile算子融合)
         mlp_start = time.time()
-        hidden_states = self._mlp_stage(layer, hidden_states, residual, attn_output)
+        hidden_states = self._mlp_(layer, hidden_states, residual, attn_output)
         mlp_time = time.time() - mlp_start
 
         # 记录耗时分布
@@ -178,8 +181,7 @@ class ModelLayerAdapter:
 
         return hidden_states, kv_cache
 
-    # @torch.compile(mode="default")
-    def _qkv_stage(self, layer, hidden_states):
+    def _qkv_(self, layer, hidden_states):
         """
         📍 **QKV阶段** (torch.compile融合优化)
         LayerNorm + QKV投影 + 形状重塑，算子融合
@@ -202,7 +204,7 @@ class ModelLayerAdapter:
 
         return hidden_states, residual, q, k, v
 
-    def _attn_stage(self, q, k, v, cache_manager, seq_ids, context_lens, layer_idx):
+    def _attn_(self, q, k, v, cache_manager, seq_ids, context_lens, layer_idx):
         """
         📍 **Attention阶段** (不编译)
         调用PagedAttention，避免C++扩展编译问题
@@ -219,21 +221,18 @@ class ModelLayerAdapter:
         # 返回attention输出和kv缓存
         return attn_output, (k.squeeze(2), v.squeeze(2))
 
-    # @torch.compile(mode="default")
-    def _mlp_stage(self, layer, hidden_states, residual, attn_output):
-        """
-        📍 **MLP阶段** (torch.compile融合优化)
-        输出投影 + MLP，算子融合
-        """
-        # 1. Qwen-7B固定输出投影: c_proj
-        batch_size = hidden_states.shape[0]
-        attn_output = layer.attn.c_proj(attn_output.reshape(batch_size, -1)).unsqueeze(1)  # [B, 1, D]
-        hidden_states = residual + attn_output
+    def _mlp_(self, layer, hidden, attn_res, attn_out):
 
-        # 2. Qwen-7B固定MLP: ln_2 + mlp (无MoE)
-        residual = hidden_states
-        hidden_states = rms_norm(hidden_states, layer.ln_2.weight, layer.ln_2.eps)
-        hidden_states = layer.mlp(hidden_states)
-        hidden_states = residual + hidden_states
-
-        return hidden_states
+        batch_size = hidden.shape[0]
+        hidden = attn_res + torch.matmul(attn_out.view(batch_size, -1), layer.attn._w).unsqueeze(1)
+        
+        normed = rms_norm(hidden, layer.ln_2.weight, layer.ln_2.eps)
+        x = normed.view(-1, 4096)
+        
+        gate_up = torch.matmul(x, layer.mlp._gu)
+        
+        up, gate = gate_up.chunk(2, dim=-1) 
+        
+        output = torch.matmul(F.silu(gate) * up, layer.mlp._d)
+        
+        return hidden + output.view(hidden.shape)
