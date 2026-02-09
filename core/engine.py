@@ -39,6 +39,8 @@ from .cache_manager import KVCacheManager, store_kvcache
 from .sequence import Sequence
 from .model_loader import load_model
 import logging
+from torch.profiler import profile, ProfilerActivity
+
 
 class InferenceEngine:
     """
@@ -281,24 +283,32 @@ class InferenceEngine:
         context_lens = [seq.current_position for seq in batch]
         self.cache_manager.cache_batch_data(seq_ids, context_lens)
 
+        with profile(
+                activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
+                record_shapes=True,
+                profile_memory=True
+            ) as prof:
+                ## 追加新的token
+                for layer_idx, layer in enumerate(self.model_layers):
 
-        ## 追加新的token
-        for layer_idx, layer in enumerate(self.model_layers):
+                    # 使用模型层适配器处理不同架构的层
+                    hidden_states, layer_kv = self.layer_adapter.process_layer(
+                        layer, hidden_states, self.cache_manager, seq_ids,
+                        context_lens, token_positions, layer_idx,
+                        [seq.current_position - 1 for seq in batch]
+                    )
 
-            # 使用模型层适配器处理不同架构的层
-            hidden_states, layer_kv = self.layer_adapter.process_layer(
-                layer, hidden_states, self.cache_manager, seq_ids,
-                context_lens, token_positions, layer_idx,
-                [seq.current_position - 1 for seq in batch]
-            )
-
-            all_layer_kvs.append(layer_kv)
+                    all_layer_kvs.append(layer_kv)
 
 
-        # 最终层归一化 - 使用模型特定的归一化层
-        hidden_states = self.norm_layer(hidden_states)
-        logits = self.model.lm_head(hidden_states).float()
-
+                # 最终层归一化 - 使用模型特定的归一化层
+                hidden_states = self.norm_layer(hidden_states)
+                logits = self.model.lm_head(hidden_states).float()
+    # 打印关键指标
+        print(prof.key_averages().table(sort_by="cuda_time_total", row_limit=10))
+        
+        # 导出 Chrome 可视化（关键！）
+        prof.export_chrome_trace("trace.json")
         # 采样下一个token
         next_tokens = []
         for i, seq in enumerate(batch):
