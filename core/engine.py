@@ -350,7 +350,8 @@ class InferenceEngine:
 
         # 📍 记录总耗时
         total_time = time.time() - start_time
-        if True:
+        # 只有当第一个序列的上下文长度能被10整除时才打印详细日志
+        if batch and batch[0].current_position % 10 == 0:
             self.logger.info(f"🔄 解码批次处理: 总耗时 {total_time * 1000:.2f}ms")
             self.logger.info(f"   📊 耗时分布: 准备={prep_time * 1000:.2f}ms | Embedding={emb_time * 1000:.2f}ms | Cache={cache_time * 1000:.2f}ms | 逐层={layer_time * 1000:.2f}ms | 归一化={norm_time * 1000:.2f}ms | 采样={sample_time * 1000:.2f}ms | 更新={update_time * 1000:.2f}ms")
 
