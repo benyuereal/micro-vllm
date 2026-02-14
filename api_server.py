@@ -175,8 +175,29 @@ async def generate_stream(request: GenerateRequest):
         engine.register_stream_callback(seq_id, callback)
 
         try:
+            step_count = 0
+            total_step_time = 0
+            first_batch_type = None
+            first_batch_size = None
+            
             while True:
+                step_start = time.time()
+                
                 engine.step()
+                step_time = time.time() - step_start
+                
+                step_count += 1
+                total_step_time += step_time
+                
+                # 记录首批次的类型和大小
+                if step_count == 1:
+                    first_batch_type = "prefill" if engine.scheduler.waiting_queue else "decode"
+                    first_batch_size = len(engine.scheduler.running_sequences)
+
+                # 每 50 步打印统计
+                if step_count % 50 == 0:
+                    avg_step = total_step_time / step_count * 1000
+                    print(f"📊 Steps {step_count-49}~{step_count}: avg={avg_step:.1f}ms/step, batch={len(engine.scheduler.running_sequences)}")
 
                 # 消费所有已生成 token
                 while not token_queue.empty():
@@ -194,7 +215,8 @@ async def generate_stream(request: GenerateRequest):
                 # 检查序列是否结束
                 running_seqs = [seq for seq in engine.scheduler.running_sequences if seq.seq_id == seq_id]
                 if not running_seqs:
-                    print("[DONE]")
+                    avg_step_time = total_step_time / step_count * 1000
+                    print(f"[DONE] 共 {step_count} steps, 首批次: type={first_batch_type}, size={first_batch_size}, 平均每step: {avg_step_time:.1f}ms")
                     end_time = time.time()
                     gen_time = end_time - start_time
                     tokens_per_sec = token_count / gen_time if gen_time > 0 else 0

@@ -332,7 +332,7 @@ class KVCacheManager:
         
         # 4. block table 
         self._block_table = torch.full(
-            (16, self.n_blocks), -1,
+            (32, self.n_blocks), -1,
             dtype=torch.int32, device=self.device
         )
         self.cache_seqlens = torch.tensor([1], dtype=torch.int32, device=self.device)

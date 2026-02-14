@@ -59,12 +59,12 @@ class InferenceEngine:
     # 扩展DEVICE_CONFIGS (支持Qwen3 MoE)
     DEVICE_CONFIGS = {
         "mps": {"block_size": 16, "max_blocks": 512, "dtype": torch.float16},
-        "cuda": {"block_size": 256, "max_blocks": 48, "dtype": None},  # 自动选择bfloat16/float16
+        "cuda": {"block_size": 256, "max_blocks": 96, "dtype": None},  # 自动选择bfloat16/float16
         "cpu": {"block_size": 16, "max_blocks": 128, "dtype": torch.float32},
         "cuda_moe": {"block_size": 256, "max_blocks": 48, "dtype": torch.bfloat16},  # ✅ Qwen3 MoE专用
     }
 
-    def __init__(self, model_path: str, max_batch_size: int = 8, max_prefill_tokens: int = 2048):
+    def __init__(self, model_path: str, max_batch_size: int = 128, max_prefill_tokens: int = 2048):
         """
         📌 **初始化推理引擎** (自动加载模型，隐藏所有配置)
 
@@ -263,16 +263,26 @@ class InferenceEngine:
     @torch.no_grad()
     def _process_decode_batch(self, batch: List[Sequence]):
         """处理解码批次，适配不同模型架构"""
-        # 准备输入数据
+        # 📍 记录开始时间
+        start_time = time.time()
+
+        # 📍 第一阶段：准备输入数据
+        prep_start = time.time()
         input_ids = torch.tensor([seq.get_next_input_ids() for seq in batch], device=self.device)
         token_positions = [[pos for pos in range(seq.current_position - 1)] for seq in batch]
         seq_ids = [seq.seq_id for seq in batch]
+        prep_time = time.time() - prep_start
 
+        # 📍 第二阶段：Embedding
+        emb_start = time.time()
         hidden_states = self.embedding_layer(input_ids)
+        emb_time = time.time() - emb_start
 
         # 逐层处理
         all_layer_kvs = []
 
+        # 📍 第三阶段：Cache追加
+        cache_append_start = time.time()
         for i, seq in enumerate(batch):
             # 追加新的token
             self.cache_manager.append(seq.seq_id)
@@ -280,7 +290,10 @@ class InferenceEngine:
         # 预更新block table
         context_lens = [seq.current_position for seq in batch]
         self.cache_manager.cache_batch_data(seq_ids, context_lens)
+        cache_time = time.time() - cache_append_start
 
+        # 📍 第四阶段：逐层处理
+        layer_start = time.time()
 
         ## 追加新的token
         for layer_idx, layer in enumerate(self.model_layers):
@@ -294,21 +307,45 @@ class InferenceEngine:
 
             all_layer_kvs.append(layer_kv)
 
+        layer_time = time.time() - layer_start
 
-        # 最终层归一化 - 使用模型特定的归一化层
+
+        # 📍 第五阶段：最终归一化 + LM Head
+        norm_start = time.time()
         hidden_states = self.norm_layer(hidden_states)
         logits = self.model.lm_head(hidden_states).float()
+        norm_time = time.time() - norm_start
 
-        # 采样下一个token
-        next_tokens = []
-        for i, seq in enumerate(batch):
-            next_token = self._sample_next_token(logits[i, -1, :], seq.temperature, seq.top_p)
-            next_tokens.append(next_token)
+        # 📍 第六阶段：Token采样 (并行版本)
+        sample_start = time.time()
 
-        # 序列更新
+        # 提取batch参数 [batch_size]
+        temperatures = torch.tensor([seq.temperature for seq in batch], device=logits.device)
+        top_ps = torch.tensor([seq.top_p for seq in batch], device=logits.device)
+
+        # logits[i, -1, :] 形状是 [batch_size, vocab_size]
+        next_tokens = self._sample_next_token_batch(
+            logits[:, -1, :],  # [batch_size, vocab_size]
+            temperatures,       # [batch_size]
+            top_ps              # [batch_size]
+        )
+
+        # next_tokens 现在是 tensor([token1, token2, ...])，可以直接转list
+        next_tokens = next_tokens.tolist()
+
+        sample_time = time.time() - sample_start
+
+        # 📍 第七阶段：序列更新
+        update_start = time.time()
         for i, seq in enumerate(batch):
             self._update_sequence(seq, next_tokens[i])
+        update_time = time.time() - update_start
 
+        # 📍 记录总耗时
+        total_time = time.time() - start_time
+        if True:
+            self.logger.info(f"🔄 解码批次处理: 总耗时 {total_time * 1000:.2f}ms")
+            self.logger.info(f"   📊 耗时分布: 准备={prep_time * 1000:.2f}ms | Embedding={emb_time * 1000:.2f}ms | Cache={cache_time * 1000:.2f}ms | 逐层={layer_time * 1000:.2f}ms | 归一化={norm_time * 1000:.2f}ms | 采样={sample_time * 1000:.2f}ms | 更新={update_time * 1000:.2f}ms")
 
         return next_tokens
 
@@ -333,23 +370,49 @@ class InferenceEngine:
         padded = [seq + [pad_token_id] * (max_len - len(seq)) for seq in sequences]
         return torch.tensor(padded, dtype=torch.long)
 
-    def _sample_next_token(self, logits: torch.Tensor, temperature: float, top_p: float) -> int:
-        """采样下一个token"""
-        logits = logits / temperature
-
-        # Top-p 采样
-        sorted_logits, sorted_indices = torch.sort(logits, descending=True)
-        cumulative_probs = torch.cumsum(F.softmax(sorted_logits, dim=-1), dim=-1)
-
-        sorted_indices_to_remove = cumulative_probs > top_p
+    def _sample_next_token_batch(
+    self, 
+    logits: torch.Tensor,  # [batch_size, vocab_size]
+    temperatures: torch.Tensor,  # [batch_size]
+    top_ps: torch.Tensor,  # [batch_size]
+    ) -> torch.Tensor:
+        """并行采样整个batch的下一个token"""
+        batch_size, vocab_size = logits.shape
+        
+        # 应用温度缩放 [batch_size, vocab_size]
+        # 注意：temperatures 需要 unsqueeze 以便广播
+        logits = logits / temperatures.unsqueeze(-1)
+        
+        # ===== Top-p 过滤 (batch版本) =====
+        # 排序 [batch_size, vocab_size]
+        sorted_logits, sorted_indices = torch.sort(logits, descending=True, dim=-1)
+        
+        # 计算累积概率 [batch_size, vocab_size]
+        sorted_probs = F.softmax(sorted_logits, dim=-1)
+        cumulative_probs = torch.cumsum(sorted_probs, dim=-1)
+        
+        # 创建mask：哪些位置需要移除 [batch_size, vocab_size]
+        sorted_indices_to_remove = cumulative_probs > top_ps.unsqueeze(-1)
+        
+        # 保持第一个token（最高概率的）
         sorted_indices_to_remove[..., 1:] = sorted_indices_to_remove[..., :-1].clone()
-        sorted_indices_to_remove[..., 0] = 0
-
-        indices_to_remove = sorted_indices[sorted_indices_to_remove]
-        logits[indices_to_remove] = float('-inf')
-
+        sorted_indices_to_remove[..., 0] = False
+        
+        # 将mask映射回原始索引顺序
+        # 使用 scatter 来 "还原" 排序后的mask到原始位置
+        indices_to_remove = torch.zeros_like(logits, dtype=torch.bool)
+        indices_to_remove.scatter_(
+            dim=-1, 
+            index=sorted_indices, 
+            src=sorted_indices_to_remove
+        )
+        
+        # 应用mask
+        logits = logits.masked_fill(indices_to_remove, float('-inf'))
+        
+        # 重新计算概率并采样 [batch_size]
         probs = F.softmax(logits, dim=-1)
-        return torch.multinomial(probs, num_samples=1).item()
+        return torch.multinomial(probs, num_samples=1).squeeze(-1)  # [batch_size]
 
     def stream_generate(self, prompt: str, max_tokens: int = 128,
                         temperature: float = 0.7, top_p: float = 0.9) -> Generator[Tuple[int, str], None, None]:
