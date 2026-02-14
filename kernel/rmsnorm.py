@@ -1,40 +1,53 @@
 import torch
-import triton
-import triton.language as tl
+try:
+    import triton
+    import triton.language as tl
+    from flash_attn import flash_attn_varlen_func, flash_attn_with_kvcache
+except ImportError:
+    print('Please install flash-attn from https://www.flash-attn.org')
+
+
+
 import torch.nn.functional as F
 
-@triton.jit
-def ln_fwd(
-    X, Y, W,          # input, output, weight
-    M, N,             # rows, cols (feature dim)
-    stride_x, eps,
-    BLOCK_SIZE: tl.constexpr,
-):
-    row = tl.program_id(0)
-    if row >= M:
-        return
-    
-    X_row = X + row * stride_x
-    Y_row = Y + row * stride_x
-    
-    # 标量累加：平方和
-    rms_sq = 0.0
-    for off in range(0, N, BLOCK_SIZE):
-        cols = off + tl.arange(0, BLOCK_SIZE)
-        mask = cols < N
-        x = tl.load(X_row + cols, mask=mask, other=0.0).to(tl.float32)
-        rms_sq += tl.sum(x * x)
-    
-    rstd = 1.0 / tl.sqrt(rms_sq / N + eps)
-    
-    # 归一化 + 仿射变换
-    for off in range(0, N, BLOCK_SIZE):
-        cols = off + tl.arange(0, BLOCK_SIZE)
-        mask = cols < N
-        x = tl.load(X_row + cols, mask=mask, other=0.0).to(tl.float32)
-        w = tl.load(W + cols, mask=mask)
-        y = x * rstd * w
-        tl.store(Y_row + cols, y, mask=mask)
+def is_macos():
+    """检测是否运行在macOS MPS设备上"""
+    return torch.backends.mps.is_available()
+
+if not is_macos() and torch.cuda.is_available():
+
+    @triton.jit
+    def ln_fwd(
+        X, Y, W,          # input, output, weight
+        M, N,             # rows, cols (feature dim)
+        stride_x, eps,
+        BLOCK_SIZE: tl.constexpr,
+    ):
+        row = tl.program_id(0)
+        if row >= M:
+            return
+        
+        X_row = X + row * stride_x
+        Y_row = Y + row * stride_x
+        
+        # 标量累加：平方和
+        rms_sq = 0.0
+        for off in range(0, N, BLOCK_SIZE):
+            cols = off + tl.arange(0, BLOCK_SIZE)
+            mask = cols < N
+            x = tl.load(X_row + cols, mask=mask, other=0.0).to(tl.float32)
+            rms_sq += tl.sum(x * x)
+        
+        rstd = 1.0 / tl.sqrt(rms_sq / N + eps)
+        
+        # 归一化 + 仿射变换
+        for off in range(0, N, BLOCK_SIZE):
+            cols = off + tl.arange(0, BLOCK_SIZE)
+            mask = cols < N
+            x = tl.load(X_row + cols, mask=mask, other=0.0).to(tl.float32)
+            w = tl.load(W + cols, mask=mask)
+            y = x * rstd * w
+            tl.store(Y_row + cols, y, mask=mask)
 
 
 def rms_norm(x: torch.Tensor, weight: torch.Tensor, eps: float = 1e-6):

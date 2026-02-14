@@ -39,6 +39,7 @@ from .cache_manager import KVCacheManager, store_kvcache
 from .sequence import Sequence
 from .model_loader import load_model
 import logging
+from .radix_tree import RadixTree
 
 class InferenceEngine:
     """
@@ -147,6 +148,7 @@ class InferenceEngine:
                          f"block_size={self.block_size}, max_blocks={self.max_blocks}")
 
         # 8.其他配置
+        self.radix_tree = RadixTree(self.max_blocks)
 
 
     def _init_logging(self):
@@ -227,7 +229,26 @@ class InferenceEngine:
         """处理预填充批次 (极简版)"""
         # 1. 准备输入
         input_ids = [seq.get_next_input_ids() for seq in batch]
+        print(f"input_ids: {input_ids}")
         input_tensor = self._pad_batch(input_ids, self.tokenizer.pad_token_id).to(self.device)
+        print(f"input_tensor: {input_tensor.shape}")
+        # 查询公共前缀 对input_tensor进行遍历，如果存在公共前缀，则返回公共前缀的长度
+        common_prefix_length = 0
+
+        for i in range(input_tensor.shape[0]):
+            input_tensor_i = input_tensor[i, :]
+            input_list = input_tensor_i.tolist()
+            seq_id = batch[i].seq_id
+            self.radix_tree.insert(seq_id, input_list)
+            common_prefix = self.radix_tree.find_longest_prefix(input_list)
+            if common_prefix[0] > 0:
+                common_prefix_length = common_prefix[0]
+                new_tokens = input_tensor_i[common_prefix_length:]
+                batch[i].new_tokens = new_tokens
+                print(f"new_tokens: {new_tokens}")
+                seq_id = common_prefix[1].pop()
+                print(f"seq_id: {seq_id}")
+        print(f"input_tensor: {input_tensor.shape}")
 
         # 2. 前向传播
         outputs = self.model(input_ids=input_tensor, use_cache=True)
@@ -235,9 +256,12 @@ class InferenceEngine:
 
         # 3. 存储KV (按序列处理)
         for i, seq in enumerate(batch):
-            num_tokens = len(input_ids[i])
+            num_tokens = len(seq.new_tokens)
             success, slot_mapping = self.cache_manager.alloc(seq.seq_id, num_tokens)
+
             if not success: continue
+             # 更新radix_tree
+            self.radix_tree.insert(seq.seq_id, seq.new_tokens)
             model_type = getattr(self, 'model_type', 'default')
             for layer_idx, (k, v) in enumerate(past_kvs):
                 # 直接提取当前序列的所有token KV (避免循环)

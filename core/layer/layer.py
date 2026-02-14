@@ -89,7 +89,7 @@ class ModelLayerAdapter:
             raise ValueError(f"Unsupported model type: {self.model_type}")
         self.cfg = self.MODEL_CONFIGS[self.model_type]
         self._ready = False
-        self.prepare(self.model)
+        # self.prepare(self.model)
 
     # 在 prepare() 中添加 debug
     def prepare(self, model):

@@ -18,6 +18,7 @@ class Sequence:
         self.top_p = 0.9
         self.eos_token_id = tokenizer.eos_token_id
         self.priority = 0
+        self.new_tokens = []
 
     def is_finished(self):
         return (len(self.output_ids) >= self.max_tokens or
