@@ -188,16 +188,11 @@ async def generate_stream(request: GenerateRequest):
                 
                 step_count += 1
                 total_step_time += step_time
-                
-                # 记录首批次的类型和大小
-                if step_count == 1:
-                    first_batch_type = "prefill" if engine.scheduler.waiting_queue else "decode"
-                    first_batch_size = len(engine.scheduler.running_sequences)
-
+            
                 # 每 50 步打印统计
-                if step_count % 50 == 0:
+                if step_count % 10 == 0:
                     avg_step = total_step_time / step_count * 1000
-                    print(f"📊 Steps {step_count-49}~{step_count}: avg={avg_step:.1f}ms/step, batch={len(engine.scheduler.running_sequences)}")
+                    print(f"📊 Steps {step_count-9}~{step_count}: avg={avg_step:.1f}ms/step, batch={len(engine.scheduler.running_sequences)}")
 
                 # 消费所有已生成 token
                 while not token_queue.empty():
