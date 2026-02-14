@@ -324,7 +324,7 @@ class InferenceEngine:
         top_ps = torch.tensor([seq.top_p for seq in batch], device=logits.device)
 
         # logits[i, -1, :] 形状是 [batch_size, vocab_size]
-        next_tokens = self._sample_next_token_batch(
+        next_tokens = self._sample_next_token(
             logits[:, -1, :],  # [batch_size, vocab_size]
             temperatures,       # [batch_size]
             top_ps              # [batch_size]
@@ -370,12 +370,12 @@ class InferenceEngine:
         padded = [seq + [pad_token_id] * (max_len - len(seq)) for seq in sequences]
         return torch.tensor(padded, dtype=torch.long)
 
-    def _sample_next_token_batch(
-    self, 
-    logits: torch.Tensor,  # [batch_size, vocab_size]
-    temperatures: torch.Tensor,  # [batch_size]
-    top_ps: torch.Tensor,  # [batch_size]
-    ) -> torch.Tensor:
+    def _sample_next_token(
+        self, 
+        logits: torch.Tensor,  # [batch_size, vocab_size]
+        temperatures: torch.Tensor,  # [batch_size]
+        top_ps: torch.Tensor,  # [batch_size]
+        ) -> torch.Tensor:
         """并行采样整个batch的下一个token"""
         batch_size, vocab_size = logits.shape
         
