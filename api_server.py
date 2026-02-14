@@ -190,7 +190,7 @@ async def generate_stream(request: GenerateRequest):
                 total_step_time += step_time
             
                 # 每 50 步打印统计
-                if step_count % 10 == 0:
+                if step_count % 50 == 0:
                     avg_step = total_step_time / step_count * 1000
                     print(f"📊 Steps {step_count-9}~{step_count}: avg={avg_step:.1f}ms/step, batch={len(engine.scheduler.running_sequences)}")
 
