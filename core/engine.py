@@ -209,6 +209,10 @@ class InferenceEngine:
     @torch.no_grad()
     def step(self) -> bool:
         """执行一个推理step，返回是否有处理任何请求"""
+        # Mark the beginning of a new iteration for CUDA graphs
+        # This prevents tensor output overwriting between consecutive runs
+        torch.compiler.cudagraph_mark_step_begin()
+        
         batch, batch_type = self.scheduler.get_next_batch()
         if not batch:
             return False

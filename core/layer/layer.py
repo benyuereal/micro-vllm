@@ -28,8 +28,11 @@ import time
 import torch
 from typing import Tuple, List, Optional
 from core.paged_attention import PagedAttention
-from kernel.rmsnorm import rms_norm
-from torch.nn import functional as F
+
+# 导入编译后的 QKV 和 MLP 模块
+from core.layer.qkv import QKVForward
+from core.layer.mlp import MLPForward
+
 # 设置日志记录
 logger = logging.getLogger(__name__)
 
@@ -90,6 +93,16 @@ class ModelLayerAdapter:
         self.cfg = self.MODEL_CONFIGS[self.model_type]
         self._ready = False
         self.prepare(self.model)
+        
+        # ✅ 使用独立的 QKV 和 MLP 编译模块
+        self._qkv_forward = QKVForward(
+            num_heads=num_heads,
+            head_size=head_size,
+            kv_num_heads=kv_num_heads,
+        )
+        self._mlp_forward = MLPForward(
+            hidden_dim=model_config.hidden_size,
+        )
 
     # 在 prepare() 中添加 debug
     def prepare(self, model):
@@ -182,27 +195,9 @@ class ModelLayerAdapter:
         return hidden_states, kv_cache
 
     def _qkv_(self, layer, hidden_states):
-        """
-        📍 **QKV阶段** (torch.compile融合优化)
-        LayerNorm + QKV投影 + 形状重塑，算子融合
-        """
-        # 1. Qwen-7B固定LayerNorm: ln_1
-        residual = hidden_states
-        # hidden_states = layer.ln_1(hidden_states)
-        hidden_states = rms_norm(hidden_states, layer.ln_1.weight, layer.ln_1.eps)
+        """调用编译后的 QKV"""
+        return self._qkv_forward(layer, hidden_states)
 
-        # 2. Qwen-7B固定合并QKV投影: c_attn
-        qkv = layer.attn.c_attn(hidden_states)
-        hidden_size = qkv.shape[-1] // 3
-        q, k, v = qkv.split(hidden_size, dim=-1)
-
-        # 3. 固定形状重塑 [B, S, D] → [B, H, D]
-        batch_size, seq_len, _ = hidden_states.shape
-        q = q.view(batch_size, seq_len, self.num_heads, self.head_size).permute(0, 2, 1, 3).contiguous()
-        k = k.view(batch_size, seq_len, self.kv_num_heads, self.head_size).permute(0, 2, 1, 3).contiguous()
-        v = v.view(batch_size, seq_len, self.kv_num_heads, self.head_size).permute(0, 2, 1, 3).contiguous()
-
-        return hidden_states, residual, q, k, v
 
     def _attn_(self, q, k, v, cache_manager, seq_ids, context_lens, layer_idx):
         """
@@ -222,17 +217,5 @@ class ModelLayerAdapter:
         return attn_output, (k.squeeze(2), v.squeeze(2))
 
     def _mlp_(self, layer, hidden, attn_res, attn_out):
-
-        batch_size = hidden.shape[0]
-        hidden = attn_res + torch.matmul(attn_out.view(batch_size, -1), layer.attn._w).unsqueeze(1)
-        
-        normed = rms_norm(hidden, layer.ln_2.weight, layer.ln_2.eps)
-        x = normed.view(-1, 4096)
-        
-        gate_up = torch.matmul(x, layer.mlp._gu)
-        
-        up, gate = gate_up.chunk(2, dim=-1) 
-        
-        output = torch.matmul(F.silu(gate) * up, layer.mlp._d)
-        
-        return hidden + output.view(hidden.shape)
+        """调用编译后的 MLP"""
+        return self._mlp_forward(layer, hidden, attn_res, attn_out)
