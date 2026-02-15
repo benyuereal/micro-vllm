@@ -421,8 +421,8 @@ class KVCacheManager:
         last_block = blocks[-1]
         current_pos = self._pos[last_block]
 
-        # 情况1: 当前Block还有空间
-        if current_pos < self.block_size:
+        # 情况1: 当前块还有空间
+        if current_pos < self.block_size - 1:
             self._pos[last_block] += 1
             return last_block * self.block_size + current_pos
 
@@ -430,7 +430,8 @@ class KVCacheManager:
         elif self._free:
             new_block = self._free.popleft()
             blocks.append(new_block)
-            self._pos[new_block] = 1  # 新块已用1个slot
+            self._blocks[seq_id] = blocks  # 确保引用同步（防御性编程）
+            self._pos[new_block] = 1
             return new_block * self.block_size
 
         # 情况3: 无可用Block
