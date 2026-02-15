@@ -39,6 +39,7 @@ from .cache_manager import KVCacheManager, store_kvcache
 from .sequence import Sequence
 from .model_loader import load_model
 import logging
+from .layer.sampler import Sampler
 
 class InferenceEngine:
     """
@@ -145,7 +146,7 @@ class InferenceEngine:
 
         self.logger.info(f"Engine initialized: layers={self.num_layers}, heads={self.num_heads}, "
                          f"block_size={self.block_size}, max_blocks={self.max_blocks}")
-
+        self.sampler = Sampler()
         # 8.其他配置
 
 
@@ -355,7 +356,7 @@ class InferenceEngine:
         # 📍 记录总耗时
         total_time = time.time() - start_time
         # 只有当第一个序列的上下文长度能被10整除时才打印详细日志
-        if batch and batch[0].current_position % 10 == 0:
+        if batch and batch[0].current_position % 50 == 0:
             self.logger.info(f"🔄 解码批次处理: 总耗时 {total_time * 1000:.2f}ms")
             self.logger.info(f"   📊 耗时分布: 准备={prep_time * 1000:.2f}ms | Embedding={emb_time * 1000:.2f}ms | Cache={cache_time * 1000:.2f}ms | 逐层={layer_time * 1000:.2f}ms | 归一化={norm_time * 1000:.2f}ms | 采样={sample_time * 1000:.2f}ms | 更新={update_time * 1000:.2f}ms")
 
@@ -425,52 +426,10 @@ class InferenceEngine:
         top_k: int,
         min_tokens_to_keep: int,
     ) -> torch.Tensor:
-        """随机采样核心逻辑（Top-K + Top-P）"""
-        batch_size = logits.shape[0]
-        
-        # 1. 温度缩放（原地操作减少内存分配）
-        logits = logits.div_(temperatures.unsqueeze(-1))
-        
-        # 2. Top-K预过滤：从152k降到1k，避免全词表排序
-        # torch.topk使用quickselect，复杂度O(n)而非O(nlogn)
-        effective_k = min(top_k, logits.shape[-1])
-        top_k_logits, top_k_indices = torch.topk(logits, k=effective_k, dim=-1)
-        # top_k_logits: [batch_size, effective_k]
-        # top_k_indices: [batch_size, effective_k]
-        
-        # 3. 在Top-K子集内计算概率分布
-        top_k_probs = F.softmax(top_k_logits, dim=-1)
-        
-        # 4. Top-P过滤（在已排序的Top-K内进行）
-        # 先按概率降序排序Top-K结果
-        sorted_probs, sorted_idx_in_topk = torch.sort(top_k_probs, descending=True, dim=-1)
-        cumulative_probs = torch.cumsum(sorted_probs, dim=-1)
-        
-        # 创建removal mask
-        sorted_indices_to_remove = cumulative_probs > top_ps.unsqueeze(-1)
-        
-        # 保持至少min_tokens_to_keep个token
-        sorted_indices_to_remove[..., :min_tokens_to_keep] = False
-        
-        # 标准Top-P逻辑：将超出top_p的token置为-inf
-        # 注意：这里不需要复杂的scatter，直接在sorted_probs上操作
-        sorted_probs_masked = sorted_probs.masked_fill(sorted_indices_to_remove, 0.0)
-        
-        # 5. 重新归一化概率
-        probs_sum = sorted_probs_masked.sum(dim=-1, keepdim=True).clamp_min(1e-12)
-        probs_normalized = sorted_probs_masked / probs_sum
-        
-        # 6. 采样（在Top-K子集内的索引）
-        samples_in_topk = torch.multinomial(probs_normalized, num_samples=1)  # [batch_size, 1]
-        
-        # 7. 映射回原始vocab索引（两步gather）
-        # 第一步：从sorted位置映射回Top-K内的原始位置
-        samples_topk_idx = sorted_idx_in_topk.gather(dim=-1, index=samples_in_topk)  # [batch_size, 1]
-        
-        # 第二步：从Top-K索引映射回原始vocab索引
-        final_tokens = top_k_indices.gather(dim=-1, index=samples_topk_idx).squeeze(-1)  # [batch_size]
-        
-        return final_tokens
+        """使用编译后的 Sampler 进行采样"""
+        # 使用 Sampler 类的编译采样函数
+        return self.sampler(logits, temperatures, top_ps, top_k)
+
 
     def stream_generate(self, prompt: str, max_tokens: int = 128,
                         temperature: float = 0.7, top_p: float = 0.9) -> Generator[Tuple[int, str], None, None]:
