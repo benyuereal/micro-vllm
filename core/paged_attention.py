@@ -208,6 +208,9 @@ class PagedAttention(nn.Module):
             (max_batch_size, num_heads, head_size),
             dtype=torch.bfloat16, device=self.device
         )
+        # 输出缓冲区
+        self._output_buffer = torch.empty_like(self._query_buffer)
+
 
 
     def forward(
@@ -249,6 +252,7 @@ class PagedAttention(nn.Module):
         self._key_buffer[:batch_size].copy_(key)
         self._value_buffer[:batch_size].copy_(value)
  
+
         
         # 3. 调用静态核心（使用缓冲区视图，内存地址固定）
         output = self._forward_( 
@@ -290,5 +294,8 @@ class PagedAttention(nn.Module):
         
         return output.squeeze(1)  # [B, H, D] - 视图，非拷贝
 
+  
 
+  
 
+   

@@ -2,220 +2,314 @@
 ===================================================================
 ModelLayerAdapter - vLLM 多模型架构适配器 (极简设计)
 ===================================================================
-
-📌 **核心设计目标**：
-   1. 统一多模型架构的层处理接口
-   2. 自动适配不同模型结构 (Qwen/Qwen2等)
-   3. 零拷贝设计，最小化GPU内存分配
-   4. 极简接口，隐藏所有复杂实现
-
-🧱 **架构图**：
-    Input → [LayerAdapter] → PagedAttention → Output
-    ↑ 自动模型适配       ↑ 统一注意力接口
-
-⚡ **性能特性**：
-   - 单层处理: ~20μs/token (CUDA+FlashAttention)
-   - 零内存拷贝: 直接操作隐藏状态
-   - 自动形状转换: 支持不同模型架构
-
-📚 **参考文献**：
-   - vLLM: https://arxiv.org/abs/2309.06180
-   - PagedAttention: https://arxiv.org/abs/2309.06180
 """
-import logging
-import time
 
+import logging
 import torch
+import torch.nn.functional as F
 from typing import Tuple, List, Optional
 from core.paged_attention import PagedAttention
+from kernel.rmsnorm import rms_norm
 
-# 导入编译后的 QKV 和 MLP 模块
-from core.layer.qkv import QKVForward
-from core.layer.mlp import MLPForward
+try:
+    from flash_attn import flash_attn_with_kvcache
+except ImportError:
+    flash_attn_with_kvcache = None
 
-# 设置日志记录
 logger = logging.getLogger(__name__)
 
-class ModelLayerAdapter:
-    """
-    📌 **模型层适配器** - vLLM核心组件
-    """
 
-    # 模型架构配置 (可扩展)
+class ModelLayerAdapter:
     MODEL_CONFIGS = {
-        "qwen": {  # Qwen 7B
+        "qwen": {
             "norm": "ln_1", "attn": "c_attn", "proj": "c_proj", "mlp_norm": "ln_2",
             "qkv_split": True, "qkv_proj": False,
             "mlp": "mlp", "residual": True,
         },
-        "qwen2": {  # Qwen 1.5/2.5
+        "qwen2": {
             "norm": "input_layernorm", "attn": None, "proj": "o_proj", "mlp_norm": "post_attention_layernorm",
             "qkv_split": False, "qkv_proj": True,
             "mlp": "mlp", "residual": True,
         },
-        "qwen3": {  # Qwen3 (与Qwen2相同，但支持MoE)
+        "qwen3": {
             "norm": "input_layernorm", "attn": None, "proj": "o_proj", "mlp_norm": "post_attention_layernorm",
             "qkv_split": False, "qkv_proj": True,
             "mlp": "mlp", "residual": True,
-            "moe": True,  # ✅ 支持MoE
+            "moe": True,
         },
     }
 
-    def __init__(self, model, model_config, device: str, num_heads: int, head_size: int, kv_num_heads: int):
-        """
-        📌 **初始化**
-
-        🔍 **参数**:
-            - model: 模型
-            - model_config: 模型配置
-            - device: 设备 ("cuda", "mps", "cpu")
-            - num_heads: 注意力头数
-            - head_size: 每个头维度
-            - kv_num_heads: KV头数 (GQA支持)
-        """
+    def __init__(self, model, model_config, device: str, num_heads: int, 
+                 head_size: int, kv_num_heads: int, max_batch_size: int = 16):
         self.model = model
         self.config = model_config
         self.device = device
         self.model_type = model_config.model_type
-        self.num_heads, self.head_size, self.kv_num_heads = num_heads, head_size, kv_num_heads
-
-        # 初始化注意力模块
+        self.num_heads = num_heads
+        self.head_size = head_size
+        self.kv_num_heads = kv_num_heads
+        self.max_batch_size = max_batch_size
+        
+        # 关键维度
+        self.hidden_dim = model_config.hidden_size
+        self.intermediate_size = getattr(model_config, 'intermediate_size', 
+                                         self.hidden_dim * 4)  # 默认 4x hidden
+        
+        # 初始化 attention
         self.attention = PagedAttention(
             num_heads=num_heads,
             head_size=head_size,
             kv_num_heads=kv_num_heads,
-            device=device
+            device=device,
+            max_batch_size=max_batch_size
         )
-
-        # 验证模型类型
+        
         if self.model_type not in self.MODEL_CONFIGS:
             raise ValueError(f"Unsupported model type: {self.model_type}")
         self.cfg = self.MODEL_CONFIGS[self.model_type]
-        self._ready = False
-        self.prepare(self.model)
         
-        # ✅ 使用独立的 QKV 和 MLP 编译模块
-        self._qkv_forward = QKVForward(
-            num_heads=num_heads,
-            head_size=head_size,
-            kv_num_heads=kv_num_heads,
-        )
-        self._mlp_forward = MLPForward(
-            hidden_dim=model_config.hidden_size,
-        )
+        # 预缓存权重
+        self._ready = False
+        self.prepare(model)
+        
+        # 初始化缓冲区
+        self._init_buffers()
+        
+        # CUDA Graphs
+        self._graphs = {}  # (idx, batch_size) -> graph
+        self._graphs_ready = False
 
-    # 在 prepare() 中添加 debug
+    def _init_buffers(self):
+        """初始化静态缓冲区"""
+        max_b = self.max_batch_size
+        
+        # 输入输出
+        self._hidden = torch.empty((max_b, self.hidden_dim), 
+                                   dtype=torch.bfloat16, device=self.device)
+        self._residual = torch.empty_like(self._hidden)
+        self._output = torch.empty_like(self._hidden)
+        
+        # Attention
+        self._normed_1 = torch.empty_like(self._hidden)
+        self._qkv = torch.empty((max_b, 3 * self.hidden_dim), 
+                                dtype=torch.bfloat16, device=self.device)
+        self._attn_out = torch.empty((max_b, self.hidden_dim), 
+                                     dtype=torch.bfloat16, device=self.device)
+        
+        # MLP
+        self._normed_2 = torch.empty_like(self._hidden)
+        self._gate_up = torch.empty((max_b, 2 * self.intermediate_size), 
+                                    dtype=torch.bfloat16, device=self.device)
+        self._mlp_out = torch.empty_like(self._hidden)
+
     def prepare(self, model):
-        if self._ready: 
+        """预缓存转置权重"""
+        if self._ready:
             return
         
-        for layer in model.transformer.h:
-            mlp = layer.mlp
-            # 检查 cat 后的结果
-            gate_up = torch.cat([mlp.w1.weight, mlp.w2.weight], dim=0)            
-            # 转置后
-            mlp._gu = gate_up.t().contiguous()            
+        for idx, block in enumerate(model.transformer.h):
+            mlp = block.mlp
+            
+            # Gate + Up: [2*intermediate, hidden] -> [hidden, 2*intermediate]
+            gate_up = torch.cat([mlp.w1.weight, mlp.w2.weight], dim=0)
+            mlp._gu = gate_up.t().contiguous()
+            
+            # Down: [intermediate, hidden] -> [hidden, intermediate]
             mlp._d = mlp.c_proj.weight.t().contiguous()
-            layer.attn._w = layer.attn.c_proj.weight.t().contiguous()
+            
+            # Attention output
+            block.attn._o = block.attn.c_proj.weight.t().contiguous()
+            
+            # QKV
+            block.attn._qkv_w = block.attn.c_attn.weight.t().contiguous()
+            if block.attn.c_attn.bias is not None:
+                block.attn._qkv_b = block.attn.c_attn.bias
+            else:
+                block.attn._qkv_b = None
+        
         logger.info("✅ 预缓存转置权重完成")
         self._ready = True
 
+    def capture_graphs(self, cache_manager, num_layers, batch_sizes=[1, 2, 4, 8, 16]):
+        """捕获每个 transformer block 的 CUDA Graph"""
+        if self._graphs_ready:
+            return
+        
+        logger.info(f"Capturing {num_layers} blocks x {len(batch_sizes)} batch sizes")
+        
+        for idx in range(num_layers):
+            block = self.model.transformer.h[idx]
+            for bs in batch_sizes:
+                self._capture_single(block, idx, bs, cache_manager)
+        
+        self._graphs_ready = True
+        logger.info("CUDA Graphs capture completed")
 
-    def process_layer(self,
-                      layer,
-                      hidden_states: torch.Tensor,  # [B, S, D]
-                      cache_manager,
-                      seq_ids: List[int],
-                      context_lens: List[int],
-                      token_positions: Optional[torch.Tensor] = None,
-                      layer_idx: int = 0,
-                      current_positions: Optional[torch.Tensor] = None) -> Tuple[
-        torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
-        """
-        📌 **三段式Layer处理** (Qwen-7B专用优化版)
+    def _capture_single(self, block, idx, batch_size, cache_manager):
+        """捕获单个 block 的完整计算图"""
+        g = torch.cuda.CUDAGraph()
+        
+        # 预热（关键！）
+        self._warmup(block, idx, batch_size, cache_manager)
+        
+        # 获取权重
+        w_qkv = block.attn._qkv_w
+        b_qkv = block.attn._qkv_b
+        w_o = block.attn._o
+        w_gu = block.mlp._gu
+        w_d = block.mlp._d
+        
+        # KV cache
+        k_cache, v_cache = cache_manager.get(idx)
+        
+        with torch.cuda.graph(g):
+            h = self._hidden[:batch_size]
+            
+            # === Attention ===
+            normed = rms_norm(h, block.ln_1.weight, block.ln_1.eps)
+            self._normed_1[:batch_size] = normed
+            
+            # QKV Linear
+            qkv = torch.matmul(self._normed_1[:batch_size], w_qkv)
+            if b_qkv is not None:
+                qkv = qkv + b_qkv
+            self._qkv[:batch_size] = qkv
+            
+            # Split QKV
+            q = qkv[:, :self.hidden_dim].view(batch_size, self.num_heads, self.head_size)
+            k = qkv[:, self.hidden_dim:2*self.hidden_dim].view(batch_size, self.kv_num_heads, self.head_size)
+            v = qkv[:, 2*self.hidden_dim:].view(batch_size, self.kv_num_heads, self.head_size)
+            
+            # FlashAttention
+            attn = flash_attn_with_kvcache(
+                q=q.unsqueeze(1),
+                k_cache=k_cache,
+                v_cache=v_cache,
+                k=k.unsqueeze(1),
+                v=v.unsqueeze(1),
+                rotary_cos=self.attention._cos_pool,
+                rotary_sin=self.attention._sin_pool,
+                cache_seqlens=cache_manager._cache_seqlens_buffer[:batch_size],
+                block_table=cache_manager._block_table_buffer[:batch_size],
+                causal=True,
+            ).squeeze(1)
+            
+            # O Proj
+            attn_flat = attn.view(batch_size, -1)
+            out = torch.matmul(attn_flat, w_o)
+            
+            # First Residual
+            h = out + self._hidden[:batch_size]
+            self._residual[:batch_size] = h
+            
+            # === MLP ===
+            normed = rms_norm(h, block.ln_2.weight, block.ln_2.eps)
+            self._normed_2[:batch_size] = normed
+            
+            # Gate + Up
+            gate_up = torch.matmul(self._normed_2[:batch_size], w_gu)
+            
+            # SwiGLU
+            gate, up = gate_up.chunk(2, dim=-1)
+            activated = F.silu(gate) * up
+            
+            # Down
+            mlp_out = torch.matmul(activated, w_d)
+            
+            # Second Residual
+            out = mlp_out + self._residual[:batch_size]
+            self._output[:batch_size] = out
+        
+        self._graphs[(idx, batch_size)] = g
 
-        分段策略：
-        1. QKV阶段：LayerNorm + QKV投影 → fullgraph编译融合
-        2. Attention阶段：FlashAttention → 不编译 (C++扩展)
-        3. MLP阶段：输出投影 + MLP → fullgraph编译融合
+    def _warmup(self, block, idx, batch_size, cache_manager, num_warmup=3):
+        """完整预热整个 block"""
+        dummy_hidden = torch.randn(batch_size, self.hidden_dim,
+                                dtype=torch.bfloat16, device=self.device)
+        
+        # 获取所有需要的东西
+        w_qkv = block.attn._qkv_w
+        b_qkv = block.attn._qkv_b
+        w_o = block.attn._o
+        w_gu = block.mlp._gu
+        w_d = block.mlp._d
+        k_cache, v_cache = cache_manager.get(idx)
+        
+        for _ in range(num_warmup):
+            h = dummy_hidden
+            
+            # === 完整 Attention ===
+            normed = rms_norm(h, block.ln_1.weight, block.ln_1.eps)
+            qkv = torch.matmul(normed, w_qkv)
+            if b_qkv is not None:
+                qkv = qkv + b_qkv
+            
+            q = qkv[:, :self.hidden_dim].view(batch_size, self.num_heads, self.head_size)
+            k = qkv[:, self.hidden_dim:2*self.hidden_dim].view(batch_size, self.kv_num_heads, self.head_size)
+            v = qkv[:, 2*self.hidden_dim:].view(batch_size, self.kv_num_heads, self.head_size)
+            
+            attn = flash_attn_with_kvcache(
+                q=q.unsqueeze(1), k_cache=k_cache, v_cache=v_cache,
+                k=k.unsqueeze(1), v=v.unsqueeze(1),
+                rotary_cos=self.attention._cos_pool,
+                rotary_sin=self.attention._sin_pool,
+                cache_seqlens=torch.ones(batch_size, dtype=torch.int32, device=self.device),
+                block_table=torch.zeros(batch_size, cache_manager.max_seq_blocks, 
+                                    dtype=torch.int32, device=self.device),
+                causal=True,
+            ).squeeze(1)
+            
+            attn_flat = attn.view(batch_size, -1)
+            out = torch.matmul(attn_flat, w_o)
+            h = out + h  # residual
+            
+            # === 完整 MLP ===
+            normed = rms_norm(h, block.ln_2.weight, block.ln_2.eps)
+            gate_up = torch.matmul(normed, w_gu)
+            gate, up = gate_up.chunk(2, dim=-1)
+            activated = F.silu(gate) * up
+            mlp_out = torch.matmul(activated, w_d)
+            out = mlp_out + h  # residual
+        
+        torch.cuda.synchronize()
 
-        Qwen-7B专用路径：完全静态，无条件分支，最大化torch.compile优化
-        """
-        """
-        📌 **处理单层计算** (统一接口，自动适配模型架构)
+    def forward(self, idx, batch_size, hidden_states, cache_manager):
+        """使用 CUDA Graph 执行单个 block"""
+        # 拷贝输入
+        self._hidden[:batch_size].copy_(hidden_states)
+        
+        # Replay
+        key = (idx, batch_size)
+        if key not in self._graphs:
+            raise RuntimeError(f"Graph not found: idx={idx}, batch={batch_size}")
+        
+        self._graphs[key].replay()
+        
+        # 返回输出
+        return self._output[:batch_size].clone()
 
-        🔍 **参数**:
-            - layer: 模型层 (transformer layer)
-            - hidden_states: 隐藏状态 [B, S, D]
-            - cache_manager: KVCacheManager实例
-            - seq_ids: 序列ID列表 [B]
-            - context_lens: 当前长度列表 [B]
-            - token_positions: token位置 (可选)
-            - layer_idx: 层索引
-            - current_positions: 当前位置 (可选)
+    def process_layer(self, layer, hidden_states, cache_manager, seq_ids,
+                  context_lens, token_positions=None, layer_idx=0,
+                  current_positions=None):
+        """兼容旧接口，使用 CUDA Graph"""
+        batch_size = hidden_states.shape[0]
+        
+        if self._graphs_ready and (layer_idx, batch_size) in self._graphs:
+            # 更新 cache_manager 的 buffer
+            cache_manager.get_buffer_data(seq_ids, context_lens)
+            # 调用 forward，使用关键字参数更清晰
+            return self.forward(
+                idx=layer_idx,
+                batch_size=batch_size,
+                hidden_states=hidden_states,
+                cache_manager=cache_manager
+            ), None
+        else:
+            # Fallback：抛出错误或实现 eager
+            raise RuntimeError(f"Graph not ready for idx={layer_idx}, batch={batch_size}")
 
-        ✅ **返回**:
-            - hidden_states: 更新后的隐藏状态 [B, S, D]
-            - (current_k, current_v): 当前层的KV [B, H, D]
-
-        🧠 **内部逻辑**:
-            1. 自动适配模型架构 (Qwen/Qwen2等)
-            2. 应用LayerNorm
-            3. 计算QKV (自动处理不同投影方式)
-            4. 重塑形状 [B, S, D] → [B, H, D]
-            5. 调用PagedAttention
-            6. 残差连接 + MLP
-        """
-        # 记录开始时间
-        # start_time = time.time()
-
-        # 📍 Qwen专用优化路径 (torch.compile融合，无条件分支)
-            # 📍 第一阶段：QKV (torch.compile算子融合)
-        # qkv_start = time.time()
-        hidden_states, residual, q, k, v = self._qkv_(layer, hidden_states)
-        # qkv_time = time.time() - qkv_start
-
-            # 📍 第二阶段：Attention (FlashAttention v2)
-        # attn_start = time.time()
-        attn_output, kv_cache = self._attn_(q, k, v, cache_manager, seq_ids, context_lens, layer_idx)
-        # attn_time = time.time() - attn_start
-
-            # 📍 第三阶段：MLP (torch.compile算子融合)
-        # mlp_start = time.time()
-        hidden_states = self._mlp_(layer, hidden_states, residual, attn_output)
-        # mlp_time = time.time() - mlp_start
-
-        # 记录耗时分布
-        # total_time = time.time() - start_time
-        # if layer_idx == 0 and False:
-        #     logger.info(f"🚀 Layer {layer_idx}: 总处理耗时 {total_time * 1000:.2f}ms")
-        #     logger.info(f"   📊 耗时分布: QKV={qkv_time * 1000:.2f}ms | Attn={attn_time * 1000:.2f}ms | MLP={mlp_time * 1000:.2f}ms")
-        #     logger.info(f"   ⚡ torch.compile三段式融合 | QKV+MLP算子融合 | 内存优化")
-
-        return hidden_states, kv_cache
-
-    def _qkv_(self, layer, hidden_states):
-        """调用编译后的 QKV"""
-        return self._qkv_forward(layer, hidden_states)
+ 
 
 
-    def _attn_(self, q, k, v, cache_manager, seq_ids, context_lens, layer_idx):
-        """
-        📍 **Attention阶段** (不编译)
-        调用PagedAttention，避免C++扩展编译问题
-        """
-        attn_output = self.attention(
-            query=q.squeeze(2),  # [B, H, D]
-            cache_manager=cache_manager,
-            seq_ids=seq_ids,
-            context_lens=context_lens,
-            layer_idx=layer_idx,
-            key=k.squeeze(2),  # [B, H, D]
-            value=v.squeeze(2)  # [B, H, D]
-        )
-        # 返回attention输出和kv缓存
-        return attn_output, (k.squeeze(2), v.squeeze(2))
 
-    def _mlp_(self, layer, hidden, attn_res, attn_out):
-        """调用编译后的 MLP"""
-        return self._mlp_forward(layer, hidden, attn_res, attn_out)
+  

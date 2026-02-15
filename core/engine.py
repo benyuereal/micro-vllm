@@ -148,7 +148,16 @@ class InferenceEngine:
                          f"block_size={self.block_size}, max_blocks={self.max_blocks}")
         self.sampler = Sampler()
         # 8.其他配置
-
+        if self.device == "cuda":
+            self.logger.info("Starting CUDA Graphs capture...")
+        
+            # 让 PagedAttention 捕获 graphs
+            self.layer_adapter.capture_graphs(
+            self.cache_manager,
+            num_layers=self.num_layers,
+            batch_sizes=[1, 2, 4, 8, 16]  # 根据你的需求调整
+            )
+            self.logger.info("CUDA Graphs capture completed")
 
     def _init_logging(self):
         """初始化日志"""
@@ -311,11 +320,11 @@ class InferenceEngine:
         for layer_idx, layer in enumerate(self.model_layers):
 
             # 使用模型层适配器处理不同架构的层
-            hidden_states, layer_kv = self.layer_adapter.process_layer(
-                layer, hidden_states, self.cache_manager, seq_ids,
-                context_lens, token_positions, layer_idx,
-                [seq.current_position - 1 for seq in batch]
-            )
+            hidden_states = self.layer_adapter.process_layer(
+                self.model_layers[layer_idx], hidden_states, self.cache_manager,
+                    seq_ids, context_lens, None, layer_idx, None
+                )
+            layer_kv = self.cache_manager.get(layer_idx)
 
             all_layer_kvs.append(layer_kv)
 
