@@ -166,7 +166,7 @@ class ModelLayerAdapter:
             h = self._hidden[:batch_size]
             
             # === Attention ===
-            normed = rms_norm(h, block.ln_1.weight, block.ln_1.eps)
+            normed = self._norm(h, block.ln_1.weight, block.ln_1.eps)
             self._normed_1[:batch_size] = normed
             
             # QKV Linear
@@ -203,7 +203,7 @@ class ModelLayerAdapter:
             self._residual[:batch_size] = h
             
             # === MLP ===
-            normed = rms_norm(h, block.ln_2.weight, block.ln_2.eps)
+            normed = self._norm(h, block.ln_2.weight, block.ln_2.eps)
             self._normed_2[:batch_size] = normed
             
             # Gate + Up
@@ -239,7 +239,7 @@ class ModelLayerAdapter:
             h = dummy_hidden
             
             # === 完整 Attention ===
-            normed = rms_norm(h, block.ln_1.weight, block.ln_1.eps)
+            normed = self._norm(h, block.ln_1.weight, block.ln_1.eps)
             qkv = torch.matmul(normed, w_qkv)
             if b_qkv is not None:
                 qkv = qkv + b_qkv
@@ -264,7 +264,7 @@ class ModelLayerAdapter:
             h = out + h  # residual
             
             # === 完整 MLP ===
-            normed = rms_norm(h, block.ln_2.weight, block.ln_2.eps)
+            normed = self._norm(h, block.ln_2.weight, block.ln_2.eps)
             gate_up = torch.matmul(normed, w_gu)
             gate, up = gate_up.chunk(2, dim=-1)
             activated = F.silu(gate) * up
@@ -295,8 +295,7 @@ class ModelLayerAdapter:
         batch_size = hidden_states.shape[0]
         
         if self._graphs_ready and (layer_idx, batch_size) in self._graphs:
-            # 更新 cache_manager 的 buffer
-            cache_manager.get_buffer_data(seq_ids, context_lens)
+            
             # 调用 forward，使用关键字参数更清晰
             return self.forward(
                 idx=layer_idx,
@@ -309,6 +308,11 @@ class ModelLayerAdapter:
             raise RuntimeError(f"Graph not ready for idx={layer_idx}, batch={batch_size}")
 
  
+
+    def _norm(self, x, weight, eps):
+        """CUDA Graph 友好的 RMSNorm"""
+        # x: [B, hidden]
+        return torch.nn.functional.rms_norm(x, x.shape[-1:], weight, eps)
 
 
 

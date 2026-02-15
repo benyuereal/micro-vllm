@@ -155,7 +155,7 @@ class InferenceEngine:
             self.layer_adapter.capture_graphs(
             self.cache_manager,
             num_layers=self.num_layers,
-            batch_sizes=[1, 2, 4, 8, 16]  # 根据你的需求调整
+            batch_sizes=[1, 2]  # 根据你的需求调整
             )
             self.logger.info("CUDA Graphs capture completed")
 
@@ -297,6 +297,8 @@ class InferenceEngine:
         # 📍 第二阶段：Embedding
         emb_start = time.time()
         hidden_states = self.embedding_layer(input_ids)
+        if hidden_states.dim() == 3:
+            hidden_states = hidden_states.squeeze(1)  # [B, 1, D] -> [B, D]
         emb_time = time.time() - emb_start
 
         # 逐层处理
@@ -320,7 +322,7 @@ class InferenceEngine:
         for layer_idx, layer in enumerate(self.model_layers):
 
             # 使用模型层适配器处理不同架构的层
-            hidden_states = self.layer_adapter.process_layer(
+            hidden_states, _ = self.layer_adapter.process_layer(
                 self.model_layers[layer_idx], hidden_states, self.cache_manager,
                     seq_ids, context_lens, None, layer_idx, None
                 )
@@ -346,7 +348,7 @@ class InferenceEngine:
 
         # logits[i, -1, :] 形状是 [batch_size, vocab_size]
         next_tokens = self._sample_next_token(
-            logits[:, -1, :],  # [batch_size, vocab_size]
+            logits,  # [batch_size, vocab_size]
             temperatures,       # [batch_size]
             top_ps              # [batch_size]
         )
