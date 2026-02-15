@@ -148,8 +148,16 @@ class PagedAttention(nn.Module):
         4. **生产就绪**: 支持AMP、异常处理、设备匹配
     """
 
-    def __init__(self, num_heads: int, head_size: int, kv_num_heads: int, device: str = "auto", max_batch_size=16, max_blocks=32, max_position=4096):
+    def __init__(self, num_heads: int, head_size: int
+    , kv_num_heads: int, device: str = "auto"
+    , max_batch_size=16, max_blocks=32
+    , max_position=4096, max_tokens=8192
+    , block_size=256
+    ):
         super().__init__()
+        self.block_size = block_size
+        self.max_tokens = max_tokens
+        self.max_seq_blocks = (max_tokens + block_size - 1) // block_size
         self.num_heads = num_heads
         self.kv_num_heads = kv_num_heads
         self.head_size = head_size
@@ -184,6 +192,21 @@ class PagedAttention(nn.Module):
         self._block_table_pool = torch.full(
             (self.max_batch_size, self.max_blocks), -1,
             dtype=torch.int32, device=self.device
+        )
+
+    
+        # query/key/value 缓冲区 目前只考虑qwen mha结构
+        self._query_buffer = torch.empty(
+            (max_batch_size, num_heads, head_size),
+            dtype=torch.bfloat16, device=self.device
+        )
+        self._key_buffer = torch.empty(
+            (max_batch_size, num_heads, head_size),
+            dtype=torch.bfloat16, device=self.device
+        )
+        self._value_buffer = torch.empty(
+            (max_batch_size, num_heads, head_size),
+            dtype=torch.bfloat16, device=self.device
         )
 
 
@@ -221,74 +244,51 @@ class PagedAttention(nn.Module):
         device = self.device
 
         timing: Dict[str, float] = {}  # 耗时记录
+        # 1. 拷贝输入到静态缓冲区（原地操作）
+        self._query_buffer[:batch_size].copy_(query)
+        self._key_buffer[:batch_size].copy_(key)
+        self._value_buffer[:batch_size].copy_(value)
+ 
+        
+        # 3. 调用静态核心（使用缓冲区视图，内存地址固定）
+        output = self._forward_( 
+            query=self._query_buffer[:batch_size],
+            key=self._key_buffer[:batch_size],
+            value=self._value_buffer[:batch_size],
+            cache_manager=cache_manager,
+            layer_idx=layer_idx,
+            block_table=cache_manager._block_table_buffer[:batch_size],      # 固定内存
+            cache_seqlens=cache_manager._cache_seqlens_buffer[:batch_size],    # 固定内存
+        )
+        return output
+
+    def _forward_(self, query, key, value, cache_manager, layer_idx,
+                       block_table, cache_seqlens):
+        """纯静态前向：所有张量形状和内存地址固定"""
+        # unsqueeze 不分配新内存，只是视图
+        k_new = key.unsqueeze(1)    # [B, 1, H, D]
+        v_new = value.unsqueeze(1)  # [B, 1, H, D]
+        
+        # 获取 KV cache（全局静态）
         k_cache, v_cache = cache_manager.get(layer_idx)
-        # 1. 获取 RoPE cos/sin
-        t0 = time.time()
-        rotary_cos = self._cos_pool
-        rotary_sin = self._sin_pool
-        timing['rope_load'] = time.time() - t0
-
-        # 2. 准备 k/v
-        t0 = time.time()
-        k_new = key.unsqueeze(1)  # [B, 1, H, D]
-        v_new = value.unsqueeze(1)
-        timing['kv_prep'] = time.time() - t0
-
-        # 3. 获取缓存
-        t0 = time.time()
-        k_cache, v_cache = cache_manager.get(layer_idx)
-        timing['cache_get'] = time.time() - t0
-
-        # 4. 构建 block_table
-        t0 = time.time()
-        # 3. 准备Block Table (自动处理动态Block分配)
-        # 优化block table构建
-
-        block_table = cache_manager._block_table
-
-        timing['block_table'] = time.time() - t0
-
-        # 5. 构造 cache_seqlens（预分配）
-        t0 = time.time()
-        cache_seqlens = cache_manager.cache_seqlens
-        timing['seq_lens'] = time.time() - t0
-
-        # 6. FlashAttention 调用
-        t0 = time.time()
+        
+        # FlashAttention（所有输入都是固定缓冲区）
         with torch.cuda.amp.autocast(enabled=False):  # 确保精度
             output = flash_attn_with_kvcache(
-                q=query.unsqueeze(1),
-                k_cache=k_cache,
-                v_cache=v_cache,
-                k=k_new,
-                v=v_new,
-                rotary_cos=rotary_cos,
-                rotary_sin=rotary_sin,
-                cache_seqlens=cache_seqlens,
-                block_table=block_table,
+                q=query.unsqueeze(1),           # [B, 1, H, D] - 缓冲区视图
+                k_cache=k_cache,                 # [num_blocks, block_size, H, D] - 静态
+                v_cache=v_cache,                 # 同上
+                k=k_new,                         # [B, 1, H, D] - 缓冲区视图
+                v=v_new,                         # [B, 1, H, D] - 缓冲区视图
+                rotary_cos=self._cos_pool,       # 预计算，静态
+                rotary_sin=self._sin_pool,       # 预计算，静态
+                cache_seqlens=cache_seqlens,     # [B] - 缓冲区视图，内容变，地址不变
+                block_table=block_table,         # [B, max_blocks] - 缓冲区视图，内容变，地址不变
                 softmax_scale=self.scale,
                 causal=True,
-                window_size=(-1, -1),
-                rotary_interleaved=False,
-                alibi_slopes=None,
             )
-        timing['flash_attn'] = time.time() - t0
-
-        # 7. 输出
-        output = output.squeeze(1)
-
-        # 8. 记录总耗时和分布
-        total_time = time.time() - start_time
-        timing['total'] = total_time
-
-        if False:
-            logger.info(f"PagedAttention Layer {layer_idx} - Total: {total_time * 1000:.2f}ms")
-            for k, v in timing.items():
-                if k != 'total':
-                    logger.info(f"  ├─ {k}: {v * 1000:.2f}ms ({v / total_time * 100:.1f}%)")
-            logger.info(f"  └─ flash_attn 占比: {timing['flash_attn'] / total_time * 100:.1f}%")
-
-        return output
+        
+        return output.squeeze(1)  # [B, H, D] - 视图，非拷贝
 
 
 
