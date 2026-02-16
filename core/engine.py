@@ -34,7 +34,6 @@ import time
 
 from models.qwen_adapter import QwenModelAdapter
 from . import Scheduler
-from .layer.layer import ModelLayerAdapter
 from .layer.model_graph import ModelGraphRunner
 from .cache_manager import KVCacheManager, store_kvcache
 from .sequence import Sequence
