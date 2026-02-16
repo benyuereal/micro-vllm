@@ -302,7 +302,6 @@ class InferenceEngine:
         emb_time = time.time() - emb_start
 
         # 逐层处理
-        all_layer_kvs = []
 
         # 📍 第三阶段：Cache追加
         cache_append_start = time.time()
@@ -313,7 +312,6 @@ class InferenceEngine:
         # 预更新block table
         context_lens = [seq.current_position for seq in batch]
         self.cache_manager.cache_batch_data(seq_ids, context_lens)
-        self.cache_manager.cache_batch_datav1(seq_ids, context_lens)
         cache_time = time.time() - cache_append_start
 
         # 📍 第四阶段：逐层处理
@@ -327,9 +325,7 @@ class InferenceEngine:
                 self.model_layers[layer_idx], hidden_states, self.cache_manager,
                     seq_ids, context_lens, None, layer_idx, None
                 )
-            layer_kv = self.cache_manager.get(layer_idx)
 
-            all_layer_kvs.append(layer_kv)
 
         layer_time = time.time() - layer_start
 
