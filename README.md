@@ -1,6 +1,6 @@
 # vLLM Framework
 
-> 高性能 LLM 推理引擎，基于 **PagedAttention + Flash Attention**，A100 上性能达 vLLM 的 **85%**,适合小规模生产部署和学习。
+> 高性能 LLM 推理引擎，基于 **PagedAttention + Flash Attention**，A100 上性能达 vLLM 的 **85%** (graph branch **96%**),适合小规模生产部署和学习。
 
 ---
 
