@@ -313,6 +313,7 @@ class InferenceEngine:
         # 预更新block table
         context_lens = [seq.current_position for seq in batch]
         self.cache_manager.cache_batch_data(seq_ids, context_lens)
+        self.cache_manager.cache_batch_datav1(seq_ids, context_lens)
         cache_time = time.time() - cache_append_start
 
         # 📍 第四阶段：逐层处理

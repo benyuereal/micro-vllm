@@ -45,9 +45,9 @@ def compiled(num_heads: int, head_size: int, kv_num_heads: int):
         batch_size, seq_len, _ = hidden_states.shape
         
         # Reshape: [B, S, D] -> [B, H, S, D]
-        q = q.view(batch_size, seq_len, num_heads, head_size).permute(0, 2, 1, 3).contiguous()
-        k = k.view(batch_size, seq_len, kv_num_heads, head_size).permute(0, 2, 1, 3).contiguous()
-        v = v.view(batch_size, seq_len, kv_num_heads, head_size).permute(0, 2, 1, 3).contiguous()
+        q = q.view(batch_size, num_heads, head_size).contiguous()
+        k = k.view(batch_size, kv_num_heads, head_size).contiguous()
+        v = v.view(batch_size, kv_num_heads, head_size).contiguous()
         
         return hidden_states, residual, q, k, v
     

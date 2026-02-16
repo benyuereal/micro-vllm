@@ -36,7 +36,7 @@ def compiled(hidden_dim: int = 4096):
         batch_size = hidden.shape[0]
         
         # Attention 输出投影 + 残差连接
-        hidden = attn_res + torch.matmul(attn_out.view(batch_size, -1), layer.attn._w).unsqueeze(1)
+        hidden = attn_res + torch.matmul(attn_out.view(batch_size, -1), layer.attn.c_proj.weight.t().contiguous()).unsqueeze(1)
         
         # LayerNorm + MLP
         normed = rms_norm(hidden, layer.ln_2.weight, layer.ln_2.eps)

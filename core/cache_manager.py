@@ -333,7 +333,10 @@ class KVCacheManager:
         self._pos = {}
         
         # 4. block table 
-        
+        self._block_table = torch.full(
+            (32, self.n_blocks), -1,
+            dtype=torch.int32, device=self.device
+        )
         self.cache_seqlens = torch.tensor([1], dtype=torch.int32, device=self.device)
 
             # 计算单序列最大块数
@@ -547,9 +550,19 @@ class KVCacheManager:
             self._cache_seqlens_buffer[:batch_size]
         )
 
-                
-    
-      
+    def cache_batch_datav1(self, seq_ids: list, context_lens: List[int], ):
+        block_tables = [self.get_blocks(seq_id) for seq_id in seq_ids]
+        max_blocks = max(map(len, block_tables), default=0)
+        block_table_tensor = torch.tensor([
+            blocks + [-1] * (max_blocks - len(blocks)) for blocks in block_tables
+        ], dtype=torch.int32, device=self.device)
+        self._block_table = block_table_tensor
+
+        self.cache_seqlens = torch.tensor(context_lens, dtype=torch.int32, device=self.device)
+
+
+
+
 
     def get_slots(self, seq_id: int, token_positions: list) -> list:
         """

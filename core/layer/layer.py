@@ -170,15 +170,12 @@ class ModelLayerAdapter:
             self._normed_1[:batch_size] = normed
             
             # QKV Linear
-            qkv = torch.matmul(self._normed_1[:batch_size], w_qkv)
-            if b_qkv is not None:
-                qkv = qkv + b_qkv
-            self._qkv[:batch_size] = qkv
-            
+            self._qkv[:batch_size] = F.linear(self._normed_1[:batch_size], block.attn.c_attn.weight, b_qkv)
+
             # Split QKV
-            q = qkv[:, :self.hidden_dim].view(batch_size, self.num_heads, self.head_size)
-            k = qkv[:, self.hidden_dim:2*self.hidden_dim].view(batch_size, self.kv_num_heads, self.head_size)
-            v = qkv[:, 2*self.hidden_dim:].view(batch_size, self.kv_num_heads, self.head_size)
+            q = self._qkv[:batch_size][:, :self.hidden_dim].view(batch_size, self.num_heads, self.head_size)
+            k = self._qkv[:batch_size][:, self.hidden_dim:2*self.hidden_dim].view(batch_size, self.kv_num_heads, self.head_size)
+            v = self._qkv[:batch_size][:, 2*self.hidden_dim:].view(batch_size, self.kv_num_heads, self.head_size)
             
             # FlashAttention
             attn = flash_attn_with_kvcache(
@@ -192,33 +189,37 @@ class ModelLayerAdapter:
                 cache_seqlens=cache_manager._cache_seqlens_buffer[:batch_size],
                 block_table=cache_manager._block_table_buffer[:batch_size],
                 causal=True,
+                window_size=(-1, -1),
+                rotary_interleaved=False,
+                alibi_slopes=None,
+                
             ).squeeze(1)
             
-            # O Proj
-            attn_flat = attn.view(batch_size, -1)
-            out = torch.matmul(attn_flat, w_o)
-            
+            # ============================================================
+            # MLP 阶段
+            # ============================================================
+
+            # O Proj: [B, num_heads*head_size] @ [hidden_dim, hidden_dim] -> [B, hidden_dim]
+            out = torch.matmul(attn.view(batch_size, -1), w_o)
+
             # First Residual
-            h = out + self._hidden[:batch_size]
-            self._residual[:batch_size] = h
-            
-            # === MLP ===
-            normed = self._norm(h, block.ln_2.weight, block.ln_2.eps)
-            self._normed_2[:batch_size] = normed
-            
-            # Gate + Up
+            self._residual[:batch_size] = out + self._hidden[:batch_size]
+
+            # MLP RMSNorm
+            self._normed_2[:batch_size] = self._norm(self._residual[:batch_size], block.ln_2.weight, block.ln_2.eps)
+
+            # Gate + Up: [B, hidden] @ [hidden, 2*intermediate] -> [B, 2*intermediate]
             gate_up = torch.matmul(self._normed_2[:batch_size], w_gu)
-            
-            # SwiGLU
-            gate, up = gate_up.chunk(2, dim=-1)
+
+            # SwiGLU: split 后激活
+            up, gate = gate_up.chunk(2, dim=-1)
             activated = F.silu(gate) * up
-            
-            # Down
+
+            # Down Proj: [B, intermediate] @ [intermediate, hidden] -> [B, hidden]
             mlp_out = torch.matmul(activated, w_d)
-            
+
             # Second Residual
-            out = mlp_out + self._residual[:batch_size]
-            self._output[:batch_size] = out
+            self._output[:batch_size] = mlp_out + self._residual[:batch_size]
         
         self._graphs[(idx, batch_size)] = g
 
@@ -227,66 +228,86 @@ class ModelLayerAdapter:
         dummy_hidden = torch.randn(batch_size, self.hidden_dim,
                                 dtype=torch.bfloat16, device=self.device)
         
-        # 获取所有需要的东西
-        w_qkv = block.attn._qkv_w
-        b_qkv = block.attn._qkv_b
-        w_o = block.attn._o
-        w_gu = block.mlp._gu
-        w_d = block.mlp._d
-        k_cache, v_cache = cache_manager.get(idx)
-        
+
         for _ in range(num_warmup):
             h = dummy_hidden
-            
-            # === 完整 Attention ===
-            normed = self._norm(h, block.ln_1.weight, block.ln_1.eps)
-            qkv = torch.matmul(normed, w_qkv)
-            if b_qkv is not None:
-                qkv = qkv + b_qkv
-            
-            q = qkv[:, :self.hidden_dim].view(batch_size, self.num_heads, self.head_size)
-            k = qkv[:, self.hidden_dim:2*self.hidden_dim].view(batch_size, self.kv_num_heads, self.head_size)
-            v = qkv[:, 2*self.hidden_dim:].view(batch_size, self.kv_num_heads, self.head_size)
-            
-            attn = flash_attn_with_kvcache(
-                q=q.unsqueeze(1), k_cache=k_cache, v_cache=v_cache,
-                k=k.unsqueeze(1), v=v.unsqueeze(1),
-                rotary_cos=self.attention._cos_pool,
-                rotary_sin=self.attention._sin_pool,
-                cache_seqlens=torch.ones(batch_size, dtype=torch.int32, device=self.device),
-                block_table=torch.zeros(batch_size, cache_manager.max_seq_blocks, 
-                                    dtype=torch.int32, device=self.device),
-                causal=True,
-            ).squeeze(1)
-            
-            attn_flat = attn.view(batch_size, -1)
-            out = torch.matmul(attn_flat, w_o)
-            h = out + h  # residual
-            
-            # === 完整 MLP ===
-            normed = self._norm(h, block.ln_2.weight, block.ln_2.eps)
-            gate_up = torch.matmul(normed, w_gu)
-            gate, up = gate_up.chunk(2, dim=-1)
-            activated = F.silu(gate) * up
-            mlp_out = torch.matmul(activated, w_d)
-            out = mlp_out + h  # residual
+            # 使用 eager 模式运行，不经过 graph
+            with torch.no_grad():
+                self._eager(idx, batch_size, h, cache_manager)
         
         torch.cuda.synchronize()
 
-    def forward(self, idx, batch_size, hidden_states, cache_manager):
-        """使用 CUDA Graph 执行单个 block"""
-        # 拷贝输入
-        self._hidden[:batch_size].copy_(hidden_states)
+    def forward(self, idx, batch_size, hidden_states, cache_manager, seq_ids, context_lens):
+        # 直接赋值（如果形状匹配）
+        self._hidden[:batch_size] = hidden_states.squeeze(1) if hidden_states.dim() == 3 else hidden_states
         
-        # Replay
+        # Replay CUDA Graph
         key = (idx, batch_size)
         if key not in self._graphs:
             raise RuntimeError(f"Graph not found: idx={idx}, batch={batch_size}")
         
         self._graphs[key].replay()
         
-        # 返回输出
+        # 返回输出（clone 防止 buffer 被外部修改）
         return self._output[:batch_size].clone()
+
+    def _eager(self, idx, batch_size, hidden_states, cache_manager):
+        """
+        Eager 模式 forward，用于预热，不操作静态 buffer
+        直接使用输入 tensor，不经过 self._hidden 等 buffer
+        """
+        block = self.model.transformer.h[idx]
+
+        w_qkv = block.attn._qkv_w
+        b_qkv = block.attn._qkv_b
+        w_o = block.attn._o
+        w_gu = block.mlp._gu
+        w_d = block.mlp._d
+        k_cache, v_cache = cache_manager.get(idx)
+
+        # Attention 阶段 - 直接使用输入，不经过 buffer
+        h = hidden_states.squeeze(1) if hidden_states.dim() == 3 else hidden_states
+        
+        normed = self._norm(h, block.ln_1.weight, block.ln_1.eps)
+        
+        qkv = F.linear(normed, block.attn.c_attn.weight, b_qkv)
+        
+        q = qkv[:, :self.hidden_dim].view(batch_size, self.num_heads, self.head_size)
+        k = qkv[:, self.hidden_dim:2*self.hidden_dim].view(batch_size, self.kv_num_heads, self.head_size)
+        v = qkv[:, 2*self.hidden_dim:].view(batch_size, self.kv_num_heads, self.head_size)
+
+        # 关键：预热时 cache_seqlens 必须正确设置
+        
+        attn = flash_attn_with_kvcache(
+            q=q.unsqueeze(1),
+            k_cache=k_cache,
+            v_cache=v_cache,
+            k=k.unsqueeze(1),
+            v=v.unsqueeze(1),
+            rotary_cos=self.attention._cos_pool,
+            rotary_sin=self.attention._sin_pool,
+            cache_seqlens=torch.ones(batch_size, dtype=torch.int32, device=self.device),
+            block_table=torch.zeros(batch_size, cache_manager.max_seq_blocks, 
+                                    dtype=torch.int32, device=self.device),
+            causal=True,
+            window_size=(-1, -1),
+            rotary_interleaved=False,
+            alibi_slopes=None,
+        ).squeeze(1)
+
+        # MLP 阶段
+        out = torch.matmul(attn.view(batch_size, -1), w_o)
+        h = out + h  # 残差
+        
+        normed = self._norm(h, block.ln_2.weight, block.ln_2.eps)
+        gate_up = torch.matmul(normed, w_gu)
+        up, gate = gate_up.chunk(2, dim=-1)
+        activated = F.silu(gate) * up
+        mlp_out = torch.matmul(activated, w_d)
+        out = mlp_out + h
+
+        return out
+
 
     def process_layer(self, layer, hidden_states, cache_manager, seq_ids,
                   context_lens, token_positions=None, layer_idx=0,
@@ -301,7 +322,9 @@ class ModelLayerAdapter:
                 idx=layer_idx,
                 batch_size=batch_size,
                 hidden_states=hidden_states,
-                cache_manager=cache_manager
+                cache_manager=cache_manager,
+                seq_ids=seq_ids,
+                context_lens=context_lens,
             ), None
         else:
             # Fallback：抛出错误或实现 eager
