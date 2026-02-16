@@ -169,13 +169,15 @@ class ModelLayerAdapter:
             normed = self._norm(h, block.ln_1.weight, block.ln_1.eps)
             self._normed_1[:batch_size] = normed
             
-            # QKV Linear
-            self._qkv[:batch_size] = F.linear(self._normed_1[:batch_size], block.attn.c_attn.weight, b_qkv)
+            # QKV Linear - 使用预计算转置权重
+            self._qkv[:batch_size] = torch.matmul(self._normed_1[:batch_size], w_qkv)
+            if b_qkv is not None:
+                self._qkv[:batch_size] = self._qkv[:batch_size] + b_qkv
 
             # Split QKV
-            q = self._qkv[:batch_size][:, :self.hidden_dim].view(batch_size, self.num_heads, self.head_size)
-            k = self._qkv[:batch_size][:, self.hidden_dim:2*self.hidden_dim].view(batch_size, self.kv_num_heads, self.head_size)
-            v = self._qkv[:batch_size][:, 2*self.hidden_dim:].view(batch_size, self.kv_num_heads, self.head_size)
+            q = self._qkv[:batch_size][:, :self.hidden_dim].reshape(batch_size, self.num_heads, self.head_size)
+            k = self._qkv[:batch_size][:, self.hidden_dim:2*self.hidden_dim].reshape(batch_size, self.kv_num_heads, self.head_size)
+            v = self._qkv[:batch_size][:, 2*self.hidden_dim:].reshape(batch_size, self.kv_num_heads, self.head_size)
             
             # FlashAttention
             attn = flash_attn_with_kvcache(
@@ -200,7 +202,7 @@ class ModelLayerAdapter:
             # ============================================================
 
             # O Proj: [B, num_heads*head_size] @ [hidden_dim, hidden_dim] -> [B, hidden_dim]
-            out = torch.matmul(attn.view(batch_size, -1), w_o)
+            out = torch.matmul(attn.reshape(batch_size, -1), w_o)
 
             # First Residual
             self._residual[:batch_size] = out + self._hidden[:batch_size]
@@ -270,11 +272,14 @@ class ModelLayerAdapter:
         
         normed = self._norm(h, block.ln_1.weight, block.ln_1.eps)
         
-        qkv = F.linear(normed, block.attn.c_attn.weight, b_qkv)
+        # 使用预计算的转置权重 + matmul，比 F.linear 少一次转置
+        qkv = torch.matmul(normed, w_qkv)
+        if b_qkv is not None:
+            qkv = qkv + b_qkv
         
-        q = qkv[:, :self.hidden_dim].view(batch_size, self.num_heads, self.head_size)
-        k = qkv[:, self.hidden_dim:2*self.hidden_dim].view(batch_size, self.kv_num_heads, self.head_size)
-        v = qkv[:, 2*self.hidden_dim:].view(batch_size, self.kv_num_heads, self.head_size)
+        q = qkv[:, :self.hidden_dim].reshape(batch_size, self.num_heads, self.head_size)
+        k = qkv[:, self.hidden_dim:2*self.hidden_dim].reshape(batch_size, self.kv_num_heads, self.head_size)
+        v = qkv[:, 2*self.hidden_dim:].reshape(batch_size, self.kv_num_heads, self.head_size)
 
         # 关键：预热时 cache_seqlens 必须正确设置
         
@@ -296,7 +301,7 @@ class ModelLayerAdapter:
         ).squeeze(1)
 
         # MLP 阶段
-        out = torch.matmul(attn.view(batch_size, -1), w_o)
+        out = torch.matmul(attn.reshape(batch_size, -1), w_o)
         h = out + h  # 残差
         
         normed = self._norm(h, block.ln_2.weight, block.ln_2.eps)
