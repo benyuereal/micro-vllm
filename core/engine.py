@@ -35,6 +35,7 @@ import time
 from models.qwen_adapter import QwenModelAdapter
 from . import Scheduler
 from .layer.layer import ModelLayerAdapter
+from .layer.model_graph import ModelGraphRunner
 from .cache_manager import KVCacheManager, store_kvcache
 from .sequence import Sequence
 from .model_loader import load_model
@@ -128,13 +129,26 @@ class InferenceEngine:
         )
 
         # 6. 初始化层适配器
-        self.layer_adapter = ModelLayerAdapter(
+        # self.layer_adapter = ModelLayerAdapter(
+        #     model=self.model,
+        #     model_config=self.config,
+        #     device=self.device,
+        #     num_heads=self.num_heads,
+        #     head_size=self.head_size,
+        #     kv_num_heads=self.kv_num_heads
+        # )
+        
+        # 7. 初始化模型层Graph运行器（整个模型一次前向）
+        self.graph_runner = ModelGraphRunner(
             model=self.model,
-            model_config=self.config,
-            device=self.device,
+            num_layers=self.num_layers,
             num_heads=self.num_heads,
             head_size=self.head_size,
-            kv_num_heads=self.kv_num_heads
+            kv_num_heads=self.kv_num_heads,
+            hidden_dim=self.config.hidden_size,
+            intermediate_size=self.config.intermediate_size,
+            device=self.device,
+            max_batch_size=max_batch_size
         )
 
         self.scheduler = Scheduler(max_batch_size, max_prefill_tokens)
@@ -151,11 +165,10 @@ class InferenceEngine:
         if self.device == "cuda":
             self.logger.info("Starting CUDA Graphs capture...")
         
-            # 让 PagedAttention 捕获 graphs
-            self.layer_adapter.capture_graphs(
-            self.cache_manager,
-            num_layers=self.num_layers,
-            batch_sizes=[1, 2]  # 根据你的需求调整
+            # 捕获整个模型的CUDA Graph
+            self.graph_runner.capture(
+                self.cache_manager,
+                batch_sizes=[1, 2]
             )
             self.logger.info("CUDA Graphs capture completed")
 
@@ -314,26 +327,20 @@ class InferenceEngine:
         self.cache_manager.cache_batch_data(seq_ids, context_lens)
         cache_time = time.time() - cache_append_start
 
-        # 📍 第四阶段：逐层处理
+        # 📍 第四阶段：使用GraphRunner一次处理所有层
         layer_start = time.time()
-
-        ## 追加新的token
-        for layer_idx, layer in enumerate(self.model_layers):
-
-            # 使用模型层适配器处理不同架构的层
-            hidden_states, _ = self.layer_adapter.process_layer(
-                self.model_layers[layer_idx], hidden_states, self.cache_manager,
-                    seq_ids, context_lens, None, layer_idx, None
-                )
-
-
+        hidden_states = self.graph_runner.forward(
+            hidden_states,
+            self.cache_manager,
+            batch_size=len(batch)
+        )
         layer_time = time.time() - layer_start
-
 
         # 📍 第五阶段：最终归一化 + LM Head
         norm_start = time.time()
         hidden_states = self.norm_layer(hidden_states)
-        logits = self.model.lm_head(hidden_states).float()
+        # 注意：不在这里转 float，让 Sampler 内部处理
+        logits = self.model.lm_head(hidden_states)
         norm_time = time.time() - norm_start
 
         # 📍 第六阶段：Token采样 (并行版本)
