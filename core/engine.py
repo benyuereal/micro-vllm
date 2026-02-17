@@ -126,16 +126,6 @@ class InferenceEngine:
             dtype=self.dtype,
             device=self.device
         )
-
-        # 6. 初始化层适配器
-        # self.layer_adapter = ModelLayerAdapter(
-        #     model=self.model,
-        #     model_config=self.config,
-        #     device=self.device,
-        #     num_heads=self.num_heads,
-        #     head_size=self.head_size,
-        #     kv_num_heads=self.kv_num_heads
-        # )
         
         # 7. 初始化模型层Graph运行器（整个模型一次前向）
         self.graph_runner = ModelGraphRunner(
