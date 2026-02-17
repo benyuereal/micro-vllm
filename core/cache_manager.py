@@ -292,7 +292,9 @@ class KVCacheManager:
                  n_heads: int,  # 注意力头数 (如16)
                  head_size: int,  # 每个头的维度 (如128)
                  dtype=torch.float16,  # 数据类型
-                 device="cuda"):  # 设备
+                 device="cuda", 
+                 max_tokens: int = 1024,
+                 max_batch_size: int = 32): 
         """
         📌 **初始化**:
             1. 创建KV缓存张量 (ParameterList支持AMP)
@@ -331,11 +333,20 @@ class KVCacheManager:
         self._pos = {}
         
         # 4. block table 
-        self._block_table = torch.full(
-            (32, self.n_blocks), -1,
-            dtype=torch.int32, device=self.device
-        )
+    
         self.cache_seqlens = torch.tensor([1], dtype=torch.int32, device=self.device)
+
+            # 计算单序列最大块数
+        self.max_tokens = max_tokens
+        self.max_seq_blocks = (max_tokens + block_size - 1) // block_size
+        # 静态缓冲区（关键改造）
+        self._block_table_buffer = torch.full(
+            (max_batch_size, self.max_seq_blocks), -1,
+            dtype=torch.int32, device=device
+        )
+        self._cache_seqlens_buffer = torch.zeros(
+            max_batch_size, dtype=torch.int32, device=device
+        )
 
     def alloc(self, seq_id: int, n_tokens: int):
         """
@@ -410,8 +421,8 @@ class KVCacheManager:
         last_block = blocks[-1]
         current_pos = self._pos[last_block]
 
-        # 情况1: 当前Block还有空间
-        if current_pos < self.block_size:
+        # 情况1: 当前块还有空间
+        if current_pos < self.block_size - 1:
             self._pos[last_block] += 1
             return last_block * self.block_size + current_pos
 
@@ -419,9 +430,10 @@ class KVCacheManager:
         elif self._free:
             new_block = self._free.popleft()
             blocks.append(new_block)
-            self._pos[new_block] = 1  # 新块已用1个slot
+            self._blocks[seq_id] = blocks  # 确保引用同步（防御性编程）
+            self._pos[new_block] = 1
             return new_block * self.block_size
-
+        print(f"❌ cache_manager.append failed for seq {seq_id}, blocks: {blocks}, current_pos: {current_pos}, block_size: {self.block_size}, _free: {len(self._free)}")
         # 情况3: 无可用Block
         return -1
 
@@ -494,19 +506,49 @@ class KVCacheManager:
         return self._blocks.get(seq_id, [])  # 直接返回内部引用 (零拷贝)
 
     # 准备推理的数据
-    def cache_batch_data(self, seq_ids: list, context_lens: List[int],):
+    def cache_batch_data(self, seq_ids: list, context_lens: list):
+        """静态化版本：原地更新缓冲区，不创建新张量"""
+        batch_size = len(seq_ids)
+        
+        # 获取 block tables
         block_tables = [self.get_blocks(seq_id) for seq_id in seq_ids]
-        max_blocks = max(map(len, block_tables), default=0)
-        block_table_tensor = torch.tensor([
-            blocks + [-1] * (max_blocks - len(blocks)) for blocks in block_tables
-        ], dtype=torch.int32, device=self.device)
-        self._block_table = block_table_tensor
+        
+        # 原地更新：先重置为 -1
+        self._block_table_buffer[:batch_size] = -1
+        
+        # 填充实际值
+        for i, blocks in enumerate(block_tables):
+            num_blocks = len(blocks)
+            if num_blocks > 0:
+                self._block_table_buffer[i, :num_blocks] = torch.tensor(
+                    blocks, dtype=torch.int32, device=self.device
+                )
+        
+        # 原地更新 cache_seqlens
+        self._cache_seqlens_buffer[:batch_size] = torch.tensor(
+            context_lens, dtype=torch.int32, device=self.device
+        )
+        
+        # 返回视图（同一内存地址）
+        return (
+            self._block_table_buffer[:batch_size],
+            self._cache_seqlens_buffer[:batch_size]
+        )
 
-        self.cache_seqlens = torch.tensor(context_lens, dtype=torch.int32, device=self.device)
 
-                
-    
-      
+        # 准备推理的数据
+    def get_buffer_data(self, seq_ids: list):
+        """静态化版本：原地更新缓冲区，不创建新张量"""
+        batch_size = len(seq_ids)
+        
+        # 返回视图（同一内存地址）
+        return (
+            self._block_table_buffer[:batch_size],
+            self._cache_seqlens_buffer[:batch_size]
+        )
+
+
+
 
     def get_slots(self, seq_id: int, token_positions: list) -> list:
         """

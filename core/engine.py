@@ -34,7 +34,7 @@ import time
 
 from models.qwen_adapter import QwenModelAdapter
 from . import Scheduler
-from .layer.layer import ModelLayerAdapter
+from .layer.model_graph import ModelGraphRunner
 from .cache_manager import KVCacheManager, store_kvcache
 from .sequence import Sequence
 from .model_loader import load_model
@@ -60,7 +60,7 @@ class InferenceEngine:
     # 扩展DEVICE_CONFIGS (支持Qwen3 MoE)
     DEVICE_CONFIGS = {
         "mps": {"block_size": 16, "max_blocks": 512, "dtype": torch.float16},
-        "cuda": {"block_size": 256, "max_blocks": 96, "dtype": None},  # 自动选择bfloat16/float16
+        "cuda": {"block_size": 256, "max_blocks": 65, "dtype": None},  # 自动选择bfloat16/float16
         "cpu": {"block_size": 16, "max_blocks": 128, "dtype": torch.float32},
         "cuda_moe": {"block_size": 256, "max_blocks": 48, "dtype": torch.bfloat16},  # ✅ Qwen3 MoE专用
     }
@@ -128,16 +128,29 @@ class InferenceEngine:
         )
 
         # 6. 初始化层适配器
-        self.layer_adapter = ModelLayerAdapter(
+        # self.layer_adapter = ModelLayerAdapter(
+        #     model=self.model,
+        #     model_config=self.config,
+        #     device=self.device,
+        #     num_heads=self.num_heads,
+        #     head_size=self.head_size,
+        #     kv_num_heads=self.kv_num_heads
+        # )
+        
+        # 7. 初始化模型层Graph运行器（整个模型一次前向）
+        self.graph_runner = ModelGraphRunner(
             model=self.model,
-            model_config=self.config,
-            device=self.device,
+            num_layers=self.num_layers,
             num_heads=self.num_heads,
             head_size=self.head_size,
-            kv_num_heads=self.kv_num_heads
+            kv_num_heads=self.kv_num_heads,
+            hidden_dim=self.config.hidden_size,
+            intermediate_size=self.config.intermediate_size,
+            device=self.device,
+            max_batch_size=max_batch_size
         )
 
-        self.scheduler = Scheduler(max_batch_size, max_prefill_tokens)
+        self.scheduler = Scheduler(max_batch_size, max_prefill_tokens, self.tokenizer)
         self.adapter = QwenModelAdapter()
 
         self.eos_token_id = self.tokenizer.eos_token_id
@@ -148,7 +161,15 @@ class InferenceEngine:
                          f"block_size={self.block_size}, max_blocks={self.max_blocks}")
         self.sampler = Sampler()
         # 8.其他配置
-
+        if self.device == "cuda":
+            self.logger.info("Starting CUDA Graphs capture...")
+        
+            # 捕获整个模型的CUDA Graph
+            self.graph_runner.capture(
+                self.cache_manager,
+                batch_sizes=[1, 2, 4, 8, 16, 32]
+            )
+            self.logger.info("CUDA Graphs capture completed")
 
     def _init_logging(self):
         """初始化日志"""
@@ -209,21 +230,34 @@ class InferenceEngine:
 
     @torch.no_grad()
     def step(self) -> bool:
-        """执行一个推理step，返回是否有处理任何请求"""
+        """执行推理step，返回是否有处理任何请求（连续批处理版本）"""
         # Mark the beginning of a new iteration for CUDA graphs
         # This prevents tensor output overwriting between consecutive runs
         torch.compiler.cudagraph_mark_step_begin()
-        
-        batch, batch_type = self.scheduler.get_next_batch()
-        if not batch:
-            return False
 
-        if batch_type == "prefill":
-            self._process_prefill_batch(batch)
-        elif batch_type == "decode":
-            self._process_decode_batch(batch)
+        working = False
 
-        return True
+        while True:
+            # 使用连续批处理：Padding 凑齐 batch + 动态剔除完成
+            batch, batch_type = self.scheduler.get_next_batch()
+
+            if not batch:
+                break  # 没有更多工作
+
+            working = True
+
+            if batch_type == "prefill":
+                self._process_prefill_batch(batch)
+            elif batch_type == "decode":
+                self._process_decode_batch(batch)
+
+            # 连续批处理：检查是否需要继续填充
+            # 如果有等待中的请求 → 继续循环填充
+            # 否则退出
+            if not self.scheduler.waiting_queue:
+                break
+
+        return working
 
     @torch.no_grad()
     def _process_prefill_batch(self, batch: List[Sequence]):
@@ -288,10 +322,11 @@ class InferenceEngine:
         # 📍 第二阶段：Embedding
         emb_start = time.time()
         hidden_states = self.embedding_layer(input_ids)
+        if hidden_states.dim() == 3:
+            hidden_states = hidden_states.squeeze(1)  # [B, 1, D] -> [B, D]
         emb_time = time.time() - emb_start
 
         # 逐层处理
-        all_layer_kvs = []
 
         # 📍 第三阶段：Cache追加
         cache_append_start = time.time()
@@ -304,28 +339,20 @@ class InferenceEngine:
         self.cache_manager.cache_batch_data(seq_ids, context_lens)
         cache_time = time.time() - cache_append_start
 
-        # 📍 第四阶段：逐层处理
+        # 📍 第四阶段：使用GraphRunner一次处理所有层
         layer_start = time.time()
-
-        ## 追加新的token
-        for layer_idx, layer in enumerate(self.model_layers):
-
-            # 使用模型层适配器处理不同架构的层
-            hidden_states, layer_kv = self.layer_adapter.process_layer(
-                layer, hidden_states, self.cache_manager, seq_ids,
-                context_lens, token_positions, layer_idx,
-                [seq.current_position - 1 for seq in batch]
-            )
-
-            all_layer_kvs.append(layer_kv)
-
+        hidden_states = self.graph_runner.forward(
+            hidden_states,
+            self.cache_manager,
+            batch_size=len(batch)
+        )
         layer_time = time.time() - layer_start
-
 
         # 📍 第五阶段：最终归一化 + LM Head
         norm_start = time.time()
         hidden_states = self.norm_layer(hidden_states)
-        logits = self.model.lm_head(hidden_states).float()
+        # 注意：不在这里转 float，让 Sampler 内部处理
+        logits = self.model.lm_head(hidden_states)
         norm_time = time.time() - norm_start
 
         # 📍 第六阶段：Token采样 (并行版本)
@@ -337,7 +364,7 @@ class InferenceEngine:
 
         # logits[i, -1, :] 形状是 [batch_size, vocab_size]
         next_tokens = self._sample_next_token(
-            logits[:, -1, :],  # [batch_size, vocab_size]
+            logits,  # [batch_size, vocab_size]
             temperatures,       # [batch_size]
             top_ps              # [batch_size]
         )

@@ -1,64 +1,44 @@
 from collections import deque, defaultdict
 from typing import List, Tuple, Dict, Optional
-
+from transformers import AutoTokenizer
 from .sequence import Sequence
 
 
 class Scheduler:
-    def __init__(self, max_batch_size: int = 8, max_prefill_tokens: int = 2048):
+    def __init__(self, max_batch_size: int = 32, max_prefill_tokens: int = 2048, tokenizer: AutoTokenizer = None):
+        self.tokenizer = tokenizer
         self.max_batch_size = max_batch_size
         self.max_prefill_tokens = max_prefill_tokens
         self.waiting_queue = deque()   # 新请求
         self.running_sequences = []    # 正在运行的序列
         self.finished_sequences = []   # 已完成
+        self.batch_sizes = [1, 2, 4, 8, 16, 32]  # 已捕获的 batch_size（与 engine 一致）
 
     def add_request(self, seq: Sequence):
         self.waiting_queue.append(seq)
 
     def get_next_batch(self) -> Tuple[List[Sequence], str]:
-        batch = []
-        batch_type = "idle"
-        # 快速路径：单个序列时直接返回
-        if len(self.waiting_queue) == 1 and not self.running_sequences:
-            seq = self.waiting_queue.popleft()
-            self.running_sequences.append(seq)
-            return [seq], "prefill"
-        if len(self.running_sequences) == 1 and not self.waiting_queue:
-            return self.running_sequences, "decode"
+        """
+        连续批处理：Padding 凑齐 batch + 动态剔除完成
+        核心逻辑：
+        1. 剔除已完成的请求
+        2. 有新请求时处理 prefill
+        3. 解码阶段 Padding 填充到已捕获的 batch_size
+        """
+        # 1. 剔除已完成的请求
+        self.running_sequences = [
+            s for s in self.running_sequences
+            if not s.is_finished()
+        ]
 
-        # 1. 预填充（保持不变）
+        # 2. 预填充阶段：有新请求时优先处理
         if self.waiting_queue:
-            length_groups = defaultdict(list)
-            for seq in list(self.waiting_queue):
-                if seq.state == "prefill":
-                    length = len(seq.input_ids)
-                    length_groups[length].append(seq)
+            batch, batch_type = self._get_prefill_batch()
+            if batch:
+                return batch, batch_type
 
-            if length_groups:
-                max_group = max(length_groups.values(), key=len)  # 最大组（同长度最多）
-                max_group.sort(key=lambda s: len(s.input_ids), reverse=True)
-
-                selected = []
-                total_tokens = 0
-                for seq in max_group:
-                    if len(selected) >= self.max_batch_size:
-                        break
-                    seq_tokens = len(seq.input_ids)
-                    if total_tokens + seq_tokens > self.max_prefill_tokens:
-                        continue
-                    selected.append(seq)
-                    total_tokens += seq_tokens
-
-                for seq in selected:
-                    self.waiting_queue.remove(seq)
-                    self.running_sequences.append(seq)
-
-                if selected:
-                    batch = selected
-                    batch_type = "prefill"
-
-        # 2. 解码：SJF + 同长度成批
-        if not batch and self.running_sequences:
+        # 3. 解码阶段：Padding 凑齐 batch_size
+        if self.running_sequences:
             length_groups = defaultdict(list)
             for seq in self.running_sequences:
                 if seq.state == "decode" and not seq.is_finished():
@@ -77,8 +57,48 @@ class Scheduler:
                 if selected:
                     batch = selected
                     batch_type = "decode"
+                    # 从 batch_sizes 中找到第一个 <= len(batch) 的值（向下取整）
+                    batch_len = len(batch)
+                    batch_sizes = max((b for b in self.batch_sizes if b <= batch_len), default=self.batch_sizes[0])
+                    return batch[:batch_sizes], batch_type
 
-        return batch, batch_type
+        return [], "idle"
+
+    def _get_prefill_batch(self) -> Tuple[List[Sequence], str]:
+        """提取 prefill 逻辑，复用给连续批处理"""
+        batch = []
+        length_groups = defaultdict(list)
+
+        for seq in list(self.waiting_queue):
+            if seq.state == "prefill":
+                length = len(seq.input_ids)
+                length_groups[length].append(seq)
+
+        if not length_groups:
+            return [], "idle"
+
+        max_group = max(length_groups.values(), key=len)
+        max_group.sort(key=lambda s: len(s.input_ids), reverse=True)
+
+        selected = []
+        total_tokens = 0
+        for seq in max_group:
+            if len(selected) >= self.max_batch_size:
+                break
+            seq_tokens = len(seq.input_ids)
+            if total_tokens + seq_tokens > self.max_prefill_tokens:
+                continue
+            selected.append(seq)
+            total_tokens += seq_tokens
+
+        for seq in selected:
+            self.waiting_queue.remove(seq)
+            self.running_sequences.append(seq)
+
+        if selected:
+            return selected, "prefill"
+
+        return [], "idle"
 
     def mark_finished(self, seq: Sequence):
         if seq in self.running_sequences:
