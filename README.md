@@ -10,33 +10,33 @@
   </a>
 </p>
 
-> 高性能 LLM 推理引擎，从零实现 **PagedAttention + Flash Attention**，A100 上性能达 vLLM 的 **98%**，适合小规模生产部署和学习。
+> A high-performance LLM inference engine implementing **PagedAttention + Flash Attention** from scratch. Achieves **98%** of vLLM's performance on A100, suitable for small-scale production deployment and learning.
 
-## ✨ 特性
+## ✨ Features
 
-* 🚀 **连续批处理** - 动态批次填充，GPU 利用率 ↑90%+
-* 💾 **PagedAttention** - KV 缓存分页管理，碎片率 ↓80%
-* ⚡ **Flash Attention** - 自动 RoPE，零拷贝缓存更新
-* 🔥 **CUDA Graph** - 整图捕获优化，GPU kernel 调度开销 ↓
-* 📦 **torch.compile** - Sampler 编译优化
-* 🌊 **流式输出** - 支持实时流式生成
-* 📖 **简洁代码** - 约 1500 行 Python 代码，易于学习和二次开发
-
----
-
-## 📚 目录
-
-- [特性](#-特性)
-- [架构设计](#-架构设计)
-- [核心技术](#-核心技术)
-- [性能基准](#-性能基准)
-- [快速开始](#-快速开始)
-- [API 参考](#-api-参考)
-- [对比测试](#-对比测试)
+* 🚀 **Continuous Batching** - Dynamic batch filling, GPU utilization ↑90%+
+* 💾 **PagedAttention** - KV cache paging management, fragmentation ↓80%
+* ⚡ **Flash Attention** - Automatic RoPE, zero-copy cache update
+* 🔥 **CUDA Graph** - Whole-graph capture optimization, GPU kernel scheduling overhead ↓
+* 📦 **torch.compile** - Sampler compilation optimization
+* 🌊 **Streaming Output** - Real-time streaming generation support
+* 📖 **Clean Codebase** - ~1500 lines of Python code, easy to learn and extend
 
 ---
 
-## 🏗️ 架构设计
+## 📚 Table of Contents
+
+- [Features](#-features)
+- [Architecture](#-architecture)
+- [Core Technologies](#-core-technologies)
+- [Performance Benchmark](#-performance-benchmark)
+- [Quick Start](#-quick-start)
+- [API Reference](#-api-reference)
+- [Comparison](#-comparison)
+
+---
+
+## 🏗️ Architecture
 
 ```
 ┌─────────────────────────────────────────────────────────────────┐
@@ -44,7 +44,8 @@
 ├─────────────────────────────────────────────────────────────────┤
 │  ┌──────────────┐    ┌──────────────┐    ┌──────────────┐   │
 │  │   Scheduler  │───▶│  KVCacheMgr  │───▶│ModelGraphRunner│   │
-│  │ (连续批处理)  │    │ (分页管理)    │    │ (CUDA Graph)  │   │
+│  │(Continuous  │    │   (Paging)   │    │(CUDA Graph)  │   │
+│  │  Batching)  │    │              │    │              │   │
 │  └──────────────┘    └──────────────┘    └──────────────┘   │
 │         │                   │                   │              │
 │         ▼                   ▼                   ▼              │
@@ -55,41 +56,41 @@
 └─────────────────────────────────────────────────────────────────┘
 ```
 
-### 核心组件
+### Core Components
 
-| 组件 | 职责 |
-|------|------|
-| `InferenceEngine` | 推理引擎入口，自动模型加载和配置 |
-| `Scheduler` | 连续批处理调度，SJF 对齐策略 |
-| `KVCacheManager` | PagedAttention KV 缓存分页管理 |
-| `ModelGraphRunner` | CUDA Graph 整图捕获和执行 |
-| `Sampler` | torch.compile 编译的 Token 采样器 |
+| Component | Responsibility |
+|-----------|----------------|
+| `InferenceEngine` | Inference engine entry, auto model loading |
+| `Scheduler` | Continuous batching, SJF alignment strategy |
+| `KVCacheManager` | PagedAttention KV cache paging |
+| `ModelGraphRunner` | CUDA Graph capture and execution |
+| `Sampler` | torch.compile compiled token sampler |
 
 ---
 
-## 🔬 核心技术
+## 🔬 Core Technologies
 
 ### 1. PagedAttention
 
-参考 [vLLM PagedAttention](https://arxiv.org/abs/2309.06180) 实现：
+Implemented based on [vLLM PagedAttention](https://arxiv.org/abs/2309.06180):
 
-- **机制**：KV 缓存分页（Block=256 tokens），动态分配和释放
-- **优势**：碎片率 5%，复用率 92%，避免预分配内存浪费
+- **Mechanism**: KV cache paging (Block=256 tokens), dynamic allocation
+- **Benefits**: 5% fragmentation, 92% reuse rate, no pre-allocation waste
 
 ```python
-# 核心接口
-cache_manager.alloc(seq_id, num_tokens)  # 分配缓存块
-cache_manager.append(seq_id)             # 追加新 token
-cache_manager.free(seq_id)               # 释放缓存
+# Core API
+cache_manager.alloc(seq_id, num_tokens)  # Allocate cache blocks
+cache_manager.append(seq_id)             # Append new token
+cache_manager.free(seq_id)               # Free cache
 ```
 
 ### 2. Flash Attention v2
 
-使用 `flash_attn_with_kvcache` 实现高效注意力：
+Using `flash_attn_with_kvcache` for efficient attention:
 
-- **自动 RoPE**：传入 `rotary_cos/sin` 即可
-- **零拷贝**：直接更新到已有 KV 缓存
-- **Paged KV**：支持 `block_table` 分页访问
+- **Auto RoPE**: Pass `rotary_cos/sin` directly
+- **Zero-copy**: Update directly to existing KV cache
+- **Paged KV**: Support `block_table` paging access
 
 ```python
 flash_attn_with_kvcache(
@@ -103,92 +104,93 @@ flash_attn_with_kvcache(
 )
 ```
 
-### 3. CUDA Graph 整图优化
+### 3. CUDA Graph Optimization
 
-将所有 Transformer 层封装到单个 CUDA Graph：
+Encapsulate all Transformer layers into a single CUDA Graph:
 
-- **机制**：捕获 N 层前向为一个 Graph，一次 replay 完成
-- **优势**：消除层间调度 overhead，支持多 batch_size 预捕获
-- **支持**：batch_size ∈ [1, 2, 4, 8, 16, 32]
+- **Mechanism**: Capture N-layer forward as one Graph, single replay
+- **Benefits**: Eliminate inter-layer scheduling overhead, pre-capture multiple batch sizes
+- **Supported**: batch_size ∈ [1, 2, 4, 8, 16, 32]
 
-### 4. torch.compile 采样优化
+### 4. torch.compile Sampling Optimization
 
-使用 PyTorch compile 编译整个采样过程：
+Compile the entire sampling process using PyTorch compile:
 
-- **融合内核**：Top-K + Top-P 过滤在一个 kernel 内完成
-- **动态 batch**：支持不同 batch_size
-- **模式**：`reduce-overhead` 减少 Python 开销
+- **Fused Kernel**: Top-K + Top-P filtering in one kernel
+- **Dynamic Batch**: Support different batch sizes
+- **Mode**: `reduce-overhead` to reduce Python overhead
 
-### 5. 连续批处理调度
+### 5. Continuous Batching Scheduler
 
-解码阶段采用连续批处理策略：
+Continuous batching strategy in decode phase:
 
-| 策略 | 实现 | 目标 |
-|------|------|------|
-| **动态填充** | 新请求随时插入 prefill | 最大化 GPU 利用率 |
-| **同长度成批** | 相同长度序列组成批次 | 消除 padding 浪费 |
-| **SJF 对齐** | 短序列优先完成 | 形成"长度簇" |
+| Strategy | Implementation | Goal |
+|----------|---------------|------|
+| **Dynamic Fill** | New requests insert prefill anytime | Maximize GPU utilization |
+| **Same Length Batch** | Sequences with same length form batch | Eliminate padding waste |
+| **SJF Alignment** | Short sequences complete first | Form "length clusters" |
 
-> **典型对齐过程**：
+> **Typical Alignment Process**:
 > ```
-> t=0: [50, 52, 55, 60, 100] → 选长度 50
-> t=1: [51, 52, 55, 60, 100] → 选长度 51
-> t=2: [52, 52, 55, 60, 100] → 选长度 52（两序列对齐）
+> t=0: [50, 52, 55, 60, 100] → Select length 50
+> t=1: [51, 52, 55, 60, 100] → Select length 51
+> t=2: [52, 52, 55, 60, 100] → Select length 52 (two sequences aligned)
 > ...
-> t=8: [60, 60, 60, 60, 100] → 四序列完美对齐！
+> t=8: [60, 60, 60, 60, 100] → Four sequences perfectly aligned!
 > ```
 
 ---
 
-## 📊 性能基准
+## 📊 Performance Benchmark
 
-### 测试配置
+### Test Configuration
 
-- **硬件**：NVIDIA A100 40GB
-- **模型**：Qwen-7B-Chat
-- **输入长度**：128-512 tokens
-- **输出长度**：500 tokens
+- **Hardware**: NVIDIA A100 40GB
+- **Model**: Qwen-7B-Chat
+- **Input Length**: 128-512 tokens
+- **Output Length**: 500 tokens
 
-### 单用户吞吐
+### Single User Throughput
 
 ```
-🔄 解码批次处理: 平均耗时 13.8ms/step
-   📊 耗时分布: 准备=0.07ms | Embedding=0.05ms | Cache=0.13ms | 
-                逐层=0.11ms | 归一化=0.19ms | 采样=12.9ms | 更新=0.04ms
+🔄 Decode batch processing: avg 13.8ms/step
+   📊 Time distribution: Prep=0.07ms | Embedding=0.05ms | Cache=0.13ms | 
+                        Layer=0.11ms | Norm=0.19ms | Sample=12.9ms | Update=0.04ms
 
 Stream generated 500 tokens in 6.97 seconds
 Throughput: 71.76 tokens/sec
 ```
 
-| 框架 | tokens/sec | 相对性能 |
-|------|------------|----------|
-| **本框架** | **71.76** | **98%** |
+| Framework | tokens/sec | Relative Performance |
+|-----------|------------|----------|
+| **This Framework** | **71.76** | **98%** |
 | vLLM | 73 | 100% |
 | HuggingFace | 20 | 27% |
 
-### 批量并发 (35 请求)
+### Batch Concurrency (35 Requests)
 
-| 框架 | 单请求 (tokens/s) | 吞吐量 (tokens/s) |
-|------|------------------|-------------------|
-| **本框架** | **52** | **1700** |
+| Framework | Per Request (tokens/s) | Total Throughput (tokens/s) |
+|-----------|----------------------|-------------------|
+| **This Framework** | **52** | **1700** |
 | vLLM | 60 | ~2100 |
+
 
 ---
 
-## 🚀 快速开始
+## 🚀 Quick Start
 
-### 安装
+### Installation
 
 ```bash
-# 克隆项目
+# Clone the project
 git clone https://github.com/your-repo/micro-vllm.git
 cd micro-vllm
 
-# 安装依赖
+# Install dependencies
 pip install -r requirements.txt
 ```
 
-### 模型下载
+### Model Download
 
 ```bash
 huggingface-cli download --resume-download Qwen/Qwen2-7B-Chat \
@@ -196,18 +198,18 @@ huggingface-cli download --resume-download Qwen/Qwen2-7B-Chat \
   --local-dir-use-symlinks False
 ```
 
-### 基础用法
+### Basic Usage
 
 ```python
 from core.engine import InferenceEngine
 
-# 初始化引擎
+# Initialize engine
 engine = InferenceEngine(
     model_path="/path/to/Qwen2-7B-Chat",
     max_batch_size=32
 )
 
-# 批量生成
+# Batch generation
 results = engine.generate(
     ["Hello", "AI is"],
     max_tokens=100
@@ -215,44 +217,44 @@ results = engine.generate(
 for prompt, text in results.items():
     print(f"{prompt}: {text}")
 
-# 流式生成
-for token, text in engine.stream_generate("AI 的未来是", max_tokens=50):
+# Streaming generation
+for token, text in engine.stream_generate("The future of AI is", max_tokens=50):
     print(text, end="", flush=True)
 ```
 
-### 启动 API 服务
+### Start API Server
 
 ```bash
 python api_server.py
 ```
 
-服务启动后可访问：
-- API 文档：http://localhost:8000/docs
-- 健康检查：http://localhost:8000/health
+After startup, available at:
+- API Docs: http://localhost:8000/docs
+- Health Check: http://localhost:8000/health
 
 ---
 
-## 🌐 API 参考
+## 🌐 API Reference
 
-### 非流式生成
+### Non-streaming Generation
 
 ```bash
 curl -X POST "http://localhost:8000/generate" \
   -H "Content-Type: application/json" \
   -d '{
-    "prompt": "写一个 Java 版本的文件上传代码",
+    "prompt": "Write a Java file upload code",
     "max_tokens": 500,
     "temperature": 0.7
   }'
 ```
 
-### 流式生成
+### Streaming Generation
 
 ```bash
 curl -X POST "http://localhost:8000/generate_stream" \
   -H "Content-Type: application/json" \
   -d '{
-    "prompt": "写一个 SpringBoot 文件上传代码",
+    "prompt": "Write a SpringBoot file upload code",
     "max_tokens": 500,
     "temperature": 0.7,
     "stream": true
@@ -261,9 +263,9 @@ curl -X POST "http://localhost:8000/generate_stream" \
 
 ---
 
-## ⚖️ 对比测试
+## ⚖️ Comparison Test
 
-### 启动 vLLM 服务
+### Start vLLM Server
 
 ```bash
 python -m vllm.entrypoints.openapi.api_server \
@@ -274,14 +276,14 @@ python -m vllm.entrypoints.openapi.api_server \
     --served-model-name Qwen-7B-Chat
 ```
 
-### 测试请求
+### Test Request
 
 ```bash
 curl http://localhost:8000/v1/completions \
     -H "Content-Type: application/json" \
     -d '{
         "model": "Qwen-7B-Chat",
-        "prompt": "你好，写一个 Java 版本的文件上传代码",
+        "prompt": "Hello, write a Java file upload code",
         "max_tokens": 1000,
         "temperature": 0.7,
         "stream": true
@@ -290,46 +292,47 @@ curl http://localhost:8000/v1/completions \
 
 ---
 
-## 📦 项目结构
+## 📦 Project Structure
 
 ```
 micro-vllm/
 ├── core/
-│   ├── engine.py           # 推理引擎入口
-│   ├── scheduler.py        # 连续批处理调度器
-│   ├── cache_manager.py    # PagedAttention KV 缓存管理
-│   ├── paged_attention.py  # 分页注意力实现
-│   ├── sequence.py         # 序列状态管理
+│   ├── engine.py           # Inference engine entry
+│   ├── scheduler.py        # Continuous batching scheduler
+│   ├── cache_manager.py    # PagedAttention KV cache manager
+│   ├── paged_attention.py  # Paged attention implementation
+│   ├── sequence.py         # Sequence state management
 │   └── layer/
-│       ├── model_graph.py  # CUDA Graph 封装
-│       └── sampler.py      # torch.compile 采样器
+│       ├── model_graph.py  # CUDA Graph wrapper
+│       └── sampler.py      # torch.compile sampler
 ├── models/
-│   └── qwen_adapter.py     # Qwen 模型适配器
+│   └── qwen_adapter.py     # Qwen model adapter
 ├── kernel/
-│   ├── rmsnorm.py          # RMSNorm 自定义实现
-│   └── swiglu_v2.py        # SwiGLU 激活函数
-├── api_server.py           # FastAPI 服务
-└── requirements.txt        # 项目依赖
+│   ├── rmsnorm.py          # RMSNorm custom implementation
+│   └── swiglu_v2.py       # SwiGLU activation function
+├── api_server.py           # FastAPI server
+└── requirements.txt         # Project dependencies
 ```
 
 ---
 
-## 📋 依赖
+## 📋 Dependencies
 
 - torch >= 2.0.0
 - transformers >= 4.56.0
 - flash-attn >= 2.0.0
 - fastapi >= 0.100.0
-- vllm (用于模型加载)
+- vllm (for model loading)
 
 ---
 
-## 💡 说明
+## 💡 Note
 
-本框架适合中小规模 LLM 服务的生产部署，性能达 vLLM 98%，代码简洁易于理解和二次开发。
+This framework is suitable for small-to-medium scale LLM service production deployment, achieving 98% of vLLM's performance with clean code that is easy to understand and extend.
 
 ---
 
-## 📄 许可证
+## 📄 License
 
 MIT License
+
