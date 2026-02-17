@@ -1,5 +1,6 @@
 from typing import Tuple, Union, List, Optional
 import torch
+import time
 
 
 class Sequence:
@@ -18,6 +19,7 @@ class Sequence:
         self.top_p = 0.9
         self.eos_token_id = tokenizer.eos_token_id
         self.priority = 0
+        self.timestamp = time.time()  # 请求到达时间戳
 
     def is_finished(self):
         return (len(self.output_ids) >= self.max_tokens or

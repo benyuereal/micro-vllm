@@ -65,7 +65,7 @@ class InferenceEngine:
         "cuda_moe": {"block_size": 256, "max_blocks": 48, "dtype": torch.bfloat16},  # ✅ Qwen3 MoE专用
     }
 
-    def __init__(self, model_path: str, max_batch_size: int = 128, max_prefill_tokens: int = 2048):
+    def __init__(self, model_path: str, max_batch_size: int = 32, max_prefill_tokens: int = 2048):
         """
         📌 **初始化推理引擎** (自动加载模型，隐藏所有配置)
 
@@ -92,14 +92,10 @@ class InferenceEngine:
         self.config = self.model.config
         self.model_type = self.config.model_type
         # 自动适配模型结构
-        if self.model_type == "qwen":
-            self.embedding_layer = self.model.transformer.wte
-            self.norm_layer = self.model.transformer.ln_f
-            self.model_layers = self.model.transformer.h
-        elif self.model_type in ["qwen2", "qwen3"]:
-            self.embedding_layer = self.model.model.embed_tokens
-            self.norm_layer = self.model.model.norm
-            self.model_layers = self.model.model.layers
+        self.embedding_layer = self.model.transformer.wte
+        self.norm_layer = self.model.transformer.ln_f
+        self.model_layers = self.model.transformer.h
+        
 
         self.logger.info(f"Detected model type: {self.model_type}")
 
@@ -144,6 +140,8 @@ class InferenceEngine:
         self.adapter = QwenModelAdapter()
 
         self.eos_token_id = self.tokenizer.eos_token_id
+        # 默认使用 0 作为 pad_token_id（scheduler 已经将序列填充到相同长度）
+        self.pad_token_id = 0
         self.stream_callbacks = {}
         self.max_position = getattr(self.config, 'max_position_embeddings', 4096)
 
@@ -223,7 +221,7 @@ class InferenceEngine:
         """执行推理step，返回是否有处理任何请求（连续批处理版本）"""
         # Mark the beginning of a new iteration for CUDA graphs
         # This prevents tensor output overwriting between consecutive runs
-        torch.compiler.cudagraph_mark_step_begin()
+        # torch.compiler.cudagraph_mark_step_begin()
 
         working = False
 
@@ -256,7 +254,7 @@ class InferenceEngine:
         """处理预填充批次 (极简版)"""
         # 1. 准备输入
         input_ids = [seq.get_next_input_ids() for seq in batch]
-        input_tensor = self._pad_batch(input_ids, self.tokenizer.pad_token_id).to(self.device)
+        input_tensor = self._pad_batch(input_ids, self.pad_token_id).to(self.device)
 
         # 2. 前向传播
         outputs = self.model(input_ids=input_tensor, use_cache=True)
@@ -267,15 +265,10 @@ class InferenceEngine:
             num_tokens = len(input_ids[i])
             success, slot_mapping = self.cache_manager.alloc(seq.seq_id, num_tokens)
             if not success: continue
-            model_type = getattr(self, 'model_type', 'default')
             for layer_idx, (k, v) in enumerate(past_kvs):
                 # 直接提取当前序列的所有token KV (避免循环)
-                if model_type == "qwen":
-                    k_tensor = k[i, :num_tokens, :, :]  # [N, H, D]
-                    v_tensor = v[i, :num_tokens, :, :]
-                else:
-                    k_tensor = k[i, :, :num_tokens, :].permute(1, 0, 2)  # [H, N, D]
-                    v_tensor = v[i, :, :num_tokens, :].permute(1, 0, 2)
+                k_tensor = k[i, :num_tokens, :, :]  # [N, H, D]
+                v_tensor = v[i, :num_tokens, :, :]
                 k_cache, v_cache = self.cache_manager.get(layer_idx)
                 store_kvcache(k_tensor, v_tensor, k_cache, v_cache,
                               torch.tensor(slot_mapping, dtype=torch.int32, device=k_tensor.device),
