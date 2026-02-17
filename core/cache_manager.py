@@ -333,10 +333,7 @@ class KVCacheManager:
         self._pos = {}
         
         # 4. block table 
-        self._block_table = torch.full(
-            (32, self.n_blocks), -1,
-            dtype=torch.int32, device=self.device
-        )
+    
         self.cache_seqlens = torch.tensor([1], dtype=torch.int32, device=self.device)
 
             # 计算单序列最大块数
@@ -436,7 +433,7 @@ class KVCacheManager:
             self._blocks[seq_id] = blocks  # 确保引用同步（防御性编程）
             self._pos[new_block] = 1
             return new_block * self.block_size
-
+        print(f"❌ cache_manager.append failed for seq {seq_id}, blocks: {blocks}, current_pos: {current_pos}, block_size: {self.block_size}, _free: {len(self._free)}")
         # 情况3: 无可用Block
         return -1
 
@@ -549,17 +546,6 @@ class KVCacheManager:
             self._block_table_buffer[:batch_size],
             self._cache_seqlens_buffer[:batch_size]
         )
-
-    def cache_batch_datav1(self, seq_ids: list, context_lens: List[int], ):
-        block_tables = [self.get_blocks(seq_id) for seq_id in seq_ids]
-        max_blocks = max(map(len, block_tables), default=0)
-        block_table_tensor = torch.tensor([
-            blocks + [-1] * (max_blocks - len(blocks)) for blocks in block_tables
-        ], dtype=torch.int32, device=self.device)
-        self._block_table = block_table_tensor
-
-        self.cache_seqlens = torch.tensor(context_lens, dtype=torch.int32, device=self.device)
-
 
 
 

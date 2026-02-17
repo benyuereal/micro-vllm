@@ -60,7 +60,7 @@ class InferenceEngine:
     # 扩展DEVICE_CONFIGS (支持Qwen3 MoE)
     DEVICE_CONFIGS = {
         "mps": {"block_size": 16, "max_blocks": 512, "dtype": torch.float16},
-        "cuda": {"block_size": 256, "max_blocks": 32, "dtype": None},  # 自动选择bfloat16/float16
+        "cuda": {"block_size": 256, "max_blocks": 65, "dtype": None},  # 自动选择bfloat16/float16
         "cpu": {"block_size": 16, "max_blocks": 128, "dtype": torch.float32},
         "cuda_moe": {"block_size": 256, "max_blocks": 48, "dtype": torch.bfloat16},  # ✅ Qwen3 MoE专用
     }
