@@ -60,7 +60,7 @@ class InferenceEngine:
     # 扩展DEVICE_CONFIGS (支持Qwen3 MoE)
     DEVICE_CONFIGS = {
         "mps": {"block_size": 16, "max_blocks": 512, "dtype": torch.float16},
-        "cuda": {"block_size": 256, "max_blocks": 96, "dtype": None},  # 自动选择bfloat16/float16
+        "cuda": {"block_size": 256, "max_blocks": 32, "dtype": None},  # 自动选择bfloat16/float16
         "cpu": {"block_size": 16, "max_blocks": 128, "dtype": torch.float32},
         "cuda_moe": {"block_size": 256, "max_blocks": 48, "dtype": torch.bfloat16},  # ✅ Qwen3 MoE专用
     }
@@ -150,7 +150,7 @@ class InferenceEngine:
             max_batch_size=max_batch_size
         )
 
-        self.scheduler = Scheduler(max_batch_size, max_prefill_tokens)
+        self.scheduler = Scheduler(max_batch_size, max_prefill_tokens, self.tokenizer)
         self.adapter = QwenModelAdapter()
 
         self.eos_token_id = self.tokenizer.eos_token_id
@@ -167,7 +167,7 @@ class InferenceEngine:
             # 捕获整个模型的CUDA Graph
             self.graph_runner.capture(
                 self.cache_manager,
-                batch_sizes=[1, 2]
+                batch_sizes=[1, 2, 4, 8, 16, 32]
             )
             self.logger.info("CUDA Graphs capture completed")
 
@@ -230,21 +230,34 @@ class InferenceEngine:
 
     @torch.no_grad()
     def step(self) -> bool:
-        """执行一个推理step，返回是否有处理任何请求"""
+        """执行推理step，返回是否有处理任何请求（连续批处理版本）"""
         # Mark the beginning of a new iteration for CUDA graphs
         # This prevents tensor output overwriting between consecutive runs
         torch.compiler.cudagraph_mark_step_begin()
-        
-        batch, batch_type = self.scheduler.get_next_batch()
-        if not batch:
-            return False
 
-        if batch_type == "prefill":
-            self._process_prefill_batch(batch)
-        elif batch_type == "decode":
-            self._process_decode_batch(batch)
+        working = False
 
-        return True
+        while True:
+            # 使用连续批处理：Padding 凑齐 batch + 动态剔除完成
+            batch, batch_type = self.scheduler.get_next_batch()
+
+            if not batch:
+                break  # 没有更多工作
+
+            working = True
+
+            if batch_type == "prefill":
+                self._process_prefill_batch(batch)
+            elif batch_type == "decode":
+                self._process_decode_batch(batch)
+
+            # 连续批处理：检查是否需要继续填充
+            # 如果有等待中的请求 → 继续循环填充
+            # 否则退出
+            if not self.scheduler.waiting_queue:
+                break
+
+        return working
 
     @torch.no_grad()
     def _process_prefill_batch(self, batch: List[Sequence]):

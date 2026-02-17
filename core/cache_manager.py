@@ -293,8 +293,8 @@ class KVCacheManager:
                  head_size: int,  # 每个头的维度 (如128)
                  dtype=torch.float16,  # 数据类型
                  device="cuda", 
-                 max_tokens: int = 8192,
-                 max_batch_size: int = 128):  # 最大token数
+                 max_tokens: int = 1024,
+                 max_batch_size: int = 32): 
         """
         📌 **初始化**:
             1. 创建KV缓存张量 (ParameterList支持AMP)

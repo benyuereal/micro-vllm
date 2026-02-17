@@ -7,7 +7,7 @@ class Sampler:
         self._compiled_sample = torch.compile(
             self._sample_impl,
             fullgraph=True,
-            dynamic=False,  # batch_size 固定
+            dynamic=True,  # batch_size 固定
             mode="reduce-overhead",
 
             # mode="max-autotune"

@@ -268,7 +268,7 @@ class ModelGraphRunner:
                 self._eager(dummy_hidden, batch_size, cache_manager)
         
         torch.cuda.synchronize()
-    
+
     def _eager(self, hidden_states, batch_size: int, cache_manager):
         """Eager模式的前向（用于预热）"""
         h = hidden_states.squeeze(1) if hidden_states.dim() == 3 else hidden_states
@@ -344,7 +344,8 @@ class ModelGraphRunner:
         
         # Replay Graph
         if batch_size not in self._graphs:
-            raise RuntimeError(f"Graph not found for batch_size={batch_size}")
+            print(f"Graph not found for batch_size={batch_size}")
+            return self._eager(hidden_states, batch_size, cache_manager)
         
         self._graphs[batch_size].replay()
         
