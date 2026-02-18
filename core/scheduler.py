@@ -27,6 +27,7 @@ class Scheduler:
         self.running_sequences = []    # 正在运行的序列
         self.finished_sequences = []   # 已完成
         self.batch_sizes = [1, 2, 4, 8, 16, 32]  # 已捕获的 batch_size（与 engine 一致）
+        self.prefill_batch_timestamp = time.time()  # 预填充批次开始等待的时间戳
 
     def _get_bucket_key(self, length: int) -> int:
         """
@@ -58,8 +59,8 @@ class Scheduler:
         # 2. 预填充阶段：有新请求时优先处理
         if self.waiting_queue:
             batch, batch_type = self._get_prefill_batch()
-            logger.info(f"batch: {batch}, batch_type: {batch_type}")
-            if batch:
+            logger.info(f"batch_type: {batch_type}, batch: {batch}")
+            if batch_type != "idle":
                 return batch, batch_type
 
         # 3. 解码阶段：Padding 凑齐 batch_size
@@ -69,7 +70,6 @@ class Scheduler:
                 if seq.state == "decode" and not seq.is_finished():
                     length = seq.current_position
                     length_groups[length].append(seq)
-
             if length_groups:
                 # 找到最短的长度组（SJF）
                 min_length = min(length_groups.keys())
@@ -78,17 +78,14 @@ class Scheduler:
                 # 同长度组内可以任意排序（已经是相同长度）
                 # 直接取前 max_batch_size 个
                 selected = min_group[:self.max_batch_size]
-
                 if selected:
                     batch = selected
                     batch_type = "decode"
                     # 从 batch_sizes 中找到第一个 <= len(batch) 的值（向下取整）
                     batch_len = len(batch)
-                    logger.info(f"batch_len: {batch_len}")
                     batch_sizes = max((b for b in self.batch_sizes if b <= batch_len), default=self.batch_sizes[0])
                     return batch[:batch_sizes], batch_type
 
-        logger.info(f"running_sequences: {len(self.running_sequences)}")
         return [], "idle"
 
     def _get_prefill_batch(self) -> Tuple[List[Sequence], str]:
@@ -138,15 +135,12 @@ class Scheduler:
             
             # 触发批次的条件：
             # 1. 达到 max_batch_size
-            # 2. 或者桶内最早请求等待时间超过 prefill_timeout（0.1s = 100ms）
+            # 2. 或者桶内最早请求等待时间超过 prefill_timeout
             
-            # while True:
-            #     current_time = time.time()
-            #     # 桶内最晚请求的等待时间（当前时间 - 桶内最早到达的请求时间）
-            #     min_timestamp = min(seq.timestamp for seq in bucket_sequences)
-            #     wait_time = current_time - min_timestamp
-                
-            if len(selected) >= 32:
+            wait_time = time.time() - self.prefill_batch_timestamp
+            
+            logger.info(f"selected: {len(selected)}, max_batch_size: {self.max_batch_size}, wait_time: {wait_time:.3f}s")
+            if len(selected) >= self.max_batch_size or wait_time >= self.prefill_timeout:
                 # 找到最长序列的长度
                 max_len = max(len(seq.input_ids) for seq in selected)
                 
@@ -160,12 +154,12 @@ class Scheduler:
                     self.waiting_queue.remove(seq)
                     self.running_sequences.append(seq)
                 
-                logger.info(f"prefill bucket: {bucket_key}, selected: {len(selected)} sequences, max_len: {max_len}, tokens: {total_tokens}")
+                logger.info(f"prefill bucket: {bucket_key}, selected: {len(selected)} sequences, max_len: {max_len}, tokens: {total_tokens}, wait_time: {wait_time:.3f}s")
+                self.prefill_batch_timestamp = time.time()  # 重置为当前时间
                 return selected, "prefill"
-                # logger.info(f"not enough sequences, do waiting: {wait_time:.3f}s")
-                # time.sleep(0.5)
         
-        return [], "idle"
+        # 不满足批次条件，返回 waiting 让外部控制等待
+        return [], "waiting"
 
     def mark_finished(self, seq: Sequence):
         if seq in self.running_sequences:
@@ -176,3 +170,26 @@ class Scheduler:
         results = [(seq, seq.full_ids) for seq in self.finished_sequences]
         self.finished_sequences.clear()
         return results
+
+    def is_finished(self, seq_id: int) -> bool:
+        """
+        判断指定序列是否已完成（不在 waiting 和 running 中）
+        
+        Args:
+            seq_id: 序列 ID
+            
+        Returns:
+            True 表示已完成（要么在 finished_sequences 中，要么已从 waiting/running 中移除）
+        """
+        # 检查是否在 waiting_queue 中
+        for seq in self.waiting_queue:
+            if seq.seq_id == seq_id:
+                return False
+        
+        # 检查是否在 running_sequences 中
+        for seq in self.running_sequences:
+            if seq.seq_id == seq_id:
+                return False
+        
+        # 不在任何队列中，认为已完成
+        return True

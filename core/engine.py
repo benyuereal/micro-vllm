@@ -229,6 +229,11 @@ class InferenceEngine:
             # 使用连续批处理：Padding 凑齐 batch + 动态剔除完成
             batch, batch_type = self.scheduler.get_next_batch()
 
+            if batch_type == "waiting":
+                self.logger.info("found waiting for prefill batch")
+                time.sleep(0.05)
+                continue
+
             if not batch:
                 break  # 没有更多工作
 
