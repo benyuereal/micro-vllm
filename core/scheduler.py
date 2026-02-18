@@ -84,7 +84,6 @@ class Scheduler:
                     batch_type = "decode"
                     # 从 batch_sizes 中找到第一个 <= len(batch) 的值（向下取整）
                     batch_len = len(batch)
-                    logger.info(f"batch_len: {batch_len}")
                     batch_sizes = max((b for b in self.batch_sizes if b <= batch_len), default=self.batch_sizes[0])
                     return batch[:batch_sizes], batch_type
 
