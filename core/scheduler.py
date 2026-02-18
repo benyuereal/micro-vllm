@@ -10,7 +10,7 @@ logger = logging.getLogger(__name__)
 
 class Scheduler:
     def __init__(self, max_batch_size: int = 32, max_prefill_tokens: int = 2048, 
-                 tokenizer: AutoTokenizer = None, prefill_timeout: float = 0.5):
+                 tokenizer: AutoTokenizer = None, prefill_timeout: float = 0.02):
         """
         Args:
             max_batch_size: 最大批次大小
@@ -27,7 +27,6 @@ class Scheduler:
         self.running_sequences = []    # 正在运行的序列
         self.finished_sequences = []   # 已完成
         self.batch_sizes = [1, 2, 4, 8, 16, 32]  # 已捕获的 batch_size（与 engine 一致）
-        self.prefill_batch_timestamp = time.time()  # 预填充批次开始等待的时间戳
 
     def _get_bucket_key(self, length: int) -> int:
         """
@@ -59,7 +58,7 @@ class Scheduler:
         # 2. 预填充阶段：有新请求时优先处理
         if self.waiting_queue:
             batch, batch_type = self._get_prefill_batch()
-            logger.info(f"batch_type: {batch_type}, batch: {batch}")
+            # logger.info(f"batch_type: {batch_type}, batch: {len(batch)}, waiting_queue: {len(self.waiting_queue)}, running_sequences: {len(self.running_sequences)}")
             if batch_type != "idle":
                 return batch, batch_type
 
@@ -124,6 +123,7 @@ class Scheduler:
             
             selected = []
             total_tokens = 0
+            timestamp = None  # 记录候选序列中最早的时间戳
             for seq in bucket_sequences:
                 if len(selected) >= self.max_batch_size:
                     break
@@ -132,14 +132,17 @@ class Scheduler:
                     continue
                 selected.append(seq)
                 total_tokens += seq_tokens
+                # 记录最早到达的时间戳
+                if timestamp is None or seq.timestamp < timestamp:
+                    timestamp = seq.timestamp
             
             # 触发批次的条件：
             # 1. 达到 max_batch_size
-            # 2. 或者桶内最早请求等待时间超过 prefill_timeout
+            # 2. 或者候选序列中最早请求等待时间超过 prefill_timeout
+                
+            wait_time = time.time() - timestamp
             
-            wait_time = time.time() - self.prefill_batch_timestamp
-            
-            logger.info(f"selected: {len(selected)}, max_batch_size: {self.max_batch_size}, wait_time: {wait_time:.3f}s")
+            # logger.info(f"selected: {len(selected)}, max_batch_size: {self.max_batch_size}, wait_time: {wait_time:.3f}s")
             if len(selected) >= self.max_batch_size or wait_time >= self.prefill_timeout:
                 # 找到最长序列的长度
                 max_len = max(len(seq.input_ids) for seq in selected)
@@ -155,7 +158,6 @@ class Scheduler:
                     self.running_sequences.append(seq)
                 
                 logger.info(f"prefill bucket: {bucket_key}, selected: {len(selected)} sequences, max_len: {max_len}, tokens: {total_tokens}, wait_time: {wait_time:.3f}s")
-                self.prefill_batch_timestamp = time.time()  # 重置为当前时间
                 return selected, "prefill"
         
         # 不满足批次条件，返回 waiting 让外部控制等待

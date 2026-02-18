@@ -40,6 +40,7 @@ from .sequence import Sequence
 from .model_loader import load_model
 import logging
 from .layer.sampler import Sampler
+import asyncio
 
 class InferenceEngine:
     """
@@ -230,8 +231,8 @@ class InferenceEngine:
             batch, batch_type = self.scheduler.get_next_batch()
 
             if batch_type == "waiting":
-                self.logger.info("found waiting for prefill batch")
-                time.sleep(0.05)
+                # time.sleep(0.001)
+                time.sleep(0.001)  # 让出控制权，事件循环可以处理其他请求
                 continue
 
             if not batch:

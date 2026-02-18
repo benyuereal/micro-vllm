@@ -34,7 +34,7 @@ async def inference_task():
             # 同步调用 engine.step()（内部有锁保护）
             status = engine.step()
             if not status:
-                await asyncio.sleep(0.05)  # 使用 async sleep
+                await asyncio.sleep(0.001)  # 使用 async sleep
             # 让出控制权，确保其他协程有机会运行
             await asyncio.sleep(0.0)
         else:
