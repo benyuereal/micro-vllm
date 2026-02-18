@@ -2,17 +2,41 @@ from collections import deque, defaultdict
 from typing import List, Tuple, Dict, Optional
 from transformers import AutoTokenizer
 from .sequence import Sequence
+import logging
+import time
+
+logger = logging.getLogger(__name__)
 
 
 class Scheduler:
-    def __init__(self, max_batch_size: int = 32, max_prefill_tokens: int = 2048, tokenizer: AutoTokenizer = None):
+    def __init__(self, max_batch_size: int = 32, max_prefill_tokens: int = 2048, 
+                 tokenizer: AutoTokenizer = None, prefill_timeout: float = 0.02):
+        """
+        Args:
+            max_batch_size: 最大批次大小
+            max_prefill_tokens: 预填充阶段最大 token 数
+            tokenizer: 分词器
+            prefill_timeout: 预填充阶段超时时间（秒），默认 0.1s
+        """
         self.tokenizer = tokenizer
         self.max_batch_size = max_batch_size
         self.max_prefill_tokens = max_prefill_tokens
+        self.prefill_timeout = prefill_timeout
+        self.bucket_size = 50  # 预填充长度分桶区间大小
         self.waiting_queue = deque()   # 新请求
         self.running_sequences = []    # 正在运行的序列
         self.finished_sequences = []   # 已完成
         self.batch_sizes = [1, 2, 4, 8, 16, 32]  # 已捕获的 batch_size（与 engine 一致）
+
+    def _get_bucket_key(self, length: int) -> int:
+        """
+        将长度映射到桶区间
+        例如 bucket_size=50:
+        - 长度 0-49   → bucket 0
+        - 长度 50-99  → bucket 50
+        - 长度 100-149 → bucket 100
+        """
+        return (length // self.bucket_size) * self.bucket_size
 
     def add_request(self, seq: Sequence):
         self.waiting_queue.append(seq)
@@ -34,7 +58,8 @@ class Scheduler:
         # 2. 预填充阶段：有新请求时优先处理
         if self.waiting_queue:
             batch, batch_type = self._get_prefill_batch()
-            if batch:
+            # logger.info(f"batch_type: {batch_type}, batch: {len(batch)}, waiting_queue: {len(self.waiting_queue)}, running_sequences: {len(self.running_sequences)}")
+            if batch_type != "idle":
                 return batch, batch_type
 
         # 3. 解码阶段：Padding 凑齐 batch_size
@@ -44,7 +69,6 @@ class Scheduler:
                 if seq.state == "decode" and not seq.is_finished():
                     length = seq.current_position
                     length_groups[length].append(seq)
-
             if length_groups:
                 # 找到最短的长度组（SJF）
                 min_length = min(length_groups.keys())
@@ -53,7 +77,6 @@ class Scheduler:
                 # 同长度组内可以任意排序（已经是相同长度）
                 # 直接取前 max_batch_size 个
                 selected = min_group[:self.max_batch_size]
-
                 if selected:
                     batch = selected
                     batch_type = "decode"
@@ -65,40 +88,80 @@ class Scheduler:
         return [], "idle"
 
     def _get_prefill_batch(self) -> Tuple[List[Sequence], str]:
-        """提取 prefill 逻辑，复用给连续批处理"""
-        batch = []
-        length_groups = defaultdict(list)
-
+        """
+        预填充批次调度：基于桶区间的分批策略
+        
+        策略说明：
+        - 将预填充请求按长度映射到 bucket_size 大小的桶中
+        - 从最短的桶开始选择批次
+        - 同一桶内的请求长度相近，padding 最小化
+        
+        示例（bucket_size=50）：
+        - 长度 [10, 45, 52, 98, 103] 
+        - 桶分组: {0: [10, 45], 50: [52], 100: [98, 103]}
+        - 优先选择桶 0（最短）
+        """
+        # 按桶区间分组
+        bucket_groups = defaultdict(list)
+        
         for seq in list(self.waiting_queue):
             if seq.state == "prefill":
                 length = len(seq.input_ids)
-                length_groups[length].append(seq)
-
-        if not length_groups:
+                bucket = self._get_bucket_key(length)
+                bucket_groups[bucket].append(seq)
+        
+        if not bucket_groups:
             return [], "idle"
-
-        max_group = max(length_groups.values(), key=len)
-        max_group.sort(key=lambda s: len(s.input_ids), reverse=True)
-
-        selected = []
-        total_tokens = 0
-        for seq in max_group:
-            if len(selected) >= self.max_batch_size:
-                break
-            seq_tokens = len(seq.input_ids)
-            if total_tokens + seq_tokens > self.max_prefill_tokens:
-                continue
-            selected.append(seq)
-            total_tokens += seq_tokens
-
-        for seq in selected:
-            self.waiting_queue.remove(seq)
-            self.running_sequences.append(seq)
-
-        if selected:
-            return selected, "prefill"
-
-        return [], "idle"
+        
+        # 从最短的桶开始选择（升序排列）
+        sorted_buckets = sorted(bucket_groups.keys())
+        
+        for bucket_key in sorted_buckets:
+            bucket_sequences = bucket_groups[bucket_key]
+            # 按长度降序排列（长的在前，减少padding）
+            bucket_sequences.sort(key=lambda s: len(s.input_ids), reverse=True)
+            
+            selected = []
+            total_tokens = 0
+            timestamp = None  # 记录候选序列中最早的时间戳
+            for seq in bucket_sequences:
+                if len(selected) >= self.max_batch_size:
+                    break
+                seq_tokens = len(seq.input_ids)
+                if total_tokens + seq_tokens > self.max_prefill_tokens:
+                    continue
+                selected.append(seq)
+                total_tokens += seq_tokens
+                # 记录最早到达的时间戳
+                if timestamp is None or seq.timestamp < timestamp:
+                    timestamp = seq.timestamp
+            
+            # 触发批次的条件：
+            # 1. 达到 max_batch_size
+            # 2. 或者候选序列中最早请求等待时间超过 prefill_timeout
+                
+            wait_time = time.time() - timestamp
+            
+            # logger.info(f"selected: {len(selected)}, max_batch_size: {self.max_batch_size}, wait_time: {wait_time:.3f}s")
+            if len(selected) >= self.max_batch_size or wait_time >= self.prefill_timeout:
+                # 找到最长序列的长度
+                max_len = max(len(seq.input_ids) for seq in selected)
+                
+                # 将所有序列填充到最长长度（用 0 填充）
+                for seq in selected:
+                    current_len = len(seq.input_ids)
+                    if current_len < max_len:
+                        seq.input_ids = seq.input_ids + [0] * (max_len - current_len)
+                
+                for seq in selected:
+                    self.waiting_queue.remove(seq)
+                    self.running_sequences.append(seq)
+                
+                logger.info(f"prefill bucket: {bucket_key}, selected: {len(selected)} sequences, max_len: {max_len}, tokens: {total_tokens}, wait_time: {wait_time:.3f}s")
+                return selected, "prefill"
+        
+        # 不满足批次条件，返回 waiting 让外部控制等待
+        return [], "waiting"
 
     def mark_finished(self, seq: Sequence):
         if seq in self.running_sequences:
@@ -109,3 +172,26 @@ class Scheduler:
         results = [(seq, seq.full_ids) for seq in self.finished_sequences]
         self.finished_sequences.clear()
         return results
+
+    def is_finished(self, seq_id: int) -> bool:
+        """
+        判断指定序列是否已完成（不在 waiting 和 running 中）
+        
+        Args:
+            seq_id: 序列 ID
+            
+        Returns:
+            True 表示已完成（要么在 finished_sequences 中，要么已从 waiting/running 中移除）
+        """
+        # 检查是否在 waiting_queue 中
+        for seq in self.waiting_queue:
+            if seq.seq_id == seq_id:
+                return False
+        
+        # 检查是否在 running_sequences 中
+        for seq in self.running_sequences:
+            if seq.seq_id == seq_id:
+                return False
+        
+        # 不在任何队列中，认为已完成
+        return True

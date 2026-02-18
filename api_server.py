@@ -12,6 +12,7 @@ from queue import Queue
 import config.config as Config
 # 全局引擎实例
 engine = None
+running = True  # 控制 step 循环
 app = FastAPI(title="vLLM API Server", version="0.1.0")
 
 
@@ -22,6 +23,23 @@ class GenerateRequest(BaseModel):
     temperature: Optional[float] = 0.7
     top_p: Optional[float] = 0.9
     stream: Optional[bool] = False
+
+
+# 异步推理任务
+async def inference_task():
+    """异步推理任务 - 在后台持续执行推理"""
+    print("Async inference task started")
+    while running:
+        if engine is not None:
+            # 同步调用 engine.step()（内部有锁保护）
+            status = engine.step()
+            if not status:
+                await asyncio.sleep(0.001)  # 使用 async sleep
+            # 让出控制权，确保其他协程有机会运行
+            await asyncio.sleep(0.0)
+        else:
+            await asyncio.sleep(0.1)
+    print("Async inference task stopped")
 
 
 class BatchGenerateRequest(BaseModel):
@@ -59,9 +77,20 @@ async def startup_event():
     try:
         engine = InferenceEngine(model_path)
         print(f"Model loaded successfully on device: {engine.device}")
+        
+        # 启动异步推理任务（不阻塞启动流程）
+        asyncio.create_task(inference_task())
+        print("Async inference task started")
     except Exception as e:
         print(f"Failed to load model: {str(e)}")
         raise e
+
+
+@app.on_event("shutdown")
+async def shutdown_event():
+    global running
+    running = False
+    print("Stopping step loop...")
 
 
 # 健康检查端点
@@ -175,20 +204,8 @@ async def generate_stream(request: GenerateRequest):
         engine.register_stream_callback(seq_id, callback)
 
         try:
-            step_count = 0
-            _total_time = 0
-            _batch_type = None
-            _batch_size = None
-            
+
             while True:
-                step_start = time.time()
-                
-                engine.step()
-                step_time = time.time() - step_start
-                
-                step_count += 1
-                _total_time += step_time
-          
                 # 消费所有已生成 token
                 while not token_queue.empty():
                     token, text = token_queue.get()
@@ -202,11 +219,8 @@ async def generate_stream(request: GenerateRequest):
                     }
                     yield f"data: {json.dumps(data, ensure_ascii=False)}\n\n"
 
-                # 检查序列是否结束
-                running_seqs = [seq for seq in engine.scheduler.running_sequences if seq.seq_id == seq_id]
-                if not running_seqs:
-                    avg_step_time = _total_time / step_count * 1000
-                    print(f"[DONE] 共 {step_count} steps, 首批次: type={_batch_type}, size={_batch_size}, 平均每step: {avg_step_time:.1f}ms")
+                # 检查序列是否结束（使用 scheduler 的方法判断）
+                if engine.scheduler.is_finished(seq_id):
                     end_time = time.time()
                     gen_time = end_time - start_time
                     tokens_per_sec = token_count / gen_time if gen_time > 0 else 0
@@ -214,9 +228,8 @@ async def generate_stream(request: GenerateRequest):
                     print(f"\nStream generated {token_count} tokens in {gen_time:.2f} seconds")
                     print(f"Throughput: {tokens_per_sec:.2f} tokens/sec")
                     break
-
-                # ✅ 关键：让出控制权，但不等待
-                await asyncio.sleep(0)  # ← 原为 0.01，现在改为 0
+                # 让出控制权，等待后台 step 产生 token
+                await asyncio.sleep(0.0)
 
         finally:
             engine.unregister_stream_callback(seq_id)
