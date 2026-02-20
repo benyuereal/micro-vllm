@@ -120,11 +120,9 @@ Custom kernel to fuse the MLP layer bottleneck:
 
 - **Mechanism**: Fuses Gate Projection, Up Projection matrix multiplication, and SwiGLU activation into a single kernel
 - **Benefits**: Reduces intermediate HBM reads/writes, significantly lowers memory bandwidth pressure, especially improving throughput in large batch scenarios
-- **Implementation**: Located in `kernel/swiglu_v2.py`
+- **Implementation**: Located in `kernel/swiglu.py`
 
 ```python
-# Before: 3 memory reads/writes (GateUp -> Chunk -> Activation -> Down)
-# After: 1 memory read/write (Fused Kernel)
 from kernel.swiglu import swiglu_fused
 activated = swiglu_fused(gate_up)  # Fused computation in one step
 ```
@@ -332,7 +330,7 @@ micro-vllm/
 │   └── qwen_adapter.py     # Qwen model adapter
 ├── kernel/
 │   ├── rmsnorm.py          # RMSNorm custom implementation
-│   └── swiglu_v2.py       # ⭐ SwiGLU fused activation (Latest optimization)
+│   └── swiglu.py       # ⭐ SwiGLU fused activation (Latest optimization)
 ├── api_server.py           # FastAPI server
 └── requirements.txt         # Project dependencies
 ```
@@ -345,18 +343,12 @@ micro-vllm/
 - transformers >= 4.56.0
 - flash-attn >= 2.0.0
 - fastapi >= 0.100.0
-- vllM (for model loading)
 
 ---
 
 ## 💡 Note
 
 This framework is suitable for small-to-medium scale LLM service production deployment, achieving 99% of vLLM's performance with clean code that is easy to understand and extend.
-
-**Branch Information**:
-- `main`: Stable version (98% vLLM performance)
-- `online`: Latest development branch (with SwiGLU fusion, 99% vLLM performance)
-
 ---
 
 ## 📄 License

@@ -119,11 +119,9 @@ flash_attn_with_kvcache(
 
 - **机制**：将 Gate Proj、Up Proj 矩阵乘法与 SwiGLU 激活融合为单个 Kernel
 - **优势**：减少中间结果的 HBM 读写，显著降低内存带宽压力，特别提升大 Batch 场景吞吐量
-- **实现**：位于 `kernel/swiglu_v2.py`
+- **实现**：位于 `kernel/swiglu.py`
 
 ```python
-# 优化前：3次内存读写 (GateUp -> Chunk -> Activation -> Down)
-# 优化后：1次内存读写 (Fused Kernel)
 from kernel.swiglu import swiglu_fused
 activated = swiglu_fused(gate_up)  # 一步完成融合计算
 ```
@@ -207,7 +205,6 @@ Throughput: 73.0 tokens/sec
 ### 安装
 
 ```bash
-# 克隆项目 (推荐切换到 online 分支体验最新优化)
 git clone https://github.com/benyuereal/micro-vllm.git
 cd micro-vllm
 # 安装依赖
@@ -316,27 +313,7 @@ curl http://localhost:8000/v1/completions \
 
 ---
 
-## 📦 项目结构
 
-```
-micro-vllm/
-├── core/
-│   ├── engine.py           # 推理引擎入口
-│   ├── scheduler.py        # 连续批处理调度器
-│   ├── cache_manager.py    # PagedAttention KV 缓存管理
-│   ├── paged_attention.py  # 分页注意力实现
-│   ├── sequence.py         # 序列状态管理
-│   └── layer/
-│       ├── model_graph.py  # CUDA Graph 封装
-│       └── sampler.py      # torch.compile 采样器
-├── models/
-│   └── qwen_adapter.py     # Qwen 模型适配器
-├── kernel/
-│   ├── rmsnorm.py          # RMSNorm 自定义实现
-│   └── swiglu_v2.py       # ⭐ SwiGLU 融合算子 (最新优化)
-├── api_server.py           # FastAPI 服务
-└── requirements.txt         # 项目依赖
-```
 
 ---
 
