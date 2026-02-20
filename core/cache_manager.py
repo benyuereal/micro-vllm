@@ -516,18 +516,28 @@ class KVCacheManager:
         # 原地更新：先重置为 -1
         self._block_table_buffer[:batch_size] = -1
         
-        # 填充实际值
-        for i, blocks in enumerate(block_tables):
-            num_blocks = len(blocks)
-            if num_blocks > 0:
-                self._block_table_buffer[i, :num_blocks] = torch.tensor(
-                    blocks, dtype=torch.int32, device=self.device
-                )
-        
-        # 原地更新 cache_seqlens
-        self._cache_seqlens_buffer[:batch_size] = torch.tensor(
-            context_lens, dtype=torch.int32, device=self.device
-        )
+        # 优化：收集所有数据到列表，然后一次性转换到GPU（避免循环中多次创建tensor）
+        if batch_size > 0:
+            # 收集所有blocks数据（展平）
+            blocks_allocated = []
+            block_offsets = [0]  # 每个序列的起始位置
+            for blocks in block_tables:
+                blocks_allocated.extend(blocks)
+                block_offsets.append(block_offsets[-1] + len(blocks))
+            
+            # 一次性创建GPU tensor并复制
+            if blocks_allocated:
+                blocks_tensor = torch.tensor(blocks_allocated, dtype=torch.int32, device=self.device)
+                # 逐行填充
+                for i, blocks in enumerate(block_tables):
+                    if blocks:
+                        start = block_offsets[i]
+                        end = block_offsets[i + 1]
+                        self._block_table_buffer[i, :len(blocks)] = blocks_tensor[start:end]
+            
+            # 优化 context_lens：使用CPU tensor一次性拷贝
+            context_lens_tensor = torch.tensor(context_lens, dtype=torch.int32)
+            self._cache_seqlens_buffer[:batch_size] = context_lens_tensor.to(self.device, non_blocking=True)
         
         # 返回视图（同一内存地址）
         return (

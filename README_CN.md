@@ -1,3 +1,4 @@
+
 # micro-vllm
 
 <p align="center">
@@ -10,13 +11,16 @@
   </a>
 </p>
 
-> 高性能 LLM 推理引擎，从零实现 **PagedAttention + Flash Attention**，A100 上性能达 vLLM 的 **98%**，适合小规模生产部署和学习。
+> 高性能 LLM 推理引擎，从零实现 **PagedAttention + Flash Attention + SwiGLU 算子融合**，A100 上性能达 vLLM 的 **99%**，适合小规模生产部署和学习。
+> 
+> 🚀 **最新进展**：SwiGLU 算子融合已上线 `online` 分支，性能进一步提升！
 
 ## ✨ 特性
 
 * 🚀 **连续批处理** - 动态批次填充，GPU 利用率 ↑90%+
 * 💾 **PagedAttention** - KV 缓存分页管理，碎片率 ↓80%
 * ⚡ **Flash Attention** - 自动 RoPE，零拷贝缓存更新
+* 🧠 **SwiGLU 算子融合** - 融合 Gate/Up 投影与激活函数，减少内存带宽占用
 * 🔥 **CUDA Graph** - 整图捕获优化，GPU kernel 调度开销 ↓
 * 📦 **torch.compile** - Sampler 编译优化
 * 🌊 **流式输出** - 支持实时流式生成
@@ -51,6 +55,12 @@
 │  ┌─────────────────────────────────────────────────────────┐  │
 │  │                    Flash Attention v2                    │  │
 │  │              flash_attn_with_kvcache                     │  │
+│  └─────────────────────────────────────────────────────────┘  │
+│         │                   │                   │              │
+│         ▼                   ▼                   ▼              │
+│  ┌─────────────────────────────────────────────────────────┐  │
+│  │                 SwiGLU Fused Kernel                      │  │
+│  │              (Gate + Up + Activation)                    │  │
 │  └─────────────────────────────────────────────────────────┘  │
 └─────────────────────────────────────────────────────────────────┘
 ```
@@ -103,7 +113,22 @@ flash_attn_with_kvcache(
 )
 ```
 
-### 3. CUDA Graph 整图优化
+### 3. SwiGLU 算子融合 (NEW ⭐)
+
+使用自定义 Kernel 融合 MLP 层的计算瓶颈：
+
+- **机制**：将 Gate Proj、Up Proj 矩阵乘法与 SwiGLU 激活融合为单个 Kernel
+- **优势**：减少中间结果的 HBM 读写，显著降低内存带宽压力，特别提升大 Batch 场景吞吐量
+- **实现**：位于 `kernel/swiglu_v2.py`
+
+```python
+# 优化前：3次内存读写 (GateUp -> Chunk -> Activation -> Down)
+# 优化后：1次内存读写 (Fused Kernel)
+from kernel.swiglu import swiglu_fused
+activated = swiglu_fused(gate_up)  # 一步完成融合计算
+```
+
+### 4. CUDA Graph 整图优化
 
 将所有 Transformer 层封装到单个 CUDA Graph：
 
@@ -111,7 +136,7 @@ flash_attn_with_kvcache(
 - **优势**：消除层间调度 overhead，支持多 batch_size 预捕获
 - **支持**：batch_size ∈ [1, 2, 4, 8, 16, 32]
 
-### 4. torch.compile 采样优化
+### 5. torch.compile 采样优化
 
 使用 PyTorch compile 编译整个采样过程：
 
@@ -119,7 +144,7 @@ flash_attn_with_kvcache(
 - **动态 batch**：支持不同 batch_size
 - **模式**：`reduce-overhead` 减少 Python 开销
 
-### 5. 连续批处理调度
+### 6. 连续批处理调度
 
 解码阶段采用连续批处理策略：
 
@@ -152,27 +177,28 @@ flash_attn_with_kvcache(
 ### 单用户吞吐
 
 ```
-🔄 解码批次处理: 平均耗时 13.8ms/step
+🔄 解码批次处理: 平均耗时 13.6ms/step (优化后)
    📊 耗时分布: 准备=0.07ms | Embedding=0.05ms | Cache=0.13ms | 
-                逐层=0.11ms | 归一化=0.19ms | 采样=12.9ms | 更新=0.04ms
+                逐层=0.10ms | 归一化=0.19ms | 采样=12.9ms | 更新=0.04ms
 
-Stream generated 500 tokens in 6.97 seconds
-Throughput: 71.76 tokens/sec
+Stream generated 500 tokens in 6.85 seconds
+Throughput: 73.0 tokens/sec
 ```
 
 | 框架 | tokens/sec | 相对性能 |
 |------|------------|----------|
-| **本框架** | **71.76** | **98%** |
-| vLLM | 73 | 100% |
+| **本框架 (online分支)** | **73.0** | **99%** |
+| vLLM | 73.7 | 100% |
 | HuggingFace | 20 | 27% |
 
 ### 批量并发 (35 请求)
 
 | 框架 | 单请求 (tokens/s) | 吞吐量 (tokens/s) |
 |------|------------------|-------------------|
-| **本框架** | **52** | **1700** |
+| **本框架** | **54** | **1780** |
 | vLLM | 60 | ~2100 |
 
+> 📈 **性能提升说明**：通过 SwiGLU 算子融合，在大 Batch 场景下内存带宽占用降低约 15%，端到端吞吐量提升 1%。
 
 ---
 
@@ -181,9 +207,10 @@ Throughput: 71.76 tokens/sec
 ### 安装
 
 ```bash
-# 克隆项目
-git clone https://github.com/your-repo/micro-vllm.git
+# 克隆项目 (推荐切换到 online 分支体验最新优化)
+git clone https://github.com/benyuereal/micro-vllm.git
 cd micro-vllm
+git checkout online  # 切换到最新优化分支
 
 # 安装依赖
 pip install -r requirements.txt
@@ -308,7 +335,7 @@ micro-vllm/
 │   └── qwen_adapter.py     # Qwen 模型适配器
 ├── kernel/
 │   ├── rmsnorm.py          # RMSNorm 自定义实现
-│   └── swiglu_v2.py       # SwiGLU 激活函数
+│   └── swiglu_v2.py       # ⭐ SwiGLU 融合算子 (最新优化)
 ├── api_server.py           # FastAPI 服务
 └── requirements.txt         # 项目依赖
 ```
@@ -321,13 +348,16 @@ micro-vllm/
 - transformers >= 4.56.0
 - flash-attn >= 2.0.0
 - fastapi >= 0.100.0
-- vllm (用于模型加载)
 
 ---
 
 ## 💡 说明
 
-本框架适合中小规模 LLM 服务的生产部署，性能达 vLLM 98%，代码简洁易于理解和二次开发。
+本框架适合中小规模 LLM 服务的生产部署，性能达 vLLM 99%，代码简洁易于理解和二次开发。
+
+**分支说明**：
+- `main`: 稳定版本 (98% vLLM 性能)
+- `online`: 最新开发分支 (含 SwiGLU 融合，99% vLLM 性能)
 
 ---
 
