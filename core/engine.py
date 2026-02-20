@@ -297,84 +297,46 @@ class InferenceEngine:
 
     @torch.no_grad()
     def _process_decode_batch(self, batch: List[Sequence]):
-        """处理解码批次，适配不同模型架构"""
-        # 📍 记录开始时间
+        """处理解码批次 - 极简全流程版本"""
         start_time = time.time()
-
-        # 📍 第一阶段：准备输入数据
+        batch_size = len(batch)
+        
+        # 1. 准备工作 (CPU 侧)
         prep_start = time.time()
-        input_ids = torch.tensor([seq.get_next_input_ids() for seq in batch], device=self.device)
-        token_positions = [[pos for pos in range(seq.current_position - 1)] for seq in batch]
-        seq_ids = [seq.seq_id for seq in batch]
-        prep_time = time.time() - prep_start
-
-        # 📍 第二阶段：Embedding
-        emb_start = time.time()
-        hidden_states = self.embedding_layer(input_ids)
-        if hidden_states.dim() == 3:
-            hidden_states = hidden_states.squeeze(1)  # [B, 1, D] -> [B, D]
-        emb_time = time.time() - emb_start
-
-        # 逐层处理
-
-        # 📍 第三阶段：Cache追加
-        cache_append_start = time.time()
-        for i, seq in enumerate(batch):
-            # 追加新的token
+        
+        # 获取输入 Token
+        input_ids = torch.tensor(
+            [seq.get_next_input_ids() for seq in batch], 
+            device=self.device
+        ).squeeze(1) # 确保是 [B] 形状
+        
+        # 更新 KV Cache 元数据
+        for seq in batch:
             self.cache_manager.append(seq.seq_id)
-
-        # 预更新block table
+        
+        # 更新 Block Table
+        seq_ids = [seq.seq_id for seq in batch]
         context_lens = [seq.current_position for seq in batch]
         self.cache_manager.cache_batch_data(seq_ids, context_lens)
-        cache_time = time.time() - cache_append_start
-
-        # 📍 第四阶段：使用GraphRunner一次处理所有层
-        layer_start = time.time()
-        hidden_states = self.graph_runner.forward(
-            hidden_states,
-            self.cache_manager,
-            batch_size=len(batch)
-        )
-        layer_time = time.time() - layer_start
-
-        # 📍 第五阶段：最终归一化 + LM Head
-        norm_start = time.time()
-        hidden_states = self.norm_layer(hidden_states)
-        # 注意：不在这里转 float，让 Sampler 内部处理
-        logits = self.model.lm_head(hidden_states)
-        norm_time = time.time() - norm_start
-
-        # 📍 第六阶段：Token采样 (并行版本)
-        sample_start = time.time()
-
-        # 提取batch参数 [batch_size]
-        temperatures = torch.tensor([seq.temperature for seq in batch], device=logits.device)
-        top_ps = torch.tensor([seq.top_p for seq in batch], device=logits.device)
-
-        # logits[i, -1, :] 形状是 [batch_size, vocab_size]
-        next_tokens = self._sample_next_token(
-            logits,  # [batch_size, vocab_size]
-            temperatures,       # [batch_size]
-            top_ps              # [batch_size]
-        )
-
-        # next_tokens 现在是 tensor([token1, token2, ...])，可以直接转list
+        
+        prep_time = time.time() - prep_start
+        
+        # 2. GPU 计算 (核心)
+        gpu_start = time.time()
+        next_tokens = self.graph_runner.forward(input_ids, self.cache_manager, batch_size)
         next_tokens = next_tokens.tolist()
-
-        sample_time = time.time() - sample_start
-
-        # 📍 第七阶段：序列更新
+        gpu_time = time.time() - gpu_start
+        
+        # 3. 后处理 (CPU 侧)
         update_start = time.time()
         for i, seq in enumerate(batch):
             self._update_sequence(seq, next_tokens[i])
         update_time = time.time() - update_start
-
-        # 📍 记录总耗时
+        
+        # 日志
         total_time = time.time() - start_time
-        # 只有当第一个序列的上下文长度能被10整除时才打印详细日志
         if batch and batch[0].current_position % 50 == 0:
-            self.logger.info(f"🔄 解码批次处理: 总耗时 {total_time * 1000:.2f}ms")
-            self.logger.info(f"   📊 耗时分布: 准备={prep_time * 1000:.2f}ms | Embedding={emb_time * 1000:.2f}ms | Cache={cache_time * 1000:.2f}ms | 逐层={layer_time * 1000:.2f}ms | 归一化={norm_time * 1000:.2f}ms | 采样={sample_time * 1000:.2f}ms | 更新={update_time * 1000:.2f}ms")
+            self.logger.info(f"🚀 解码: 总耗时 {total_time*1000:.2f}ms | 准备={prep_time*1000:.2f}ms | GPU={gpu_time*1000:.2f}ms | 更新={update_time*1000:.2f}ms")
 
         return next_tokens
 
