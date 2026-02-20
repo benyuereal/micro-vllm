@@ -41,7 +41,6 @@ class ModelGraphRunner:
         self.max_batch_size = max_batch_size
         self.dtype = dtype
         self.top_k = top_k # 固定下来，因为 Graph 需要静态形状
-        self.sample = Sample()
         
         # 初始化 PagedAttention
         self.attention = PagedAttention(
