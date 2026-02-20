@@ -13,7 +13,7 @@
 
 > A high-performance LLM inference engine implementing **PagedAttention + Flash Attention + SwiGLU Kernel Fusion** from scratch. Achieves **99%** of vLLM's performance on A100, suitable for small-scale production deployment and learning.
 > 
-> 🚀 **Latest Update**: SwiGLU kernel fusion is now available on the `online` branch for even better performance!
+> 🚀 **Latest Update**: SwiGLU kernel fusion is now available for even better performance!
 
 ## ✨ Features
 
@@ -199,8 +199,6 @@ Throughput: 73.0 tokens/sec
 | **This Framework** | **54** | **1780** |
 | vLLM | 60 | ~2100 |
 
-> 📈 **Performance Improvement Note**: With SwiGLU kernel fusion, memory bandwidth usage is reduced by ~15% in large batch scenarios, improving end-to-end throughput by 1%.
-
 ---
 
 ## 🚀 Quick Start
@@ -211,8 +209,6 @@ Throughput: 73.0 tokens/sec
 # Clone the project (recommend switching to online branch for latest optimizations)
 git clone https://github.com/benyuereal/micro-vllm.git
 cd micro-vllm
-git checkout online  # Switch to latest optimization branch
-
 # Install dependencies
 pip install -r requirements.txt
 ```

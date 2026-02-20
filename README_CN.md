@@ -13,7 +13,7 @@
 
 > 高性能 LLM 推理引擎，从零实现 **PagedAttention + Flash Attention + SwiGLU 算子融合**，A100 上性能达 vLLM 的 **99%**，适合小规模生产部署和学习。
 > 
-> 🚀 **最新进展**：SwiGLU 算子融合已上线 `online` 分支，性能进一步提升！
+> 🚀 **最新进展**：SwiGLU 算子融合，性能进一步提升！
 
 ## ✨ 特性
 
@@ -198,7 +198,7 @@ Throughput: 73.0 tokens/sec
 | **本框架** | **54** | **1780** |
 | vLLM | 60 | ~2100 |
 
-> 📈 **性能提升说明**：通过 SwiGLU 算子融合，在大 Batch 场景下内存带宽占用降低约 15%，端到端吞吐量提升 1%。
+
 
 ---
 
@@ -210,8 +210,6 @@ Throughput: 73.0 tokens/sec
 # 克隆项目 (推荐切换到 online 分支体验最新优化)
 git clone https://github.com/benyuereal/micro-vllm.git
 cd micro-vllm
-git checkout online  # 切换到最新优化分支
-
 # 安装依赖
 pip install -r requirements.txt
 ```
@@ -354,10 +352,6 @@ micro-vllm/
 ## 💡 说明
 
 本框架适合中小规模 LLM 服务的生产部署，性能达 vLLM 99%，代码简洁易于理解和二次开发。
-
-**分支说明**：
-- `main`: 稳定版本 (98% vLLM 性能)
-- `online`: 最新开发分支 (含 SwiGLU 融合，99% vLLM 性能)
 
 ---
 
