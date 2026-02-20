@@ -297,37 +297,48 @@ class InferenceEngine:
 
     @torch.no_grad()
     def _process_decode_batch(self, batch: List[Sequence]):
-        """处理解码批次 - 极简全流程版本"""
+        """处理解码批次 - 带采样参数版本"""
         start_time = time.time()
         batch_size = len(batch)
         
-        # 1. 准备工作 (CPU 侧)
+        # 1. 准备
         prep_start = time.time()
         
-        # 获取输入 Token
+        # 输入 Token
         input_ids = torch.tensor(
             [seq.get_next_input_ids() for seq in batch], 
             device=self.device
-        ).squeeze(1) # 确保是 [B] 形状
+        ).squeeze(1)
         
-        # 更新 KV Cache 元数据
+        # 【新增】提取采样参数
+        temperatures = torch.tensor([seq.temperature for seq in batch], device=self.device)
+        top_ps = torch.tensor([seq.top_p for seq in batch], device=self.device)
+        
+        # KV Cache 更新
         for seq in batch:
             self.cache_manager.append(seq.seq_id)
-        
-        # 更新 Block Table
         seq_ids = [seq.seq_id for seq in batch]
         context_lens = [seq.current_position for seq in batch]
         self.cache_manager.cache_batch_data(seq_ids, context_lens)
         
         prep_time = time.time() - prep_start
         
-        # 2. GPU 计算 (核心)
+        # 2. 推理
         gpu_start = time.time()
-        next_tokens = self.graph_runner.forward(input_ids, self.cache_manager, batch_size)
+        
+        # 【修改】现在 forward 接收 5 个参数
+        next_tokens = self.graph_runner.forward(
+            input_ids, 
+            temperatures, 
+            top_ps,
+            self.cache_manager, 
+            batch_size
+        )
+        
         next_tokens = next_tokens.tolist()
         gpu_time = time.time() - gpu_start
         
-        # 3. 后处理 (CPU 侧)
+        # 3. 更新
         update_start = time.time()
         for i, seq in enumerate(batch):
             self._update_sequence(seq, next_tokens[i])
@@ -336,7 +347,7 @@ class InferenceEngine:
         # 日志
         total_time = time.time() - start_time
         if batch and batch[0].current_position % 50 == 0:
-            self.logger.info(f"🚀 解码: 总耗时 {total_time*1000:.2f}ms | 准备={prep_time*1000:.2f}ms | GPU={gpu_time*1000:.2f}ms | 更新={update_time*1000:.2f}ms")
+            self.logger.info(f"🚀 解码 (Graph+Sampling): 总耗时 {total_time*1000:.2f}ms")
 
         return next_tokens
 
