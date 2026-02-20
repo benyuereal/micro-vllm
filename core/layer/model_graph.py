@@ -240,7 +240,8 @@ class ModelGraphRunner:
                 gate_up = torch.matmul(self._normed_2[:batch_size], w_gu)
                 
                 # SwiGLU
-                activated = swiglu(gate_up)
+                up, gate = gate_up.chunk(2, dim=-1)
+                activated = swiglu(gate, up)
 
                 # Down Proj
                 mlp_out = torch.matmul(activated, w_d)
@@ -320,7 +321,8 @@ class ModelGraphRunner:
                 h, h.shape[-1:], block.ln_2.weight, block.ln_2.eps
             )
             gate_up = torch.matmul(normed, w_gu)
-            activated = swiglu(gate_up)
+            up, gate = gate_up.chunk(2, dim=-1)
+            activated = swiglu(gate, up)
             mlp_out = torch.matmul(activated, w_d)
             h = mlp_out + h
         
