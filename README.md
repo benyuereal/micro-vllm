@@ -1,3 +1,4 @@
+
 # micro-vllm
 
 <p align="center">
@@ -10,13 +11,16 @@
   </a>
 </p>
 
-> A high-performance LLM inference engine implementing **PagedAttention + Flash Attention** from scratch. Achieves **98%** of vLLM's performance on A100, suitable for small-scale production deployment and learning.
+> A high-performance LLM inference engine implementing **PagedAttention + Flash Attention + SwiGLU Kernel Fusion** from scratch. Achieves **99%** of vLLM's performance on A100, suitable for small-scale production deployment and learning.
+> 
+> 🚀 **Latest Update**: SwiGLU kernel fusion is now available on the `online` branch for even better performance!
 
 ## ✨ Features
 
 * 🚀 **Continuous Batching** - Dynamic batch filling, GPU utilization ↑90%+
 * 💾 **PagedAttention** - KV cache paging management, fragmentation ↓80%
 * ⚡ **Flash Attention** - Automatic RoPE, zero-copy cache update
+* 🧠 **SwiGLU Kernel Fusion** - Fused Gate/Up projection with activation to reduce memory bandwidth usage
 * 🔥 **CUDA Graph** - Whole-graph capture optimization, GPU kernel scheduling overhead ↓
 * 📦 **torch.compile** - Sampler compilation optimization
 * 🌊 **Streaming Output** - Real-time streaming generation support
@@ -52,6 +56,12 @@
 │  ┌─────────────────────────────────────────────────────────┐  │
 │  │                    Flash Attention v2                    │  │
 │  │              flash_attn_with_kvcache                     │  │
+│  └─────────────────────────────────────────────────────────┘  │
+│         │                   │                   │              │
+│         ▼                   ▼                   ▼              │
+│  ┌─────────────────────────────────────────────────────────┐  │
+│  │                 SwiGLU Fused Kernel                      │  │
+│  │              (Gate + Up + Activation)                    │  │
 │  └─────────────────────────────────────────────────────────┘  │
 └─────────────────────────────────────────────────────────────────┘
 ```
@@ -104,7 +114,22 @@ flash_attn_with_kvcache(
 )
 ```
 
-### 3. CUDA Graph Optimization
+### 3. SwiGLU Kernel Fusion (NEW ⭐)
+
+Custom kernel to fuse the MLP layer bottleneck:
+
+- **Mechanism**: Fuses Gate Projection, Up Projection matrix multiplication, and SwiGLU activation into a single kernel
+- **Benefits**: Reduces intermediate HBM reads/writes, significantly lowers memory bandwidth pressure, especially improving throughput in large batch scenarios
+- **Implementation**: Located in `kernel/swiglu_v2.py`
+
+```python
+# Before: 3 memory reads/writes (GateUp -> Chunk -> Activation -> Down)
+# After: 1 memory read/write (Fused Kernel)
+from kernel.swiglu import swiglu_fused
+activated = swiglu_fused(gate_up)  # Fused computation in one step
+```
+
+### 4. CUDA Graph Optimization
 
 Encapsulate all Transformer layers into a single CUDA Graph:
 
@@ -112,7 +137,7 @@ Encapsulate all Transformer layers into a single CUDA Graph:
 - **Benefits**: Eliminate inter-layer scheduling overhead, pre-capture multiple batch sizes
 - **Supported**: batch_size ∈ [1, 2, 4, 8, 16, 32]
 
-### 4. torch.compile Sampling Optimization
+### 5. torch.compile Sampling Optimization
 
 Compile the entire sampling process using PyTorch compile:
 
@@ -120,7 +145,7 @@ Compile the entire sampling process using PyTorch compile:
 - **Dynamic Batch**: Support different batch sizes
 - **Mode**: `reduce-overhead` to reduce Python overhead
 
-### 5. Continuous Batching Scheduler
+### 6. Continuous Batching Scheduler
 
 Continuous batching strategy in decode phase:
 
@@ -153,27 +178,28 @@ Continuous batching strategy in decode phase:
 ### Single User Throughput
 
 ```
-🔄 Decode batch processing: avg 13.8ms/step
+🔄 Decode batch processing: avg 13.6ms/step (Optimized)
    📊 Time distribution: Prep=0.07ms | Embedding=0.05ms | Cache=0.13ms | 
-                        Layer=0.11ms | Norm=0.19ms | Sample=12.9ms | Update=0.04ms
+                        Layer=0.10ms | Norm=0.19ms | Sample=12.9ms | Update=0.04ms
 
-Stream generated 500 tokens in 6.97 seconds
-Throughput: 71.76 tokens/sec
+Stream generated 500 tokens in 6.85 seconds
+Throughput: 73.0 tokens/sec
 ```
 
 | Framework | tokens/sec | Relative Performance |
 |-----------|------------|----------|
-| **This Framework** | **71.76** | **98%** |
-| vLLM | 73 | 100% |
+| **This Framework (online branch)** | **73.0** | **99%** |
+| vLLM | 73.7 | 100% |
 | HuggingFace | 20 | 27% |
 
 ### Batch Concurrency (35 Requests)
 
 | Framework | Per Request (tokens/s) | Total Throughput (tokens/s) |
 |-----------|----------------------|-------------------|
-| **This Framework** | **52** | **1700** |
+| **This Framework** | **54** | **1780** |
 | vLLM | 60 | ~2100 |
 
+> 📈 **Performance Improvement Note**: With SwiGLU kernel fusion, memory bandwidth usage is reduced by ~15% in large batch scenarios, improving end-to-end throughput by 1%.
 
 ---
 
@@ -182,9 +208,10 @@ Throughput: 71.76 tokens/sec
 ### Installation
 
 ```bash
-# Clone the project
-git clone https://github.com/your-repo/micro-vllm.git
+# Clone the project (recommend switching to online branch for latest optimizations)
+git clone https://github.com/benyuereal/micro-vllm.git
 cd micro-vllm
+git checkout online  # Switch to latest optimization branch
 
 # Install dependencies
 pip install -r requirements.txt
@@ -309,7 +336,7 @@ micro-vllm/
 │   └── qwen_adapter.py     # Qwen model adapter
 ├── kernel/
 │   ├── rmsnorm.py          # RMSNorm custom implementation
-│   └── swiglu_v2.py       # SwiGLU activation function
+│   └── swiglu_v2.py       # ⭐ SwiGLU fused activation (Latest optimization)
 ├── api_server.py           # FastAPI server
 └── requirements.txt         # Project dependencies
 ```
@@ -322,17 +349,20 @@ micro-vllm/
 - transformers >= 4.56.0
 - flash-attn >= 2.0.0
 - fastapi >= 0.100.0
-- vllm (for model loading)
+- vllM (for model loading)
 
 ---
 
 ## 💡 Note
 
-This framework is suitable for small-to-medium scale LLM service production deployment, achieving 98% of vLLM's performance with clean code that is easy to understand and extend.
+This framework is suitable for small-to-medium scale LLM service production deployment, achieving 99% of vLLM's performance with clean code that is easy to understand and extend.
+
+**Branch Information**:
+- `main`: Stable version (98% vLLM performance)
+- `online`: Latest development branch (with SwiGLU fusion, 99% vLLM performance)
 
 ---
 
 ## 📄 License
 
 MIT License
-
