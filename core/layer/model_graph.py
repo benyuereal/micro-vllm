@@ -16,6 +16,7 @@ import torch
 import torch.nn.functional as F
 from typing import Dict, List
 from core.paged_attention import PagedAttention
+from kernel.swiglu import swiglu_fused as swiglu
 
 try:
     from flash_attn import flash_attn_with_kvcache
@@ -240,8 +241,8 @@ class ModelGraphRunner:
                 
                 # SwiGLU
                 up, gate = gate_up.chunk(2, dim=-1)
-                activated = F.silu(gate) * up
-                
+                activated = swiglu(gate, up)
+
                 # Down Proj
                 mlp_out = torch.matmul(activated, w_d)
                 
@@ -321,7 +322,7 @@ class ModelGraphRunner:
             )
             gate_up = torch.matmul(normed, w_gu)
             up, gate = gate_up.chunk(2, dim=-1)
-            activated = F.silu(gate) * up
+            activated = swiglu(gate, up)
             mlp_out = torch.matmul(activated, w_d)
             h = mlp_out + h
         
