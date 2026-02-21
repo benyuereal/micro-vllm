@@ -347,6 +347,7 @@ class InferenceEngine:
         # 日志
         total_time = time.time() - start_time
         if batch and batch[0].current_position % 50 == 0:
+            self.logger.info(f"🚀 解码 (Graph+Sampling): 预处理时间 {prep_time*1000:.2f}ms, GPU推理时间 {gpu_time*1000:.2f}ms, 更新时间 {update_time*1000:.2f}ms")
             self.logger.info(f"🚀 解码 (Graph+Sampling): 总耗时 {total_time*1000:.2f}ms")
 
         return next_tokens
