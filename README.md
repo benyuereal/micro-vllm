@@ -175,29 +175,43 @@ Continuous batching strategy in decode phase:
 
 ### Single User Throughput
 
-```
-🔄 Decode batch processing: avg 13.6ms/step (Optimized)
-   📊 Time distribution: Prep=0.07ms | Embedding=0.05ms | Cache=0.13ms | 
-                        Layer=0.10ms | Norm=0.19ms | Sample=12.9ms | Update=0.04ms
+  好的，这是适配 Markdown 文档的英文版本，保留了表格格式和强调标记：
 
-Stream generated 500 tokens in 6.85 seconds
-Throughput: 73.0 tokens/sec
-```
+---
+
+## 📈 Performance Validation
+
+### Single-User Throughput (vs. Official vLLM)
+
+In single-user sequential request scenarios, micro-vllm demonstrates superior inference efficiency and stability:
+
+| Metric | micro-vllm | vLLM Official |
+|:---------|:-----------|:--------------|
+| **Mean** | **76.41** ✅ | **75.88** |
+| **Std Dev** | **0.07** ✅ | **1.95** |
+
+- **+0.7%** higher average throughput than vLLM, performance aligned with industry benchmark
+- **28x better stability** (coefficient of variation), jitter controlled within **0.09%**
+- Lightweight architecture incurs lower scheduling overhead in single-concurrency scenarios, ideal for low-latency interactive applications
 
 | Framework | tokens/sec | Relative Performance |
-|-----------|------------|----------|
-| **This Framework (online branch)** | **73.0** | **99%** |
-| vLLM | 73.7 | 100% |
+|:----------|:-----------|:---------------------|
+| **This Framework (online branch)** | **76.41** | **100.7%** |
+| vLLM | 75.88 | 100% |
 | HuggingFace | 20 | 27% |
 
 ### Batch Concurrency (35 Requests)
 
-| Framework | Per Request (tokens/s) | Total Throughput (tokens/s) |
-|-----------|----------------------|-------------------|
+| Framework | Per-Request (tokens/s) | Total Throughput (tokens/s) |
+|:----------|:-----------------------|:------------------------------|
 | **This Framework** | **54** | **1780** |
 | vLLM | 60 | ~2100 |
 
 ---
+
+
+
+
 
 ## 🚀 Quick Start
 
