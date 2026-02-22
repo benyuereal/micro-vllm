@@ -66,7 +66,8 @@ class InferenceEngine:
         "cuda_moe": {"block_size": 256, "max_blocks": 48, "dtype": torch.bfloat16},  # ✅ Qwen3 MoE专用
     }
 
-    def __init__(self, model_path: str, max_batch_size: int = 32, max_prefill_tokens: int = 2048):
+    def __init__(self, model_path: str, max_batch_size: int = 32, max_prefill_tokens: int = 2048,
+                  multi_step : int = 15):
         """
         📌 **初始化推理引擎** (自动加载模型，隐藏所有配置)
 
@@ -140,7 +141,15 @@ class InferenceEngine:
         self.scheduler = Scheduler(max_batch_size, max_prefill_tokens, self.tokenizer)
         self.adapter = QwenModelAdapter()
 
-        self.eos_token_id = self.tokenizer.eos_token_id
+        self.eos_token_id = self.tokenizer.eos_token_id 
+        if self.eos_token_id is None:
+            self.eos_token_id = getattr(self.config, "eos_token_id", None)
+            print(f"eos_token_id config {self.eos_token_id }")
+        if self.eos_token_id is None:
+            self.eos_token_id = 151643  # 最终兜底：Qwen 系列标准值
+            print(f"eos_token_id hard code {self.eos_token_id }")
+
+
         # 默认使用 0 作为 pad_token_id（scheduler 已经将序列填充到相同长度）
         self.pad_token_id = 0
         self.stream_callbacks = {}
@@ -159,6 +168,10 @@ class InferenceEngine:
                 batch_sizes=[1, 2, 4, 8, 16, 32]
             )
             self.logger.info("CUDA Graphs capture completed")
+
+        # multi_step
+        self.multi_step = multi_step
+        self.logger.info(f"engine eos = {self.eos_token_id}")
 
     def _init_logging(self):
         """初始化日志"""
@@ -228,7 +241,7 @@ class InferenceEngine:
 
         while True:
             # 使用连续批处理：Padding 凑齐 batch + 动态剔除完成
-            batch, batch_type = self.scheduler.get_next_batch()
+            batch, batch_type, multi_step = self.scheduler.get_next_batch()
 
             if batch_type == "waiting":
                 # time.sleep(0.001)
@@ -243,7 +256,7 @@ class InferenceEngine:
             if batch_type == "prefill":
                 self._process_prefill_batch(batch)
             elif batch_type == "decode":
-                self._process_decode_batch(batch)
+                self._process_decode_multi(batch, multi_step)
 
             # 连续批处理：检查是否需要继续填充
             # 如果有等待中的请求 → 继续循环填充
@@ -300,50 +313,49 @@ class InferenceEngine:
         """处理解码批次 - 带采样参数版本"""
         start_time = time.time()
         batch_size = len(batch)
-        
+
         # 1. 准备
         prep_start = time.time()
-        
+
         # 输入 Token
         input_ids = torch.tensor(
-            [seq.get_next_input_ids() for seq in batch], 
+            [seq.get_next_input_ids() for seq in batch],
             device=self.device
         ).squeeze(1)
-        
+
         # 【新增】提取采样参数
         temperatures = torch.tensor([seq.temperature for seq in batch], device=self.device)
         top_ps = torch.tensor([seq.top_p for seq in batch], device=self.device)
-        
+
         # KV Cache 更新
         for seq in batch:
             self.cache_manager.append(seq.seq_id)
         seq_ids = [seq.seq_id for seq in batch]
         context_lens = [seq.current_position for seq in batch]
         self.cache_manager.cache_batch_data(seq_ids, context_lens)
-        
+
         prep_time = time.time() - prep_start
-        
+
         # 2. 推理
         gpu_start = time.time()
-        
-        # 【修改】现在 forward 接收 5 个参数
+
         next_tokens = self.graph_runner.forward(
-            input_ids, 
-            temperatures, 
+            input_ids,
+            temperatures,
             top_ps,
-            self.cache_manager, 
+            self.cache_manager,
             batch_size
         )
-        
+
         next_tokens = next_tokens.tolist()
         gpu_time = time.time() - gpu_start
-        
+
         # 3. 更新
         update_start = time.time()
         for i, seq in enumerate(batch):
             self._update_sequence(seq, next_tokens[i])
         update_time = time.time() - update_start
-        
+
         # 日志
         total_time = time.time() - start_time
         if batch and batch[0].current_position % 50 == 0:
@@ -351,6 +363,88 @@ class InferenceEngine:
             self.logger.info(f"🚀 解码 (Graph+Sampling): 总耗时 {total_time*1000:.2f}ms")
 
         return next_tokens
+
+    @torch.no_grad()
+    def _process_decode_multi(self, batch: List[Sequence], multi_step: int = 10):
+        """多步解码：一次调度，执行 K 步（保留耗时分布 + 修复 None 值 + 类型安全）"""
+        batch_size = len(batch)
+        if not batch_size: 
+            return
+
+        # 初始化耗时统计
+        total_start = time.time()
+        total_gpu_time = 0.0
+        steps_executed = 0
+
+        # 1. 初始化核心参数
+        device = self.device
+        eos_token_id = self.eos_token_id  # 提前取出，避免重复调用
+        temps = torch.tensor([s.temperature for s in batch], device=device)
+        topps = torch.tensor([s.top_p for s in batch], device=device)
+        
+        # 初始输入：确保是有效整数，兜底eos
+        input_ids = []
+        for s in batch:
+            token = s.get_next_input_ids()
+            input_ids.append(token if token is not None else eos_token_id)
+        input_ids = torch.tensor(input_ids, device=device).squeeze(1)
+        
+        active = torch.ones(batch_size, dtype=torch.bool, device=device)
+        seq_ids = [s.seq_id for s in batch]
+
+        # 2. 多步循环
+        for _ in range(multi_step):
+            if not active.any(): 
+                break  # 所有序列都结束，提前退出
+
+            # 2.1 KV Cache 步进（仅活跃序列）
+            ctx_lens = []
+            for i, s in enumerate(batch):
+                if active[i]:
+                    self.cache_manager.append(s.seq_id)
+                ctx_lens.append(s.current_position)
+            self.cache_manager.cache_batch_data(seq_ids, ctx_lens)
+
+            # 2.2 推理（CUDA Graph Replay）+ 耗时统计 + 结果校验
+            gpu_start = time.time()
+            next_tokens = self.graph_runner.forward(input_ids, temps, topps, self.cache_manager, batch_size)
+            total_gpu_time += time.time() - gpu_start
+            steps_executed += 1
+            
+            next_tokens = next_tokens.tolist()
+            # 关键修复1：兜底 None 值，确保所有 token 都是整数
+            next_tokens = [t if t is not None else eos_token_id for t in next_tokens]
+
+            # 2.3 更新序列状态 + 构造下一步输入
+            next_input_ids = []
+            for i, s in enumerate(batch):
+                if active[i]:
+                    # 更新序列，即使token是eos也正常处理
+                    self._update_sequence(s, next_tokens[i])
+                    # 标记已结束的序列
+                    if s.is_finished():
+                        active[i] = False
+                
+                new_token = next_tokens[i] if active[i] else eos_token_id
+                next_input_ids.append(new_token)
+
+
+
+            input_ids = torch.tensor(next_input_ids, device=device)
+
+        # 3. 耗时分布日志（保留核心统计，去掉GPU利用率）
+        total_time = time.time() - total_start
+        avg_step_time = (total_time / steps_executed) * 1000
+        total_time_ms = total_time * 1000
+        
+        # 仅在关键节点打印（避免日志刷屏）
+        if batch and batch[0].current_position % 50 < steps_executed:
+            self.logger.info(
+                f"📊 Multi-Step Decode Stats | Steps: {steps_executed} | "
+                f"Total: {total_time_ms:.1f}ms | Avg Step: {avg_step_time:.2f}ms"
+                f"batch_size {batch_size}"
+            )
+            
 
 
     def _update_sequence(self, seq: Sequence, next_token: int):

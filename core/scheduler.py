@@ -10,7 +10,8 @@ logger = logging.getLogger(__name__)
 
 class Scheduler:
     def __init__(self, max_batch_size: int = 32, max_prefill_tokens: int = 2048, 
-                 tokenizer: AutoTokenizer = None, prefill_timeout: float = 0.02):
+                 tokenizer: AutoTokenizer = None, prefill_timeout: float = 0.02,
+                 max_multi_step : int = 16, multi_step : int = 10):
         """
         Args:
             max_batch_size: 最大批次大小
@@ -27,6 +28,10 @@ class Scheduler:
         self.running_sequences = []    # 正在运行的序列
         self.finished_sequences = []   # 已完成
         self.batch_sizes = [1, 2, 4, 8, 16, 32]  # 已捕获的 batch_size（与 engine 一致）
+        self.max_multi_step = max_multi_step          # 防止步数过大的上限
+        self.multi_step = multi_step
+
+
 
     def _get_bucket_key(self, length: int) -> int:
         """
@@ -60,8 +65,9 @@ class Scheduler:
             batch, batch_type = self._get_prefill_batch()
             # logger.info(f"batch_type: {batch_type}, batch: {len(batch)}, waiting_queue: {len(self.waiting_queue)}, running_sequences: {len(self.running_sequences)}")
             if batch_type != "idle":
-                return batch, batch_type
+                return batch, batch_type, self.multi_step
 
+        multi_step = self.multi_step  # 默认值兜底
         # 3. 解码阶段：Padding 凑齐 batch_size
         if self.running_sequences:
             length_groups = defaultdict(list)
@@ -71,9 +77,16 @@ class Scheduler:
                     length_groups[length].append(seq)
             if length_groups:
                 # 找到最短的长度组（SJF）
+                sorted_lengths = sorted(length_groups.keys())
                 min_length = min(length_groups.keys())
                 min_group = length_groups[min_length]
-
+                # 计算动态 multi-step：最短 vs 次短
+                if len(sorted_lengths) >= 2:
+                    second_min_length = sorted_lengths[1]
+                    delta = second_min_length - min_length
+                    # 边界保护：步数不能为负/0，也不能超过上限
+                    multi_step = max(1, min(delta, self.max_multi_step))
+        
                 # 同长度组内可以任意排序（已经是相同长度）
                 # 直接取前 max_batch_size 个
                 selected = min_group[:self.max_batch_size]
@@ -83,9 +96,9 @@ class Scheduler:
                     # 从 batch_sizes 中找到第一个 <= len(batch) 的值（向下取整）
                     batch_len = len(batch)
                     batch_sizes = max((b for b in self.batch_sizes if b <= batch_len), default=self.batch_sizes[0])
-                    return batch[:batch_sizes], batch_type
+                    return batch[:batch_sizes], batch_type, multi_step
 
-        return [], "idle"
+        return [], "idle", multi_step
 
     def _get_prefill_batch(self) -> Tuple[List[Sequence], str]:
         """
