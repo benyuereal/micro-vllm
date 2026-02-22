@@ -11,6 +11,7 @@ from typing import Dict, List
 from core.paged_attention import PagedAttention
 from kernel.swiglu import swiglu_fused as swiglu
 from .sampler import Sampler  # 引入独立的 Sampler
+from kernel.rmsnorm_add import rmsnorm_residual_fused ,rmsnorm
 
 try:
     from flash_attn import flash_attn_with_kvcache
@@ -100,7 +101,7 @@ class ModelGraphRunner:
                 block_table[:, 0] = 0 # 安全修复
             
             # Attention
-            normed = F.rms_norm(h, h.shape[-1:], block.ln_1.weight, block.ln_1.eps)
+            normed = rmsnorm(h, block.ln_1.weight, block.ln_1.eps)
             qkv = torch.matmul(normed, w_qkv)
             if b_qkv is not None: qkv = qkv + b_qkv
             qkv_reshaped = qkv.reshape(batch_size, 3, self.num_heads, self.head_size)
@@ -116,8 +117,12 @@ class ModelGraphRunner:
             
             # MLP
             out = torch.matmul(attn.reshape(batch_size, -1), w_o)
-            residual = out + h
-            normed = F.rms_norm(residual, residual.shape[-1:], block.ln_2.weight, block.ln_2.eps)
+            normed, residual = rmsnorm_residual_fused(
+                                x=out,
+                                residual=h,
+                                weight=block.ln_2.weight,
+                                eps=block.ln_2.eps
+                            )
             gate_up = torch.matmul(normed, w_gu)
             up, gate = gate_up.chunk(2, dim=-1)
             activated = swiglu(gate, up)
