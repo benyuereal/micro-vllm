@@ -300,65 +300,70 @@ class InferenceEngine:
         """处理解码批次 - 带采样参数版本 (支持 Padding)"""
         start_time = time.time()
         batch_size = len(batch)
+        if not batch_size: return []
+
+        # 1. 一次性构建标记和索引
+        seen = set()
+        mask = []
+        indices = []
         
-        # 【新增】记录真实的 seq_id 集合（用于去重）
-        running_seq_ids = set()
-        for s in batch:
-            running_seq_ids.add(s.seq_id)
-        # 构建索引级的掩码
-        indices = [i for i, s in enumerate(batch) if s.seq_id in running_seq_ids]
-        # 去重后的真实列表（用于最后日志）
-        running_batch = [batch[i] for i in indices]
+        for i, seq in enumerate(batch):
+            if seq.seq_id not in seen:
+                seen.add(seq.seq_id)
+                mask.append(True)
+                indices.append(i)
+            else:
+                mask.append(False)
         
-        # 1. 准备
+        # 2. 准备输入数据
         prep_start = time.time()
+        device = self.device
         
-        # 输入 Token
         input_ids = torch.tensor(
             [seq.get_next_input_ids() for seq in batch], 
-            device=self.device
+            device=device
         ).squeeze(1)
         
-        # 提取采样参数
-        temperatures = torch.tensor([seq.temperature for seq in batch], device=self.device)
-        top_ps = torch.tensor([seq.top_p for seq in batch], device=self.device)
+        temperatures = torch.tensor([seq.temperature for seq in batch], device=device)
+        top_ps = torch.tensor([seq.top_p for seq in batch], device=device)
         
-        # KV Cache 更新 (保持原样，不动)
-        for seq in batch:
-            self.cache_manager.append(seq.seq_id)
+        # 3. KV Cache 管理
+        for i in indices:
+            self.cache_manager.append(batch[i].seq_id)
+        
         seq_ids = [seq.seq_id for seq in batch]
         context_lens = [seq.current_position for seq in batch]
         self.cache_manager.cache_batch_data(seq_ids, context_lens)
         
+        # 修复 Padding 位置防止重复写入
+        for i in range(batch_size):
+            if not mask[i]:
+                self.cache_manager._cache_seqlens_buffer[i] -= 1
+        
         prep_time = time.time() - prep_start
         
-        # 2. 推理 (保持原样，不动)
+        # 4. 推理
         gpu_start = time.time()
-        
         next_tokens = self.graph_runner.forward(
-            input_ids, 
-            temperatures, 
-            top_ps,
-            self.cache_manager, 
-            batch_size
-        )
-        
-        next_tokens = next_tokens.tolist()
+            input_ids, temperatures, top_ps,
+            self.cache_manager, batch_size
+        ).tolist()
         gpu_time = time.time() - gpu_start
         
-        # 3. 更新 (仅这里加去重判断)
+        # 5. 更新状态
         update_start = time.time()
-        for i, seq in enumerate(batch):
-            # 【核心修改】只有真实序列才更新
-            if seq.seq_id in running_seq_ids:
-                self._update_sequence(seq, next_tokens[i])
+        for i in indices:
+            self._update_sequence(batch[i], next_tokens[i])
         update_time = time.time() - update_start
         
-        # 日志 (batch 换成 running_batch)
+        # 6. 日志
         total_time = time.time() - start_time
-        if running_batch and running_batch[0].current_position % 50 == 0:
-            self.logger.info(f"🚀 解码 (Graph+Sampling): 预处理时间 {prep_time*1000:.2f}ms, GPU推理时间 {gpu_time*1000:.2f}ms, 更新时间 {update_time*1000:.2f}ms")
-            self.logger.info(f"🚀 解码 (Graph+Sampling): 总耗时 {total_time*1000:.2f}ms | Batch {batch_size}")
+        if indices and batch[indices[0]].current_position % 50 == 0:
+            self.logger.info(
+                f"🚀 解码 (Graph+Sampling): "
+                f"Prep {prep_time*1000:.2f}ms, GPU {gpu_time*1000:.2f}ms, Update {update_time*1000:.2f}ms, "
+                f"Total {total_time*1000:.2f}ms | Batch{batch_size}"
+            )
 
         return next_tokens
 
