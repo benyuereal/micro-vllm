@@ -11,7 +11,7 @@ logger = logging.getLogger(__name__)
 class Scheduler:
     def __init__(self, max_batch_size: int = 32, max_prefill_tokens: int = 2048, 
                  tokenizer: AutoTokenizer = None, prefill_timeout: float = 0.02,
-                 max_multi_step : int = 16, multi_step : int = 10):
+                 max_multi_step : int = 20, multi_step : int = 10):
         """
         Args:
             max_batch_size: 最大批次大小
@@ -70,14 +70,18 @@ class Scheduler:
         multi_step = self.multi_step  # 默认值兜底
         # 3. 解码阶段：Padding 凑齐 batch_size
         if self.running_sequences:
+            selected = []
             length_groups = defaultdict(list)
             for seq in self.running_sequences:
                 if seq.state == "decode" and not seq.is_finished():
                     length = seq.current_position
                     length_groups[length].append(seq)
+                    selected.append(seq)
             if length_groups:
                 # 找到最短的长度组（SJF）
                 sorted_lengths = sorted(length_groups.keys())
+                if(sorted_lengths[0] < 30):
+                 logger.info(f"sorted length {sorted_lengths}")
                 min_length = min(length_groups.keys())
                 min_group = length_groups[min_length]
                 # 计算动态 multi-step：最短 vs 次短
@@ -85,18 +89,26 @@ class Scheduler:
                     second_min_length = sorted_lengths[1]
                     delta = second_min_length - min_length
                     # 边界保护：步数不能为负/0，也不能超过上限
-                    multi_step = max(1, min(delta, self.max_multi_step))
+                    multi_step = min(delta, self.max_multi_step)
         
                 # 同长度组内可以任意排序（已经是相同长度）
                 # 直接取前 max_batch_size 个
-                selected = min_group[:self.max_batch_size]
+                # selected = min_group[:self.max_batch_size]
                 if selected:
                     batch = selected
                     batch_type = "decode"
                     # 从 batch_sizes 中找到第一个 <= len(batch) 的值（向下取整）
                     batch_len = len(batch)
-                    batch_sizes = max((b for b in self.batch_sizes if b <= batch_len), default=self.batch_sizes[0])
-                    return batch[:batch_sizes], batch_type, multi_step
+                    batch_size = min((b for b in self.batch_sizes if b >= batch_len), default=self.batch_sizes[-1])
+                    
+                    # 【修改2】Padding补齐：简单复制，直到长度达标
+                    padded_batch = batch.copy()
+                    idx = 0
+                    while len(padded_batch) < batch_size:
+                        padded_batch.append(padded_batch[idx % len(batch)])  # 循环复制
+                        idx += 1
+                    
+                    return padded_batch, batch_type, multi_step
 
         return [], "idle", multi_step
 

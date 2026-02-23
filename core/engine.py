@@ -256,7 +256,8 @@ class InferenceEngine:
             if batch_type == "prefill":
                 self._process_prefill_batch(batch)
             elif batch_type == "decode":
-                self._process_decode_multi(batch, multi_step)
+                # self._process_decode_batch(batch)
+                self._process_decode_multi(batch)
 
             # 连续批处理：检查是否需要继续填充
             # 如果有等待中的请求 → 继续循环填充
@@ -358,22 +359,22 @@ class InferenceEngine:
 
         # 日志
         total_time = time.time() - start_time
-        if batch and batch[0].current_position % 50 == 0:
+        if batch and batch[0].current_position < 30:
             self.logger.info(f"🚀 解码 (Graph+Sampling): 预处理时间 {prep_time*1000:.2f}ms, GPU推理时间 {gpu_time*1000:.2f}ms, 更新时间 {update_time*1000:.2f}ms")
-            self.logger.info(f"🚀 解码 (Graph+Sampling): 总耗时 {total_time*1000:.2f}ms")
+            self.logger.info(f"🚀 解码 (Graph+Sampling): 总耗时 {total_time*1000:.2f}ms |"
+                            f"Batch {batch_size}")
 
         return next_tokens
 
     @torch.no_grad()
     def _process_decode_multi(self, batch: List[Sequence], multi_step: int = 10):
-        """多步解码：一次调度，执行 K 步（保留耗时分布 + 修复 None 值 + 类型安全）"""
+        """多步解码：活跃数 != 初始Batch数 -> 立即中断重新调度"""
         batch_size = len(batch)
         if not batch_size: 
             return
 
         # 初始化耗时统计
         total_start = time.time()
-        total_gpu_time = 0.0
         steps_executed = 0
 
         # 1. 初始化核心参数
@@ -392,10 +393,19 @@ class InferenceEngine:
         active = torch.ones(batch_size, dtype=torch.bool, device=device)
         seq_ids = [s.seq_id for s in batch]
 
+        # 【新增】记录真实的 seq_id 集合（用于去重）
+        multi_seq_ids = set()
+        for s in batch:
+            multi_seq_ids.add(s.seq_id)
+        # 构建索引级的掩码
+        indices = [i for i, s in enumerate(batch) if s.seq_id in multi_seq_ids]
+        # 去重后的真实列表（用于最后日志）
+        multi_batch = [batch[i] for i in indices]
+
         # 2. 多步循环
         for _ in range(multi_step):
-            if not active.any(): 
-                break  # 所有序列都结束，提前退出
+            # 检查1：全挂了直接退
+            if not active.any(): break
 
             # 2.1 KV Cache 步进（仅活跃序列）
             ctx_lens = []
@@ -408,7 +418,6 @@ class InferenceEngine:
             # 2.2 推理（CUDA Graph Replay）+ 耗时统计 + 结果校验
             gpu_start = time.time()
             next_tokens = self.graph_runner.forward(input_ids, temps, topps, self.cache_manager, batch_size)
-            total_gpu_time += time.time() - gpu_start
             steps_executed += 1
             
             next_tokens = next_tokens.tolist()
@@ -419,30 +428,34 @@ class InferenceEngine:
             next_input_ids = []
             for i, s in enumerate(batch):
                 if active[i]:
-                    # 更新序列，即使token是eos也正常处理
-                    self._update_sequence(s, next_tokens[i])
-                    # 标记已结束的序列
-                    if s.is_finished():
-                        active[i] = False
-                
+                    # 【核心修改】只有在 multi_seq_ids 里的才真正更新
+                    if s.seq_id in multi_seq_ids:
+                        # 更新序列，即使token是eos也正常处理
+                        self._update_sequence(s, next_tokens[i])
+                        # 标记已结束的序列
+                        if s.is_finished():
+                            active[i] = False
+                    
                 new_token = next_tokens[i] if active[i] else eos_token_id
                 next_input_ids.append(new_token)
 
-
-
             input_ids = torch.tensor(next_input_ids, device=device)
+
+            # 检查2：活跃数 != 初始Batch数 -> 打破重新调度
+            if active.sum().item() != batch_size:
+                break
 
         # 3. 耗时分布日志（保留核心统计，去掉GPU利用率）
         total_time = time.time() - total_start
-        avg_step_time = (total_time / steps_executed) * 1000
+        avg_step_time = (total_time / steps_executed) * 1000 if steps_executed else 0
         total_time_ms = total_time * 1000
         
         # 仅在关键节点打印（避免日志刷屏）
-        if batch and batch[0].current_position % 50 < steps_executed:
+        if multi_batch and multi_batch[0].current_position < 30:
             self.logger.info(
                 f"📊 Multi-Step Decode Stats | Steps: {steps_executed} | "
-                f"Total: {total_time_ms:.1f}ms | Avg Step: {avg_step_time:.2f}ms"
-                f"batch_size {batch_size}"
+                f"Total: {total_time_ms:.1f}ms | Avg Step: {avg_step_time:.2f}ms | "
+                f"Batch {batch_size}"
             )
             
 
