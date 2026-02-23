@@ -297,9 +297,18 @@ class InferenceEngine:
 
     @torch.no_grad()
     def _process_decode_batch(self, batch: List[Sequence]):
-        """处理解码批次 - 带采样参数版本"""
+        """处理解码批次 - 带采样参数版本 (支持 Padding)"""
         start_time = time.time()
         batch_size = len(batch)
+        
+        # 【新增】记录真实的 seq_id 集合（用于去重）
+        running_seq_ids = set()
+        for s in batch:
+            running_seq_ids.add(s.seq_id)
+        # 构建索引级的掩码
+        indices = [i for i, s in enumerate(batch) if s.seq_id in running_seq_ids]
+        # 去重后的真实列表（用于最后日志）
+        running_batch = [batch[i] for i in indices]
         
         # 1. 准备
         prep_start = time.time()
@@ -310,11 +319,11 @@ class InferenceEngine:
             device=self.device
         ).squeeze(1)
         
-        # 【新增】提取采样参数
+        # 提取采样参数
         temperatures = torch.tensor([seq.temperature for seq in batch], device=self.device)
         top_ps = torch.tensor([seq.top_p for seq in batch], device=self.device)
         
-        # KV Cache 更新
+        # KV Cache 更新 (保持原样，不动)
         for seq in batch:
             self.cache_manager.append(seq.seq_id)
         seq_ids = [seq.seq_id for seq in batch]
@@ -323,10 +332,9 @@ class InferenceEngine:
         
         prep_time = time.time() - prep_start
         
-        # 2. 推理
+        # 2. 推理 (保持原样，不动)
         gpu_start = time.time()
         
-        # 【修改】现在 forward 接收 5 个参数
         next_tokens = self.graph_runner.forward(
             input_ids, 
             temperatures, 
@@ -338,17 +346,19 @@ class InferenceEngine:
         next_tokens = next_tokens.tolist()
         gpu_time = time.time() - gpu_start
         
-        # 3. 更新
+        # 3. 更新 (仅这里加去重判断)
         update_start = time.time()
         for i, seq in enumerate(batch):
-            self._update_sequence(seq, next_tokens[i])
+            # 【核心修改】只有真实序列才更新
+            if seq.seq_id in running_seq_ids:
+                self._update_sequence(seq, next_tokens[i])
         update_time = time.time() - update_start
         
-        # 日志
+        # 日志 (batch 换成 running_batch)
         total_time = time.time() - start_time
-        if batch and batch[0].current_position % 50 == 0:
+        if running_batch and running_batch[0].current_position % 50 == 0:
             self.logger.info(f"🚀 解码 (Graph+Sampling): 预处理时间 {prep_time*1000:.2f}ms, GPU推理时间 {gpu_time*1000:.2f}ms, 更新时间 {update_time*1000:.2f}ms")
-            self.logger.info(f"🚀 解码 (Graph+Sampling): 总耗时 {total_time*1000:.2f}ms")
+            self.logger.info(f"🚀 解码 (Graph+Sampling): 总耗时 {total_time*1000:.2f}ms | Batch {batch_size}")
 
         return next_tokens
 

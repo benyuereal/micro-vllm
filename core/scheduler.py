@@ -82,8 +82,17 @@ class Scheduler:
                     batch_type = "decode"
                     # 从 batch_sizes 中找到第一个 <= len(batch) 的值（向下取整）
                     batch_len = len(batch)
-                    batch_sizes = max((b for b in self.batch_sizes if b <= batch_len), default=self.batch_sizes[0])
-                    return batch[:batch_sizes], batch_type
+                    batch_size = min((b for b in self.batch_sizes if b >= batch_len), default=self.batch_sizes[-1])
+
+                    # 【修改2】Padding补齐：简单复制，直到长度达标
+                    padded_batch = batch.copy()
+                    idx = 0
+                    while len(padded_batch) < batch_size:
+                        padded_batch.append(padded_batch[idx % len(batch)])  # 循环复制
+                        idx += 1
+
+                    return padded_batch, batch_type
+
 
         return [], "idle"
 
