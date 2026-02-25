@@ -255,43 +255,70 @@ class InferenceEngine:
 
     @torch.no_grad()
     def _process_prefill_batch(self, batch: List[Sequence]):
-        """处理预填充批次，适配不同模型架构"""
+        """处理预填充批次 - 统一风格版"""
+        start_time = time.time()
+        batch_size = len(batch)
+        if not batch_size: return []
 
-        """处理预填充批次 (极简版)"""
-        # 1. 准备输入
-        input_ids = [seq.get_next_input_ids() for seq in batch]
-        input_tensor = self._pad_batch(input_ids, self.pad_token_id).to(self.device)
+        # 1. 准备输入数据
+        prep_start = time.time()
+        device = self.device
+        
+        # 因为是定长分桶，直接 stack
+        input_ids_list = [seq.get_next_input_ids() for seq in batch]
+        input_tensor = torch.tensor(input_ids_list, dtype=torch.long, device=device)
+        
+        temperatures = torch.tensor([seq.temperature for seq in batch], device=device)
+        top_ps = torch.tensor([seq.top_p for seq in batch], device=device)
+        
+        seq_lens = [len(ids) for ids in input_ids_list]
+        # 定长保证
+        seq_len = seq_lens[0]
 
-        # 2. 前向传播
-        outputs = self.model(input_ids=input_tensor, use_cache=True)
-        logits, past_kvs = outputs.logits, outputs.past_key_values
-
-        # 3. 存储KV (按序列处理)
+        # 2. KV Cache 管理 (先分配)
+        seq_ids = []
         for i, seq in enumerate(batch):
-            num_tokens = len(input_ids[i])
-            success, slot_mapping = self.cache_manager.alloc(seq.seq_id, num_tokens)
-            if not success: continue
-            for layer_idx, (k, v) in enumerate(past_kvs):
-                # 直接提取当前序列的所有token KV (避免循环)
-                k_tensor = k[i, :num_tokens, :, :]  # [N, H, D]
-                v_tensor = v[i, :num_tokens, :, :]
-                k_cache, v_cache = self.cache_manager.get(layer_idx)
-                store_kvcache(k_tensor, v_tensor, k_cache, v_cache,
-                              torch.tensor(slot_mapping, dtype=torch.int32, device=k_tensor.device),
-                              self.block_size)
-        # 批量采样下一个token
-        temperatures = torch.tensor([seq.temperature for seq in batch], device=logits.device)
-        top_ps = torch.tensor([seq.top_p for seq in batch], device=logits.device)
+            success, _ = self.cache_manager.alloc(seq.seq_id, seq_len)
+            if not success:
+                raise RuntimeError(f"OOM allocating cache for seq {seq.seq_id}")
+            seq_ids.append(seq.seq_id)
+            
+        # 🔧 关键：更新 CacheManager 的静态缓冲区
+        # 这里 context_lens 传实际长度，graph_runner 内部会决定是否清零
+        self.cache_manager.cache_batch_data(seq_ids, seq_lens)
         
-        next_tokens = self._sample_next_token(
-            logits[:, -1, :],  # [batch_size, vocab_size]
-            temperatures,       # [batch_size]
-            top_ps              # [batch_size]
+        prep_time = time.time() - prep_start
+
+        # 3. 推理
+        gpu_start = time.time()
+        logits = self.graph_runner.prefill(
+            input_tensor, 
+            self.cache_manager, 
+            batch_size
         )
-        next_tokens = next_tokens.tolist()
-        
+        gpu_time = time.time() - gpu_start
+
+        # 4. 采样
+        sample_start = time.time()
+        # 取最后一个 token
+        last_logits = logits[:, -1, :]
+        next_tokens = self._sample_next_token(last_logits, temperatures, top_ps).tolist()
+        sample_time = time.time() - sample_start
+
+        # 5. 更新状态
+        update_start = time.time()
         for i, seq in enumerate(batch):
             self._update_sequence(seq, next_tokens[i])
+        update_time = time.time() - update_start
+
+        # 6. 日志
+        total_time = time.time() - start_time
+        self.logger.info(
+            f"📝 预填充 (Prefill): "
+            f"Prep {prep_time*1000:.2f}ms, GPU {gpu_time*1000:.2f}ms, "
+            f"Sample {sample_time*1000:.2f}ms, Update {update_time*1000:.2f}ms, "
+            f"Total {total_time*1000:.2f}ms | Batch{batch_size}, Len{seq_len}"
+        )
 
         return next_tokens
 

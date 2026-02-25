@@ -12,9 +12,10 @@ from core.paged_attention import PagedAttention
 from kernel.swiglu import swiglu_fused as swiglu
 from .sampler import Sampler  # 引入独立的 Sampler
 from kernel.rmsnorm_add import rmsnorm_residual_fused ,rmsnorm
+from .rope import RoPE
 
 try:
-    from flash_attn import flash_attn_with_kvcache
+    from flash_attn import flash_attn_with_kvcache, flash_attn_varlen_func
 except ImportError:
     flash_attn_with_kvcache = None
 
@@ -54,6 +55,7 @@ class ModelGraphRunner:
         self._allocate_buffers()
         self._graphs: Dict[int, torch.cuda.CUDAGraph] = {}
         self._ready = False
+        self.rope = RoPE()
     
     def prepare(self):
         """预缓存转置权重"""
@@ -180,3 +182,76 @@ class ModelGraphRunner:
         
         self._graphs[batch_size].replay()
         return self._output_ids[:batch_size]
+
+
+    def prefill(self, input_ids: torch.Tensor, cache_manager, batch_size: int) -> torch.Tensor:
+        """
+        定长Prefill (修复 cos/sin seqlen 报错)
+        """
+        batch_size_val, seq_len = input_ids.shape
+        device = self.device
+
+        # 1. Embedding
+        h = self.model.transformer.wte(input_ids)
+
+        # 2. 获取静态缓冲区视图
+        block_table = cache_manager._block_table_buffer[:batch_size]
+        cache_seqlens = cache_manager._cache_seqlens_buffer[:batch_size]
+        
+        # 置 0 触发 Prefill 写入模式
+        cache_seqlens.zero_()
+
+        # 3. Transformer Layers
+        for layer_idx in range(self.num_layers):
+            block = self.model.transformer.h[layer_idx]
+            w_qkv, b_qkv = block.attn._qkv_w, block.attn._qkv_b
+            w_o = block.attn._o
+            w_gu, w_d = block.mlp._gu, block.mlp._d
+
+            # Attention
+            normed = rmsnorm(h, block.ln_1.weight, block.ln_1.eps)
+            qkv = torch.matmul(normed, w_qkv)
+            if b_qkv is not None: qkv = qkv + b_qkv
+            
+            # 重塑形状 [batch, seq_len, 3, heads, dim]
+            qkv_reshaped = qkv.reshape(batch_size_val, seq_len, 3, self.num_heads, self.head_size)
+            q, k, v = qkv_reshaped[:, :, 0], qkv_reshaped[:, :, 1], qkv_reshaped[:, :, 2]
+
+       
+            
+            cos = self.attention._cos_pool
+            sin = self.attention._sin_pool
+            q, k = self.rope.forward(q, k, cos, sin)
+
+            # 获取当前层的 Cache 指针
+            k_cache, v_cache = cache_manager.get(layer_idx)
+
+            attn = flash_attn_with_kvcache(
+                q=q,
+                k_cache=k_cache,
+                v_cache=v_cache,
+                k=k,
+                v=v,
+                cache_seqlens=cache_seqlens,
+                block_table=block_table,
+                causal=True,
+                # rotary_cos 和 rotary_sin 已彻底移除
+            )
+
+            # MLP
+            out = torch.matmul(attn.reshape(batch_size_val, seq_len, -1), w_o)
+            normed, residual = rmsnorm_residual_fused(
+                                x=out, residual=h,
+                                weight=block.ln_2.weight, eps=block.ln_2.eps
+                            )
+            gate_up = torch.matmul(normed, w_gu)
+            up, gate = gate_up.chunk(2, dim=-1)
+            activated = swiglu(gate, up)
+            mlp_out = torch.matmul(activated, w_d)
+            h = mlp_out + residual
+
+        # 4. Final Norm + LM Head
+        h = self.model.transformer.ln_f(h)
+        logits = self.model.lm_head(h)
+
+        return logits
