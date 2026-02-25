@@ -10,6 +10,8 @@ from core.engine import InferenceEngine
 import asyncio
 from queue import Queue
 import config.config as Config
+from core.parallel_config import is_main_process, get_rank
+
 # 全局引擎实例
 engine = None
 running = True  # 控制 step 循环
@@ -239,4 +241,10 @@ async def generate_stream(request: GenerateRequest):
 if __name__ == "__main__":
     import uvicorn
 
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    # 只有主进程（Rank 0）启动 API 服务
+    if is_main_process():
+        uvicorn.run(app, host="0.0.0.0", port=8000)
+    else:
+        # 非主进程保持运行，不启动服务（避免端口冲突）
+        while running:
+            time.sleep(0.1)

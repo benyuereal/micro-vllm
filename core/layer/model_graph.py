@@ -14,6 +14,12 @@ from .sampler import Sampler  # 引入独立的 Sampler
 from kernel.rmsnorm_add import rmsnorm_residual_fused ,rmsnorm
 from .rope import RoPE
 
+from core.parallel_config import (
+    get_rank,
+    get_world_size,
+    all_reduce,
+)
+
 try:
     from flash_attn import flash_attn_with_kvcache, flash_attn_varlen_func
 except ImportError:
@@ -34,21 +40,32 @@ class ModelGraphRunner:
                  top_k: int = 1000):
         self.model = model
         self.num_layers = num_layers
-        self.num_heads = num_heads
+        
+        # ========== TP 修改开始 ==========
+        self.rank = get_rank()
+        self.world_size = get_world_size()
+        
+        # 更新为本地维度
+        self.num_heads = num_heads 
+        self.kv_num_heads = kv_num_heads 
+        self.intermediate_size = intermediate_size 
+        # ========== TP 修改结束 ==========
+        
         self.head_size = head_size
-        self.kv_num_heads = kv_num_heads
         self.hidden_dim = hidden_dim
-        self.intermediate_size = intermediate_size
         self.vocab_size = model.config.vocab_size
         self.device = device
         self.max_batch_size = max_batch_size
         self.dtype = dtype
         self.top_k = top_k
-        # 初始化组件
+        
+        # 初始化组件 (注意：这里传入的已经是切分后的 num_heads)
         self.attention = PagedAttention(
-            num_heads=num_heads, head_size=head_size, kv_num_heads=kv_num_heads,
+            num_heads=self.num_heads, head_size=head_size, kv_num_heads=self.kv_num_heads,
             device=device, max_batch_size=max_batch_size
         )
+
+        logger.info(f"Rank {self.rank}: attention device = {self.attention.device}, kv_num_heads = {self.kv_num_heads}, num_heads = {self.num_heads}, head_size = {self.head_size}")
         self.sampler = Sampler()
         
         self.prepare()
@@ -58,16 +75,46 @@ class ModelGraphRunner:
         self.rope = RoPE()
     
     def prepare(self):
-        """预缓存转置权重"""
+        """预缓存转置权重 & TP 切分"""
+        rank = self.rank
+        world_size = self.world_size
+        
         for idx, block in enumerate(self.model.transformer.h):
             mlp = block.mlp
-            gate_up = torch.cat([mlp.w1.weight, mlp.w2.weight], dim=0)
+            
+            # 1. 处理 MLP Gate + Up (Column Parallel)
+            global_w1 = mlp.w1.weight
+            global_w2 = mlp.w2.weight
+            # 按 Output Dim 切分
+            local_w1 = global_w1.chunk(world_size, dim=0)[rank]
+            local_w2 = global_w2.chunk(world_size, dim=0)[rank]
+            # 拼接并转置
+            gate_up = torch.cat([local_w1, local_w2], dim=0)
             mlp._gu = gate_up.t().contiguous()
-            mlp._d = mlp.c_proj.weight.t().contiguous()
-            block.attn._o = block.attn.c_proj.weight.t().contiguous()
-            block.attn._qkv_w = block.attn.c_attn.weight.t().contiguous()
-            block.attn._qkv_b = block.attn.c_attn.bias
-        logger.info("✅ 权重预缓存完成")
+            
+            # 2. 处理 MLP Down (Row Parallel)
+            global_wd = mlp.c_proj.weight
+            # 按 Input Dim 切分 (dim=1)
+            local_wd = global_wd.chunk(world_size, dim=1)[rank]
+            mlp._d = local_wd.t().contiguous()
+            
+            # 3. 处理 Attention Output (Row Parallel)
+            global_wo = block.attn.c_proj.weight
+            # 按 Input Dim 切分 (dim=1)
+            local_wo = global_wo.chunk(world_size, dim=1)[rank]
+            block.attn._o = local_wo.t().contiguous()
+            
+            # 4. 处理 Attention QKV (Column Parallel)
+            global_qkv_w = block.attn.c_attn.weight
+            global_qkv_b = block.attn.c_attn.bias
+            # 按 Output Dim 切分 (dim=0)
+            local_qkv_w = global_qkv_w.chunk(world_size, dim=0)[rank]
+            local_qkv_b = global_qkv_b.chunk(world_size, dim=0)[rank] if global_qkv_b is not None else None
+            
+            block.attn._qkv_w = local_qkv_w.t().contiguous()
+            block.attn._qkv_b = local_qkv_b
+            
+        logger.info(f"✅ 权重预缓存 & TP 切分完成 (Rank {self.rank})")
     
     def _allocate_buffers(self):
         """分配静态内存池"""
@@ -119,6 +166,8 @@ class ModelGraphRunner:
             
             # MLP
             out = torch.matmul(attn.reshape(batch_size, -1), w_o)
+            out = all_reduce(out)
+            
             normed, residual = rmsnorm_residual_fused(
                                 x=out,
                                 residual=h,
@@ -129,6 +178,9 @@ class ModelGraphRunner:
             up, gate = gate_up.chunk(2, dim=-1)
             activated = swiglu(gate, up)
             mlp_out = torch.matmul(activated, w_d)
+            
+            mlp_out = all_reduce(mlp_out)
+            
             h = mlp_out + residual
             
         # 3. Final Norm + LM Head
@@ -240,6 +292,8 @@ class ModelGraphRunner:
 
             # MLP
             out = torch.matmul(attn.reshape(batch_size_val, seq_len, -1), w_o)
+            out = all_reduce(out)
+            
             normed, residual = rmsnorm_residual_fused(
                                 x=out, residual=h,
                                 weight=block.ln_2.weight, eps=block.ln_2.eps
@@ -248,6 +302,9 @@ class ModelGraphRunner:
             up, gate = gate_up.chunk(2, dim=-1)
             activated = swiglu(gate, up)
             mlp_out = torch.matmul(activated, w_d)
+            
+            mlp_out = all_reduce(mlp_out)
+            
             h = mlp_out + residual
 
         # 4. Final Norm + LM Head

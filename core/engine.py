@@ -41,6 +41,7 @@ from .model_loader import load_model
 import logging
 from .layer.sampler import Sampler
 import asyncio
+from core.parallel_config import get_rank, setup, get_world_size
 
 class InferenceEngine:
     """
@@ -81,14 +82,22 @@ class InferenceEngine:
             3. 初始化KV缓存和注意力模块
             4. 设置日志和回调
         """
+
+        # tp配置
+        setup()
+        rank = get_rank()
+        if torch.cuda.is_available():
+           torch.cuda.set_device(rank)
         self.logger = self._init_logging()
         self.logger.info(f"Initializing InferenceEngine for {model_path}")
 
         # 1. 自动加载模型 (零拷贝)
-        self.model, self.tokenizer = load_model(model_path)
+        device = f"cuda:{rank}" if torch.cuda.is_available() else "cpu"
+        self.model, self.tokenizer = load_model(model_path, device=device)  # 传入 device
         self.model.eval()
-
-
+        # 新增日志：打印模型关键参数的设备
+        self.logger.info(f"Rank {rank}: ln_f weight device = {self.model.transformer.ln_f.weight.device}")
+        self.logger.info(f"Rank {rank}: set_device = cuda:{rank}")
         # 2. 获取模型配置
         self.config = self.model.config
         self.model_type = self.config.model_type
@@ -109,6 +118,16 @@ class InferenceEngine:
             self.head_size = self.config.head_dim
         else:  # Qwen2 使用 hidden_size // num_heads
             self.head_size = self.config.hidden_size // self.num_heads
+        
+        world_size = get_world_size()
+        # 维度校验
+        assert self.num_heads % world_size == 0, f"num_heads {self.num_heads} must be divisible by world_size {world_size}"
+        assert self.kv_num_heads % world_size == 0, f"kv_num_heads {self.kv_num_heads} must be divisible by world_size {world_size}"
+        # 执行切分
+        self.num_heads = self.num_heads // world_size
+        self.kv_num_heads = self.kv_num_heads // world_size
+
+        self.logger.info(f"Rank {rank}: head_size = {self.config.hidden_size}, num_heads = {self.num_heads}, kv_num_heads = {self.kv_num_heads}, head_size = {self.head_size}")
         # 4. 自动检测设备和精度
         self.device, self.dtype, self.block_size, self.max_blocks = self._auto_configure()
         self.logger.info(f"Using device={self.device}, dtype={self.dtype}")
@@ -159,6 +178,8 @@ class InferenceEngine:
                 batch_sizes=[1, 2, 4, 8, 16, 32]
             )
             self.logger.info("CUDA Graphs capture completed")
+
+        
 
     def _init_logging(self):
         """初始化日志"""
