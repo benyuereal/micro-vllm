@@ -43,6 +43,15 @@ from .layer.sampler import Sampler
 import asyncio
 from core.parallel_config import get_rank, setup, get_world_size
 
+# Configure logging globally
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s [%(levelname)s] %(message)s',
+    handlers=[logging.FileHandler("inference_perf.log"), logging.StreamHandler()]
+)
+
+logger = logging.getLogger("InferenceEngine")
+
 class InferenceEngine:
     """
     📌 **推理引擎** - vLLM核心组件
@@ -88,16 +97,16 @@ class InferenceEngine:
         rank = get_rank()
         if torch.cuda.is_available():
            torch.cuda.set_device(rank)
-        self.logger = self._init_logging()
-        self.logger.info(f"Initializing InferenceEngine for {model_path}")
+        
+        logger.info(f"Initializing InferenceEngine for {model_path}")
 
         # 1. 自动加载模型 (零拷贝)
         device = f"cuda:{rank}" if torch.cuda.is_available() else "cpu"
         self.model, self.tokenizer = load_model(model_path, device=device)  # 传入 device
         self.model.eval()
         # 新增日志：打印模型关键参数的设备
-        self.logger.info(f"Rank {rank}: ln_f weight device = {self.model.transformer.ln_f.weight.device}")
-        self.logger.info(f"Rank {rank}: set_device = cuda:{rank}")
+        logger.info(f"Rank {rank}: ln_f weight device = {self.model.transformer.ln_f.weight.device}")
+        logger.info(f"Rank {rank}: set_device = cuda:{rank}")
         # 2. 获取模型配置
         self.config = self.model.config
         self.model_type = self.config.model_type
@@ -107,7 +116,7 @@ class InferenceEngine:
         self.model_layers = self.model.transformer.h
         
 
-        self.logger.info(f"Detected model type: {self.model_type}")
+        logger.info(f"Detected model type: {self.model_type}")
 
         # 3. 自动配置参数
         self.num_layers = self.config.num_hidden_layers
@@ -127,10 +136,10 @@ class InferenceEngine:
         self.num_heads = self.num_heads // world_size
         self.kv_num_heads = self.kv_num_heads // world_size
 
-        self.logger.info(f"Rank {rank}: head_size = {self.config.hidden_size}, num_heads = {self.num_heads}, kv_num_heads = {self.kv_num_heads}, head_size = {self.head_size}")
+        logger.info(f"Rank {rank}: head_size = {self.config.hidden_size}, num_heads = {self.num_heads}, kv_num_heads = {self.kv_num_heads}, head_size = {self.head_size}")
         # 4. 自动检测设备和精度
         self.device, self.dtype, self.block_size, self.max_blocks = self._auto_configure()
-        self.logger.info(f"Using device={self.device}, dtype={self.dtype}")
+        logger.info(f"Using device={self.device}, dtype={self.dtype}")
 
         # 5. 初始化核心模块 (零拷贝)
         self.cache_manager = KVCacheManager(
@@ -165,32 +174,21 @@ class InferenceEngine:
         self.stream_callbacks = {}
         self.max_position = getattr(self.config, 'max_position_embeddings', 4096)
 
-        self.logger.info(f"Engine initialized: layers={self.num_layers}, heads={self.num_heads}, "
+        logger.info(f"Engine initialized: layers={self.num_layers}, heads={self.num_heads}, "
                          f"block_size={self.block_size}, max_blocks={self.max_blocks}")
         self.sampler = Sampler()
         # 8.其他配置
         if self.device == "cuda":
-            self.logger.info("Starting CUDA Graphs capture...")
+            logger.info("Starting CUDA Graphs capture...")
         
             # 捕获整个模型的CUDA Graph
             self.graph_runner.capture(
                 self.cache_manager,
                 batch_sizes=[1, 2, 4, 8, 16, 32]
             )
-            self.logger.info("CUDA Graphs capture completed")
+            logger.info("CUDA Graphs capture completed")
 
         
-
-    def _init_logging(self):
-        """初始化日志"""
-        logging.basicConfig(
-            level=logging.INFO,
-            format='%(asctime)s [%(levelname)s] %(message)s',
-            handlers=[logging.FileHandler("inference_perf.log"), logging.StreamHandler()]
-        )
-        return logging.getLogger("InferenceEngine")
-
-
 
     def _auto_configure(self):
         """自动配置设备和精度"""
@@ -323,7 +321,7 @@ class InferenceEngine:
         sample_start = time.time()
         # 取最后一个 token
         last_logits = logits[:, -1, :]
-        next_tokens = self._sample_next_token(last_logits, temperatures, top_ps).tolist()
+        next_tokens = self.sampler(last_logits, temperatures, top_ps, 1000).tolist()
         sample_time = time.time() - sample_start
 
         # 5. 更新状态
@@ -334,7 +332,7 @@ class InferenceEngine:
 
         # 6. 日志
         total_time = time.time() - start_time
-        self.logger.info(
+        logger.info(
             f"📝 预填充 (Prefill): "
             f"Prep {prep_time*1000:.2f}ms, GPU {gpu_time*1000:.2f}ms, "
             f"Sample {sample_time*1000:.2f}ms, Update {update_time*1000:.2f}ms, "
@@ -402,7 +400,7 @@ class InferenceEngine:
         # 4. 采样 (移到 Engine 层)
         sample_start = time.time()
         
-        next_tokens = self._sample_next_token(logits, temperatures, top_ps).tolist()
+        next_tokens = self.sampler(logits, temperatures, top_ps, 1000).tolist()
         sample_time = time.time() - sample_start
         
         gpu_time = time.time() - gpu_start
@@ -416,7 +414,7 @@ class InferenceEngine:
         # 6. 日志
         total_time = time.time() - start_time
         if indices and batch[indices[0]].current_position % 50 == 0:
-            self.logger.info(
+            logger.info(
                 f"🚀 解码 (Graph+Sampling): "
                 f"Prep {prep_time*1000:.2f}ms, GPU {gpu_time*1000:.2f}ms, Update {update_time*1000:.2f}ms, "
                 f"Total {total_time*1000:.2f}ms | Batch{batch_size}"
@@ -436,7 +434,7 @@ class InferenceEngine:
         if seq.is_finished():
             self.scheduler.mark_finished(seq)
             self.cache_manager.free(seq.seq_id)
-            self.logger.info(f"FINISHED: {seq.seq_id}")
+            logger.info(f"FINISHED: {seq.seq_id}")
 
 
     def _pad_batch(self, sequences: List[List[int]], pad_token_id: int) -> torch.Tensor:
@@ -445,85 +443,7 @@ class InferenceEngine:
         padded = [seq + [pad_token_id] * (max_len - len(seq)) for seq in sequences]
         return torch.tensor(padded, dtype=torch.long)
 
-    def _sample_next_token(
-    self, 
-    logits: torch.Tensor,        # [batch_size, vocab_size]
-    temperatures: torch.Tensor,  # [batch_size]
-    top_ps: torch.Tensor,        # [batch_size]
-    top_k: int = 1000,           # 预过滤的k值，Qwen 152k词表建议1000-2000
-    min_tokens_to_keep: int = 1, # 保证至少保留的token数
-    ) -> torch.Tensor:
-        """Top-K预过滤 + Top-P采样的批量实现"""
-        batch_size, vocab_size = logits.shape
-        
-        # 处理temperature=0的greedy情况（快速路径）
-        zero_temp_mask = temperatures < 1e-6
-        if zero_temp_mask.any():
-            result = torch.zeros(batch_size, dtype=torch.long, device=logits.device)
-            if zero_temp_mask.all():
-                # 全部greedy，直接argmax
-                return logits.argmax(dim=-1)
-            else:
-                # 混合情况：greedy的argmax，其他的正常采样
-                result[zero_temp_mask] = logits[zero_temp_mask].argmax(dim=-1)
-                # 继续处理非零温度部分
-                non_zero_mask = ~zero_temp_mask
-                result[non_zero_mask] = self._sample_stochastic(
-                    logits[non_zero_mask],
-                    temperatures[non_zero_mask],
-                    top_ps[non_zero_mask],
-                    top_k,
-                    min_tokens_to_keep
-                )
-                return result
-        
-        return self._sample_stochastic(logits, temperatures, top_ps, top_k, min_tokens_to_keep)
-
-
-    def _sample_stochastic(
-        self,
-        logits: torch.Tensor,        # [batch_size, vocab_size]
-        temperatures: torch.Tensor,  # [batch_size]
-        top_ps: torch.Tensor,        # [batch_size]
-        top_k: int,
-        min_tokens_to_keep: int,
-    ) -> torch.Tensor:
-        """使用编译后的 Sampler 进行采样"""
-        # 使用 Sampler 类的编译采样函数
-        return self.sampler(logits, temperatures, top_ps, top_k)
-        
-
-    def stream_generate(self, prompt: str, max_tokens: int = 128,
-                        temperature: float = 0.7, top_p: float = 0.9) -> Generator[Tuple[int, str], None, None]:
-        """流式生成"""
-        seq_id = self.add_request(prompt, max_tokens, temperature, top_p)
-        token_queue = Queue()
-
-        def callback(token, text):
-            token_queue.put((token, text))
-
-        self.register_stream_callback(seq_id, callback)
-
-        try:
-            generated_count = 0
-            while generated_count < max_tokens:
-                if self.step():
-                    # 处理新生成的token
-                    while not token_queue.empty():
-                        token, text = token_queue.get()
-                        yield token, text
-                        generated_count += 1
-
-                        if token == self.eos_token_id:
-                            return
-
-                # 检查序列状态
-                if not any(seq.seq_id == seq_id for seq in self.scheduler.running_sequences):
-                    break
-
-                time.sleep(0.001)
-        finally:
-            self.unregister_stream_callback(seq_id)
+    
 
     def generate(self, prompts: List[str], max_tokens: int = 100) -> Dict[Sequence, str]:
         """批量生成"""
