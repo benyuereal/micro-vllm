@@ -236,41 +236,30 @@ class InferenceEngine:
             except Exception as e:
                 print(f"Error in stream callback for seq {seq_id}: {e}")
 
+    def get_next_batch(self) -> Tuple[List[Sequence], str]:
+        """获取下一个批次"""
+        return self.scheduler.get_next_batch()
+
     @torch.no_grad()
-    def step(self) -> bool:
-        """执行推理step，返回是否有处理任何请求（连续批处理版本）"""
-        # Mark the beginning of a new iteration for CUDA graphs
-        # This prevents tensor output overwriting between consecutive runs
-        # torch.compiler.cudagraph_mark_step_begin()
-
-        working = False
-
-        while True:
-            # 使用连续批处理：Padding 凑齐 batch + 动态剔除完成
-            batch, batch_type = self.scheduler.get_next_batch()
-
-            if batch_type == "waiting":
-                # time.sleep(0.001)
-                time.sleep(0.001)  # 让出控制权，事件循环可以处理其他请求
-                continue
-
-            if not batch:
-                break  # 没有更多工作
-
-            working = True
-
-            if batch_type == "prefill":
-                self._process_prefill_batch(batch)
-            elif batch_type == "decode":
-                self._process_decode_batch(batch)
-
-            # 连续批处理：检查是否需要继续填充
-            # 如果有等待中的请求 → 继续循环填充
-            # 否则退出
-            if not self.scheduler.waiting_queue:
-                break
-
-        return working
+    def schedule(self, batch: List[Sequence], batch_type: str):
+        """调度方法：处理批次，根据类型调用不同的处理方法"""
+        if batch_type == "prefill":
+            self._process_prefill_batch(batch)
+        elif batch_type == "decode":
+            self._process_decode_batch(batch)
+            
+    @torch.no_grad()
+    def step(self, batch: List[Sequence], batch_type: str) -> bool:
+        """执行推理step：接受batch进行推理"""
+        if not batch:
+            return False
+            
+        if batch_type == "prefill":
+            self._process_prefill_batch(batch)
+        elif batch_type == "decode":
+            self._process_decode_batch(batch)
+            
+        return True
 
     @torch.no_grad()
     def _process_prefill_batch(self, batch: List[Sequence]):
@@ -453,7 +442,8 @@ class InferenceEngine:
 
         # 执行推理直到完成
         for _ in range(max_tokens):
-            if not self.step() and not self.scheduler.running_sequences:
+            batch , batch_type = self.get_next_batch()
+            if not self.step(batch, batch_type) and not self.scheduler.running_sequences:
                 break
 
         # 处理结果

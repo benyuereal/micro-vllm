@@ -28,19 +28,27 @@ class GenerateRequest(BaseModel):
 
 
 # 异步推理任务
-async def inference_task():
+async def inference_task(engine: InferenceEngine):
     """异步推理任务 - 在后台持续执行推理"""
     print("Async inference task started")
     while running:
-        if engine is not None:
-            # 同步调用 engine.step()（内部有锁保护）
-            status = engine.step()
-            if not status:
-                await asyncio.sleep(0.001)  # 使用 async sleep
-            # 让出控制权，确保其他协程有机会运行
-            await asyncio.sleep(0.0)
-        else:
-            await asyncio.sleep(0.1)
+        # 获取批次
+        batch, batch_type = engine.get_next_batch()
+        
+        if not batch or batch_type == "waiting":
+            await asyncio.sleep(0.001)
+            continue
+            
+        if batch_type == "idle":
+            await asyncio.sleep(0.001)
+            continue
+            
+        # 执行推理
+        engine.step(batch, batch_type)
+        
+        # 让出控制权，确保其他协程有机会运行
+        await asyncio.sleep(0.0)
+        
     print("Async inference task stopped")
 
 
@@ -81,7 +89,7 @@ async def startup_event():
         print(f"Model loaded successfully on device: {engine.device}")
         
         # 启动异步推理任务（不阻塞启动流程）
-        asyncio.create_task(inference_task())
+        asyncio.create_task(inference_task(engine))
         print("Async inference task started")
     except Exception as e:
         print(f"Failed to load model: {str(e)}")
