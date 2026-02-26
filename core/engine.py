@@ -392,10 +392,19 @@ class InferenceEngine:
         
         # 4. 推理
         gpu_start = time.time()
-        next_tokens = self.graph_runner.forward(
-            input_ids, temperatures, top_ps,
-            self.cache_manager, batch_size
-        ).tolist()
+        
+        logits = self.graph_runner.forward(
+            input_ids, 
+            self.cache_manager, 
+            batch_size
+        )
+        
+        # 4. 采样 (移到 Engine 层)
+        sample_start = time.time()
+        
+        next_tokens = self._sample_next_token(logits, temperatures, top_ps).tolist()
+        sample_time = time.time() - sample_start
+        
         gpu_time = time.time() - gpu_start
         
         # 5. 更新状态

@@ -10,7 +10,7 @@ import torch.nn.functional as F
 from typing import Dict, List
 from core.paged_attention import PagedAttention
 from kernel.swiglu import swiglu_fused as swiglu
-from .sampler import Sampler  # 引入独立的 Sampler
+# from .sampler import Sampler  # 移除 Sampler 依赖
 from kernel.rmsnorm_add import rmsnorm_residual_fused ,rmsnorm
 from .rope import RoPE
 
@@ -66,7 +66,7 @@ class ModelGraphRunner:
         )
 
         logger.info(f"Rank {self.rank}: attention device = {self.attention.device}, kv_num_heads = {self.kv_num_heads}, num_heads = {self.num_heads}, head_size = {self.head_size}")
-        self.sampler = Sampler()
+        # self.sampler = Sampler() # 移除 Sampler
         
         self.prepare()
         self._allocate_buffers()
@@ -120,11 +120,12 @@ class ModelGraphRunner:
         """分配静态内存池"""
         max_b = self.max_batch_size
         self._input_ids = torch.empty((max_b,), dtype=torch.long, device=self.device)
-        self._temps = torch.empty((max_b,), dtype=self.dtype, device=self.device)
-        self._topps = torch.empty((max_b,), dtype=self.dtype, device=self.device)
+        # self._temps = torch.empty((max_b,), dtype=self.dtype, device=self.device) # 移除
+        # self._topps = torch.empty((max_b,), dtype=self.dtype, device=self.device) # 移除
         self._output_ids = torch.empty((max_b,), dtype=torch.long, device=self.device)
+        self._logits = torch.empty((max_b, self.vocab_size), dtype=self.dtype, device=self.device) # 添加 logits buffer
     
-    def _forward(self, input_ids, temps, topps, batch_size: int, cache_manager, use_graph_cache: bool):
+    def _forward(self, input_ids, batch_size: int, cache_manager, use_graph_cache: bool):
         """
         核心前向逻辑
         """
@@ -187,10 +188,10 @@ class ModelGraphRunner:
         h = self.model.transformer.ln_f(h)
         logits = self.model.lm_head(h)
         
-        # 4. 采样 (调用独立模块)
-        output_ids = self.sampler._sample_impl(logits.float(), temps, topps, self.top_k)
+        # 4. 采样 (移至 Engine 层)
+        # output_ids = self.sampler._sample_impl(logits.float(), temps, topps, self.top_k)
         
-        return output_ids
+        return logits
     
     def capture(self, cache_manager, batch_sizes: List[int] = [1, 2, 4, 8, 16, 32]):
         if self._ready: return
@@ -206,34 +207,29 @@ class ModelGraphRunner:
         
         with torch.cuda.graph(g):
             in_ids = self._input_ids[:batch_size]
-            in_temps = self._temps[:batch_size]
-            in_topps = self._topps[:batch_size]
-            out_ids = self._forward(in_ids, in_temps, in_topps, batch_size, cache_manager, use_graph_cache=True)
-            self._output_ids[:batch_size] = out_ids
+            out_logits = self._forward(in_ids, batch_size, cache_manager, use_graph_cache=True)
+            self._logits[:batch_size] = out_logits
         
         self._graphs[batch_size] = g
         logger.info(f"   - Batch size {batch_size} OK")
     
     def _warmup(self, batch_size: int, cache_manager, num_warmup: int = 3):
         dummy_ids = torch.randint(0, self.vocab_size, (batch_size,), dtype=torch.long, device=self.device)
-        dummy_temps = torch.ones((batch_size,), dtype=self.dtype, device=self.device)
-        dummy_topps = torch.ones((batch_size,), dtype=self.dtype, device=self.device)
+        # dummy_temps = torch.ones((batch_size,), dtype=self.dtype, device=self.device)
+        # dummy_topps = torch.ones((batch_size,), dtype=self.dtype, device=self.device)
         for _ in range(num_warmup):
             with torch.no_grad():
-                self._forward(dummy_ids, dummy_temps, dummy_topps, batch_size, cache_manager, use_graph_cache=False)
+                self._forward(dummy_ids, batch_size, cache_manager, use_graph_cache=False)
         torch.cuda.synchronize()
     
-    def forward(self, input_ids: torch.Tensor, temperatures: torch.Tensor, top_ps: torch.Tensor,
-                cache_manager, batch_size: int) -> torch.Tensor:
+    def forward(self, input_ids: torch.Tensor, cache_manager, batch_size: int) -> torch.Tensor:
         self._input_ids[:batch_size] = input_ids
-        self._temps[:batch_size] = temperatures.to(self.dtype)
-        self._topps[:batch_size] = top_ps.to(self.dtype)
         
         if batch_size not in self._graphs:
-            return self._forward(input_ids, temperatures, top_ps, batch_size, cache_manager, use_graph_cache=False)
+            return self._forward(input_ids, batch_size, cache_manager, use_graph_cache=False)
         
         self._graphs[batch_size].replay()
-        return self._output_ids[:batch_size]
+        return self._logits[:batch_size]
 
 
     def prefill(self, input_ids: torch.Tensor, cache_manager, batch_size: int) -> torch.Tensor:
