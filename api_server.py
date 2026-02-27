@@ -116,7 +116,7 @@ async def startup_event():
         else:
             # 非主Rank启动Step循环
             import threading
-            thread = threading.Thread(target=non_rank0_step_loop, args=(engine,))
+            thread = threading.Thread(target=inference_task1, args=(engine,))
             thread.start()
     except Exception as e:
         print(f"Failed to load model: {str(e)}")
@@ -276,7 +276,7 @@ async def generate_stream(request: GenerateRequest):
 # ------------------------------
 # 非Rank0 Step循环（传入dummy_tokenizer）
 # ------------------------------
-def non_rank0_step_loop(engine: InferenceEngine):
+def inference_task1(engine: InferenceEngine):
     print(f"Non-Rank 0 step loop started (Rank {get_rank()})")
     # 创建一个dummy_tokenizer（仅用于初始化Sequence，不会实际使用）
     dummy_tokenizer = engine.tokenizer # 非主Rank也加载了tokenizer，直接用即可

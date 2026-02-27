@@ -225,7 +225,7 @@ class InferenceEngine:
             self._process_prefill_batch(batch)
         elif batch_type == "decode":
             self._process_decode_batch(batch)
-        
+
         return True
     
     def update_sequences(self, sequences: List[Sequence]):
@@ -245,8 +245,12 @@ class InferenceEngine:
             
             # 结束处理
             if seq.is_finished():
-                self.scheduler.mark_finished(seq)
+                # 缓存释放（所有Rank都需要执行）
                 self.cache_manager.free(seq.seq_id)
+                
+                # 调度器状态更新（只在主Rank执行）
+                if rank0():
+                    self.scheduler.mark_finished(seq)
 
 
     @torch.no_grad()
@@ -296,11 +300,11 @@ class InferenceEngine:
             sample_start = time.time()
             last_logits = logits[:, -1, :]
             next_tokens = self.sampler(last_logits, temperatures, top_ps, 1000).tolist()
-            
+
             # 存储采样结果
             for i, seq in enumerate(batch):
                 seq._next_token = next_tokens[i]
-            
+
             sample_time = time.time() - sample_start
 
             # 5. 日志
@@ -373,7 +377,7 @@ class InferenceEngine:
         # 5. 采样（只在主Rank执行）
         if rank0():
             sample_start = time.time()
-            
+
             next_tokens = self.sampler(logits, temperatures, top_ps, 1000).tolist()
             
             # 存储采样结果
@@ -381,9 +385,9 @@ class InferenceEngine:
                 seq._next_token = next_tokens[i]
                 
             sample_time = time.time() - sample_start
-            
+
             gpu_time = time.time() - gpu_start
-            
+
             # 7. 日志
             total_time = time.time() - start_time
             if indices and batch[indices[0]].current_position % 50 == 0:
