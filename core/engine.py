@@ -104,9 +104,12 @@ class InferenceEngine:
         # 维度校验
         assert self.num_heads % world_size == 0, f"num_heads {self.num_heads} must be divisible by world_size {world_size}"
         assert self.kv_num_heads % world_size == 0, f"kv_num_heads {self.kv_num_heads} must be divisible by world_size {world_size}"
+        assert self.config.intermediate_size % world_size == 0, f"intermediate_size {self.config.intermediate_size} must be divisible by world_size {world_size}"  # 新增
+
         # 执行切分
         self.num_heads = self.num_heads // world_size
         self.kv_num_heads = self.kv_num_heads // world_size
+        self.intermediate_size = self.config.intermediate_size // world_size
 
         logger.info(f"Rank {rank}: head_size = {self.config.hidden_size}, num_heads = {self.num_heads}, kv_num_heads = {self.kv_num_heads}, head_size = {self.head_size}")
         
@@ -133,7 +136,7 @@ class InferenceEngine:
             head_size=self.head_size,
             kv_num_heads=self.kv_num_heads,
             hidden_dim=self.config.hidden_size,
-            intermediate_size=self.config.intermediate_size,
+            intermediate_size=self.intermediate_size,
             device=self.device,
             max_batch_size=max_batch_size
         )
@@ -295,6 +298,7 @@ class InferenceEngine:
         )
         gpu_time = time.time() - gpu_start
 
+        next_tokens = None
         # 4. 采样（只在主Rank执行）
         if rank0():
             sample_start = time.time()
@@ -374,6 +378,8 @@ class InferenceEngine:
             batch_size
         )
         
+        next_tokens = None
+
         # 5. 采样（只在主Rank执行）
         if rank0():
             sample_start = time.time()
