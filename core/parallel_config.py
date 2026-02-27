@@ -7,6 +7,7 @@ class _ParallelContext:
     """内部类，用于封装状态"""
     world_group = None
     parallel_group = None
+    is_main_rank = False
 
 _ctx = _ParallelContext()
 
@@ -37,6 +38,9 @@ def setup():
     # 新增：仅当分布式初始化后，才创建并行组
     if dist.is_initialized() and _ctx.parallel_group is None:
         _ctx.parallel_group = dist.new_group(ranks=list(range(get_world_size())))
+    
+    # 初始化 is_main_rank
+    _ctx.is_main_rank = rank0()
 
 def get_group():
     # 新增：分布式未初始化时返回None，避免后续调用报错
@@ -48,8 +52,19 @@ def get_rank():
 def get_world_size():
     return dist.get_world_size() if dist.is_initialized() else 1
 
-def is_main_process():
+def rank0():
+    """返回当前进程是否是主Rank（用于采样等操作）
+    优先从环境变量读取，否则fallback到分布式初始化状态
+    """
+    # 优先从环境变量读取
+    rank = os.environ.get("RANK")
+    if rank is not None:
+        return int(rank) == 0
+    
+    # Fallback到分布式初始化状态
     return get_rank() == 0
+
+
 
 def all_reduce(input_):
     if get_world_size() == 1:

@@ -32,6 +32,9 @@ class Sequence:
             return [self.output_ids[-1]]
         return None
 
+    # 用于非主Rank存储推理结果（临时属性，不持久化）
+    _next_token: int = None
+
     def update_state(self, next_token: int, new_past_key_values: List[Tuple[torch.Tensor, torch.Tensor]]):
         self.output_ids.append(next_token)
         self.full_ids.append(next_token)

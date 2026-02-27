@@ -22,7 +22,8 @@ from .model_loader import load_model
 import logging
 from .layer.sampler import Sampler
 import asyncio
-from core.parallel_config import get_rank, setup, get_world_size
+from core.parallel_config import get_rank, setup, get_world_size, rank0
+from core.inference_context import BatchInferenceContext
 
 # Configure logging globally
 logging.basicConfig(
@@ -212,8 +213,11 @@ class InferenceEngine:
 
             
     @torch.no_grad()
-    def step(self, batch: List[Sequence], batch_type: str) -> bool:
-        """执行推理step：接受batch进行推理"""
+    def step(self, ctx: BatchInferenceContext) -> bool:
+        """执行推理step：统一接受BatchInferenceContext"""
+        batch = ctx.sequences
+        batch_type = ctx.batch_type
+        
         if not batch:
             return False
             
@@ -221,8 +225,29 @@ class InferenceEngine:
             self._process_prefill_batch(batch)
         elif batch_type == "decode":
             self._process_decode_batch(batch)
-            
+        
         return True
+    
+    def update_sequences(self, sequences: List[Sequence]):
+        """更新序列状态（所有Rank都需要执行）"""
+        for seq in sequences:
+            next_token = seq._next_token
+            if next_token is None:
+                continue
+                
+            # 更新序列状态
+            seq.update_state(next_token, None)
+            
+            # 流式回调（只在主Rank执行）
+            if rank0():
+                token_text = self.tokenizer.decode([next_token], skip_special_tokens=True)
+                self._invoke_stream_callback(seq.seq_id, next_token, token_text)
+            
+            # 结束处理
+            if seq.is_finished():
+                self.scheduler.mark_finished(seq)
+                self.cache_manager.free(seq.seq_id)
+
 
     @torch.no_grad()
     def _process_prefill_batch(self, batch: List[Sequence]):
@@ -266,26 +291,26 @@ class InferenceEngine:
         )
         gpu_time = time.time() - gpu_start
 
-        # 4. 采样
-        sample_start = time.time()
-        last_logits = logits[:, -1, :]
-        next_tokens = self.sampler(last_logits, temperatures, top_ps, 1000).tolist()
-        sample_time = time.time() - sample_start
+        # 4. 采样（只在主Rank执行）
+        if rank0():
+            sample_start = time.time()
+            last_logits = logits[:, -1, :]
+            next_tokens = self.sampler(last_logits, temperatures, top_ps, 1000).tolist()
+            
+            # 存储采样结果
+            for i, seq in enumerate(batch):
+                seq._next_token = next_tokens[i]
+            
+            sample_time = time.time() - sample_start
 
-        # 5. 更新状态
-        update_start = time.time()
-        for i, seq in enumerate(batch):
-            self._update_sequence(seq, next_tokens[i])
-        update_time = time.time() - update_start
-
-        # 6. 日志
-        total_time = time.time() - start_time
-        logger.info(
-            f"📝 预填充 (Prefill): "
-            f"Prep {prep_time*1000:.2f}ms, GPU {gpu_time*1000:.2f}ms, "
-            f"Sample {sample_time*1000:.2f}ms, Update {update_time*1000:.2f}ms, "
-            f"Total {total_time*1000:.2f}ms | Batch{batch_size}, Len{seq_len}"
-        )
+            # 5. 日志
+            total_time = time.time() - start_time
+            logger.info(
+                f"📝 预填充 (Prefill): "
+                f"Prep {prep_time*1000:.2f}ms, GPU {gpu_time*1000:.2f}ms, "
+                f"Sample {sample_time*1000:.2f}ms, "
+                f"Total {total_time*1000:.2f}ms | Batch{batch_size}, Len{seq_len}"
+            )
 
         return next_tokens
 
@@ -345,28 +370,28 @@ class InferenceEngine:
             batch_size
         )
         
-        # 5. 采样
-        sample_start = time.time()
-        
-        next_tokens = self.sampler(logits, temperatures, top_ps, 1000).tolist()
-        sample_time = time.time() - sample_start
-        
-        gpu_time = time.time() - gpu_start
-        
-        # 6. 更新状态
-        update_start = time.time()
-        for i in indices:
-            self._update_sequence(batch[i], next_tokens[i])
-        update_time = time.time() - update_start
-        
-        # 7. 日志
-        total_time = time.time() - start_time
-        if indices and batch[indices[0]].current_position % 50 == 0:
-            logger.info(
-                f"🚀 解码 (Graph+Sampling): "
-                f"Prep {prep_time*1000:.2f}ms, GPU {gpu_time*1000:.2f}ms, Update {update_time*1000:.2f}ms, "
-                f"Total {total_time*1000:.2f}ms | Batch{batch_size}"
-            )
+        # 5. 采样（只在主Rank执行）
+        if rank0():
+            sample_start = time.time()
+            
+            next_tokens = self.sampler(logits, temperatures, top_ps, 1000).tolist()
+            
+            # 存储采样结果
+            for i, seq in enumerate(batch):
+                seq._next_token = next_tokens[i]
+                
+            sample_time = time.time() - sample_start
+            
+            gpu_time = time.time() - gpu_start
+            
+            # 7. 日志
+            total_time = time.time() - start_time
+            if indices and batch[indices[0]].current_position % 50 == 0:
+                logger.info(
+                    f"🚀 解码 (Graph+Sampling): "
+                    f"Prep {prep_time*1000:.2f}ms, GPU {gpu_time*1000:.2f}ms, "
+                    f"Total {total_time*1000:.2f}ms | Batch{batch_size}"
+                )
 
         return next_tokens
 
@@ -401,8 +426,18 @@ class InferenceEngine:
 
         # 执行推理直到完成
         for _ in range(max_tokens):
-            batch , batch_type = self.get_next_batch()
-            if not self.step(batch, batch_type) and not self.scheduler.running_sequences:
+            batch, batch_type = self.get_next_batch()
+            if not batch:
+                break
+            
+            # 构造上下文（兼容 generate 场景）
+            ctx = BatchInferenceContext(
+                batch_size=len(batch),
+                batch_type=batch_type,
+                sequences=batch
+            )
+            
+            if not self.step(ctx) and not self.scheduler.running_sequences:
                 break
 
         # 处理结果

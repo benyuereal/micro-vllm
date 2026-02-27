@@ -10,7 +10,10 @@ from core.engine import InferenceEngine
 import asyncio
 from queue import Queue
 import config.config as Config
-from core.parallel_config import is_main_process, get_rank
+from core.parallel_config import rank0, get_rank
+from core.inference_context import BatchInferenceContext
+from core.sequence import Sequence
+import time
 
 # 全局引擎实例
 engine = None
@@ -29,27 +32,44 @@ class GenerateRequest(BaseModel):
 
 # 异步推理任务
 async def inference_task(engine: InferenceEngine):
-    """异步推理任务 - 在后台持续执行推理"""
-    print("Async inference task started")
+    print("Async inference task started (Rank 0)")
     while running:
         # 获取批次
         batch, batch_type = engine.get_next_batch()
         
-        if not batch or batch_type == "waiting":
+        # 2. 构建上下文（直接携带Sequence对象）
+        if batch_type == "waiting" or not batch:
+            ctx = BatchInferenceContext(batch_size=0, batch_type="waiting")
+            ctx.broadcast()
             await asyncio.sleep(0.001)
             continue
-            
-        if batch_type == "idle":
-            await asyncio.sleep(0.001)
-            continue
-            
-        # 执行推理
-        engine.step(batch, batch_type)
+        
+        # 2. 构建上下文（直接携带Sequence对象）
+        ctx = BatchInferenceContext(
+            batch_size=len(batch),
+            batch_type=batch_type,
+            sequences=batch
+        )
+
+        # 3. 广播上下文（第一次广播：输入数据）
+        # 第二次广播在循环末尾，确保所有Rank同步
+        ctx.broadcast()
+
+        # 4. 执行推理（包含采样和缓存释放）
+        engine.step(ctx)
+        
+        # 5. 广播（确保所有Rank同步，并接收采样结果）
+        ctx.broadcast()
+        
+        # 6. 更新序列状态（由非主Rank从Context中提取next_token并更新）
+        # 主Rank已经在step中更新了，非主Rank需要手动更新
+        # 注：为了保持一致性和代码清晰，这里统一由各Rank根据Context更新
+        engine.update_sequences(ctx.sequences)
         
         # 让出控制权，确保其他协程有机会运行
         await asyncio.sleep(0.0)
         
-    print("Async inference task stopped")
+    print("Async inference task stopped (Rank 0)")
 
 
 class BatchGenerateRequest(BaseModel):
@@ -89,8 +109,15 @@ async def startup_event():
         print(f"Model loaded successfully on device: {engine.device}")
         
         # 启动异步推理任务（不阻塞启动流程）
-        asyncio.create_task(inference_task(engine))
-        print("Async inference task started")
+        # 只有主Rank执行 inference_task（负责获取批次、构建上下文、广播）
+        if rank0():
+            asyncio.create_task(inference_task(engine))
+            print("Async inference task started (Main Rank)")
+        else:
+            # 非主Rank启动Step循环
+            import threading
+            thread = threading.Thread(target=non_rank0_step_loop, args=(engine,))
+            thread.start()
     except Exception as e:
         print(f"Failed to load model: {str(e)}")
         raise e
@@ -246,11 +273,37 @@ async def generate_stream(request: GenerateRequest):
 
     return StreamingResponse(event_generator(), media_type="text/event-stream")
 
+# ------------------------------
+# 非Rank0 Step循环（传入dummy_tokenizer）
+# ------------------------------
+def non_rank0_step_loop(engine: InferenceEngine):
+    print(f"Non-Rank 0 step loop started (Rank {get_rank()})")
+    # 创建一个dummy_tokenizer（仅用于初始化Sequence，不会实际使用）
+    dummy_tokenizer = engine.tokenizer # 非主Rank也加载了tokenizer，直接用即可
+    while running:
+        # 接收上下文
+        ctx = BatchInferenceContext.receive(dummy_tokenizer)
+        
+        if ctx.batch_type == "waiting" or ctx.batch_size == 0:
+            time.sleep(0.001)
+            continue
+        
+        # 执行推理
+        engine.step(ctx)
+        
+        # 接收第二次广播（采样结果）
+        ctx.receive(dummy_tokenizer)
+        
+        # 更新序列状态
+        engine.update_sequences(ctx.sequences)
+        
+    print(f"Non-Rank 0 step loop stopped (Rank {get_rank()})")
+
 if __name__ == "__main__":
     import uvicorn
 
     # 只有主进程（Rank 0）启动 API 服务
-    if is_main_process():
+    if rank0():
         uvicorn.run(app, host="0.0.0.0", port=8000)
     else:
         # 非主进程保持运行，不启动服务（避免端口冲突）
