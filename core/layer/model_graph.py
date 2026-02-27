@@ -73,47 +73,84 @@ class ModelGraphRunner:
         self._graphs: Dict[int, torch.cuda.CUDAGraph] = {}
         self._ready = False
         self.rope = RoPE()
-    
+
     def prepare(self):
-        """预缓存转置权重 & TP 切分"""
+        """预缓存转置权重 & TP 切分（修正版 QKV 处理）"""
         rank = self.rank
         world_size = self.world_size
-        
+
         for idx, block in enumerate(self.model.transformer.h):
             mlp = block.mlp
-            
-            # 1. 处理 MLP Gate + Up (Column Parallel)
+
+            # 1. 处理 MLP Gate + Up (Column Parallel) - 你的原有逻辑是对的
             global_w1 = mlp.w1.weight
             global_w2 = mlp.w2.weight
-            # 按 Output Dim 切分
             local_w1 = global_w1.chunk(world_size, dim=0)[rank]
             local_w2 = global_w2.chunk(world_size, dim=0)[rank]
-            # 拼接并转置
             gate_up = torch.cat([local_w1, local_w2], dim=0)
             mlp._gu = gate_up.t().contiguous()
-            
-            # 2. 处理 MLP Down (Row Parallel)
+
+            # 2. 处理 MLP Down (Row Parallel) - 你的原有逻辑是对的
             global_wd = mlp.c_proj.weight
-            # 按 Input Dim 切分 (dim=1)
             local_wd = global_wd.chunk(world_size, dim=1)[rank]
             mlp._d = local_wd.t().contiguous()
-            
-            # 3. 处理 Attention Output (Row Parallel)
+
+            # 3. 处理 Attention Output (Row Parallel) - 你的原有逻辑是对的
             global_wo = block.attn.c_proj.weight
-            # 按 Input Dim 切分 (dim=1)
             local_wo = global_wo.chunk(world_size, dim=1)[rank]
             block.attn._o = local_wo.t().contiguous()
-            
-            # 4. 处理 Attention QKV (Column Parallel)
-            global_qkv_w = block.attn.c_attn.weight
-            global_qkv_b = block.attn.c_attn.bias
-            # 按 Output Dim 切分 (dim=0)
-            local_qkv_w = global_qkv_w.chunk(world_size, dim=0)[rank]
-            local_qkv_b = global_qkv_b.chunk(world_size, dim=0)[rank] if global_qkv_b is not None else None
-            
+
+            # ========== 修正部分：QKV 处理 ==========
+            global_qkv_w = block.attn.c_attn.weight  # [3*num_heads*head_size, hidden_dim]
+            global_qkv_b = block.attn.c_attn.bias  # [3*num_heads*head_size]
+
+            # 计算全局维度（注意：这里用全局头数，需要从外部传入或从 model config 获取）
+            # 假设你在 __init__ 中保存了全局头数：self.global_num_heads = 32
+            # 或者从 model config 读取：
+            global_num_heads = self.model.config.num_attention_heads  # Qwen-7B 是 32
+            global_kv_heads = getattr(self.model.config, "num_key_value_heads", global_num_heads)
+            head_size = self.head_size  # 128
+
+            # 计算 Q/K/V 各自的全局维度
+            q_dim_global = global_num_heads * head_size
+            kv_dim_global = global_kv_heads * head_size
+
+            # 1. 先分离全局 Q/K/V
+            w_q_global = global_qkv_w[:q_dim_global, :]
+            w_k_global = global_qkv_w[q_dim_global:q_dim_global + kv_dim_global, :]
+            w_v_global = global_qkv_w[q_dim_global + kv_dim_global:, :]
+
+            if global_qkv_b is not None:
+                b_q_global = global_qkv_b[:q_dim_global]
+                b_k_global = global_qkv_b[q_dim_global:q_dim_global + kv_dim_global]
+                b_v_global = global_qkv_b[q_dim_global + kv_dim_global:]
+            else:
+                b_q_global = b_k_global = b_v_global = None
+
+            # 2. 对 Q/K/V 分别进行 Column Parallel 切分（按 dim=0 切分）
+            w_q_local = w_q_global.chunk(world_size, dim=0)[rank]
+            w_k_local = w_k_global.chunk(world_size, dim=0)[rank]
+            w_v_local = w_v_global.chunk(world_size, dim=0)[rank]
+
+            if b_q_global is not None:
+                b_q_local = b_q_global.chunk(world_size, dim=0)[rank]
+                b_k_local = b_k_global.chunk(world_size, dim=0)[rank]
+                b_v_local = b_v_global.chunk(world_size, dim=0)[rank]
+            else:
+                b_q_local = b_k_local = b_v_local = None
+
+            # 3. 重组本地 QKV
+            local_qkv_w = torch.cat([w_q_local, w_k_local, w_v_local], dim=0)
+            if b_q_local is not None:
+                local_qkv_b = torch.cat([b_q_local, b_k_local, b_v_local], dim=0)
+            else:
+                local_qkv_b = None
+
+            # 4. 转置为你代码中使用的格式 [hidden_dim, local_qkv_dim]
             block.attn._qkv_w = local_qkv_w.t().contiguous()
             block.attn._qkv_b = local_qkv_b
-            
+            # ==========================================
+
         logger.info(f"✅ 权重预缓存 & TP 切分完成 (Rank {self.rank})")
     
     def _allocate_buffers(self):
@@ -265,7 +302,7 @@ class ModelGraphRunner:
             qkv_reshaped = qkv.reshape(batch_size_val, seq_len, 3, self.num_heads, self.head_size)
             q, k, v = qkv_reshaped[:, :, 0], qkv_reshaped[:, :, 1], qkv_reshaped[:, :, 2]
 
-       
+
             
             cos = self.attention._cos_pool
             sin = self.attention._sin_pool

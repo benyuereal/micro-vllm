@@ -2,7 +2,7 @@ from dataclasses import dataclass, field
 from typing import List
 import torch
 import torch.distributed as dist
-from core.parallel_config import get_rank, rank0
+from core.parallel_config import get_rank, rank0, get_world_size
 from core.sequence import Sequence
 
 
@@ -23,6 +23,10 @@ class BatchInferenceContext:
     # 主Rank广播：所有元数据统一用broadcast_object_list
     # ------------------------------
     def broadcast(self):
+
+        if get_world_size() <= 1 :
+            print(f"current rank is {get_world_size()}")
+            return
         if not rank0():
             raise RuntimeError("broadcast can only be called on main rank (Rank 0)")
         
