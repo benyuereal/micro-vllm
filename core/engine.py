@@ -10,10 +10,8 @@ InferenceEngine - Micro-vLLM 推理引擎
 import torch
 import torch.nn.functional as F
 from typing import List, Tuple, Dict, Generator
-from queue import Queue
 import time
 
-from models.qwen_adapter import QwenModelAdapter
 from . import Scheduler
 from .layer.model_graph import ModelGraphRunner
 from .cache_manager import KVCacheManager, store_kvcache
@@ -32,7 +30,17 @@ logging.basicConfig(
     handlers=[logging.FileHandler("inference_perf.log"), logging.StreamHandler()]
 )
 
+from dataclasses import dataclass
+
 logger = logging.getLogger("InferenceEngine")
+
+@dataclass
+class DeviceConfig:
+    """设备配置对象"""
+    device: str
+    dtype: torch.dtype
+    block_size: int
+    max_blocks: int
 
 class InferenceEngine:
     """
@@ -114,35 +122,27 @@ class InferenceEngine:
         logger.info(f"Rank {rank}: head_size = {self.config.hidden_size}, num_heads = {self.num_heads}, kv_num_heads = {self.kv_num_heads}, head_size = {self.head_size}")
         
         # 4. 自动检测设备和精度
-        self.device, self.dtype, self.block_size, self.max_blocks = self._auto_configure()
+        self.device_config = self._auto_configure()
+        self.device = self.device_config.device
+        self.dtype = self.device_config.dtype
         logger.info(f"Using device={self.device}, dtype={self.dtype}")
 
         # 5. 初始化核心模块
         self.cache_manager = KVCacheManager(
-            n_blocks=self.max_blocks,
-            block_size=self.block_size,
-            n_layers=self.num_layers,
-            n_heads=self.kv_num_heads,
-            head_size=self.head_size,
-            dtype=self.dtype,
-            device=self.device
+            n_blocks=self.device_config.max_blocks, block_size=self.device_config.block_size,
+            n_layers=self.num_layers, n_heads=self.kv_num_heads, head_size=self.head_size,
+            dtype=self.dtype, device=self.device
         )
         
         # 6. 初始化模型层Graph运行器
         self.graph_runner = ModelGraphRunner(
-            model=self.model,
-            num_layers=self.num_layers,
-            num_heads=self.num_heads,
-            head_size=self.head_size,
-            kv_num_heads=self.kv_num_heads,
-            hidden_dim=self.config.hidden_size,
-            intermediate_size=self.intermediate_size,
-            device=self.device,
-            max_batch_size=max_batch_size
+            model=self.model, num_layers=self.num_layers, num_heads=self.num_heads,
+            head_size=self.head_size, kv_num_heads=self.kv_num_heads,
+            hidden_dim=self.config.hidden_size, intermediate_size=self.intermediate_size,
+            device=self.device, max_batch_size=max_batch_size, dtype=self.dtype
         )
 
         self.scheduler = Scheduler(max_batch_size, max_prefill_tokens, self.tokenizer)
-        self.adapter = QwenModelAdapter()
 
         self.eos_token_id = self.tokenizer.eos_token_id
         self.pad_token_id = 0
@@ -150,7 +150,7 @@ class InferenceEngine:
         self.max_position = getattr(self.config, 'max_position_embeddings', 4096)
 
         logger.info(f"Engine initialized: layers={self.num_layers}, heads={self.num_heads}, "
-                         f"block_size={self.block_size}, max_blocks={self.max_blocks}")
+                         f"block_size={self.device_config.block_size}, max_blocks={self.device_config.max_blocks}")
         self.sampler = Sampler()
         
         # 7. CUDA Graph 配置
@@ -166,22 +166,12 @@ class InferenceEngine:
 
     def _auto_configure(self):
         """自动配置设备和精度"""
-        # 1. 检测设备
-        if torch.backends.mps.is_available():
-            device = 'mps'
-        elif torch.cuda.is_available():
-            device = 'cuda'
-        else:
-            device = 'cpu'
+        # 1. 硬编码 CUDA 配置
+        config = self.DEVICE_CONFIGS["cuda"]
+        dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
+        if dtype == torch.bfloat16: self.model.to(torch.bfloat16)
 
-        # 2. 获取设备配置
-        config = self.DEVICE_CONFIGS[device]
-        dtype = config["dtype"]
-        if device == "cuda" and dtype is None:
-            dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
-            if dtype == torch.bfloat16: self.model.to(torch.bfloat16)
-
-        return device, dtype, config["block_size"], config["max_blocks"]
+        return DeviceConfig("cuda", dtype, config["block_size"], config["max_blocks"])
 
     def add_request(self, prompt: str, max_tokens: int = 128,
                     temperature: float = 0.7, top_p: float = 0.9, priority: int = 0) -> int:
@@ -405,28 +395,6 @@ class InferenceEngine:
 
         return next_tokens
 
-
-    def _update_sequence(self, seq: Sequence, next_token: int):
-        """更新序列状态"""
-        seq.update_state(next_token, None)
-
-        # 流式输出回调
-        token_text = self.tokenizer.decode([next_token], skip_special_tokens=True)
-        self._invoke_stream_callback(seq.seq_id, next_token, token_text)
-
-        if seq.is_finished():
-            self.scheduler.mark_finished(seq)
-            self.cache_manager.free(seq.seq_id)
-            logger.info(f"FINISHED: {seq.seq_id}")
-
-
-    def _pad_batch(self, sequences: List[List[int]], pad_token_id: int) -> torch.Tensor:
-        """填充批次"""
-        max_len = max(len(seq) for seq in sequences)
-        padded = [seq + [pad_token_id] * (max_len - len(seq)) for seq in sequences]
-        return torch.tensor(padded, dtype=torch.long)
-
-    
 
     def generate(self, prompts: List[str], max_tokens: int = 100) -> Dict[Sequence, str]:
         """批量生成"""
