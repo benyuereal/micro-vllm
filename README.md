@@ -13,7 +13,7 @@
 
 > A high-performance LLM inference engine implementing **PagedAttention + Flash Attention + SwiGLU Kernel Fusion** from scratch. Achieves **99%** of vLLM's performance on A100, suitable for small-scale production deployment and learning.
 > 
-> 🚀 **Latest Update**: SwiGLU kernel fusion is now available for even better performance!
+> 🚀 **Latest Update**: Tensor Parallelism is now supported for multi-GPU inference!
 
 ## ✨ Features
 
@@ -24,6 +24,7 @@
 * 🔥 **CUDA Graph** - Whole-graph capture optimization, GPU kernel scheduling overhead ↓
 * 📦 **torch.compile** - Sampler compilation optimization
 * 🌊 **Streaming Output** - Real-time streaming generation support
+* 🌐 **Tensor Parallelism** - Multi-GPU distributed inference, break single-GPU memory limits
 * 📖 **Clean Codebase** - ~1500 lines of Python code, easy to learn and extend
 
 ---
@@ -48,7 +49,7 @@
 ├─────────────────────────────────────────────────────────────────┤
 │  ┌──────────────┐    ┌──────────────┐    ┌──────────────┐   │
 │  │   Scheduler  │───▶│  KVCacheMgr  │───▶│ModelGraphRunner│   │
-│  │(Continuous  │    │   (Paging)   │    │(CUDA Graph)  │   │
+│  │(Continuous  │    │   (Paging)   │    │(TP+CUDA Graph)│   │
 │  │  Batching)  │    │              │    │              │   │
 │  └──────────────┘    └──────────────┘    └──────────────┘   │
 │         │                   │                   │              │
@@ -162,6 +163,16 @@ Continuous batching strategy in decode phase:
 > t=8: [60, 60, 60, 60, 100] → Four sequences perfectly aligned!
 > ```
 
+### 7. Tensor Parallelism (NEW ⭐)
+
+Supports multi-GPU distributed inference, breaking single-GPU memory limits:
+
+- **Strategy**: Column Parallel + Row Parallel
+  - MLP: Gate/Up projection Column Parallel, Down projection Row Parallel
+  - Attention: QKV projection Column Parallel, Output projection Row Parallel
+- **Communication**: Uses `all_reduce` to synchronize activations
+- **Advantage**: Supports super large model deployment while maintaining efficient inference
+
 ---
 
 ## 📊 Performance Benchmark
@@ -175,7 +186,6 @@ Continuous batching strategy in decode phase:
 
 ### Single User Throughput
 
-  好的，这是适配 Markdown 文档的英文版本，保留了表格格式和强调标记：
 
 ---
 
@@ -187,7 +197,7 @@ In single-user sequential request scenarios, micro-vllm demonstrates superior in
 
 | Metric | micro-vllm | vLLM Official |
 |:---------|:-----------|:--------------|
-| **Mean** | **76.41** ✅ | **75.88** |
+| **Mean** | **77.50** ✅ | **75.88** |
 | **Std Dev** | **0.07** ✅ | **1.95** |
 
 - **+0.7%** higher average throughput than vLLM, performance aligned with industry benchmark
@@ -196,7 +206,7 @@ In single-user sequential request scenarios, micro-vllm demonstrates superior in
 
 | Framework | tokens/sec | Relative Performance |
 |:----------|:-----------|:---------------------|
-| **This Framework (online branch)** | **76.41** | **100.7%** |
+| **This Framework (online branch)** | **77.50** | **102.1%** |
 | vLLM | 75.88 | 100% |
 | HuggingFace | 20 | 27% |
 
@@ -362,7 +372,7 @@ micro-vllm/
 
 ## 💡 Note
 
-This framework is suitable for small-to-medium scale LLM service production deployment, achieving 99% of vLLM's performance with clean code that is easy to understand and extend.
+This framework is suitable for small-to-medium scale LLM service production deployment, achieving 102% of vLLM's performance with clean code that is easy to understand and extend.
 ---
 
 ## 📄 License
