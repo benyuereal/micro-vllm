@@ -1,28 +1,9 @@
 """
 ===================================================================
-InferenceEngine - vLLM 推理引擎 (极简设计)
+InferenceEngine - Micro-vLLM 推理引擎
 ===================================================================
-
-📌 **核心设计目标**：
-   1. 自动适配多模型架构 (Qwen/Qwen2等)
-   2. 零拷贝设计，最小化GPU内存分配
-   3. 极简配置，隐藏所有复杂实现
-   4. 生产就绪，支持AMP、异常处理
-
-🧱 **架构图**：
-    Input → [Engine] → [LayerAdapter] → PagedAttention → Output
-    ↑ 自动模型加载       ↑ 自动适配架构       ↑ 统一注意力
-
-⚡ **性能特性**：
-   - 初始化: ~1s (自动模型加载)
-   - 单token推理: ~20μs/token (CUDA+FlashAttention)
-   - 零内存拷贝: 直接操作模型参数
-   - 自动精度: 自动选择bfloat16/float16
-
-📚 **参考文献**：
-   - vLLM: https://arxiv.org/abs/2309.06180
-   - FlashAttention: https://arxiv.org/abs/2205.14135
 """
+
 
 
 
@@ -41,79 +22,102 @@ from .model_loader import load_model
 import logging
 from .layer.sampler import Sampler
 import asyncio
+from core.parallel_config import get_rank, setup, get_world_size, rank0
+from core.inference_context import BatchInferenceContext
+
+# Configure logging globally
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s [%(levelname)s] %(message)s',
+    handlers=[logging.FileHandler("inference_perf.log"), logging.StreamHandler()]
+)
+
+logger = logging.getLogger("InferenceEngine")
 
 class InferenceEngine:
     """
-    📌 **推理引擎** - vLLM核心组件
+    📌 推理引擎 - vLLM核心组件
 
-    🔍 **设计哲学**:
-        1. **极简接口**: 自动加载模型，隐藏所有复杂配置
-        2. **自动适配**: 根据模型类型自动选择最佳配置
-        3. **零拷贝**: 直接操作模型参数，无中间拷贝
-        4. **生产就绪**: 支持AMP、日志、回调
+    🔍 设计哲学:
+        1. 极简接口: 自动加载模型
+        2. 自动适配: 根据模型类型自动选择最佳配置
+        3. 零拷贝: 直接操作模型参数
 
-    🧪 **典型用法**:
+    🧪 典型用法:
         engine = InferenceEngine(model_path="Qwen/Qwen2-0.5B", max_batch_size=8)
         output = engine.generate(input_ids, max_new_tokens=100)
     """
 
-    # 设备配置 (可扩展)
-    # 扩展DEVICE_CONFIGS (支持Qwen3 MoE)
+    # 设备配置
     DEVICE_CONFIGS = {
         "mps": {"block_size": 16, "max_blocks": 512, "dtype": torch.float16},
         "cuda": {"block_size": 256, "max_blocks": 65, "dtype": None},  # 自动选择bfloat16/float16
         "cpu": {"block_size": 16, "max_blocks": 128, "dtype": torch.float32},
-        "cuda_moe": {"block_size": 256, "max_blocks": 48, "dtype": torch.bfloat16},  # ✅ Qwen3 MoE专用
+        "cuda_moe": {"block_size": 256, "max_blocks": 48, "dtype": torch.bfloat16},
     }
 
     def __init__(self, model_path: str, max_batch_size: int = 32, max_prefill_tokens: int = 2048):
         """
-        📌 **初始化推理引擎** (自动加载模型，隐藏所有配置)
+        📌 初始化推理引擎
 
-        🔍 **参数**:
-            - model_path: 模型路径 (HuggingFace格式)
+        🔍 参数:
+            - model_path: 模型路径
             - max_batch_size: 最大批次大小
             - max_prefill_tokens: 最大预填充token数
-
-        🧠 **内部逻辑**:
-            1. 自动加载模型和分词器
-            2. 自动检测设备和模型架构
-            3. 初始化KV缓存和注意力模块
-            4. 设置日志和回调
         """
-        self.logger = self._init_logging()
-        self.logger.info(f"Initializing InferenceEngine for {model_path}")
 
-        # 1. 自动加载模型 (零拷贝)
-        self.model, self.tokenizer = load_model(model_path)
+        # tp配置
+        setup()
+        rank = get_rank()
+        if torch.cuda.is_available():
+           torch.cuda.set_device(rank)
+        
+        logger.info(f"Initializing InferenceEngine for {model_path}")
+
+        # 1. 自动加载模型
+        device = f"cuda:{rank}" if torch.cuda.is_available() else "cpu"
+        self.model, self.tokenizer = load_model(model_path, device=device)
         self.model.eval()
-
-
+        logger.info(f"Rank {rank}: ln_f weight device = {self.model.transformer.ln_f.weight.device}")
+        
         # 2. 获取模型配置
         self.config = self.model.config
         self.model_type = self.config.model_type
-        # 自动适配模型结构
         self.embedding_layer = self.model.transformer.wte
         self.norm_layer = self.model.transformer.ln_f
         self.model_layers = self.model.transformer.h
         
-
-        self.logger.info(f"Detected model type: {self.model_type}")
+        logger.info(f"Detected model type: {self.model_type}")
 
         # 3. 自动配置参数
         self.num_layers = self.config.num_hidden_layers
         self.num_heads = self.config.num_attention_heads
         self.kv_num_heads = getattr(self.config, 'num_key_value_heads', self.num_heads)
+        
         # ✅ 修复：从模型配置获取 head_size (支持Qwen3)
-        if hasattr(self.config, 'head_dim'):  # Qwen3 使用 head_dim
+        if hasattr(self.config, 'head_dim'):
             self.head_size = self.config.head_dim
-        else:  # Qwen2 使用 hidden_size // num_heads
+        else:
             self.head_size = self.config.hidden_size // self.num_heads
+        
+        world_size = get_world_size()
+        # 维度校验
+        assert self.num_heads % world_size == 0, f"num_heads {self.num_heads} must be divisible by world_size {world_size}"
+        assert self.kv_num_heads % world_size == 0, f"kv_num_heads {self.kv_num_heads} must be divisible by world_size {world_size}"
+        assert self.config.intermediate_size % world_size == 0, f"intermediate_size {self.config.intermediate_size} must be divisible by world_size {world_size}"  # 新增
+
+        # 执行切分
+        self.num_heads = self.num_heads // world_size
+        self.kv_num_heads = self.kv_num_heads // world_size
+        self.intermediate_size = self.config.intermediate_size // world_size
+
+        logger.info(f"Rank {rank}: head_size = {self.config.hidden_size}, num_heads = {self.num_heads}, kv_num_heads = {self.kv_num_heads}, head_size = {self.head_size}")
+        
         # 4. 自动检测设备和精度
         self.device, self.dtype, self.block_size, self.max_blocks = self._auto_configure()
-        self.logger.info(f"Using device={self.device}, dtype={self.dtype}")
+        logger.info(f"Using device={self.device}, dtype={self.dtype}")
 
-        # 5. 初始化核心模块 (零拷贝)
+        # 5. 初始化核心模块
         self.cache_manager = KVCacheManager(
             n_blocks=self.max_blocks,
             block_size=self.block_size,
@@ -124,7 +128,7 @@ class InferenceEngine:
             device=self.device
         )
         
-        # 7. 初始化模型层Graph运行器（整个模型一次前向）
+        # 6. 初始化模型层Graph运行器
         self.graph_runner = ModelGraphRunner(
             model=self.model,
             num_layers=self.num_layers,
@@ -132,7 +136,7 @@ class InferenceEngine:
             head_size=self.head_size,
             kv_num_heads=self.kv_num_heads,
             hidden_dim=self.config.hidden_size,
-            intermediate_size=self.config.intermediate_size,
+            intermediate_size=self.intermediate_size,
             device=self.device,
             max_batch_size=max_batch_size
         )
@@ -141,35 +145,24 @@ class InferenceEngine:
         self.adapter = QwenModelAdapter()
 
         self.eos_token_id = self.tokenizer.eos_token_id
-        # 默认使用 0 作为 pad_token_id（scheduler 已经将序列填充到相同长度）
         self.pad_token_id = 0
         self.stream_callbacks = {}
         self.max_position = getattr(self.config, 'max_position_embeddings', 4096)
 
-        self.logger.info(f"Engine initialized: layers={self.num_layers}, heads={self.num_heads}, "
+        logger.info(f"Engine initialized: layers={self.num_layers}, heads={self.num_heads}, "
                          f"block_size={self.block_size}, max_blocks={self.max_blocks}")
         self.sampler = Sampler()
-        # 8.其他配置
-        if self.device == "cuda":
-            self.logger.info("Starting CUDA Graphs capture...")
         
-            # 捕获整个模型的CUDA Graph
+        # 7. CUDA Graph 配置
+        if self.device == "cuda":
+            logger.info("Starting CUDA Graphs capture...")
             self.graph_runner.capture(
                 self.cache_manager,
                 batch_sizes=[1, 2, 4, 8, 16, 32]
             )
-            self.logger.info("CUDA Graphs capture completed")
+            logger.info("CUDA Graphs capture completed")
 
-    def _init_logging(self):
-        """初始化日志"""
-        logging.basicConfig(
-            level=logging.INFO,
-            format='%(asctime)s [%(levelname)s] %(message)s',
-            handlers=[logging.FileHandler("inference_perf.log"), logging.StreamHandler()]
-        )
-        return logging.getLogger("InferenceEngine")
-
-
+        
 
     def _auto_configure(self):
         """自动配置设备和精度"""
@@ -217,45 +210,55 @@ class InferenceEngine:
             except Exception as e:
                 print(f"Error in stream callback for seq {seq_id}: {e}")
 
+    def get_next_batch(self) -> Tuple[List[Sequence], str]:
+        """获取下一个批次"""
+        return self.scheduler.get_next_batch()
+
+            
     @torch.no_grad()
-    def step(self) -> bool:
-        """执行推理step，返回是否有处理任何请求（连续批处理版本）"""
-        # Mark the beginning of a new iteration for CUDA graphs
-        # This prevents tensor output overwriting between consecutive runs
-        # torch.compiler.cudagraph_mark_step_begin()
+    def step(self, ctx: BatchInferenceContext) -> bool:
+        """执行推理step：统一接受BatchInferenceContext"""
+        batch = ctx.sequences
+        batch_type = ctx.batch_type
+        
+        if not batch:
+            return False
+            
+        if batch_type == "prefill":
+            self._process_prefill_batch(batch)
+        elif batch_type == "decode":
+            self._process_decode_batch(batch)
 
-        working = False
-
-        while True:
-            # 使用连续批处理：Padding 凑齐 batch + 动态剔除完成
-            batch, batch_type = self.scheduler.get_next_batch()
-
-            if batch_type == "waiting":
-                # time.sleep(0.001)
-                time.sleep(0.001)  # 让出控制权，事件循环可以处理其他请求
+        return True
+    
+    def update_sequences(self, sequences: List[Sequence]):
+        """更新序列状态（所有Rank都需要执行）"""
+        for seq in sequences:
+            next_token = seq._next_token
+            if next_token is None:
                 continue
+                
+            # 更新序列状态
+            seq.update_state(next_token, None)
+            
+            # 流式回调（只在主Rank执行）
+            if rank0():
+                token_text = self.tokenizer.decode([next_token], skip_special_tokens=True)
+                self._invoke_stream_callback(seq.seq_id, next_token, token_text)
+            
+            # 结束处理
+            if seq.is_finished():
+                # 缓存释放（所有Rank都需要执行）
+                self.cache_manager.free(seq.seq_id)
+                
+                # 调度器状态更新（只在主Rank执行）
+                if rank0():
+                    self.scheduler.mark_finished(seq)
 
-            if not batch:
-                break  # 没有更多工作
-
-            working = True
-
-            if batch_type == "prefill":
-                self._process_prefill_batch(batch)
-            elif batch_type == "decode":
-                self._process_decode_batch(batch)
-
-            # 连续批处理：检查是否需要继续填充
-            # 如果有等待中的请求 → 继续循环填充
-            # 否则退出
-            if not self.scheduler.waiting_queue:
-                break
-
-        return working
 
     @torch.no_grad()
     def _process_prefill_batch(self, batch: List[Sequence]):
-        """处理预填充批次 - 统一风格版"""
+        """处理预填充批次"""
         start_time = time.time()
         batch_size = len(batch)
         if not batch_size: return []
@@ -264,7 +267,7 @@ class InferenceEngine:
         prep_start = time.time()
         device = self.device
         
-        # 因为是定长分桶，直接 stack
+        # 定长分桶，直接 stack
         input_ids_list = [seq.get_next_input_ids() for seq in batch]
         input_tensor = torch.tensor(input_ids_list, dtype=torch.long, device=device)
         
@@ -272,10 +275,9 @@ class InferenceEngine:
         top_ps = torch.tensor([seq.top_p for seq in batch], device=device)
         
         seq_lens = [len(ids) for ids in input_ids_list]
-        # 定长保证
         seq_len = seq_lens[0]
 
-        # 2. KV Cache 管理 (先分配)
+        # 2. KV Cache 管理
         seq_ids = []
         for i, seq in enumerate(batch):
             success, _ = self.cache_manager.alloc(seq.seq_id, seq_len)
@@ -283,8 +285,6 @@ class InferenceEngine:
                 raise RuntimeError(f"OOM allocating cache for seq {seq.seq_id}")
             seq_ids.append(seq.seq_id)
             
-        # 🔧 关键：更新 CacheManager 的静态缓冲区
-        # 这里 context_lens 传实际长度，graph_runner 内部会决定是否清零
         self.cache_manager.cache_batch_data(seq_ids, seq_lens)
         
         prep_time = time.time() - prep_start
@@ -298,38 +298,38 @@ class InferenceEngine:
         )
         gpu_time = time.time() - gpu_start
 
-        # 4. 采样
-        sample_start = time.time()
-        # 取最后一个 token
-        last_logits = logits[:, -1, :]
-        next_tokens = self._sample_next_token(last_logits, temperatures, top_ps).tolist()
-        sample_time = time.time() - sample_start
+        next_tokens = None
+        # 4. 采样（只在主Rank执行）
+        if rank0():
+            sample_start = time.time()
+            last_logits = logits[:, -1, :]
+            next_tokens = self.sampler(last_logits, temperatures, top_ps, 1000).tolist()
 
-        # 5. 更新状态
-        update_start = time.time()
-        for i, seq in enumerate(batch):
-            self._update_sequence(seq, next_tokens[i])
-        update_time = time.time() - update_start
+            # 存储采样结果
+            for i, seq in enumerate(batch):
+                seq._next_token = next_tokens[i]
 
-        # 6. 日志
-        total_time = time.time() - start_time
-        self.logger.info(
-            f"📝 预填充 (Prefill): "
-            f"Prep {prep_time*1000:.2f}ms, GPU {gpu_time*1000:.2f}ms, "
-            f"Sample {sample_time*1000:.2f}ms, Update {update_time*1000:.2f}ms, "
-            f"Total {total_time*1000:.2f}ms | Batch{batch_size}, Len{seq_len}"
-        )
+            sample_time = time.time() - sample_start
+
+            # 5. 日志
+            total_time = time.time() - start_time
+            logger.info(
+                f"📝 预填充 (Prefill): "
+                f"Prep {prep_time*1000:.2f}ms, GPU {gpu_time*1000:.2f}ms, "
+                f"Sample {sample_time*1000:.2f}ms, "
+                f"Total {total_time*1000:.2f}ms | Batch{batch_size}, Len{seq_len}"
+            )
 
         return next_tokens
 
     @torch.no_grad()
     def _process_decode_batch(self, batch: List[Sequence]):
-        """处理解码批次 - 带采样参数版本 (支持 Padding)"""
+        """处理解码批次"""
         start_time = time.time()
         batch_size = len(batch)
         if not batch_size: return []
 
-        # 1. 一次性构建标记和索引
+        # 1. 构建 mask 和 indices
         seen = set()
         mask = []
         indices = []
@@ -371,26 +371,37 @@ class InferenceEngine:
         
         # 4. 推理
         gpu_start = time.time()
-        next_tokens = self.graph_runner.forward(
-            input_ids, temperatures, top_ps,
-            self.cache_manager, batch_size
-        ).tolist()
-        gpu_time = time.time() - gpu_start
         
-        # 5. 更新状态
-        update_start = time.time()
-        for i in indices:
-            self._update_sequence(batch[i], next_tokens[i])
-        update_time = time.time() - update_start
+        logits = self.graph_runner.forward(
+            input_ids, 
+            self.cache_manager, 
+            batch_size
+        )
         
-        # 6. 日志
-        total_time = time.time() - start_time
-        if indices and batch[indices[0]].current_position % 50 == 0:
-            self.logger.info(
-                f"🚀 解码 (Graph+Sampling): "
-                f"Prep {prep_time*1000:.2f}ms, GPU {gpu_time*1000:.2f}ms, Update {update_time*1000:.2f}ms, "
-                f"Total {total_time*1000:.2f}ms | Batch{batch_size}"
-            )
+        next_tokens = None
+
+        # 5. 采样（只在主Rank执行）
+        if rank0():
+            sample_start = time.time()
+
+            next_tokens = self.sampler(logits, temperatures, top_ps, 1000).tolist()
+            
+            # 存储采样结果
+            for i, seq in enumerate(batch):
+                seq._next_token = next_tokens[i]
+                
+            sample_time = time.time() - sample_start
+
+            gpu_time = time.time() - gpu_start
+
+            # 7. 日志
+            total_time = time.time() - start_time
+            if indices and batch[indices[0]].current_position % 50 == 0:
+                logger.info(
+                    f"🚀 解码 (Graph+Sampling): "
+                    f"Prep {prep_time*1000:.2f}ms, GPU {gpu_time*1000:.2f}ms, "
+                    f"Total {total_time*1000:.2f}ms | Batch{batch_size}"
+                )
 
         return next_tokens
 
@@ -406,7 +417,7 @@ class InferenceEngine:
         if seq.is_finished():
             self.scheduler.mark_finished(seq)
             self.cache_manager.free(seq.seq_id)
-            self.logger.info(f"FINISHED: {seq.seq_id}")
+            logger.info(f"FINISHED: {seq.seq_id}")
 
 
     def _pad_batch(self, sequences: List[List[int]], pad_token_id: int) -> torch.Tensor:
@@ -415,85 +426,7 @@ class InferenceEngine:
         padded = [seq + [pad_token_id] * (max_len - len(seq)) for seq in sequences]
         return torch.tensor(padded, dtype=torch.long)
 
-    def _sample_next_token(
-    self, 
-    logits: torch.Tensor,        # [batch_size, vocab_size]
-    temperatures: torch.Tensor,  # [batch_size]
-    top_ps: torch.Tensor,        # [batch_size]
-    top_k: int = 1000,           # 预过滤的k值，Qwen 152k词表建议1000-2000
-    min_tokens_to_keep: int = 1, # 保证至少保留的token数
-    ) -> torch.Tensor:
-        """Top-K预过滤 + Top-P采样的批量实现"""
-        batch_size, vocab_size = logits.shape
-        
-        # 处理temperature=0的greedy情况（快速路径）
-        zero_temp_mask = temperatures < 1e-6
-        if zero_temp_mask.any():
-            result = torch.zeros(batch_size, dtype=torch.long, device=logits.device)
-            if zero_temp_mask.all():
-                # 全部greedy，直接argmax
-                return logits.argmax(dim=-1)
-            else:
-                # 混合情况：greedy的argmax，其他的正常采样
-                result[zero_temp_mask] = logits[zero_temp_mask].argmax(dim=-1)
-                # 继续处理非零温度部分
-                non_zero_mask = ~zero_temp_mask
-                result[non_zero_mask] = self._sample_stochastic(
-                    logits[non_zero_mask],
-                    temperatures[non_zero_mask],
-                    top_ps[non_zero_mask],
-                    top_k,
-                    min_tokens_to_keep
-                )
-                return result
-        
-        return self._sample_stochastic(logits, temperatures, top_ps, top_k, min_tokens_to_keep)
-
-
-    def _sample_stochastic(
-        self,
-        logits: torch.Tensor,        # [batch_size, vocab_size]
-        temperatures: torch.Tensor,  # [batch_size]
-        top_ps: torch.Tensor,        # [batch_size]
-        top_k: int,
-        min_tokens_to_keep: int,
-    ) -> torch.Tensor:
-        """使用编译后的 Sampler 进行采样"""
-        # 使用 Sampler 类的编译采样函数
-        return self.sampler(logits, temperatures, top_ps, top_k)
-        
-
-    def stream_generate(self, prompt: str, max_tokens: int = 128,
-                        temperature: float = 0.7, top_p: float = 0.9) -> Generator[Tuple[int, str], None, None]:
-        """流式生成"""
-        seq_id = self.add_request(prompt, max_tokens, temperature, top_p)
-        token_queue = Queue()
-
-        def callback(token, text):
-            token_queue.put((token, text))
-
-        self.register_stream_callback(seq_id, callback)
-
-        try:
-            generated_count = 0
-            while generated_count < max_tokens:
-                if self.step():
-                    # 处理新生成的token
-                    while not token_queue.empty():
-                        token, text = token_queue.get()
-                        yield token, text
-                        generated_count += 1
-
-                        if token == self.eos_token_id:
-                            return
-
-                # 检查序列状态
-                if not any(seq.seq_id == seq_id for seq in self.scheduler.running_sequences):
-                    break
-
-                time.sleep(0.001)
-        finally:
-            self.unregister_stream_callback(seq_id)
+    
 
     def generate(self, prompts: List[str], max_tokens: int = 100) -> Dict[Sequence, str]:
         """批量生成"""
@@ -503,7 +436,18 @@ class InferenceEngine:
 
         # 执行推理直到完成
         for _ in range(max_tokens):
-            if not self.step() and not self.scheduler.running_sequences:
+            batch, batch_type = self.get_next_batch()
+            if not batch:
+                break
+            
+            # 构造上下文（兼容 generate 场景）
+            ctx = BatchInferenceContext(
+                batch_size=len(batch),
+                batch_type=batch_type,
+                sequences=batch
+            )
+            
+            if not self.step(ctx) and not self.scheduler.running_sequences:
                 break
 
         # 处理结果

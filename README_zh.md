@@ -13,7 +13,7 @@
 
 > 高性能 LLM 推理引擎，从零实现 **PagedAttention + Flash Attention + SwiGLU 算子融合**，A100 上性能达 vLLM 的 **100.7%**，适合小规模生产部署和学习。
 > 
-> 🚀 **最新进展**：SwiGLU 算子融合，性能进一步提升！
+> 🚀 **最新进展**：张量并行发布，支持多卡推理！
 
 ## ✨ 特性
 
@@ -24,6 +24,7 @@
 * 🔥 **CUDA Graph** - 整图捕获优化，GPU kernel 调度开销 ↓
 * 📦 **torch.compile** - Sampler 编译优化
 * 🌊 **流式输出** - 支持实时流式生成
+* 🌐 **张量并行 (Tensor Parallelism)** - 支持多卡并行推理，突破单卡显存限制
 * 📖 **简洁代码** - 约 1500 行 Python 代码，易于学习和二次开发
 
 ---
@@ -48,7 +49,7 @@
 ├─────────────────────────────────────────────────────────────────┤
 │  ┌──────────────┐    ┌──────────────┐    ┌──────────────┐   │
 │  │   Scheduler  │───▶│  KVCacheMgr  │───▶│ModelGraphRunner│   │
-│  │ (连续批处理)  │    │ (分页管理)    │    │ (CUDA Graph)  │   │
+│  │ (连续批处理)  │    │ (分页管理)    │    │(TP+CUDA Graph)│   │
 │  └──────────────┘    └──────────────┘    └──────────────┘   │
 │         │                   │                   │              │
 │         ▼                   ▼                   ▼              │
@@ -161,6 +162,16 @@ activated = swiglu_fused(gate_up)  # 一步完成融合计算
 > t=8: [60, 60, 60, 60, 100] → 四序列完美对齐！
 > ```
 
+### 7. 张量并行 (Tensor Parallelism) (NEW ⭐)
+
+支持多 GPU 分布式推理，突破单卡显存限制：
+
+- **切分策略**：Column Parallel + Row Parallel
+  - MLP: Gate/Up 投影Column Parallel，Down 投影 Row Parallel
+  - Attention: QKV 投影 Column Parallel，Output 投影 Row Parallel
+- **通信**：使用 `all_reduce` 汇总激活，确保语义一致
+- **优势**：支持超大模型部署，保持高效推理
+
 ---
 
 ## 📊 性能基准
@@ -182,7 +193,7 @@ activated = swiglu_fused(gate_up)  # 一步完成融合计算
 
 | 指标 | micro-vllm | vLLM 官方 |
 |---------|-----------|-----------|
-| **平均** | **76.41** ✅ | **75.88** |
+| **平均** | **77.50** ✅ | **75.88** |
 | **标准差** | **0.07** ✅ | **1.95** |
 
 - 单用户平均吞吐领先 vLLM **0.7%**，性能已对齐业界标杆
@@ -192,7 +203,7 @@ activated = swiglu_fused(gate_up)  # 一步完成融合计算
 
 | 框架 | tokens/sec | 相对性能 |
 |------|------------|----------|
-| **本框架 (online分支)** | **76.41** | **100.7%** |
+| **本框架 (online分支)** | **77.50** | **102.1%** |
 | vLLM | 75.88 | 100% |
 | HuggingFace | 20 | 27% |
 
@@ -296,27 +307,9 @@ curl -X POST "http://localhost:8000/generate_stream" \
 ### 启动 vLLM 服务
 
 ```bash
-python -m vllm.entrypoints.openapi.api_server \
-    --model /path/to/Qwen-7B-Chat \
-    --host 0.0.0.0 \
-    --port 8000 \
-    --trust-remote-code \
-    --served-model-name Qwen-7B-Chat
+python api_server_vllm.py
 ```
 
-### 测试请求
-
-```bash
-curl http://localhost:8000/v1/completions \
-    -H "Content-Type: application/json" \
-    -d '{
-        "model": "Qwen-7B-Chat",
-        "prompt": "你好，写一个 Java 版本的文件上传代码",
-        "max_tokens": 1000,
-        "temperature": 0.7,
-        "stream": true
-    }'
-```
 
 ---
 
@@ -335,7 +328,7 @@ curl http://localhost:8000/v1/completions \
 
 ## 💡 说明
 
-本框架适合中小规模 LLM 服务的生产部署，性能达 vLLM 99%，代码简洁易于理解和二次开发。
+本框架适合中小规模 LLM 服务的生产部署，性能达 vLLM 102%，代码简洁易于理解和二次开发。
 
 ---
 
