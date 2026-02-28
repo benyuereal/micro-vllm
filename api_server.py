@@ -72,7 +72,7 @@ async def rank0_inference_loop():
         ctx.broadcast()
         engine.step(ctx)
         ctx.broadcast()
-        engine._update_seq_states(ctx.sequences)
+        engine.update_sequences(ctx.sequences)
         await asyncio.sleep(0.0)
 
 
@@ -87,7 +87,7 @@ def non_rank0_inference_loop():
         
         engine.step(ctx)
         ctx = BatchInferenceContext.receive(tokenizer)
-        engine._update_seq_states(ctx.sequences)
+        engine.update_sequences(ctx.sequences)
 
 
 # ------------------------------

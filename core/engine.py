@@ -264,7 +264,7 @@ class InferenceEngine:
             if batch and batch[0].current_position % 50 == 0:
                 logger.info(f"Decode: Prep {stats.prep_time*1000:.1f}ms, GPU {stats.gpu_time*1000:.1f}ms, Total {stats.total_time*1000:.1f}ms | Batch {batch_size}")
 
-    def _update_seq_states(self, sequences: List[Sequence]):
+    def update_sequences(self, sequences: List[Sequence]):
         for seq in sequences:
             if seq._next_token is None: continue
             
