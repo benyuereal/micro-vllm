@@ -1,27 +1,16 @@
-"""
-===================================================================
-ModelGraphRunner - 极简全流程 CUDA Graph (Token -> Token)
-===================================================================
-"""
-
 import logging
 import torch
 import torch.nn.functional as F
 from typing import Dict, List
+
 from core.paged_attention import PagedAttention
 from kernel.swiglu import swiglu_fused as swiglu
-# from .sampler import Sampler  # 移除 Sampler 依赖
-from kernel.rmsnorm_add import rmsnorm_residual_fused ,rmsnorm
+from kernel.rmsnorm_add import rmsnorm_residual_fused, rmsnorm
 from .rope import RoPE
-
-from core.parallel_config import (
-    get_rank,
-    get_world_size,
-    all_reduce,
-)
+from core.parallel_config import get_rank, get_world_size, all_reduce
 
 try:
-    from flash_attn import flash_attn_with_kvcache, flash_attn_varlen_func
+    from flash_attn import flash_attn_with_kvcache
 except ImportError:
     flash_attn_with_kvcache = None
 
@@ -29,28 +18,18 @@ logger = logging.getLogger(__name__)
 
 
 class ModelGraphRunner:
-    """
-    输入: Token IDs, Temperatures, Top_Ps
-    输出: Next Token IDs
-    """
-    
     def __init__(self, model, num_layers: int, num_heads: int, head_size: int,
                  kv_num_heads: int, hidden_dim: int, intermediate_size: int,
                  device: str, max_batch_size: int = 32, dtype: torch.dtype = torch.bfloat16,
                  top_k: int = 1000):
         self.model = model
         self.num_layers = num_layers
-        
-        # ========== TP 修改开始 ==========
-        self.rank = get_rank()
-        self.world_size = get_world_size()
-        
-        # 更新为本地维度
-        self.num_heads = num_heads 
-        self.kv_num_heads = kv_num_heads 
-        self.intermediate_size = intermediate_size 
-        # ========== TP 修改结束 ==========
-        
+        self.rank, self.world_size = get_rank(), get_world_size()
+
+        # 本地维度（已TP切分）
+        self.num_heads = num_heads
+        self.kv_num_heads = kv_num_heads
+        self.intermediate_size = intermediate_size
         self.head_size = head_size
         self.hidden_dim = hidden_dim
         self.vocab_size = model.config.vocab_size
@@ -58,259 +37,175 @@ class ModelGraphRunner:
         self.max_batch_size = max_batch_size
         self.dtype = dtype
         self.top_k = top_k
-        
-        # 初始化组件 (注意：这里传入的已经是切分后的 num_heads)
-        self.attention = PagedAttention(
-            num_heads=self.num_heads, head_size=head_size, kv_num_heads=self.kv_num_heads,
-            device=device, max_batch_size=max_batch_size
-        )
 
-        logger.info(f"Rank {self.rank}: attention device = {self.attention.device}, kv_num_heads = {self.kv_num_heads}, num_heads = {self.num_heads}, head_size = {self.head_size}")
-        # self.sampler = Sampler() # 移除 Sampler
-        
-        self.prepare()
+        self.attention = PagedAttention(num_heads, head_size, kv_num_heads, device, max_batch_size)
         self._allocate_buffers()
         self._graphs: Dict[int, torch.cuda.CUDAGraph] = {}
         self._ready = False
         self.rope = RoPE()
+        self.prepare()
 
     def prepare(self):
-        """预缓存转置权重 & TP 切分（修正版 QKV 处理）"""
-        rank = self.rank
-        world_size = self.world_size
+        """预缓存转置权重 & TP切分（简化QKV处理）"""
+        cfg = self.model.config
+        global_num_heads = cfg.num_attention_heads
+        global_kv_heads = getattr(cfg, "num_key_value_heads", global_num_heads)
+        head_size = self.head_size
+        q_dim = global_num_heads * head_size
+        kv_dim = global_kv_heads * head_size
 
-        for idx, block in enumerate(self.model.transformer.h):
+        for block in self.model.transformer.h:
             mlp = block.mlp
 
-            # 1. 处理 MLP Gate + Up (Column Parallel) - 你的原有逻辑是对的
-            global_w1 = mlp.w1.weight
-            global_w2 = mlp.w2.weight
-            local_w1 = global_w1.chunk(world_size, dim=0)[rank]
-            local_w2 = global_w2.chunk(world_size, dim=0)[rank]
-            gate_up = torch.cat([local_w1, local_w2], dim=0)
-            mlp._gu = gate_up.t().contiguous()
+            # MLP Gate/Up (Column Parallel)
+            w1, w2 = mlp.w1.weight, mlp.w2.weight
+            mlp._gu = torch.cat([
+                w1.chunk(self.world_size, dim=0)[self.rank],
+                w2.chunk(self.world_size, dim=0)[self.rank]
+            ], dim=0).t().contiguous()
 
-            # 2. 处理 MLP Down (Row Parallel) - 你的原有逻辑是对的
-            global_wd = mlp.c_proj.weight
-            local_wd = global_wd.chunk(world_size, dim=1)[rank]
-            mlp._d = local_wd.t().contiguous()
+            # MLP Down (Row Parallel)
+            mlp._d = mlp.c_proj.weight.chunk(self.world_size, dim=1)[self.rank].t().contiguous()
 
-            # 3. 处理 Attention Output (Row Parallel) - 你的原有逻辑是对的
-            global_wo = block.attn.c_proj.weight
-            local_wo = global_wo.chunk(world_size, dim=1)[rank]
-            block.attn._o = local_wo.t().contiguous()
+            # Attention Output (Row Parallel)
+            block.attn._o = block.attn.c_proj.weight.chunk(self.world_size, dim=1)[self.rank].t().contiguous()
 
-            # ========== 修正部分：QKV 处理 ==========
-            global_qkv_w = block.attn.c_attn.weight  # [3*num_heads*head_size, hidden_dim]
-            global_qkv_b = block.attn.c_attn.bias  # [3*num_heads*head_size]
+            # QKV (Column Parallel)
+            w_qkv, b_qkv = block.attn.c_attn.weight, block.attn.c_attn.bias
+            w_q, w_k, w_v = w_qkv.split([q_dim, kv_dim, kv_dim], dim=0)
+            local_qkv = [w.chunk(self.world_size, dim=0)[self.rank] for w in (w_q, w_k, w_v)]
+            block.attn._qkv_w = torch.cat(local_qkv, dim=0).t().contiguous()
 
-            # 计算全局维度（注意：这里用全局头数，需要从外部传入或从 model config 获取）
-            # 假设你在 __init__ 中保存了全局头数：self.global_num_heads = 32
-            # 或者从 model config 读取：
-            global_num_heads = self.model.config.num_attention_heads  # Qwen-7B 是 32
-            global_kv_heads = getattr(self.model.config, "num_key_value_heads", global_num_heads)
-            head_size = self.head_size  # 128
-
-            # 计算 Q/K/V 各自的全局维度
-            q_dim_global = global_num_heads * head_size
-            kv_dim_global = global_kv_heads * head_size
-
-            # 1. 先分离全局 Q/K/V
-            w_q_global = global_qkv_w[:q_dim_global, :]
-            w_k_global = global_qkv_w[q_dim_global:q_dim_global + kv_dim_global, :]
-            w_v_global = global_qkv_w[q_dim_global + kv_dim_global:, :]
-
-            if global_qkv_b is not None:
-                b_q_global = global_qkv_b[:q_dim_global]
-                b_k_global = global_qkv_b[q_dim_global:q_dim_global + kv_dim_global]
-                b_v_global = global_qkv_b[q_dim_global + kv_dim_global:]
+            if b_qkv is not None:
+                b_q, b_k, b_v = b_qkv.split([q_dim, kv_dim, kv_dim], dim=0)
+                local_b = [b.chunk(self.world_size, dim=0)[self.rank] for b in (b_q, b_k, b_v)]
+                block.attn._qkv_b = torch.cat(local_b, dim=0)
             else:
-                b_q_global = b_k_global = b_v_global = None
+                block.attn._qkv_b = None
 
-            # 2. 对 Q/K/V 分别进行 Column Parallel 切分（按 dim=0 切分）
-            w_q_local = w_q_global.chunk(world_size, dim=0)[rank]
-            w_k_local = w_k_global.chunk(world_size, dim=0)[rank]
-            w_v_local = w_v_global.chunk(world_size, dim=0)[rank]
+        logger.info(f"✅ 权重预缓存完成 (Rank {self.rank})")
 
-            if b_q_global is not None:
-                b_q_local = b_q_global.chunk(world_size, dim=0)[rank]
-                b_k_local = b_k_global.chunk(world_size, dim=0)[rank]
-                b_v_local = b_v_global.chunk(world_size, dim=0)[rank]
-            else:
-                b_q_local = b_k_local = b_v_local = None
-
-            # 3. 重组本地 QKV
-            local_qkv_w = torch.cat([w_q_local, w_k_local, w_v_local], dim=0)
-            if b_q_local is not None:
-                local_qkv_b = torch.cat([b_q_local, b_k_local, b_v_local], dim=0)
-            else:
-                local_qkv_b = None
-
-            # 4. 转置为你代码中使用的格式 [hidden_dim, local_qkv_dim]
-            block.attn._qkv_w = local_qkv_w.t().contiguous()
-            block.attn._qkv_b = local_qkv_b
-            # ==========================================
-
-        logger.info(f"✅ 权重预缓存 & TP 切分完成 (Rank {self.rank})")
-    
     def _allocate_buffers(self):
-        """分配静态内存池"""
         max_b = self.max_batch_size
-        self._input_ids = torch.empty((max_b,), dtype=torch.long, device=self.device)
-        # self._temps = torch.empty((max_b,), dtype=self.dtype, device=self.device) # 移除
-        # self._topps = torch.empty((max_b,), dtype=self.dtype, device=self.device) # 移除
-        self._output_ids = torch.empty((max_b,), dtype=torch.long, device=self.device)
-        self._logits = torch.empty((max_b, self.vocab_size), dtype=self.dtype, device=self.device) # 添加 logits buffer
-    
-    def _forward(self, input_ids, batch_size: int, cache_manager, use_graph_cache: bool):
-        """
-        核心前向逻辑
-        """
-        # 1. Embedding
+        self._input_ids = torch.empty(max_b, dtype=torch.long, device=self.device)
+        self._logits = torch.empty(max_b, self.vocab_size, dtype=self.dtype, device=self.device)
+
+    def _mlp(self, x, block):
+        """MLP前向（含residual和all_reduce）"""
+        gate_up = torch.matmul(x, block.mlp._gu)
+        up, gate = gate_up.chunk(2, dim=-1)
+        activated = swiglu(gate, up)
+        out = torch.matmul(activated, block.mlp._d)
+        return all_reduce(out)
+
+    def decode(self, input_ids, batch_size, cache_manager, use_graph_cache):
+        """单token前向（decode步）"""
         h = self.model.transformer.wte(input_ids)
-        
-        # 2. Transformer Layers
+
         for layer_idx in range(self.num_layers):
             block = self.model.transformer.h[layer_idx]
-            
             w_qkv, b_qkv = block.attn._qkv_w, block.attn._qkv_b
             w_o = block.attn._o
-            w_gu, w_d = block.mlp._gu, block.mlp._d
-            
-            if use_graph_cache:
-                k_cache, v_cache = cache_manager.get(layer_idx)
-                cache_seqlens = cache_manager._cache_seqlens_buffer[:batch_size]
-                block_table = cache_manager._block_table_buffer[:batch_size]
-            else:
-                k_cache, v_cache = cache_manager.get(layer_idx)
-                cache_seqlens = torch.ones(batch_size, dtype=torch.int32, device=self.device)
-                block_table = torch.zeros(batch_size, self.attention.max_blocks, dtype=torch.int32, device=self.device)
-                block_table[:, 0] = 0 # 安全修复
-            
+
             # Attention
             normed = rmsnorm(h, block.ln_1.weight, block.ln_1.eps)
             qkv = torch.matmul(normed, w_qkv)
-            if b_qkv is not None: qkv = qkv + b_qkv
-            qkv_reshaped = qkv.reshape(batch_size, 3, self.num_heads, self.head_size)
-            q, k, v = qkv_reshaped[:, 0], qkv_reshaped[:, 1], qkv_reshaped[:, 2]
-            
+            if b_qkv is not None:
+                qkv += b_qkv
+
+            q, k, v = qkv.reshape(batch_size, 3, self.num_heads, self.head_size).unbind(dim=1)
+
+            k_cache, v_cache = cache_manager.get(layer_idx)
+            cache_seqlens = cache_manager._cache_seqlens_buffer[:batch_size]
+            block_table = (
+                cache_manager._block_table_buffer[:batch_size]
+                if use_graph_cache else
+                torch.zeros(batch_size, self.attention.max_blocks, dtype=torch.int32, device=self.device)
+            )
+
             attn = flash_attn_with_kvcache(
-                q=q.unsqueeze(1), k_cache=k_cache, v_cache=v_cache,
-                k=k.unsqueeze(1), v=v.unsqueeze(1),
-                rotary_cos=self.attention._cos_pool, rotary_sin=self.attention._sin_pool,
-                cache_seqlens=cache_seqlens, block_table=block_table,
-                causal=True, window_size=(-1, -1), rotary_interleaved=False, alibi_slopes=None,
+                q=q.unsqueeze(1),
+                k_cache=k_cache,
+                v_cache=v_cache,
+                k=k.unsqueeze(1),
+                v=v.unsqueeze(1),
+                rotary_cos=self.attention._cos_pool,
+                rotary_sin=self.attention._sin_pool,
+                cache_seqlens=cache_seqlens,
+                block_table=block_table,
+                causal=True,
+                window_size=(-1, -1),
+                rotary_interleaved=False,
+                alibi_slopes=None,
             ).squeeze(1)
-            
-            # MLP
-            out = torch.matmul(attn.reshape(batch_size, -1), w_o)
-            out = all_reduce(out)
-            
-            normed, residual = rmsnorm_residual_fused(
-                                x=out,
-                                residual=h,
-                                weight=block.ln_2.weight,
-                                eps=block.ln_2.eps
-                            )
-            gate_up = torch.matmul(normed, w_gu)
-            up, gate = gate_up.chunk(2, dim=-1)
-            activated = swiglu(gate, up)
-            mlp_out = torch.matmul(activated, w_d)
-            
-            mlp_out = all_reduce(mlp_out)
-            
-            h = mlp_out + residual
-            
-        # 3. Final Norm + LM Head
+
+            out = all_reduce(torch.matmul(attn.reshape(batch_size, -1), w_o))
+
+            normed, residual = rmsnorm_residual_fused(out, h, block.ln_2.weight, block.ln_2.eps)
+            h = self._mlp(normed, block) + residual
+
         h = self.model.transformer.ln_f(h)
-        logits = self.model.lm_head(h)
-        
-        # 4. 采样 (移至 Engine 层)
-        # output_ids = self.sampler._sample_impl(logits.float(), temps, topps, self.top_k)
-        
-        return logits
-    
+        return self.model.lm_head(h)
+
     def capture(self, cache_manager, batch_sizes: List[int] = [1, 2, 4, 8, 16, 32]):
-        if self._ready: return
-        logger.info(f"🎯 开始捕获 CUDA Graph ...")
+        if self._ready:
+            return
+
+        logger.info("🎯 开始捕获 CUDA Graph ...")
         for bs in batch_sizes:
-            self._capture_single(bs, cache_manager)
+            g = torch.cuda.CUDAGraph()
+
+            # Warmup
+            dummy = torch.randint(0, self.vocab_size, (bs,), device=self.device)
+            for _ in range(3):
+                with torch.no_grad():
+                    self.decode(dummy, bs, cache_manager, use_graph_cache=False)
+            torch.cuda.synchronize()
+
+            # Capture
+            with torch.cuda.graph(g):
+                self._logits[:bs] = self.decode(
+                    self._input_ids[:bs], bs, cache_manager, use_graph_cache=True
+                )
+            self._graphs[bs] = g
+            logger.info(f"   - Batch size {bs} OK")
+
         self._ready = True
-        logger.info("✅ 捕获完成")
-    
-    def _capture_single(self, batch_size: int, cache_manager):
-        g = torch.cuda.CUDAGraph()
-        self._warmup(batch_size, cache_manager)
-        
-        with torch.cuda.graph(g):
-            in_ids = self._input_ids[:batch_size]
-            out_logits = self._forward(in_ids, batch_size, cache_manager, use_graph_cache=True)
-            self._logits[:batch_size] = out_logits
-        
-        self._graphs[batch_size] = g
-        logger.info(f"   - Batch size {batch_size} OK")
-    
-    def _warmup(self, batch_size: int, cache_manager, num_warmup: int = 3):
-        dummy_ids = torch.randint(0, self.vocab_size, (batch_size,), dtype=torch.long, device=self.device)
-        # dummy_temps = torch.ones((batch_size,), dtype=self.dtype, device=self.device)
-        # dummy_topps = torch.ones((batch_size,), dtype=self.dtype, device=self.device)
-        for _ in range(num_warmup):
-            with torch.no_grad():
-                self._forward(dummy_ids, batch_size, cache_manager, use_graph_cache=False)
-        torch.cuda.synchronize()
-    
+
     def forward(self, input_ids: torch.Tensor, cache_manager, batch_size: int) -> torch.Tensor:
         self._input_ids[:batch_size] = input_ids
-        
+
         if batch_size not in self._graphs:
-            return self._forward(input_ids, batch_size, cache_manager, use_graph_cache=False)
-        
+            return self.decode(input_ids, batch_size, cache_manager, use_graph_cache=False)
+
         self._graphs[batch_size].replay()
         return self._logits[:batch_size]
 
-
     def prefill(self, input_ids: torch.Tensor, cache_manager, batch_size: int) -> torch.Tensor:
-        """
-        定长Prefill (修复 cos/sin seqlen 报错)
-        """
-        batch_size_val, seq_len = input_ids.shape
-        device = self.device
-
-        # 1. Embedding
+        """定长Prefill（batch, seq_len）"""
+        B, S = input_ids.shape
         h = self.model.transformer.wte(input_ids)
 
-        # 2. 获取静态缓冲区视图
+        # 初始化cache状态
+        cache_seqlens = cache_manager._cache_seqlens_buffer[:batch_size].zero_()
         block_table = cache_manager._block_table_buffer[:batch_size]
-        cache_seqlens = cache_manager._cache_seqlens_buffer[:batch_size]
-        
-        # 置 0 触发 Prefill 写入模式
-        cache_seqlens.zero_()
 
-        # 3. Transformer Layers
         for layer_idx in range(self.num_layers):
             block = self.model.transformer.h[layer_idx]
             w_qkv, b_qkv = block.attn._qkv_w, block.attn._qkv_b
             w_o = block.attn._o
-            w_gu, w_d = block.mlp._gu, block.mlp._d
 
-            # Attention
             normed = rmsnorm(h, block.ln_1.weight, block.ln_1.eps)
             qkv = torch.matmul(normed, w_qkv)
-            if b_qkv is not None: qkv = qkv + b_qkv
-            
-            # 重塑形状 [batch, seq_len, 3, heads, dim]
-            qkv_reshaped = qkv.reshape(batch_size_val, seq_len, 3, self.num_heads, self.head_size)
-            q, k, v = qkv_reshaped[:, :, 0], qkv_reshaped[:, :, 1], qkv_reshaped[:, :, 2]
+            if b_qkv is not None:
+                qkv += b_qkv
 
+            q, k, v = qkv.view(B, S, 3, self.num_heads, self.head_size).unbind(dim=2)
 
-            
-            cos = self.attention._cos_pool
-            sin = self.attention._sin_pool
-            q, k = self.rope.forward(q, k, cos, sin)
+            # 手动RoPE
+            q, k = self.rope.forward(q, k, self.attention._cos_pool, self.attention._sin_pool)
 
-            # 获取当前层的 Cache 指针
             k_cache, v_cache = cache_manager.get(layer_idx)
-
             attn = flash_attn_with_kvcache(
                 q=q,
                 k_cache=k_cache,
@@ -319,29 +214,13 @@ class ModelGraphRunner:
                 v=v,
                 cache_seqlens=cache_seqlens,
                 block_table=block_table,
-                causal=True,
-                # rotary_cos 和 rotary_sin 已彻底移除
+                causal=True
             )
 
-            # MLP
-            out = torch.matmul(attn.reshape(batch_size_val, seq_len, -1), w_o)
-            out = all_reduce(out)
-            
-            normed, residual = rmsnorm_residual_fused(
-                                x=out, residual=h,
-                                weight=block.ln_2.weight, eps=block.ln_2.eps
-                            )
-            gate_up = torch.matmul(normed, w_gu)
-            up, gate = gate_up.chunk(2, dim=-1)
-            activated = swiglu(gate, up)
-            mlp_out = torch.matmul(activated, w_d)
-            
-            mlp_out = all_reduce(mlp_out)
-            
-            h = mlp_out + residual
+            out = all_reduce(torch.matmul(attn.view(B, S, -1), w_o))
 
-        # 4. Final Norm + LM Head
+            normed, residual = rmsnorm_residual_fused(out, h, block.ln_2.weight, block.ln_2.eps)
+            h = self._mlp(normed, block) + residual
+
         h = self.model.transformer.ln_f(h)
-        logits = self.model.lm_head(h)
-
-        return logits
+        return self.model.lm_head(h)

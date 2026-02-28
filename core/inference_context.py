@@ -25,8 +25,8 @@ class BatchInferenceContext:
     def broadcast(self):
 
         if get_world_size() <= 1 :
-            print(f"current rank is {get_world_size()}")
             return
+
         if not rank0():
             raise RuntimeError("broadcast can only be called on main rank (Rank 0)")
         
