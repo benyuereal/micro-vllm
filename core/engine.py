@@ -13,6 +13,7 @@ from .model_loader import load_model
 from .layer.sampler import Sampler
 from core.parallel_config import get_rank, setup, get_world_size, rank0
 from core.inference_context import BatchInferenceContext
+from torch.profiler import profile, ProfilerActivity
 
 # Configure logging
 logging.basicConfig(
@@ -151,7 +152,17 @@ class InferenceEngine:
         if ctx.batch_type == "prefill":
             self._prefill(ctx.sequences)
         else:
+            # 仅包裹 Decode 阶段
             self._decode(ctx.sequences)
+            # with profile(
+            #     activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
+            #     record_shapes=True,
+            #     profile_memory=True
+            # ) as prof:
+            #     self._decode(ctx.sequences)
+            # # 可选：如果需要保存 profiler 结果，取消下面注释
+            # print(prof.key_averages().table(sort_by="cuda_time_total", row_limit=20))
+            # prof.export_chrome_trace(f"decode_trace_{time.time()}.json")
         
         return True
 
