@@ -109,8 +109,9 @@ class ModelGraphRunner:
 
             # Attention
             normed = rmsnorm(h, block.ln_1.weight, block.ln_1.eps)
-            qkv = torch.addmm(b_qkv, normed, w_qkv)  # 直接传，无需 unsqueeze
-
+            qkv = torch.matmul(normed, w_qkv)
+            if b_qkv is not None:
+                qkv += b_qkv
 
             q, k, v = qkv.reshape(batch_size, 3, self.num_heads, self.head_size).unbind(dim=1)
 
