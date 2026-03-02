@@ -137,6 +137,7 @@ class ModelGraphRunner:
                 window_size=(-1, -1),
                 rotary_interleaved=False,
                 alibi_slopes=None,
+                num_splits= 32 // (batch_size * 4)
             ).squeeze(1)
 
             out = all_reduce(torch.matmul(attn.reshape(batch_size, -1), w_o))

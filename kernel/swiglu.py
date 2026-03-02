@@ -63,9 +63,6 @@ def _swiglu_kernel(
     up = tl.load(Up + offsets, mask=mask, other=0.0).to(tl.float32)
 
     # Compute SiLU(gate) = gate * sigmoid(gate)
-    # sigmoid(x) = 1 / (1 + exp(-x))
-    # For numerical stability, use: sigmoid(x) = 0.5 * (1 + tanh(x/2))
-    # But the standard form works fine with Triton's exp implementation
     sigmoid_gate = tl.sigmoid(gate)
     silu_gate = gate * sigmoid_gate
 
@@ -76,12 +73,17 @@ def _swiglu_kernel(
     tl.store(Out + offsets, out, mask=mask)
 
 
+
+# ============================================================================
+# 主入口函数
+# ============================================================================
+
 def swiglu_fused(
     gate: torch.Tensor,
     up: torch.Tensor,
 ) -> torch.Tensor:
     """
-    Fused SwiGLU activation.
+    Fused SwiGLU activation with adaptive configuration.
 
     Computes: y = silu(gate) * up
 
@@ -91,6 +93,11 @@ def swiglu_fused(
 
     This kernel fuses the silu and elementwise multiply, saving one
     memory round-trip compared to: F.silu(gate) * up
+
+    Configuration is automatically selected based on tensor size:
+    - Small tensors (< 32K): Smaller blocks, fewer warps
+    - Medium tensors (32K-256K): Balanced config
+    - Large tensors (> 256K): Larger blocks, more warps, pipelined
 
     Args:
         gate: Gate tensor of shape (...,), result of x @ W_gate projection.
@@ -109,18 +116,16 @@ def swiglu_fused(
     assert up.is_cuda, "Up must be on CUDA device"
     assert gate.shape == up.shape, f"Shape mismatch: gate={gate.shape}, up={up.shape}"
 
-    # Flatten for kernel
     original_shape = gate.shape
     gate_flat = gate.contiguous().view(-1)
     up_flat = up.contiguous().view(-1)
     n_elements = gate_flat.numel()
 
-    # Allocate output
     out_flat = torch.empty_like(gate_flat)
 
-    # Launch kernel
-    # FIXME: smaller block size might be better for small tensors
-    BLOCK_SIZE = 2048
+    # 🔑 根据元素数量选择最优配置
+    BLOCK_SIZE, num_warps, num_stages = _get_swiglu_config(n_elements)
+
     grid = (triton.cdiv(n_elements, BLOCK_SIZE),)
 
     _swiglu_kernel[grid](
@@ -129,7 +134,61 @@ def swiglu_fused(
         out_flat,
         n_elements,
         BLOCK_SIZE=BLOCK_SIZE,
+        num_warps=num_warps,
+        num_stages=num_stages,
     )
 
     return out_flat.view(original_shape)
+
+
+# ============================================================================
+# 配置选择策略
+# ============================================================================
+
+def _get_swiglu_config(n_elements: int):
+    """
+    根据元素数量选择最优 kernel 配置
+
+    优化原则：
+    1. BLOCK_SIZE：影响每个 program 处理的元素数
+       - 大 BLOCK：减少 program 数量，降低 launch 开销
+       - 小 BLOCK：更多并行，但 overhead 增加
+
+    2. num_warps：每个 program 实例的线程束数
+       - 每个 warp 32 线程
+       - 更多 warps = 更多并行，但寄存器压力增大
+       - 内存受限的 kernel，warps 多不一定更快
+
+    3. num_stages：内存流水线深度
+       - 阶段化加载，隐藏内存延迟
+       - 小 tensor 不需要多 stages
+
+    返回: (BLOCK_SIZE, num_warps, num_stages)
+    """
+    # 元素数量阈值（基于典型 GPU 特性）
+
+    # 极小 tensor (< 4K elements)
+    # 单个 program 就够了，最小配置
+    if n_elements < 4096:
+        return (1024, 4, 1)
+
+    # 小 tensor (4K - 32K elements)
+    # 需要少量 programs，保守配置
+    elif n_elements < 32 * 1024:
+        return (1024, 4, 2)
+
+    # 中等 tensor (32K - 256K elements)
+    # 开始需要更多并行度
+    elif n_elements < 256 * 1024:
+        return (2048, 8, 2)
+
+    # 大 tensor (256K - 1M elements)
+    # 典型的 decode batch 场景
+    elif n_elements < 1024 * 1024:
+        return (4096, 8, 3)
+
+    # 超大 tensor (> 1M elements)
+    # Prefill 或大 batch 场景，最大化吞吐
+    else:
+        return (8192, 16, 4)
 
