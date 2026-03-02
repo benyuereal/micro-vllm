@@ -14,6 +14,7 @@ from .layer.sampler import Sampler
 from core.parallel_config import get_rank, setup, get_world_size, rank0
 from core.inference_context import BatchInferenceContext
 from torch.profiler import profile, ProfilerActivity
+from collections import defaultdict
 
 # Configure logging
 logging.basicConfig(
@@ -253,8 +254,8 @@ class InferenceEngine:
         self.cache_manager.cache_batch_data([s.seq_id for s in batch], [s.current_position for s in batch])
         
         # 回滚 padding 位置
-        for i in range(batch_size):
-            if not mask[i]: self.cache_manager._cache_seqlens_buffer[i] -= 1
+        # for i in range(batch_size):
+        #     if not mask[i]: self.cache_manager._cache_seqlens_buffer[i] -= 1
         
         stats.prep_time = time.time() - stats.prep_time
 
@@ -276,9 +277,15 @@ class InferenceEngine:
                 logger.info(f"Decode: Prep {stats.prep_time*1000:.1f}ms, GPU {stats.gpu_time*1000:.1f}ms, Total {stats.total_time*1000:.1f}ms | Batch {batch_size}")
 
     def update_sequences(self, sequences: List[Sequence]):
+        seq_dict = defaultdict(int)
         for seq in sequences:
             if seq._next_token is None: continue
             
+            if seq.seq_id in seq_dict:
+                # 已经更新的队列 不再更新
+                continue
+
+            seq_dict[seq.seq_id] = seq.current_position
             seq.update_state(seq._next_token, None)
             
             if rank0():
