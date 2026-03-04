@@ -307,7 +307,7 @@ curl -X POST "http://localhost:8000/generate_stream" \
 ### 启动 vLLM 服务
 
 ```bash
-python api_server_vllm.py
+python vllm_server.py
 ```
 
 
