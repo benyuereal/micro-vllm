@@ -39,11 +39,13 @@ class ModelGraphRunner:
         self.top_k = top_k
 
         self.attention = PagedAttention(num_heads, head_size, kv_num_heads, device, max_batch_size)
-        self._allocate_buffers()
         self._graphs: Dict[int, torch.cuda.CUDAGraph] = {}
         self._ready = False
         self.rope = RoPE()
+
+        # 先准备权重，再分配Buffer（确保维度匹配）
         self.prepare()
+        self._allocate_buffers()
 
     def prepare(self):
         """预缓存转置权重 & TP切分（简化QKV处理）"""
@@ -86,17 +88,22 @@ class ModelGraphRunner:
         logger.info(f"✅ 权重预缓存完成 (Rank {self.rank})")
 
     def _allocate_buffers(self):
+        """预分配Decode阶段的中间Buffer"""
         max_b = self.max_batch_size
         self._input_ids = torch.empty(max_b, dtype=torch.long, device=self.device)
         self._logits = torch.empty(max_b, self.vocab_size, dtype=self.dtype, device=self.device)
 
-    def _mlp(self, x, block):
-        """MLP前向（含residual和all_reduce）"""
-        gate_up = torch.matmul(x, block.mlp._gu)
-        up, gate = gate_up.chunk(2, dim=-1)
-        activated = swiglu(gate, up)
-        out = torch.matmul(activated, block.mlp._d)
-        return all_reduce(out)
+        # 从第一个block获取切分后的实际维度
+        _block = self.model.transformer.h[0]
+        qkv_dim = _block.attn._qkv_w.shape[1]
+        gu_dim = _block.mlp._gu.shape[1]
+        o_dim = _block.attn._o.shape[1]
+
+        # 分配中间Buffer
+        self._qkv_buffer = torch.empty(max_b, qkv_dim, dtype=self.dtype, device=self.device)
+        self._gate_up_buffer = torch.empty(max_b, gu_dim, dtype=self.dtype, device=self.device)
+        self._attn_output_buffer = torch.empty(max_b, o_dim, dtype=self.dtype, device=self.device)
+        self._mlp_output_buffer = torch.empty(max_b, o_dim, dtype=self.dtype, device=self.device)
 
     def decode(self, input_ids, batch_size, cache_manager, use_graph_cache):
         """单token前向（decode步）"""
@@ -107,9 +114,10 @@ class ModelGraphRunner:
             w_qkv, b_qkv = block.attn._qkv_w, block.attn._qkv_b
             w_o = block.attn._o
 
-            # Attention
+            # Attention (复用QKV Buffer)
             normed = rmsnorm(h, block.ln_1.weight, block.ln_1.eps)
-            qkv = torch.matmul(normed, w_qkv)
+            qkv = self._qkv_buffer[:batch_size]
+            torch.matmul(normed, w_qkv, out=qkv)
             if b_qkv is not None:
                 qkv += b_qkv
 
@@ -137,13 +145,22 @@ class ModelGraphRunner:
                 window_size=(-1, -1),
                 rotary_interleaved=False,
                 alibi_slopes=None,
-                num_splits= 32 // (batch_size * 4)
+                num_splits=max(1, 32 // max(1, batch_size * 4))  # 修复除0
             ).squeeze(1)
 
-            out = all_reduce(torch.matmul(attn.reshape(batch_size, -1), w_o))
+            attn_out = self._attn_output_buffer[:batch_size]
+            torch.matmul(attn.reshape(batch_size, -1), w_o, out=attn_out)
+            out = all_reduce(attn_out)
 
             normed, residual = rmsnorm_residual_fused(out, h, block.ln_2.weight, block.ln_2.eps)
-            h = self._mlp(normed, block) + residual
+
+            gate_up = self._gate_up_buffer[:batch_size]
+            torch.matmul(normed, block.mlp._gu, out=gate_up)
+            up, gate = gate_up.chunk(2, dim=-1)
+            activated = swiglu(gate, up)
+            mlp_out = self._mlp_output_buffer[:batch_size]
+            torch.matmul(activated, block.mlp._d, out=mlp_out)
+            h = all_reduce(mlp_out).add_(residual)
 
         h = self.model.transformer.ln_f(h)
         return self.model.lm_head(h)
@@ -163,8 +180,7 @@ class ModelGraphRunner:
                     self.decode(dummy, bs, cache_manager, use_graph_cache=False)
             torch.cuda.synchronize()
 
-            # Capture
-            with torch.cuda.graph(g):
+            with torch.no_grad(), torch.cuda.graph(g):
                 self._logits[:bs] = self.decode(
                     self._input_ids[:bs], bs, cache_manager, use_graph_cache=True
                 )
@@ -221,7 +237,12 @@ class ModelGraphRunner:
             out = all_reduce(torch.matmul(attn.view(B, S, -1), w_o))
 
             normed, residual = rmsnorm_residual_fused(out, h, block.ln_2.weight, block.ln_2.eps)
-            h = self._mlp(normed, block) + residual
+
+            gate_up = torch.matmul(normed, block.mlp._gu)
+            up, gate = gate_up.chunk(2, dim=-1)
+            activated = swiglu(gate, up)
+            mlp_out = torch.matmul(activated, block.mlp._d)
+            h = all_reduce(mlp_out).add_(residual)
 
         h = self.model.transformer.ln_f(h)
         return self.model.lm_head(h)

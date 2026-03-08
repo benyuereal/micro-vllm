@@ -65,7 +65,7 @@ async def rank0_inference_loop():
         
         if batch_type == "waiting" or not batch:
             BatchInferenceContext(0, "waiting").broadcast()
-            await asyncio.sleep(0.001)
+            await asyncio.sleep(0.000)
             continue
         
         ctx = BatchInferenceContext(len(batch), batch_type, batch)
@@ -82,7 +82,7 @@ def non_rank0_inference_loop():
     while running:
         ctx = BatchInferenceContext.receive(tokenizer)
         if ctx.batch_type == "waiting" or ctx.batch_size == 0:
-            time.sleep(0.001)
+            time.sleep(0.000)
             continue
         
         engine.step(ctx)
