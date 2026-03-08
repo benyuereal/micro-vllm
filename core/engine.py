@@ -146,7 +146,7 @@ class InferenceEngine:
     def get_next_batch(self) -> Tuple[List[Sequence], str]:
         return self.scheduler.get_next_batch()
 
-    @torch.no_grad()
+    @torch.inference_mode()
     def step(self, ctx: BatchInferenceContext) -> bool:
         if not ctx.sequences: return False
         
