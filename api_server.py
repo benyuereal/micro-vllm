@@ -82,7 +82,7 @@ def non_rank0_inference_loop():
     while running:
         ctx = BatchInferenceContext.receive(tokenizer)
         if ctx.batch_type == "waiting" or ctx.batch_size == 0:
-            time.sleep(0.001)
+            time.sleep(0.000)
             continue
         
         engine.step(ctx)

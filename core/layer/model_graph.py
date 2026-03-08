@@ -8,7 +8,7 @@ from kernel.swiglu import swiglu_fused as swiglu
 from kernel.rmsnorm_add import rmsnorm_residual_fused, rmsnorm
 from .rope import RoPE
 from core.parallel_config import get_rank, get_world_size, all_reduce
-
+from kernel.silu_and_mul import silu_and_mul
 try:
     from flash_attn import flash_attn_with_kvcache
 except ImportError:
@@ -60,10 +60,9 @@ class ModelGraphRunner:
             # MLP Gate/Up (Column Parallel)
             w1, w2 = mlp.w1.weight, mlp.w2.weight
             mlp._gu = torch.cat([
+                w2.chunk(self.world_size, dim=0)[self.rank],
                 w1.chunk(self.world_size, dim=0)[self.rank],
-                w2.chunk(self.world_size, dim=0)[self.rank]
             ], dim=0).t().contiguous()
-
             # MLP Down (Row Parallel)
             mlp._d = mlp.c_proj.weight.chunk(self.world_size, dim=1)[self.rank].t().contiguous()
 
@@ -92,9 +91,9 @@ class ModelGraphRunner:
 
     def _mlp(self, x, block):
         """MLP前向（含residual和all_reduce）"""
+
         gate_up = torch.matmul(x, block.mlp._gu)
-        up, gate = gate_up.chunk(2, dim=-1)
-        activated = swiglu(gate, up)
+        activated = silu_and_mul(gate_up)
         out = torch.matmul(activated, block.mlp._d)
         return all_reduce(out)
 
