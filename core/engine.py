@@ -231,12 +231,12 @@ class InferenceEngine:
             logger.info(f"Prefill: Prep {stats.prep_time*1000:.1f}ms, GPU {stats.gpu_time*1000:.1f}ms, Total {stats.total_time*1000:.1f}ms | Batch {len(batch)}")
 
     def _decode(self, batch: List[Sequence]):
-        stats = InferenceStats(total_time=time.time())
+        # stats = InferenceStats(total_time=time.time())
         device = self.device
         batch_size = len(batch)
 
         # 1. 准备与去重
-        stats.prep_time = time.time()
+        # stats.prep_time = time.time()
         seen = set()
         mask = []
         for seq in batch:
@@ -257,24 +257,24 @@ class InferenceEngine:
         # for i in range(batch_size):
         #     if not mask[i]: self.cache_manager._cache_seqlens_buffer[i] -= 1
         
-        stats.prep_time = time.time() - stats.prep_time
+        # stats.prep_time = time.time() - stats.prep_time
 
         # 3. 推理
-        stats.gpu_time = time.time()
+        # stats.gpu_time = time.time()
         logits = self.graph_runner.forward(input_ids, self.cache_manager, batch_size)
-        stats.gpu_time = time.time() - stats.gpu_time
+        # stats.gpu_time = time.time() - stats.gpu_time
 
         # 4. 采样
         if rank0():
-            stats.sample_time = time.time()
+            # stats.sample_time = time.time()
             next_tokens = self.sampler(logits, temps, topp, 1000).tolist()
             for i, seq in enumerate(batch):
                 seq._next_token = next_tokens[i]
-            stats.sample_time = time.time() - stats.sample_time
+            # stats.sample_time = time.time() - stats.sample_time
 
-            stats.total_time = time.time() - stats.total_time
-            if batch and batch[0].current_position % 50 == 0:
-                logger.info(f"Decode: Prep {stats.prep_time*1000:.1f}ms, GPU {stats.gpu_time*1000:.1f}ms, Total {stats.total_time*1000:.1f}ms | Batch {batch_size}")
+            # stats.total_time = time.time() - stats.total_time
+            # if batch and batch[0].current_position % 50 == 0:
+            #     logger.info(f"Decode: Prep {stats.prep_time*1000:.1f}ms, GPU {stats.gpu_time*1000:.1f}ms, Total {stats.total_time*1000:.1f}ms | Batch {batch_size}")
 
     def update_sequences(self, sequences: List[Sequence]):
         seq_dict = defaultdict(int)
