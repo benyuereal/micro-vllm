@@ -156,8 +156,7 @@ class ModelGraphRunner:
 
             gate_up = self._gate_up_buffer[:batch_size]
             torch.matmul(normed, block.mlp._gu, out=gate_up)
-            up, gate = gate_up.chunk(2, dim=-1)
-            activated = swiglu(gate, up)
+            activated = swiglu(gate_up)
             mlp_out = self._mlp_output_buffer[:batch_size]
             torch.matmul(activated, block.mlp._d, out=mlp_out)
             h = all_reduce(mlp_out).add_(residual)
@@ -239,8 +238,7 @@ class ModelGraphRunner:
             normed, residual = rmsnorm_residual_fused(out, h, block.ln_2.weight, block.ln_2.eps)
 
             gate_up = torch.matmul(normed, block.mlp._gu)
-            up, gate = gate_up.chunk(2, dim=-1)
-            activated = swiglu(gate, up)
+            activated = swiglu(gate_up)
             mlp_out = torch.matmul(activated, block.mlp._d)
             h = all_reduce(mlp_out).add_(residual)
 
