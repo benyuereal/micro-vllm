@@ -68,7 +68,7 @@ def _swiglu_kernel(
 
     # Compute output: silu(gate) * up
     out = silu_gate * up
-
+    out = out.to(tl.bfloat16)
     # Store output
     tl.store(Out + offsets, out, mask=mask)
 
