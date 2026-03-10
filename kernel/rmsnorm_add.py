@@ -131,7 +131,7 @@ class ProRMSNorm(torch.nn.Module):
 # 【新增代码：优化后的 RMSNorm 方法】
 # ============================================================================
 @triton.jit
-def _rmsnorm_fused_for_gemm_kernel(
+def _rmsnorm_gemm_kernel(
         X,  # 输入 h
         Y,  # 预分配的输出缓冲区 (matmul 输入)
         W,  # ln weight
@@ -167,7 +167,7 @@ def _rmsnorm_fused_for_gemm_kernel(
         tl.store(Y + cols, y.to(tl.bfloat16), mask=mask)
 
 
-def rmsnorm_fused_for_gemm(
+def rmsnorm_(
         x: torch.Tensor,
         weight: torch.Tensor,
         out_buffer: torch.Tensor,
@@ -197,7 +197,7 @@ def rmsnorm_fused_for_gemm(
     # 针对 Decode 阶段优化
     BLOCK_SIZE = min(triton.next_power_of_2(hidden_dim), 2048)
 
-    _rmsnorm_fused_for_gemm_kernel[(num_rows,)](
+    _rmsnorm_gemm_kernel[(num_rows,)](
         x_flat, y_flat, weight,
         x_flat.stride(0), y_flat.stride(0),
         hidden_dim, eps, BLOCK_SIZE=BLOCK_SIZE,
@@ -242,7 +242,7 @@ def benchmark_rmsnorm():
     # 方案 2: 新增的 rmsnorm_fused_for_gemm
     # -------------------------------------------------------------------------
     def fused_path():
-        rmsnorm_fused_for_gemm(x, weight, normed_buffer)
+        rmsnorm_(x, weight, normed_buffer)
         torch.matmul(
             normed_buffer.view(batch_size, hidden_size),
             w_qkv,
