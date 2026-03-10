@@ -4,13 +4,14 @@ import torch.nn.functional as F
 from typing import Dict, List
 
 from core.paged_attention import PagedAttention
-from kernel.swiglu import swiglu_fused as swiglu
 from kernel.rmsnorm_add import rmsnorm_residual_fused, rmsnorm, rmsnorm_
 from kernel.rmsnorm_residual import rmsnorm_residual_hybrid, rmsnorm_residual_gemm
 
 from .rope import RoPE
 from core.parallel_config import get_rank, get_world_size, all_reduce
-
+import torch._dynamo
+torch._dynamo.config.recompile_limit = 128  # 设置一个足够大的值
+torch._dynamo.config.cache_size_limit = 128  # 增加缓存容量
 try:
     from flash_attn import flash_attn_with_kvcache
 except ImportError:
@@ -45,9 +46,43 @@ class ModelGraphRunner:
         self._ready = False
         self.rope = RoPE()
 
+        # 【新增】编译 MLP 前向传播函数
+        # 使用 'max-autotune' 模式获得最佳性能（编译时间较长）
+        # 若需快速迭代，可改为 'reduce-overhead'
+        self._compiled_mlp = torch.compile(
+            self._standalone_mlp_forward,
+            fullgraph=True,
+            backend="inductor",
+            options={
+                # 模拟 "max-autotune" 的行为
+                "max_autotune": True,
+                "max_autotune_gemm": True,
+                # 【核心】禁用 Inductor 内部的 CUDAGraph，防止与外层捕获冲突
+                "triton.cudagraphs": False,
+                "triton.cudagraph_trees": False,
+            }
+        )
+
         # 先准备权重，再分配Buffer（确保维度匹配）
         self.prepare()
         self._allocate_buffers()
+
+    def _standalone_mlp_forward(self, x, gu_weight, d_weight):
+        """
+        标准的 SwiGLU MLP 前向传播。
+        用纯 PyTorch 操作编写，以便 torch.compile 优化。
+        替换了原来的 swiglu_gemm 等手写 kernel。
+        """
+        # 1. Gate & Up 投影 (Column Parallel)
+        gate_up = x @ gu_weight
+
+        # 2. SwiGLU 激活
+        # 替代 swiglu_gemm / swiglu_fused
+        up, gate = gate_up.chunk(2, dim=-1)
+        activated = F.silu(gate) * up
+
+        # 3. Down 投影 (Row Parallel)
+        return activated @ d_weight
 
     def prepare(self):
         """预缓存转置权重 & TP切分（简化QKV处理）"""
@@ -98,19 +133,13 @@ class ModelGraphRunner:
         # 从第一个block获取切分后的实际维度
         _block = self.model.transformer.h[0]
         qkv_dim = _block.attn._qkv_w.shape[1]
-        gu_dim = _block.mlp._gu.shape[1]
         o_dim = _block.attn._o.shape[1]
 
-
-        # 分配中间Buffer
-        self._normed_buffer = torch.empty((max_b, self.hidden_dim),dtype=self.dtype, device=self.device)
+        # 分配中间Buffer (移除了不再需要的 _gate_up, _swiglu_out, _mlp_out)
+        self._normed_buffer = torch.empty((max_b, self.hidden_dim), dtype=self.dtype, device=self.device)
         self._qkv_buffer = torch.empty(max_b, qkv_dim, dtype=self.dtype, device=self.device)
-        self._gate_up = torch.empty(max_b, gu_dim, dtype=self.dtype, device=self.device)
         self._attn_output_buffer = torch.empty(max_b, o_dim, dtype=self.dtype, device=self.device)
-        self._mlp_out = torch.empty(max_b, o_dim, dtype=self.dtype, device=self.device)
-        self._swiglu_out = torch.empty(max_b, self.hidden_dim, dtype=self.dtype, device=self.device)
         self._out_residual = torch.empty((max_b, self.hidden_dim), dtype=self.dtype, device=self.device)
-
 
     def decode(self, input_ids, batch_size, cache_manager, use_graph_cache):
         """单token前向（decode步）"""
@@ -159,14 +188,18 @@ class ModelGraphRunner:
             torch.matmul(attn.reshape(batch_size, -1), w_o, out=attn_out)
             out = all_reduce(attn_out)
 
-            normed, residual = rmsnorm_residual_hybrid(out, h, block.ln_2.weight, self._normed_buffer[:batch_size],
-                                                       block.ln_2.eps)
+            rmsnorm_residual_gemm(out, h, block.ln_2.weight,
+                                  self._normed_buffer[:batch_size],
+                                  self._out_residual[:batch_size],
+                                  block.ln_2.eps)
 
-
-            torch.matmul(self._normed_buffer[:batch_size], block.mlp._gu, out=self._gate_up[:batch_size])
-            activated = swiglu(self._gate_up[:batch_size])
-            torch.matmul(activated, block.mlp._d, out=self._mlp_out[:batch_size])
-            h = all_reduce(self._mlp_out[:batch_size]).add_(residual)
+            # 【修改】使用 torch.compile 优化后的 MLP
+            mlp_out = self._compiled_mlp(
+                self._normed_buffer[:batch_size],
+                block.mlp._gu,
+                block.mlp._d
+            )
+            h = all_reduce(mlp_out).add_(self._out_residual[:batch_size])
 
         h = self.model.transformer.ln_f(h)
         return self.model.lm_head(h)
@@ -175,7 +208,30 @@ class ModelGraphRunner:
         if self._ready:
             return
 
-        logger.info("🎯 开始捕获 CUDA Graph ...")
+        logger.info("🎯 开始捕获 CUDA Graph & 预热 torch.compile ...")
+
+        # 【修改 3】关键步骤：多 Batch Size 预热
+        if batch_sizes:
+            logger.info(f"   步骤 1/2: 预热 MLP (针对 shapes: {batch_sizes}) ...")
+
+            # 获取权重引用
+            _gu = self.model.transformer.h[0].mlp._gu
+            _d = self.model.transformer.h[0].mlp._d
+
+            with torch.no_grad():
+                for bs in batch_sizes:
+                    logger.info(f"     - 编译 batch_size = {bs} ...")
+                    # 构造对应形状的假输入
+                    _x = torch.randn(bs, self.hidden_dim, dtype=self.dtype, device=self.device)
+
+                    # 每个形状多跑几次，确保编译稳定
+                    for _ in range(3):
+                        _ = self._compiled_mlp(_x, _gu, _d)
+
+            torch.cuda.synchronize()
+            logger.info("   ✅ MLP 多形状预热完成")
+
+        # 步骤 2：正常捕获 CUDA Graph
         for bs in batch_sizes:
             g = torch.cuda.CUDAGraph()
 
@@ -186,6 +242,7 @@ class ModelGraphRunner:
                     self.decode(dummy, bs, cache_manager, use_graph_cache=False)
             torch.cuda.synchronize()
 
+            logger.info(f"   步骤 2/2: 捕获 Batch size {bs} ...")
             with torch.no_grad(), torch.cuda.graph(g):
                 self._logits[:bs] = self.decode(
                     self._input_ids[:bs], bs, cache_manager, use_graph_cache=True
@@ -244,9 +301,8 @@ class ModelGraphRunner:
 
             normed, residual = rmsnorm_residual_fused(out, h, block.ln_2.weight, block.ln_2.eps)
 
-            gate_up = torch.matmul(normed, block.mlp._gu)
-            activated = swiglu(gate_up)
-            mlp_out = torch.matmul(activated, block.mlp._d)
+            # 【修改】Prefill 阶段也使用编译后的 MLP
+            mlp_out = self._compiled_mlp(normed, block.mlp._gu, block.mlp._d)
             h = all_reduce(mlp_out).add_(residual)
 
         h = self.model.transformer.ln_f(h)
