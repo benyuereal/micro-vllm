@@ -6,6 +6,7 @@ from typing import Dict, List
 from core.paged_attention import PagedAttention
 from kernel.rmsnorm_add import rmsnorm_residual_fused, rmsnorm, rmsnorm_
 from kernel.rmsnorm_residual import rmsnorm_residual_hybrid, rmsnorm_residual_gemm
+from kernel.swiglu import swiglu_gemm
 
 from .rope import RoPE
 from core.parallel_config import get_rank, get_world_size, all_reduce
@@ -66,6 +67,7 @@ class ModelGraphRunner:
         # 先准备权重，再分配Buffer（确保维度匹配）
         self.prepare()
         self._allocate_buffers()
+
 
     def _standalone_mlp_forward(self, x, gu_weight, d_weight):
         """
@@ -140,6 +142,12 @@ class ModelGraphRunner:
         self._qkv_buffer = torch.empty(max_b, qkv_dim, dtype=self.dtype, device=self.device)
         self._attn_output_buffer = torch.empty(max_b, o_dim, dtype=self.dtype, device=self.device)
         self._out_residual = torch.empty((max_b, self.hidden_dim), dtype=self.dtype, device=self.device)
+        # _gate_up: (batch, intermediate_size)
+        self._gate_up = torch.empty((max_b, self.intermediate_size), dtype=self.dtype, device=self.device)
+        # _swiglu_out: (batch, intermediate_size // 2) - swiglu 后维度减半
+        self._swiglu_out = torch.empty((max_b, self.intermediate_size // 2), dtype=self.dtype, device=self.device)
+        # 【修复 2/2】_mlp_out 应该是 (batch, hidden_dim)，因为 down 投影回 hidden
+        self._mlp_out = torch.empty((max_b, self.hidden_dim), dtype=self.dtype, device=self.device)
 
     def decode(self, input_ids, batch_size, cache_manager, use_graph_cache):
         """单token前向（decode步）"""
@@ -194,12 +202,23 @@ class ModelGraphRunner:
                                   block.ln_2.eps)
 
             # 【修改】使用 torch.compile 优化后的 MLP
-            mlp_out = self._compiled_mlp(
-                self._normed_buffer[:batch_size],
-                block.mlp._gu,
-                block.mlp._d
-            )
-            h = all_reduce(mlp_out).add_(self._out_residual[:batch_size])
+            if batch_size <= 16:
+                mlp_out = self._compiled_mlp(
+                    self._normed_buffer[:batch_size],
+                    block.mlp._gu,
+                    block.mlp._d
+                )
+                h = all_reduce(mlp_out).add_(self._out_residual[:batch_size])
+            else:
+                torch.matmul(self._normed_buffer[:batch_size], block.mlp._gu, out=self._gate_up[:batch_size])
+                # 2. SwiGLU Activation
+                swiglu_gemm(self._gate_up[:batch_size], self._swiglu_out[:batch_size])
+                # 3. Down Projection
+                torch.matmul(self._swiglu_out[:batch_size], block.mlp._d, out=self._mlp_out[:batch_size])
+                # 4. Residual Add
+                h = all_reduce(self._mlp_out[:batch_size]).add_(self._out_residual[:batch_size])
+
+
 
         h = self.model.transformer.ln_f(h)
         return self.model.lm_head(h)
@@ -210,26 +229,28 @@ class ModelGraphRunner:
 
         logger.info("🎯 开始捕获 CUDA Graph & 预热 torch.compile ...")
 
-        # 【修改 3】关键步骤：多 Batch Size 预热
+        # 【修改】多 Batch Size 预热
         if batch_sizes:
-            logger.info(f"   步骤 1/2: 预热 MLP (针对 shapes: {batch_sizes}) ...")
+            logger.info(f"   步骤 1/2: 预热 Kernel (Shapes: {batch_sizes}) ...")
 
-            # 获取权重引用
-            _gu = self.model.transformer.h[0].mlp._gu
-            _d = self.model.transformer.h[0].mlp._d
+            # 获取第0层的权重引用用于预热
+            _block0 = self.model.transformer.h[0]
+            _gu = _block0.mlp._gu
+            _d = _block0.mlp._d
+
 
             with torch.no_grad():
                 for bs in batch_sizes:
-                    logger.info(f"     - 编译 batch_size = {bs} ...")
-                    # 构造对应形状的假输入
+                    logger.info(f"     - Compiling for BS={bs} ...")
                     _x = torch.randn(bs, self.hidden_dim, dtype=self.dtype, device=self.device)
 
-                    # 每个形状多跑几次，确保编译稳定
+
+                    # 预热 MLP
                     for _ in range(3):
                         _ = self._compiled_mlp(_x, _gu, _d)
 
             torch.cuda.synchronize()
-            logger.info("   ✅ MLP 多形状预热完成")
+            logger.info("   ✅ 预热完成")
 
         # 步骤 2：正常捕获 CUDA Graph
         for bs in batch_sizes:
