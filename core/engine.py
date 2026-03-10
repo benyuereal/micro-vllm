@@ -7,6 +7,7 @@ from dataclasses import dataclass
 
 from . import Scheduler
 from .layer.model_graph import ModelGraphRunner
+from .layer.model_prefill import ModelPrefillRunner
 from .cache_manager import KVCacheManager
 from .sequence import Sequence
 from .model_loader import load_model
@@ -55,6 +56,13 @@ class InferenceEngine:
             dtype=self.dtype, device=self.device, max_batch_size=max_batch_size
         )
         self.graph_runner = ModelGraphRunner(
+            model=self.model, num_layers=self.num_layers, num_heads=self.num_heads,
+            head_size=self.head_size, kv_num_heads=self.kv_num_heads,
+            hidden_dim=self.config.hidden_size, intermediate_size=self.intermediate_size,
+            device=self.device, max_batch_size=max_batch_size, dtype=self.dtype
+        )
+
+        self.prefill_runner = ModelPrefillRunner(
             model=self.model, num_layers=self.num_layers, num_heads=self.num_heads,
             head_size=self.head_size, kv_num_heads=self.kv_num_heads,
             hidden_dim=self.config.hidden_size, intermediate_size=self.intermediate_size,
@@ -216,7 +224,7 @@ class InferenceEngine:
 
         # 3. 推理
         stats.gpu_time = time.time()
-        logits = self.graph_runner.prefill(input_ids, self.cache_manager, len(batch))
+        logits = self.prefill_runner.forward(input_ids, self.cache_manager, len(batch))
         stats.gpu_time = time.time() - stats.gpu_time
 
         # 4. 采样
