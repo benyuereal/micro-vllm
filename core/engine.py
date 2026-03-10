@@ -7,6 +7,7 @@ from dataclasses import dataclass
 
 from . import Scheduler
 from .layer.model_graph import ModelGraphRunner
+from .layer.model_prefill import ModelPrefillRunner
 from .cache_manager import KVCacheManager
 from .sequence import Sequence
 from .model_loader import load_model
@@ -39,9 +40,9 @@ class InferenceEngine:
     
     # 预设配置 (简化为仅保留关键逻辑，硬编码CUDA最优实践)
     DEFAULT_BLOCK_SIZE = 256
-    DEFAULT_MAX_BLOCKS = 65
+    DEFAULT_MAX_BLOCKS = 81
 
-    def __init__(self, model_path: str, max_batch_size: int = 32, max_prefill_tokens: int = 2048):
+    def __init__(self, model_path: str, max_batch_size: int = 40, max_prefill_tokens: int = 2048):
         self._init_distributed()
         self._init_model(model_path)
         self._init_config()
@@ -52,9 +53,16 @@ class InferenceEngine:
         self.cache_manager = KVCacheManager(
             n_blocks=self.DEFAULT_MAX_BLOCKS, block_size=self.DEFAULT_BLOCK_SIZE,
             n_layers=self.num_layers, n_heads=self.kv_num_heads, head_size=self.head_size,
-            dtype=self.dtype, device=self.device
+            dtype=self.dtype, device=self.device, max_batch_size=max_batch_size
         )
         self.graph_runner = ModelGraphRunner(
+            model=self.model, num_layers=self.num_layers, num_heads=self.num_heads,
+            head_size=self.head_size, kv_num_heads=self.kv_num_heads,
+            hidden_dim=self.config.hidden_size, intermediate_size=self.intermediate_size,
+            device=self.device, max_batch_size=max_batch_size, dtype=self.dtype
+        )
+
+        self.prefill_runner = ModelPrefillRunner(
             model=self.model, num_layers=self.num_layers, num_heads=self.num_heads,
             head_size=self.head_size, kv_num_heads=self.kv_num_heads,
             hidden_dim=self.config.hidden_size, intermediate_size=self.intermediate_size,
@@ -71,7 +79,7 @@ class InferenceEngine:
         # 捕获 CUDA Graph
         if self.device == "cuda":
             logger.info("Capturing CUDA Graphs...")
-            self.graph_runner.capture(self.cache_manager, batch_sizes=[1, 2, 4, 8, 16, 32])
+            self.graph_runner.capture(self.cache_manager, batch_sizes=[1, 2, 4, 8, 16, 32, 40])
             logger.info("CUDA Graphs captured.")
             
         # 注册退出钩子
@@ -216,7 +224,7 @@ class InferenceEngine:
 
         # 3. 推理
         stats.gpu_time = time.time()
-        logits = self.graph_runner.prefill(input_ids, self.cache_manager, len(batch))
+        logits = self.prefill_runner.forward(input_ids, self.cache_manager, len(batch))
         stats.gpu_time = time.time() - stats.gpu_time
 
         # 4. 采样

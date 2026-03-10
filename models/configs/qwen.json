@@ -1,0 +1,21 @@
+{
+  "embedding": "transformer.wte.weight",
+  "final_norm": "transformer.ln_f.weight",
+  "lm_head": "lm_head.weight",
+  "blocks": "transformer.h",
+
+  "attn": {
+    "qkv": "attn.c_attn.weight",
+    "qkv_bias": "attn.c_attn.bias",
+    "out": "attn.c_proj.weight"
+  },
+  "mlp": {
+    "gate": "mlp.w1.weight",
+    "up": "mlp.w2.weight",
+    "down": "mlp.c_proj.weight"
+  },
+  "norms": {
+    "attn": "ln_1.weight",
+    "ffn": "ln_2.weight"
+  }
+}
