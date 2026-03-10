@@ -6,6 +6,7 @@ from typing import Dict, List
 from core.paged_attention import PagedAttention
 from kernel.swiglu import swiglu_fused as swiglu
 from kernel.rmsnorm_add import rmsnorm_residual_fused, rmsnorm, rmsnorm_
+from kernel.rmsnorm_residual import rmsnorm_residual_, rmsnorm_residual_gemm
 
 from .rope import RoPE
 from core.parallel_config import get_rank, get_world_size, all_reduce
@@ -108,6 +109,7 @@ class ModelGraphRunner:
         self._attn_output_buffer = torch.empty(max_b, o_dim, dtype=self.dtype, device=self.device)
         self._mlp_out = torch.empty(max_b, o_dim, dtype=self.dtype, device=self.device)
         self._swiglu_out = torch.empty(max_b, self.hidden_dim, dtype=self.dtype, device=self.device)
+        self._out_residual = torch.empty((max_b, self.hidden_dim), dtype=self.dtype, device=self.device)
 
 
     def decode(self, input_ids, batch_size, cache_manager, use_graph_cache):
@@ -157,8 +159,11 @@ class ModelGraphRunner:
             torch.matmul(attn.reshape(batch_size, -1), w_o, out=attn_out)
             out = all_reduce(attn_out)
 
-            normed, residual = rmsnorm_residual_fused(out, h, block.ln_2.weight, block.ln_2.eps)
-            torch.matmul(normed, block.mlp._gu, out=self._gate_up[:batch_size])
+            normed, residual = rmsnorm_residual_(out, h, block.ln_2.weight, self._normed_buffer[:batch_size],
+                                                 block.ln_2.eps)
+
+
+            torch.matmul(self._normed_buffer[:batch_size], block.mlp._gu, out=self._gate_up[:batch_size])
             activated = swiglu(self._gate_up[:batch_size])
             torch.matmul(activated, block.mlp._d, out=self._mlp_out[:batch_size])
             h = all_reduce(self._mlp_out[:batch_size]).add_(residual)

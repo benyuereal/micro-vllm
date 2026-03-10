@@ -124,7 +124,7 @@ def _rmsnorm_residual_fused_for_gemm_kernel(
         tl.store(Y + cols, y, mask=mask)
 
 
-def rmsnorm_residual_fused_for_gemm(
+def rmsnorm_residual_gemm(
         x: torch.Tensor,
         residual: torch.Tensor,
         weight: torch.Tensor,
@@ -166,7 +166,7 @@ def rmsnorm_residual_fused_for_gemm(
     return out_normed_buffer, out_residual_buffer
 
 
-def rmsnorm_residual_fused_hybrid(
+def rmsnorm_residual_(
         x: torch.Tensor,
         residual: torch.Tensor,
         weight: torch.Tensor,
@@ -237,7 +237,7 @@ def benchmark_rmsnorm_residual():
     # 方案 2: 修复后的 rmsnorm_residual_fused_for_gemm
     # -------------------------------------------------------------------------
     def fused_path():
-        normed, res_out = rmsnorm_residual_fused_hybrid(
+        normed, res_out = rmsnorm_residual_(
             attn_out, residual_h, ln_weight,
             out_normed_buffer
         )
