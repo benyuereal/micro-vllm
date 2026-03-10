@@ -11,8 +11,8 @@ from kernel.swiglu import swiglu_gemm
 from .rope import RoPE
 from core.parallel_config import get_rank, get_world_size, all_reduce
 import torch._dynamo
-torch._dynamo.config.recompile_limit = 128  # 设置一个足够大的值
-torch._dynamo.config.cache_size_limit = 128  # 增加缓存容量
+torch._dynamo.config.recompile_limit = 128
+torch._dynamo.config.cache_size_limit = 128
 try:
     from flash_attn import flash_attn_with_kvcache
 except ImportError:
@@ -47,110 +47,86 @@ class ModelGraphRunner:
         self._ready = False
         self.rope = RoPE()
 
-        # 【新增】编译 MLP 前向传播函数
-        # 使用 'max-autotune' 模式获得最佳性能（编译时间较长）
-        # 若需快速迭代，可改为 'reduce-overhead'
+        # 编译MLP前向以优化性能（禁用内部CUDAGraph防止冲突）
         self._compiled_mlp = torch.compile(
-            self._standalone_mlp_forward,
+            self._mlp_forward,
             fullgraph=True,
             backend="inductor",
             options={
-                # 模拟 "max-autotune" 的行为
                 "max_autotune": True,
                 "max_autotune_gemm": True,
-                # 【核心】禁用 Inductor 内部的 CUDAGraph，防止与外层捕获冲突
                 "triton.cudagraphs": False,
                 "triton.cudagraph_trees": False,
             }
         )
 
-        # 先准备权重，再分配Buffer（确保维度匹配）
         self.prepare()
         self._allocate_buffers()
 
-
-    def _standalone_mlp_forward(self, x, gu_weight, d_weight):
-        """
-        标准的 SwiGLU MLP 前向传播。
-        用纯 PyTorch 操作编写，以便 torch.compile 优化。
-        替换了原来的 swiglu_gemm 等手写 kernel。
-        """
-        # 1. Gate & Up 投影 (Column Parallel)
+    def _mlp_forward(self, x, gu_weight, d_weight):
+        """SwiGLU MLP前向传播，纯PyTorch实现便于torch.compile优化"""
+        # Gate & Up投影 + SwiGLU激活
         gate_up = x @ gu_weight
-
-        # 2. SwiGLU 激活
-        # 替代 swiglu_gemm / swiglu_fused
         up, gate = gate_up.chunk(2, dim=-1)
         activated = F.silu(gate) * up
-
-        # 3. Down 投影 (Row Parallel)
+        # Down投影
         return activated @ d_weight
 
     def prepare(self):
-        """预缓存转置权重 & TP切分（简化QKV处理）"""
+        """预缓存转置权重 & TP切分"""
         cfg = self.model.config
         global_num_heads = cfg.num_attention_heads
         global_kv_heads = getattr(cfg, "num_key_value_heads", global_num_heads)
-        head_size = self.head_size
-        q_dim = global_num_heads * head_size
-        kv_dim = global_kv_heads * head_size
+        q_dim = global_num_heads * self.head_size
+        kv_dim = global_kv_heads * self.head_size
 
         for block in self.model.transformer.h:
             mlp = block.mlp
-
             # MLP Gate/Up (Column Parallel)
             w1, w2 = mlp.w1.weight, mlp.w2.weight
             mlp._gu = torch.cat([
                 w1.chunk(self.world_size, dim=0)[self.rank],
                 w2.chunk(self.world_size, dim=0)[self.rank]
             ], dim=0).t().contiguous()
-
             # MLP Down (Row Parallel)
             mlp._d = mlp.c_proj.weight.chunk(self.world_size, dim=1)[self.rank].t().contiguous()
-
             # Attention Output (Row Parallel)
             block.attn._o = block.attn.c_proj.weight.chunk(self.world_size, dim=1)[self.rank].t().contiguous()
-
             # QKV (Column Parallel)
             w_qkv, b_qkv = block.attn.c_attn.weight, block.attn.c_attn.bias
             w_q, w_k, w_v = w_qkv.split([q_dim, kv_dim, kv_dim], dim=0)
             local_qkv = [w.chunk(self.world_size, dim=0)[self.rank] for w in (w_q, w_k, w_v)]
             block.attn._qkv_w = torch.cat(local_qkv, dim=0).t().contiguous()
-
+            block.attn._qkv_b = None
             if b_qkv is not None:
                 b_q, b_k, b_v = b_qkv.split([q_dim, kv_dim, kv_dim], dim=0)
                 local_b = [b.chunk(self.world_size, dim=0)[self.rank] for b in (b_q, b_k, b_v)]
                 block.attn._qkv_b = torch.cat(local_b, dim=0)
-            else:
-                block.attn._qkv_b = None
 
         logger.info(f"✅ 权重预缓存完成 (Rank {self.rank})")
 
     def _allocate_buffers(self):
-        """预分配Decode阶段的中间Buffer"""
+        """预分配Decode阶段中间Buffer"""
         max_b = self.max_batch_size
         self._input_ids = torch.empty(max_b, dtype=torch.long, device=self.device)
         self._logits = torch.empty(max_b, self.vocab_size, dtype=self.dtype, device=self.device)
 
-        # 从第一个block获取切分后的实际维度
+        # 从第一个block获取切分后维度
         _block = self.model.transformer.h[0]
         qkv_dim = _block.attn._qkv_w.shape[1]
         o_dim = _block.attn._o.shape[1]
 
-        # 分配中间Buffer (移除了不再需要的 _gate_up, _swiglu_out, _mlp_out)
-        self._normed_buffer = torch.empty((max_b, self.hidden_dim), dtype=self.dtype, device=self.device)
-        self._qkv_buffer = torch.empty(max_b, qkv_dim, dtype=self.dtype, device=self.device)
-        self._attn_output_buffer = torch.empty(max_b, o_dim, dtype=self.dtype, device=self.device)
-        self._out_residual = torch.empty((max_b, self.hidden_dim), dtype=self.dtype, device=self.device)
-        # _gate_up: (batch, intermediate_size)
+        # 分配中间Buffer
+        self._normed = torch.empty((max_b, self.hidden_dim), dtype=self.dtype, device=self.device)
+        self._qkv = torch.empty(max_b, qkv_dim, dtype=self.dtype, device=self.device)
+        self._attn_out = torch.empty(max_b, o_dim, dtype=self.dtype, device=self.device)
+        self._residual = torch.empty((max_b, self.hidden_dim), dtype=self.dtype, device=self.device)
         self._gate_up = torch.empty((max_b, self.intermediate_size), dtype=self.dtype, device=self.device)
-        # _swiglu_out: (batch, intermediate_size // 2) - swiglu 后维度减半
         self._swiglu_out = torch.empty((max_b, self.intermediate_size // 2), dtype=self.dtype, device=self.device)
-        # 【修复 2/2】_mlp_out 应该是 (batch, hidden_dim)，因为 down 投影回 hidden
         self._mlp_out = torch.empty((max_b, self.hidden_dim), dtype=self.dtype, device=self.device)
 
     def decode(self, input_ids, batch_size, cache_manager, use_graph_cache):
-        """单token前向（decode步）"""
+        """单token前向（Decode步）"""
         h = self.model.transformer.wte(input_ids)
 
         for layer_idx in range(self.num_layers):
@@ -158,17 +134,16 @@ class ModelGraphRunner:
             w_qkv, b_qkv = block.attn._qkv_w, block.attn._qkv_b
             w_o = block.attn._o
 
-            # Attention (复用QKV Buffer)
-            rmsnorm_(h, block.ln_1.weight, self._normed_buffer[:batch_size], block.ln_1.eps)
-            qkv = self._qkv_buffer[:batch_size]
-            torch.matmul(self._normed_buffer[:batch_size], w_qkv, out=qkv)
+            # Attention
+            rmsnorm_(h, block.ln_1.weight, self._normed[:batch_size], block.ln_1.eps)
+            qkv = self._qkv[:batch_size]
+            torch.matmul(self._normed[:batch_size], w_qkv, out=qkv)
             if b_qkv is not None:
                 qkv.add_(b_qkv)
 
             q, k, v = qkv.reshape(batch_size, 3, self.num_heads, self.head_size).unbind(dim=1)
-
             k_cache, v_cache = cache_manager.get(layer_idx)
-            cache_seqlens = cache_manager._cache_seqlens_buffer[:batch_size]
+            cache_lens = cache_manager._cache_seqlens_buffer[:batch_size]
             block_table = (
                 cache_manager._block_table_buffer[:batch_size]
                 if use_graph_cache else
@@ -176,86 +151,61 @@ class ModelGraphRunner:
             )
 
             attn = flash_attn_with_kvcache(
-                q=q.unsqueeze(1),
-                k_cache=k_cache,
-                v_cache=v_cache,
-                k=k.unsqueeze(1),
-                v=v.unsqueeze(1),
-                rotary_cos=self.attention._cos_pool,
-                rotary_sin=self.attention._sin_pool,
-                cache_seqlens=cache_seqlens,
-                block_table=block_table,
-                causal=True,
-                window_size=(-1, -1),
-                rotary_interleaved=False,
-                alibi_slopes=None,
-                num_splits=max(1, 32 // max(1, batch_size * 4))  # 修复除0
+                q=q.unsqueeze(1), k_cache=k_cache, v_cache=v_cache,
+                k=k.unsqueeze(1), v=v.unsqueeze(1),
+                rotary_cos=self.attention._cos_pool, rotary_sin=self.attention._sin_pool,
+                cache_seqlens=cache_lens, block_table=block_table,
+                causal=True, window_size=(-1, -1), rotary_interleaved=False,
+                alibi_slopes=None, num_splits=max(1, 32 // max(1, batch_size * 4))
             ).squeeze(1)
 
-            attn_out = self._attn_output_buffer[:batch_size]
+            attn_out = self._attn_out[:batch_size]
             torch.matmul(attn.reshape(batch_size, -1), w_o, out=attn_out)
             out = all_reduce(attn_out)
 
             rmsnorm_residual_gemm(out, h, block.ln_2.weight,
-                                  self._normed_buffer[:batch_size],
-                                  self._out_residual[:batch_size],
+                                  self._normed[:batch_size], self._residual[:batch_size],
                                   block.ln_2.eps)
 
-            # 【修改】使用 torch.compile 优化后的 MLP
+            # MLP（小batch用编译版本，大batch用手写kernel）
             if batch_size <= 16:
-                mlp_out = self._compiled_mlp(
-                    self._normed_buffer[:batch_size],
-                    block.mlp._gu,
-                    block.mlp._d
-                )
-                h = all_reduce(mlp_out).add_(self._out_residual[:batch_size])
+                mlp_out = self._compiled_mlp(self._normed[:batch_size], block.mlp._gu, block.mlp._d)
+                h = all_reduce(mlp_out).add_(self._residual[:batch_size])
             else:
-                torch.matmul(self._normed_buffer[:batch_size], block.mlp._gu, out=self._gate_up[:batch_size])
-                # 2. SwiGLU Activation
+                torch.matmul(self._normed[:batch_size], block.mlp._gu, out=self._gate_up[:batch_size])
                 swiglu_gemm(self._gate_up[:batch_size], self._swiglu_out[:batch_size])
-                # 3. Down Projection
                 torch.matmul(self._swiglu_out[:batch_size], block.mlp._d, out=self._mlp_out[:batch_size])
-                # 4. Residual Add
-                h = all_reduce(self._mlp_out[:batch_size]).add_(self._out_residual[:batch_size])
-
-
+                h = all_reduce(self._mlp_out[:batch_size]).add_(self._residual[:batch_size])
 
         h = self.model.transformer.ln_f(h)
         return self.model.lm_head(h)
 
     def capture(self, cache_manager, batch_sizes: List[int] = [1, 2, 4, 8, 16, 32]):
+        """捕获CUDA Graph & 预热torch.compile"""
         if self._ready:
             return
 
-        logger.info("🎯 开始捕获 CUDA Graph & 预热 torch.compile ...")
+        logger.info("🎯 开始捕获 CUDA Graph & 预热 ...")
 
-        # 【修改】多 Batch Size 预热
+        # 步骤1：多Batch Size预热MLP
         if batch_sizes:
-            logger.info(f"   步骤 1/2: 预热 Kernel (Shapes: {batch_sizes}) ...")
-
-            # 获取第0层的权重引用用于预热
+            logger.info(f"   步骤1/2: 预热Kernel (Shapes: {batch_sizes}) ...")
             _block0 = self.model.transformer.h[0]
-            _gu = _block0.mlp._gu
-            _d = _block0.mlp._d
-
+            _gu, _d = _block0.mlp._gu, _block0.mlp._d
 
             with torch.no_grad():
                 for bs in batch_sizes:
                     logger.info(f"     - Compiling for BS={bs} ...")
                     _x = torch.randn(bs, self.hidden_dim, dtype=self.dtype, device=self.device)
-
-
-                    # 预热 MLP
                     for _ in range(3):
                         _ = self._compiled_mlp(_x, _gu, _d)
 
             torch.cuda.synchronize()
             logger.info("   ✅ 预热完成")
 
-        # 步骤 2：正常捕获 CUDA Graph
+        # 步骤2：捕获CUDA Graph
         for bs in batch_sizes:
             g = torch.cuda.CUDAGraph()
-
             # Warmup
             dummy = torch.randint(0, self.vocab_size, (bs,), device=self.device)
             for _ in range(3):
@@ -263,11 +213,9 @@ class ModelGraphRunner:
                     self.decode(dummy, bs, cache_manager, use_graph_cache=False)
             torch.cuda.synchronize()
 
-            logger.info(f"   步骤 2/2: 捕获 Batch size {bs} ...")
+            logger.info(f"   步骤2/2: 捕获 Batch size {bs} ...")
             with torch.no_grad(), torch.cuda.graph(g):
-                self._logits[:bs] = self.decode(
-                    self._input_ids[:bs], bs, cache_manager, use_graph_cache=True
-                )
+                self._logits[:bs] = self.decode(self._input_ids[:bs], bs, cache_manager, use_graph_cache=True)
             self._graphs[bs] = g
             logger.info(f"   - Batch size {bs} OK")
 
@@ -275,10 +223,8 @@ class ModelGraphRunner:
 
     def forward(self, input_ids: torch.Tensor, cache_manager, batch_size: int) -> torch.Tensor:
         self._input_ids[:batch_size] = input_ids
-
         if batch_size not in self._graphs:
             return self.decode(input_ids, batch_size, cache_manager, use_graph_cache=False)
-
         self._graphs[batch_size].replay()
         return self._logits[:batch_size]
 
@@ -288,7 +234,7 @@ class ModelGraphRunner:
         h = self.model.transformer.wte(input_ids)
 
         # 初始化cache状态
-        cache_seqlens = cache_manager._cache_seqlens_buffer[:batch_size].zero_()
+        cache_lens = cache_manager._cache_seqlens_buffer[:batch_size].zero_()
         block_table = cache_manager._block_table_buffer[:batch_size]
 
         for layer_idx in range(self.num_layers):
@@ -302,27 +248,18 @@ class ModelGraphRunner:
                 qkv += b_qkv
 
             q, k, v = qkv.view(B, S, 3, self.num_heads, self.head_size).unbind(dim=2)
-
-            # 手动RoPE
             q, k = self.rope.forward(q, k, self.attention._cos_pool, self.attention._sin_pool)
 
             k_cache, v_cache = cache_manager.get(layer_idx)
             attn = flash_attn_with_kvcache(
-                q=q,
-                k_cache=k_cache,
-                v_cache=v_cache,
-                k=k,
-                v=v,
-                cache_seqlens=cache_seqlens,
-                block_table=block_table,
-                causal=True
+                q=q, k_cache=k_cache, v_cache=v_cache, k=k, v=v,
+                cache_seqlens=cache_lens, block_table=block_table, causal=True
             )
 
             out = all_reduce(torch.matmul(attn.view(B, S, -1), w_o))
-
             normed, residual = rmsnorm_residual_fused(out, h, block.ln_2.weight, block.ln_2.eps)
 
-            # 【修改】Prefill 阶段也使用编译后的 MLP
+            # Prefill阶段使用编译后的MLP
             mlp_out = self._compiled_mlp(normed, block.mlp._gu, block.mlp._d)
             h = all_reduce(mlp_out).add_(residual)
 
