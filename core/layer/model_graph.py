@@ -5,7 +5,7 @@ from typing import Dict, List
 
 from core.paged_attention import PagedAttention
 from kernel.swiglu import swiglu_fused as swiglu
-from kernel.rmsnorm_add import rmsnorm_residual_fused, rmsnorm
+from kernel.rmsnorm_add import rmsnorm_residual_fused, rmsnorm, rmsnorm_fused_for_gemm
 from .rope import RoPE
 from core.parallel_config import get_rank, get_world_size, all_reduce
 
@@ -99,7 +99,9 @@ class ModelGraphRunner:
         gu_dim = _block.mlp._gu.shape[1]
         o_dim = _block.attn._o.shape[1]
 
+
         # 分配中间Buffer
+        self._normed_buffer = torch.empty((max_b, self.hidden_dim),dtype=self.dtype, device=self.device)
         self._qkv_buffer = torch.empty(max_b, qkv_dim, dtype=self.dtype, device=self.device)
         self._gate_up_buffer = torch.empty(max_b, gu_dim, dtype=self.dtype, device=self.device)
         self._attn_output_buffer = torch.empty(max_b, o_dim, dtype=self.dtype, device=self.device)
@@ -115,9 +117,9 @@ class ModelGraphRunner:
             w_o = block.attn._o
 
             # Attention (复用QKV Buffer)
-            normed = rmsnorm(h, block.ln_1.weight, block.ln_1.eps)
+            rmsnorm_fused_for_gemm(h, block.ln_1.weight,  self._normed_buffer[:batch_size] ,block.ln_1.eps)
             qkv = self._qkv_buffer[:batch_size]
-            torch.matmul(normed, w_qkv, out=qkv)
+            torch.matmul(self._normed_buffer[:batch_size], w_qkv, out=qkv)
             if b_qkv is not None:
                 qkv += b_qkv
 

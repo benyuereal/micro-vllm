@@ -65,33 +65,34 @@ class Scheduler:
         # 3. 解码阶段：Padding 凑齐 batch_size
         if self.running_sequences:
             length_groups = defaultdict(list)
-            for seq in self.running_sequences:
-                if seq.state == "decode" and not seq.is_finished():
-                    length = seq.current_position
-                    length_groups[length].append(seq)
-            if length_groups:
-                # 找到最短的长度组（SJF）
-                min_length = min(length_groups.keys())
-                min_group = length_groups[min_length]
-
-                # 同长度组内可以任意排序（已经是相同长度）
-                # 直接取前 max_batch_size 个
-                selected = min_group[:self.max_batch_size]
-                if selected:
-                    batch = selected
-                    batch_type = "decode"
-                    # 从 batch_sizes 中找到第一个 <= len(batch) 的值（向下取整）
-                    batch_len = len(batch)
-                    batch_size = min((b for b in self.batch_sizes if b >= batch_len), default=self.batch_sizes[-1])
-
-                    # 【修改2】Padding补齐：简单复制，直到长度达标
-                    padded_batch = batch.copy()
-                    idx = 0
-                    while len(padded_batch) < batch_size:
-                        padded_batch.append(padded_batch[idx % len(batch)])  # 循环复制
-                        idx += 1
-
-                    return padded_batch, batch_type
+            return self.running_sequences, "running"
+            # for seq in self.running_sequences:
+            #     if seq.state == "decode" and not seq.is_finished():
+            #         length = seq.current_position
+            #         length_groups[length].append(seq)
+            # if length_groups:
+            #     # 找到最短的长度组（SJF）
+            #     min_length = min(length_groups.keys())
+            #     min_group = length_groups[min_length]
+            #
+            #     # 同长度组内可以任意排序（已经是相同长度）
+            #     # 直接取前 max_batch_size 个
+            #     selected = min_group[:self.max_batch_size]
+            #     if selected:
+            #         batch = selected
+            #         batch_type = "decode"
+            #         # 从 batch_sizes 中找到第一个 <= len(batch) 的值（向下取整）
+            #         batch_len = len(batch)
+            #         batch_size = min((b for b in self.batch_sizes if b >= batch_len), default=self.batch_sizes[-1])
+            #
+            #         # 【修改2】Padding补齐：简单复制，直到长度达标
+            #         padded_batch = batch.copy()
+            #         idx = 0
+            #         while len(padded_batch) < batch_size:
+            #             padded_batch.append(padded_batch[idx % len(batch)])  # 循环复制
+            #             idx += 1
+            #
+            #         return padded_batch, batch_type
 
 
         return [], "idle"
