@@ -298,6 +298,15 @@ curl -X POST "http://localhost:8000/generate_stream" \
     "temperature": 0.7,
     "stream": true
   }'
+  
+curl -X POST "http://localhost:8000/generate_stream" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "prompt": "介绍一下北京这个城市",
+    "max_tokens": 500,
+    "temperature": 0.7,
+    "stream": true
+  }'
 ```
 
 ---

@@ -275,7 +275,7 @@ class InferenceEngine:
         # 4. 采样
         if rank0():
             # stats.sample_time = time.time()
-            next_tokens = self.sampler(logits, temps, topp, 1000).tolist()
+            next_tokens = self.sampler(logits, temps, topp, 50).tolist()
             for i, seq in enumerate(batch):
                 seq._next_token = next_tokens[i]
             # stats.sample_time = time.time() - stats.sample_time
