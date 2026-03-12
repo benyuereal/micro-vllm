@@ -210,12 +210,12 @@ In single-user sequential request scenarios, micro-vllm demonstrates superior in
 | vLLM | 75.88      | 100%                 |
 | HuggingFace | 20         | 27%                  |
 
-### Batch Concurrency (35 Requests)
+### Batch Concurrency (32 Requests)
 
 | Framework | Per-Request (tokens/s) | Total Throughput (tokens/s) |
 |:----------|:-----------------------|:------------------------------|
-| **This Framework** | **54** | **1780** |
-| vLLM | 60 | ~2100 |
+| **This Framework** | **60** | **1920** |
+| vLLM | 62 | ~1984 |
 
 ---
 

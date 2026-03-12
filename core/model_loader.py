@@ -12,6 +12,10 @@ def load_model(model_path, device=None):
             use_fast=True,
             local_files_only=True
         )
+        print(f"Tokenizer class: {tokenizer.__class__.__name__}")  # 应该输出 "QWenTokenizer"
+        print(f"[DEBUG] eos_token_id: {tokenizer.eos_token_id}")  # Qwen-7B-Chat 通常是 151643
+
+
     except Exception as e:
         print(f"Fast tokenizer failed: {e}, trying slow tokenizer")
         tokenizer = AutoTokenizer.from_pretrained(

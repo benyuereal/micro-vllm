@@ -207,12 +207,12 @@ activated = swiglu_fused(gate_up)  # 一步完成融合计算
 | vLLM | 75.88      | 100%       |
 | HuggingFace | 20         | 27%        |
 
-### 批量并发 (35 请求)
+### 批量并发 (32 请求)
 
 | 框架 | 单请求 (tokens/s) | 吞吐量 (tokens/s) |
 |------|------------------|-------------------|
-| **本框架** | **54** | **1780** |
-| vLLM | 60 | ~2100 |
+| **本框架** | **60** | **1920** |
+| vLLM | 62 | ~1984 |
 
 
 
@@ -294,6 +294,15 @@ curl -X POST "http://localhost:8000/generate_stream" \
   -H "Content-Type: application/json" \
   -d '{
     "prompt": "写一个 SpringBoot 文件上传代码",
+    "max_tokens": 500,
+    "temperature": 0.7,
+    "stream": true
+  }'
+  
+curl -X POST "http://localhost:8000/generate_stream" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "prompt": "介绍一下北京这个城市",
     "max_tokens": 500,
     "temperature": 0.7,
     "stream": true
