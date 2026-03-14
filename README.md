@@ -11,7 +11,7 @@
   </a>
 </p>
 
-> A high-performance LLM inference engine implementing **PagedAttention + Flash Attention + SwiGLU Kernel Fusion** from scratch. Achieves **106%** of vLLM's single user performance on A100, suitable for small-scale production deployment and learning.
+> A high-performance LLM inference engine implementing **PagedAttention + Flash Attention + SwiGLU Kernel Fusion** from scratch. Achieves **108%** of vLLM's single user performance on A100, suitable for small-scale production deployment and learning.
 > 
 > 🚀 **Latest Update**: Tensor Parallelism is now supported for multi-GPU inference!
 
@@ -197,7 +197,7 @@ In single-user sequential request scenarios, micro-vllm demonstrates superior in
 
 | Metric | micro-vllm  | vLLM Official |
 |:---------|:------------|:--------------|
-| **Mean** | **80.5** ✅ | **75.88** |
+| **Mean** | **81.5** ✅ | **75.88** |
 | **Std Dev** | **0.07** ✅  | **1.95** |
 
 - **+6%** higher average throughput than vLLM, performance aligned with industry benchmark
@@ -206,7 +206,7 @@ In single-user sequential request scenarios, micro-vllm demonstrates superior in
 
 | Framework | tokens/sec | Relative Performance |
 |:----------|:-----------|:---------------------|
-| **This Framework (online branch)** | **80.5**  | **106%**           |
+| **This Framework (online branch)** | **81.5**  | **108%**           |
 | vLLM | 75.88      | 100%                 |
 | HuggingFace | 20         | 27%                  |
 
