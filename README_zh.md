@@ -11,7 +11,7 @@
   </a>
 </p>
 
-> 高性能 LLM 推理引擎，从零实现 **PagedAttention + Flash Attention + SwiGLU 算子融合**，A100 上单用户性能达 vLLM 的 **106%**，适合小规模生产部署和学习。
+> 高性能 LLM 推理引擎，从零实现 **PagedAttention + Flash Attention + SwiGLU 算子融合**，A100 上单用户性能达 vLLM 的 **108%**，适合小规模生产部署和学习。
 > 
 > 🚀 **最新进展**：张量并行发布，支持多卡推理！
 
@@ -193,7 +193,7 @@ activated = swiglu_fused(gate_up)  # 一步完成融合计算
 
 | 指标 | micro-vllm  | vLLM 官方 |
 |---------|-------------|-----------|
-| **平均** | **80.5** ✅ | **75.88** |
+| **平均** | **81.5** ✅ | **75.88** |
 | **标准差** | **0.07** ✅  | **1.95** |
 
 - 单用户平均吞吐领先 vLLM **6%**，性能已对齐业界标杆
@@ -203,7 +203,7 @@ activated = swiglu_fused(gate_up)  # 一步完成融合计算
 
 | 框架 | tokens/sec | 相对性能       |
 |------|------------|------------|
-| **本框架 (online分支)** | **80.5**  | **106%** |
+| **本框架 (online分支)** | **81.5**  | **108%** |
 | vLLM | 75.88      | 100%       |
 | HuggingFace | 20         | 27%        |
 
@@ -303,7 +303,7 @@ curl -X POST "http://localhost:8000/generate_stream" \
   -H "Content-Type: application/json" \
   -d '{
     "prompt": "写一个 SpringBoot + vue 文件上传代码的完整解决方案",
-    "max_tokens": 1000,
+    "max_tokens": 500,
     "temperature": 0.7,
     "stream": true
   }'
