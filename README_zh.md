@@ -299,10 +299,19 @@ curl -X POST "http://localhost:8000/generate_stream" \
     "stream": true
   }'
   
+  curl -X POST "http://localhost:8000/generate_stream" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "prompt": "写一个 SpringBoot + vue 文件上传代码的完整解决方案",
+    "max_tokens": 1000,
+    "temperature": 0.7,
+    "stream": true
+  }'
+  
 curl -X POST "http://localhost:8000/generate_stream" \
   -H "Content-Type: application/json" \
   -d '{
-    "prompt": "介绍一下北京这个城市",
+    "prompt": "介绍一下北京这个城市,还有沈阳 天津",
     "max_tokens": 500,
     "temperature": 0.7,
     "stream": true
