@@ -16,7 +16,7 @@ async def send_request(session, data):
     ) as response:
         async for chunk in response.content:
             chunk_str = chunk.decode('utf-8')  # 将字节转换为字符串
-            if len(chunk_str) > 10:
+            if len(chunk_str) > len(data['prompt']) + 5:
                 text = chunk_str
             # print(f"Received chunk for prompt '{data['prompt'][:20]}...': {chunk_str.strip()}")
             # 统计token数
