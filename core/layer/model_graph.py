@@ -47,9 +47,8 @@ class ModelGraphRunner:
         self.attention = PagedAttention(num_heads, head_size, kv_num_heads, device, max_batch_size)
         self.rope = RoPE()
 
-        # 编译优化函数
-        self._compiled_mlp = self._compile_fn(self._mlp)
-        self._compiled_mlp_next = self._compile_fn(self._mlp_next)
+        # 【关键恢复】保留 _compiled_mlp 作为公共接口
+        self._fast_mlp = self._compile_fn(self._mlp)
 
         # 初始化
         self.prepare_weights()
@@ -60,6 +59,7 @@ class ModelGraphRunner:
         self._is_graph_ready = False
 
     def _compile_fn(self, fn):
+        """保留编译函数供其他类使用"""
         return torch.compile(
             fn,
             fullgraph=True,
@@ -72,34 +72,13 @@ class ModelGraphRunner:
             }
         )
 
-
     @staticmethod
     def _mlp(x, gu_weight, d_weight):
+        """保留纯MLP静态方法供其他类使用"""
         gate_up = x @ gu_weight
         up, gate = gate_up.chunk(2, dim=-1)
         activated = F.silu(gate) * up
         return activated @ d_weight
-
-    @staticmethod
-    def _mlp_next(attn_out, residual_h, ln_2_w, ln_2_eps,
-                  gu_w, d_w, next_ln_w, next_ln_eps, next_qkv_w, next_qkv_b):
-        """融合计算：Attn残差 + MLP + 下一层QKV"""
-        x = attn_out + residual_h
-        var = x.pow(2).mean(dim=-1, keepdim=True)
-        x_normed = x * torch.rsqrt(var + ln_2_eps) * ln_2_w
-
-        gate_up = x_normed @ gu_w
-        up, gate = gate_up.chunk(2, dim=-1)
-        mlp_out = (F.silu(gate) * up) @ d_w
-
-        new_h = mlp_out + x
-
-        next_var = new_h.pow(2).mean(dim=-1, keepdim=True)
-        next_normed = new_h * torch.rsqrt(next_var + next_ln_eps) * next_ln_w
-        next_qkv = next_normed @ next_qkv_w
-        if next_qkv_b is not None:
-            next_qkv += next_qkv_b
-        return next_qkv, new_h
 
     # ==========================================
     # 初始化 (Init)
@@ -159,19 +138,18 @@ class ModelGraphRunner:
     # 工具函数 (Utils)
     # ==========================================
 
-    def _read_ahead(self, h, bs):
-        """初始化第一层 QKV"""
-        first_block = self.model.transformer.h[0]
-        rmsnorm_(h, first_block.ln_1.weight, self._normed[:bs], first_block.ln_1.eps)
+    def _qkv_proj(self, h, block, bs):
+        """QKV投影"""
+        rmsnorm_(h, block.ln_1.weight, self._normed[:bs], block.ln_1.eps)
         qkv_buf = self._qkv[:bs]
-        torch.matmul(self._normed[:bs], first_block.attn._qkv_w, out=qkv_buf)
-        if first_block.attn._qkv_b is not None:
-            qkv_buf.add_(first_block.attn._qkv_b)
+        torch.matmul(self._normed[:bs], block.attn._qkv_w, out=qkv_buf)
+        if block.attn._qkv_b is not None:
+            qkv_buf.add_(block.attn._qkv_b)
         return qkv_buf
 
-    def _flash_attn(self, next_qkv, block, layer_idx, bs, cache_manager, use_graph_cache):
-        """封装 Flash Attention 调用"""
-        q, k, v = next_qkv.reshape(bs, 3, self.num_heads, self.head_size).unbind(dim=1)
+    def _flash_attn(self, qkv, block, layer_idx, bs, cache_manager, use_graph_cache):
+        """Flash Attention"""
+        q, k, v = qkv.reshape(bs, 3, self.num_heads, self.head_size).unbind(dim=1)
         k_cache, v_cache = cache_manager.get(layer_idx)
         cache_lens = cache_manager._cache_seqlens_buffer[:bs]
         block_table = (
@@ -193,77 +171,54 @@ class ModelGraphRunner:
         torch.matmul(attn.reshape(bs, -1), block.attn._o, out=out_buf)
         return out_buf
 
-    def _calc_ffn(self, x_normed, block, bs, use_compiled):
-        """计算 FFN 输出 (不含残差)"""
-        if use_compiled:
-            return self._compiled_mlp(x_normed, block.mlp._gu, block.mlp._d)
+    def _ffn(self, x_normed, block, bs, fast_mode=False):
+        """FFN计算
+        【关键修改】支持动态切换编译/手写路径
+        """
+        if fast_mode:
+            # 小Batch：用编译好的MLP
+            return self._fast_mlp(x_normed, block.mlp._gu, block.mlp._d)
         else:
+            # 大Batch：用手写Kernel
             torch.matmul(x_normed, block.mlp._gu, out=self._gate_up[:bs])
             swiglu_gemm(self._gate_up[:bs], self._swiglu_out[:bs])
             torch.matmul(self._swiglu_out[:bs], block.mlp._d, out=self._mlp_out[:bs])
             return self._mlp_out[:bs]
-
-    def _calc_next(self, h, next_block, bs):
-        """计算下一层的 QKV"""
-        rmsnorm_(h, next_block.ln_1.weight, self._normed[:bs], next_block.ln_1.eps)
-        qkv_buf = self._qkv[:bs]
-        torch.matmul(self._normed[:bs], next_block.attn._qkv_w, out=qkv_buf)
-        if next_block.attn._qkv_b is not None:
-            qkv_buf.add_(next_block.attn._qkv_b)
-        return qkv_buf
 
     # ==========================================
     # 主推理逻辑 (Main Decode)
     # ==========================================
 
     def decode(self, input_ids, bs, cache_manager, use_graph_cache):
+        """标准Transformer计算流
+        【关键修改】根据Batch大小决定是否用 _compiled_mlp
+        """
         h = self.model.transformer.wte(input_ids)
-        next_qkv = self._read_ahead(h, bs)
 
-        # 模式判断
+        # 【关键修改】小Batch用编译MLP，大Batch用手写Kernel
         fast_mode = (self.world_size == 1) and (bs <= 16)
 
-        # --- 1. 中间层循环 (0 到 num_layers - 2) ---
-        for layer_idx in range(self.num_layers - 1):
+        # --- 1. 所有层统一循环 ---
+        for layer_idx in range(self.num_layers):
             block = self.model.transformer.h[layer_idx]
-            next_block = self.model.transformer.h[layer_idx + 1]
 
-            # Attention
-            attn_out = self._flash_attn(next_qkv, block, layer_idx, bs, cache_manager, use_graph_cache)
+            # Step 1: QKV投影
+            qkv = self._qkv_proj(h, block, bs)
+
+            # Step 2: Flash Attention
+            attn_out = self._flash_attn(qkv, block, layer_idx, bs, cache_manager, use_graph_cache)
             attn_out = all_reduce(attn_out)
 
-            # FFN + 下一层 QKV
-            if fast_mode:
-                next_qkv, h = self._compiled_mlp_next(
-                    attn_out, h, block.ln_2.weight, block.ln_2.eps,
-                    block.mlp._gu, block.mlp._d,
-                    next_block.ln_1.weight, next_block.ln_1.eps,
-                    next_block.attn._qkv_w, next_block.attn._qkv_b
-                )
-            else:
-                rmsnorm_residual_gemm(attn_out, h, block.ln_2.weight,
-                                      self._normed[:bs], self._residual[:bs], block.ln_2.eps)
+            # Step 3: FFN (包含残差连接)
+            rmsnorm_residual_gemm(
+                attn_out, h, block.ln_2.weight,
+                self._normed[:bs], self._residual[:bs], block.ln_2.eps
+            )
+            # 【关键修改】传入 use_compiled 参数
+            mlp_out = self._ffn(self._normed[:bs], block, bs, fast_mode=fast_mode)
+            h = all_reduce(mlp_out).add_(self._residual[:bs])
 
-                mlp_out = self._calc_ffn(self._normed[:bs], block, bs, use_compiled=(bs <= 16))
-                h = all_reduce(mlp_out).add_(self._residual[:bs])
-
-                next_qkv = self._calc_next(h, next_block, bs)
-
-        # --- 2. 单独处理最后一层 ---
-        last_block = self.model.transformer.h[-1]
-
-        # Attention
-        attn_out = self._flash_attn(next_qkv, last_block, self.num_layers - 1, bs, cache_manager, use_graph_cache)
-        attn_out = all_reduce(attn_out)
-
-        # FFN
-        rmsnorm_residual_gemm(attn_out, h, last_block.ln_2.weight,
-                              self._normed[:bs], self._residual[:bs], last_block.ln_2.eps)
-
-        mlp_out = self._calc_ffn(self._normed[:bs], last_block, bs, use_compiled=fast_mode)
-        h = all_reduce(mlp_out).add_(self._residual[:bs])
-
-        # Final Norm & Head
+        # --- 2. Final Norm & Head ---
         h = self.model.transformer.ln_f(h)
         return self.model.lm_head(h)
 
@@ -272,14 +227,13 @@ class ModelGraphRunner:
 
         logger.info("🎯 开始捕获 CUDA Graph ...")
 
-        # 预热 MLP
         if batch_sizes:
             _block0 = self.model.transformer.h[0]
             _gu, _d = _block0.mlp._gu, _block0.mlp._d
             with torch.no_grad():
                 for bs in batch_sizes:
                     _x = torch.randn(bs, self.hidden_dim, dtype=self.dtype, device=self.device)
-                    for _ in range(3): _ = self._compiled_mlp(_x, _gu, _d)
+                    for _ in range(3): _ = self._fast_mlp(_x, _gu, _d)
             torch.cuda.synchronize()
 
         # 捕获 Graph
