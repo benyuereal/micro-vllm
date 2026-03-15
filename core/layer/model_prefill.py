@@ -55,7 +55,7 @@ class ModelPrefillRunner(ModelGraphRunner):
             normed, residual = rmsnorm_residual_fused(out, h, block.ln_2.weight, block.ln_2.eps)
 
             # MLP 前向 (复用父类编译好的函数)
-            mlp_out = self._compiled_mlp(normed, block.mlp._gu, block.mlp._d)
+            mlp_out = self._fast_mlp(normed, block.mlp._gu, block.mlp._d)
             h = all_reduce(mlp_out).add_(residual)
 
         h = self.model.transformer.ln_f(h)
