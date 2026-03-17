@@ -239,12 +239,10 @@ class InferenceEngine:
             logger.info(f"Prefill: Prep {stats.prep_time*1000:.1f}ms, GPU {stats.gpu_time*1000:.1f}ms, Total {stats.total_time*1000:.1f}ms | Batch {len(batch)}")
 
     def _decode(self, batch: List[Sequence]):
-        # stats = InferenceStats(total_time=time.time())
+
         device = self.device
         batch_size = len(batch)
 
-        # 1. 准备与去重
-        # stats.prep_time = time.time()
         seen = set()
         mask = []
         for seq in batch:
@@ -260,25 +258,16 @@ class InferenceEngine:
             if mask[i]: self.cache_manager.append(seq.seq_id)
         
         self.cache_manager.cache_batch_data([s.seq_id for s in batch], [s.current_position for s in batch])
-        
-        # 回滚 padding 位置
-        # for i in range(batch_size):
-        #     if not mask[i]: self.cache_manager._cache_seqlens_buffer[i] -= 1
-        
-        # stats.prep_time = time.time() - stats.prep_time
 
         # 3. 推理
-        # stats.gpu_time = time.time()
         logits = self.graph_runner.forward(input_ids, self.cache_manager, batch_size)
-        # stats.gpu_time = time.time() - stats.gpu_time
 
         # 4. 采样
         if rank0():
-            # stats.sample_time = time.time()
+
             next_tokens = self.sampler(logits, temps, topp, 50).tolist()
             for i, seq in enumerate(batch):
                 seq._next_token = next_tokens[i]
-            # stats.sample_time = time.time() - stats.sample_time
 
             # stats.total_time = time.time() - stats.total_time
             # if batch and batch[0].current_position % 50 == 0:
@@ -286,24 +275,47 @@ class InferenceEngine:
 
     def update_sequences(self, sequences: List[Sequence]):
         seq_dict = defaultdict(int)
+
+        output_tokens = []
+        callbacks_batch = []
+
+        # 局部变量缓存，减少循环内开销
+        stream_callbacks = self.stream_callbacks
+
+        # --- 第一阶段：GPU 状态更新与数据收集 ---
         for seq in sequences:
-            if seq._next_token is None: continue
-            
-            if seq.seq_id in seq_dict:
-                # 已经更新的队列 不再更新
+            next_token = seq._next_token
+            if next_token is None:
                 continue
 
-            seq_dict[seq.seq_id] = seq.current_position
-            seq.update_state(seq._next_token, None)
-            
+            seq_id = seq.seq_id
+            if seq_id in seq_dict:
+                continue
+
+            seq_dict[seq_id] = seq.current_position
+            seq.update_state(next_token, None)
+
+            # 收集需要回调的数据
             if rank0():
-                # 流式输出
-                txt = self.tokenizer.decode([seq._next_token], skip_special_tokens=True)
-                if cb := self.stream_callbacks.get(seq.seq_id):
-                    try: cb(seq._next_token, txt)
-                    except: pass
-            
+                cb = stream_callbacks.get(seq_id)
+                if cb:
+                    output_tokens.append(next_token)
+                    callbacks_batch.append(cb)
+
             if seq.is_finished():
-                self.cache_manager.free(seq.seq_id)
+                self.cache_manager.free(seq_id)
                 if rank0():
                     self.scheduler.mark_finished(seq)
+
+        # --- 第二阶段：批量 CPU 解码与回调 ---
+        if rank0() and callbacks_batch:
+            texts = self.tokenizer.batch_decode(
+                [[t] for t in output_tokens],
+                skip_special_tokens=True
+            )
+
+            for cb, token, txt in zip(callbacks_batch, output_tokens, texts):
+                try:
+                    cb(token, txt)
+                except Exception:
+                    pass

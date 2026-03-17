@@ -140,6 +140,40 @@ if not is_macos() and torch.cuda.is_available():
         tl.store(v_cache_ptr + cache_offset, value)
 
 
+    @triton.jit
+    def _block_table_kernel(
+            flat_blocks_ptr,  # [total_blocks] 所有的 block id 展平
+            flat_offsets_ptr,  # [batch_size+1] 每个序列的起始偏移
+            block_table_ptr,  # [max_batch, max_seq_blocks] 目标表
+            batch_size: tl.constexpr,
+            max_seq_blocks: tl.constexpr,
+            BLOCK_TABLE_BATCH_STRIDE: tl.constexpr,
+            BLOCK_TABLE_BLOCK_STRIDE: tl.constexpr,
+    ):
+        """
+        一个线程负责写入 block_table 中的一个位置 (i, j)
+        """
+        idx = tl.program_id(0)
+        i = idx // max_seq_blocks  # 当前处理的 batch index
+        j = idx % max_seq_blocks  # 当前处理的 block index
+
+        if i < batch_size:
+            # 读取当前序列的范围 [start, end)
+            start = tl.load(flat_offsets_ptr + i)
+            end = tl.load(flat_offsets_ptr + i + 1)
+            num_blocks = end - start
+
+            # 如果 j 在范围内，写入数据；否则写入 -1
+            if j < num_blocks:
+                block_id = tl.load(flat_blocks_ptr + start + j)
+            else:
+                block_id = -1
+
+            # 计算地址并写入
+            offset = (i * BLOCK_TABLE_BATCH_STRIDE +
+                      j * BLOCK_TABLE_BLOCK_STRIDE)
+            tl.store(block_table_ptr + offset, block_id)
+
 def store_kvcache(
         key: torch.Tensor,  # [num_tokens, num_heads, head_size]
         value: torch.Tensor,  # [num_tokens, num_heads, head_size]
@@ -348,6 +382,11 @@ class KVCacheManager:
             max_batch_size, dtype=torch.int32, device=device
         )
 
+        # ================= 为 Triton Kernel 准备的临时缓冲区 =================
+        max_possible_blocks = max_batch_size * self.max_seq_blocks
+        self._pre_blocks_buffer = torch.zeros(max_possible_blocks, dtype=torch.int32, device=device)
+        self._offsets_buffer = torch.zeros(max_batch_size + 1, dtype=torch.int32, device=device)
+
     def alloc(self, seq_id: int, n_tokens: int):
         """
         📌 **分配缓存块** (预填充阶段调用)
@@ -507,44 +546,46 @@ class KVCacheManager:
 
     # 准备推理的数据
     def cache_batch_data(self, seq_ids: list, context_lens: list):
-        """静态化版本：原地更新缓冲区，不创建新张量"""
         batch_size = len(seq_ids)
-        
-        # 获取 block tables
-        block_tables = [self.get_blocks(seq_id) for seq_id in seq_ids]
-        
-        # 原地更新：先重置为 -1
-        self._block_table_buffer[:batch_size] = -1
-        
-        # 优化：收集所有数据到列表，然后一次性转换到GPU（避免循环中多次创建tensor）
-        if batch_size > 0:
-            # 收集所有blocks数据（展平）
-            blocks_allocated = []
-            block_offsets = [0]  # 每个序列的起始位置
-            for blocks in block_tables:
-                blocks_allocated.extend(blocks)
-                block_offsets.append(block_offsets[-1] + len(blocks))
-            
-            # 一次性创建GPU tensor并复制
-            if blocks_allocated:
-                blocks_tensor = torch.tensor(blocks_allocated, dtype=torch.int32, device=self.device)
-                # 逐行填充
-                for i, blocks in enumerate(block_tables):
-                    if blocks:
-                        start = block_offsets[i]
-                        end = block_offsets[i + 1]
-                        self._block_table_buffer[i, :len(blocks)] = blocks_tensor[start:end]
-            
-            # 优化 context_lens：使用CPU tensor一次性拷贝
-            context_lens_tensor = torch.tensor(context_lens, dtype=torch.int32)
-            self._cache_seqlens_buffer[:batch_size] = context_lens_tensor.to(self.device, non_blocking=True)
-        
-        # 返回视图（同一内存地址）
-        return (
-            self._block_table_buffer[:batch_size],
-            self._cache_seqlens_buffer[:batch_size]
+        if batch_size == 0:
+            return self._block_table_buffer[:0], self._cache_seqlens_buffer[:0]
+
+        # 1. 收集并展平数据
+        flat = []
+        offsets = [0]
+        for seq_id in seq_ids:
+            blocks = self._blocks[seq_id]
+            flat.extend(blocks)
+            offsets.append(offsets[-1] + len(blocks))
+
+        total_blocks = offsets[-1]
+
+        # 2. 写入 context_lens
+        self._cache_seqlens_buffer[:batch_size].copy_(
+            torch.tensor(context_lens, dtype=torch.int32)
         )
 
+        # 3. 批量写入辅助缓冲区
+        self._pre_blocks_buffer[:total_blocks].copy_(
+            torch.tensor(flat, dtype=torch.int32)
+        )
+        self._offsets_buffer[:batch_size + 1].copy_(
+            torch.tensor(offsets, dtype=torch.int32)
+        )
+
+        # 4. 启动 Kernel 填充主表
+        grid = (batch_size * self.max_seq_blocks,)
+        _block_table_kernel[grid](
+            self._pre_blocks_buffer,
+            self._offsets_buffer,
+            self._block_table_buffer,
+            batch_size,
+            self.max_seq_blocks,
+            self._block_table_buffer.stride(0),
+            self._block_table_buffer.stride(1),
+        )
+
+        return self._block_table_buffer[:batch_size], self._cache_seqlens_buffer[:batch_size]
 
         # 准备推理的数据
     def get_buffer_data(self, seq_ids: list):
