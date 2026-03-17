@@ -167,7 +167,7 @@ class ModelGraphRunner:
             rotary_cos=self.attention._cos_pool, rotary_sin=self.attention._sin_pool,
             cache_seqlens=cache_lens, block_table=block_table,
             causal=True, window_size=(-1, -1), rotary_interleaved=False,
-            alibi_slopes=None, num_splits=max(1, 32 // max(1, bs * 4))
+            alibi_slopes=None, num_splits=0 if bs >= 32 else max(1, 32 // max(1, bs * 4))
         ).squeeze(1)
 
         out_buf = self._attn_out[:bs]
