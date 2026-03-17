@@ -286,24 +286,47 @@ class InferenceEngine:
 
     def update_sequences(self, sequences: List[Sequence]):
         seq_dict = defaultdict(int)
+
+        output_tokens = []
+        callbacks_batch = []
+
+        # 局部变量缓存，减少循环内开销
+        stream_callbacks = self.stream_callbacks
+
+        # --- 第一阶段：GPU 状态更新与数据收集 ---
         for seq in sequences:
-            if seq._next_token is None: continue
-            
-            if seq.seq_id in seq_dict:
-                # 已经更新的队列 不再更新
+            next_token = seq._next_token
+            if next_token is None:
                 continue
 
-            seq_dict[seq.seq_id] = seq.current_position
-            seq.update_state(seq._next_token, None)
-            
+            seq_id = seq.seq_id
+            if seq_id in seq_dict:
+                continue
+
+            seq_dict[seq_id] = seq.current_position
+            seq.update_state(next_token, None)
+
+            # 收集需要回调的数据
             if rank0():
-                # 流式输出
-                txt = self.tokenizer.decode([seq._next_token], skip_special_tokens=True)
-                if cb := self.stream_callbacks.get(seq.seq_id):
-                    try: cb(seq._next_token, txt)
-                    except: pass
-            
+                cb = stream_callbacks.get(seq_id)
+                if cb:
+                    output_tokens.append(next_token)
+                    callbacks_batch.append(cb)
+
             if seq.is_finished():
-                self.cache_manager.free(seq.seq_id)
+                self.cache_manager.free(seq_id)
                 if rank0():
                     self.scheduler.mark_finished(seq)
+
+        # --- 第二阶段：批量 CPU 解码与回调 ---
+        if rank0() and callbacks_batch:
+            texts = self.tokenizer.batch_decode(
+                [[t] for t in output_tokens],
+                skip_special_tokens=True
+            )
+
+            for cb, token, txt in zip(callbacks_batch, output_tokens, texts):
+                try:
+                    cb(token, txt)
+                except Exception:
+                    pass
