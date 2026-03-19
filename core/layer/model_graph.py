@@ -4,9 +4,10 @@ import torch.nn.functional as F
 from typing import Dict, List
 
 from core.paged_attention import PagedAttention
+from kernel.matmul import matmul_v3
 from kernel.rmsnorm_add import rmsnorm_
 from kernel.rmsnorm_residual import rmsnorm_residual_gemm as rmsnorm_residual
-from kernel.swiglu import swiglu_gemm as swiglu
+from kernel.mixed_gemm import matmul_swiglu
 from .rope import RoPE
 from core.parallel_config import get_rank, get_world_size, all_reduce
 import torch._dynamo
@@ -133,7 +134,6 @@ class ModelGraphRunner:
         self._qkv = torch.empty(max_b, qkv_dim, dtype=self.dtype, device=self.device)
         self._attn_out = torch.empty(max_b, o_dim, dtype=self.dtype, device=self.device)
         self._residual = torch.empty((max_b, self.hidden_dim), dtype=self.dtype, device=self.device)
-        self._gate_up = torch.empty((max_b, self.intermediate_size), dtype=self.dtype, device=self.device)
         self._swiglu_out = torch.empty((max_b, self.intermediate_size // 2), dtype=self.dtype, device=self.device)
         self._mlp_out = torch.empty((max_b, self.hidden_dim), dtype=self.dtype, device=self.device)
 
@@ -191,9 +191,8 @@ class ModelGraphRunner:
         if fast_mode:
             mlp_out = self._fast_mlp(self._normed[:bs], block.mlp._gu, block.mlp._d)
         else:
-            torch.matmul(self._normed[:bs], block.mlp._gu, out=self._gate_up[:bs])
-            swiglu(self._gate_up[:bs], self._swiglu_out[:bs])
-            torch.matmul(self._swiglu_out[:bs], block.mlp._d, out=self._mlp_out[:bs])
+            matmul_swiglu(self._normed[:bs], block.mlp._gu, self._swiglu_out[:bs])
+            matmul_v3(self._swiglu_out[:bs], block.mlp._d, out=self._mlp_out[:bs])
             mlp_out = self._mlp_out[:bs]
         return mlp_out, self._residual[:bs]
 
