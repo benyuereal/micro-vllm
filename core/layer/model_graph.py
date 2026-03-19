@@ -79,6 +79,9 @@ class ModelGraphRunner:
         return activated @ d_weight
 
     def prepare(self):
+        if self.model.transformer.h[0].mlp.w1 is None:
+            logger.info(f"⏩ 权重已预处理，跳过 prepare (Rank {self.rank})")
+            return
         cfg = self.model.config
         global_num_heads = cfg.num_attention_heads
         global_kv_heads = getattr(cfg, "num_key_value_heads", global_num_heads)
@@ -107,8 +110,14 @@ class ModelGraphRunner:
                 b_q, b_k, b_v = b_qkv.split([q_dim, kv_dim, kv_dim], dim=0)
                 local_b = [b.chunk(self.world_size, dim=0)[self.rank] for b in (b_q, b_k, b_v)]
                 block.attn._qkv_b = torch.cat(local_b, dim=0)
+            block.mlp.w1 = None
+            block.mlp.w2 = None
+            block.mlp.c_proj = None
+            block.attn.c_attn = None
+            block.attn.c_proj = None
+            torch.cuda.empty_cache()
 
-        logger.info(f"✅ 权重预缓存完成 (Rank {self.rank})")
+        logger.info(f"✅ 权重预缓存完成，原始权重已释放 (Rank {self.rank})")
 
     def _alloc_bufs(self):
         max_b = self.max_bs

@@ -63,7 +63,7 @@ async def startup_event():
             tensor_parallel_size=1,
             trust_remote_code=True,
             gpu_memory_utilization=0.8,
-            max_model_len=2048,
+            max_model_len=1024,
             disable_log_stats=True  # 减少日志输出
         )
 
