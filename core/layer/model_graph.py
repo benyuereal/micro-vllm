@@ -4,9 +4,10 @@ import torch.nn.functional as F
 from typing import Dict, List
 
 from core.paged_attention import PagedAttention
+from kernel.matmul import matmul_v3
 from kernel.rmsnorm_add import rmsnorm_
 from kernel.rmsnorm_residual import rmsnorm_residual_gemm as rmsnorm_residual
-from kernel.swiglu import swiglu_gemm as swiglu
+from kernel.mixed_gemm import matmul_swiglu
 from .rope import RoPE
 from core.parallel_config import get_rank, get_world_size, all_reduce
 import torch._dynamo
@@ -79,6 +80,9 @@ class ModelGraphRunner:
         return activated @ d_weight
 
     def prepare(self):
+        if self.model.transformer.h[0].mlp.w1 is None:
+            logger.info(f"⏩ 权重已预处理，跳过 prepare (Rank {self.rank})")
+            return
         cfg = self.model.config
         global_num_heads = cfg.num_attention_heads
         global_kv_heads = getattr(cfg, "num_key_value_heads", global_num_heads)
@@ -107,8 +111,14 @@ class ModelGraphRunner:
                 b_q, b_k, b_v = b_qkv.split([q_dim, kv_dim, kv_dim], dim=0)
                 local_b = [b.chunk(self.world_size, dim=0)[self.rank] for b in (b_q, b_k, b_v)]
                 block.attn._qkv_b = torch.cat(local_b, dim=0)
+            block.mlp.w1 = None
+            block.mlp.w2 = None
+            block.mlp.c_proj = None
+            block.attn.c_attn = None
+            block.attn.c_proj = None
+            torch.cuda.empty_cache()
 
-        logger.info(f"✅ 权重预缓存完成 (Rank {self.rank})")
+        logger.info(f"✅ 权重预缓存完成，原始权重已释放 (Rank {self.rank})")
 
     def _alloc_bufs(self):
         max_b = self.max_bs
@@ -124,7 +134,6 @@ class ModelGraphRunner:
         self._qkv = torch.empty(max_b, qkv_dim, dtype=self.dtype, device=self.device)
         self._attn_out = torch.empty(max_b, o_dim, dtype=self.dtype, device=self.device)
         self._residual = torch.empty((max_b, self.hidden_dim), dtype=self.dtype, device=self.device)
-        self._gate_up = torch.empty((max_b, self.intermediate_size), dtype=self.dtype, device=self.device)
         self._swiglu_out = torch.empty((max_b, self.intermediate_size // 2), dtype=self.dtype, device=self.device)
         self._mlp_out = torch.empty((max_b, self.hidden_dim), dtype=self.dtype, device=self.device)
 
@@ -182,9 +191,8 @@ class ModelGraphRunner:
         if fast_mode:
             mlp_out = self._fast_mlp(self._normed[:bs], block.mlp._gu, block.mlp._d)
         else:
-            torch.matmul(self._normed[:bs], block.mlp._gu, out=self._gate_up[:bs])
-            swiglu(self._gate_up[:bs], self._swiglu_out[:bs])
-            torch.matmul(self._swiglu_out[:bs], block.mlp._d, out=self._mlp_out[:bs])
+            matmul_swiglu(self._normed[:bs], block.mlp._gu, self._swiglu_out[:bs])
+            matmul_v3(self._swiglu_out[:bs], block.mlp._d, out=self._mlp_out[:bs])
             mlp_out = self._mlp_out[:bs]
         return mlp_out, self._residual[:bs]
 

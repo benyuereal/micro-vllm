@@ -166,11 +166,12 @@ class InferenceEngine:
             # with profile(
             #     activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
             #     record_shapes=True,
-            #     profile_memory=True
+            #     # profile_memory=True
             # ) as prof:
             #     self._decode(ctx.sequences)
             # # 可选：如果需要保存 profiler 结果，取消下面注释
-            # print(prof.key_averages().table(sort_by="cuda_time_total", row_limit=20))
+            # if ctx.sequences[0].current_position % 50 ==0 :
+            #    print(prof.key_averages().table(sort_by="cuda_time_total", row_limit=20))
             # prof.export_chrome_trace(f"decode_trace_{time.time()}.json")
         
         return True
