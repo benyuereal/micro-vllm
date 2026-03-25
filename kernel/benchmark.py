@@ -13,7 +13,7 @@ from typing import Callable
 
 import torch
 
-from flash import TritonDecodeAttention
+from flash import FlashAttention
 
 
 # ── Data helpers ───────────────────────────────────────────────────────────────
@@ -57,8 +57,8 @@ def bench_triton(
         head_size: int, seq_len: int, block_size: int = 16,
         device: str = "cuda",
 ) -> dict:
-    attn           = TritonDecodeAttention(num_heads=num_heads, num_kv_heads=num_kv_heads,
-                                           head_size=head_size, block_size=block_size)
+    attn           = FlashAttention(num_heads=num_heads, num_kv_heads=num_kv_heads,
+                                    head_size=head_size, block_size=block_size)
     q              = torch.randn(batch_size, num_heads, head_size, device=device, dtype=torch.float16)
     kc, vc, bt, cl = make_paged_kv_cache(batch_size, seq_len, num_kv_heads, head_size, block_size, device)
 
