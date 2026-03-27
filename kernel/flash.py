@@ -4,79 +4,23 @@ Paged decode attention — Triton kernels + Python wrapper.
 Supports MHA / GQA, optional sliding-window, Split-KV for long sequences.
 
 算法概览
-# ═══════════════════════════════════════════════════════════════════════════════
-# 第一部分：为什么需要 Flash Attention？
-# ═══════════════════════════════════════════════════════════════════════════════
+--------
+标准注意力需要将完整的 softmax 权重矩阵 P [B, H, 1, N] 写入显存再读回，
+Flash Attention 用「在线 softmax」消除了这次 HBM 往返：
 
-标准注意力机制的内存问题
-------------------------
-假设：Q [B, H, 1, D], K [B, H, N, D], V [B, H, N, D]（解码场景）
+    初始化：cur_max = -∞,  cur_exp_sum = 0,  acc = 0
+    对每个 KV tile（BLOCK_N 个 token）：
+        S        = scale * Q @ K^T          # 注意力分数
+        block_max = max(cur_max, max(S))
+        rescale  = exp(cur_max - block_max) # 旧统计量的校正因子
+        P        = exp(S - block_max)
+        cur_exp_sum = rescale * cur_exp_sum + sum(P)   # 更新 softmax 分母
+        acc         = rescale * acc + P @ V            # 更新加权输出
+        cur_max     = block_max
+    输出：acc / cur_exp_sum
 
-标准注意力计算流程：
-    S = Q @ K^T  → [B, H, 1, N]  （注意力分数）
-    P = softmax(S) → [B, H, 1, N]  （注意力权重，需要存储到显存）
-    O = P @ V  → [B, H, 1, D]  （输出）
-
-问题：P 的形状是 [B, H, 1, N]，在与 V 相乘之前必须存储到显存(HBM)中。
-当 N = 100,000 个 token，B = 8, H = 32 时：
-    内存占用 = 8 × 32 × 100,000 × 4 字节 (float32) = 102.4 MB 每层！
-
-Flash Attention 的解决方案
---------------------------
-核心洞见：我们不需要存储完整的 P 矩阵！可以增量式地计算 O。
-
-技巧在于永远不将完整的 P 矩阵物化到内存中，而是：
-1. 分块处理 KV token（例如每次处理 64 个 token）
-2. 维护运行时统计量：最大值、exp 之和、加权输出
-3. 使用在线 softmax 增量更新统计量
-4. 只存储最终输出 O [B, H, D]
-
-内存占用：8 × 32 × 128 × 4 字节 = 131 KB（减少了 1000 倍！）
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# 第二部分：在线 Softmax 算法（核心！）
-# ═══════════════════════════════════════════════════════════════════════════════
-
-标准 Softmax（两遍扫描）
------------------------
-对于向量 x = [x₁, x₂, ..., xₙ]：
-
-    第一遍：m = max(x)                    # 找到最大值
-    第二遍：l = Σᵢ exp(xᵢ - m)            # 计算分母
-            softmax(x)ᵢ = exp(xᵢ - m) / l # 计算输出
-
-问题：需要对数据进行两遍扫描 = 两次显存读写。
-
-在线 Softmax（一遍扫描）
------------------------
-核心思想：分块处理数据，维护运行时统计量。
-
-假设我们已经处理了元素 x₁...xₖ，并维护以下状态：
-    mₖ = max(x₁...xₖ)           # 当前的最大值
-    lₖ = Σᵢ₌₁ᵏ exp(xᵢ - mₖ)     # 当前的和（以当前最大值为基准归一化）
-    oₖ = Σᵢ₌₁ᵏ exp(xᵢ - mₖ) · vᵢ  # 当前的加权输出
-
-现在处理新的块 xₖ₊₁...xₖ₊ₘ：
-
-步骤 1：计算新的最大值
-    m_new = max(mₖ, max(xₖ₊₁...xₖ₊ₘ))
-
-步骤 2：计算校正因子
-    α = exp(mₖ - m_new)
-
-    这个 α 用于重新缩放所有旧的统计量，因为：
-    - 旧统计量使用 mₖ 作为参考基准
-    - 新的参考基准是 m_new（可能更大）
-    - 如果 m_new > mₖ，我们需要缩小旧的贡献
-
-步骤 3：更新和
-    l_new = α · lₖ + Σⱼ₌ₖ₊₁ᵏ₊ₘ exp(xⱼ - m_new)
-
-步骤 4：更新输出
-    o_new = α · oₖ + Σⱼ₌ₖ₊₁ᵏ₊ₘ exp(xⱼ - m_new) · vⱼ
-
-最终输出
-    output = o_final / l_final
+对于超长序列（>8K token），Split-KV 将 KV 分成若干段并行计算，
+再用相同的在线 softmax 原理把各段结果归约合并。
 """
 
 import math
@@ -127,7 +71,8 @@ def _attend_tiles(
     #
     # 因果掩码：offs_n <= query_pos，超范围位置 S 置 -inf（exp 后贡献为零）
     # 滑动窗口：额外限制 query_pos - offs_n < SLIDING_WINDOW
-    for j in range(0, _cdiv(kv_end - kv_start, BLOCK_N)):
+    num_tiles = _cdiv(kv_end - kv_start, BLOCK_N)
+    for j in range(0, num_tiles):
         offs_n    = kv_start + j * BLOCK_N + tl.arange(0, BLOCK_N)
         kv_mask   = offs_n < kv_end
         kv_d      = kv_mask[:, None] & d_mask[None, :]
