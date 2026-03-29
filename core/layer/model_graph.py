@@ -148,19 +148,18 @@ class ModelGraphRunner:
     def _compute_qkv(self, h, block, bs):
         rmsnorm_(h, block.ln_1.weight, self._normed[:bs], block.ln_1.eps)
         qkv_buf = self._qkv[:bs]
-        torch.matmul(self._normed[:bs], block.attn._qkv_w, out=qkv_buf)
+        matmul_v3(self._normed[:bs], block.attn._qkv_w, out=qkv_buf)
         if block.attn._qkv_b is not None:
             qkv_buf.add_(block.attn._qkv_b)
         return qkv_buf
 
     def _compute_next(self, mlp_out_prev, res_prev, block_curr, bs):
-
         rmsnorm_residual(
             mlp_out_prev, res_prev, block_curr.ln_1.weight,
             self._normed[:bs], self._residual[:bs], block_curr.ln_1.eps
         )
         qkv_buf = self._qkv[:bs]
-        torch.matmul(self._normed[:bs], block_curr.attn._qkv_w, out=qkv_buf)
+        matmul_v3(self._normed[:bs], block_curr.attn._qkv_w, out=qkv_buf)
         if block_curr.attn._qkv_b is not None:
             qkv_buf.add_(block_curr.attn._qkv_b)
         return qkv_buf, self._residual[:bs]
@@ -180,7 +179,7 @@ class ModelGraphRunner:
         ).squeeze(1)
 
         out_buf = self._attn_out[:bs]
-        torch.matmul(attn.reshape(bs, -1), block.attn._o, out=out_buf)
+        matmul_v3(attn.reshape(bs, -1), block.attn._o, out=out_buf)
         return out_buf
 
     def _compute_ffn(self, attn_out, current_h, block, bs, fast_mode):
@@ -268,9 +267,12 @@ class ModelGraphRunner:
 
         self._is_graph_ready = True
 
-    def forward(self, input_ids: torch.Tensor, cache_manager, batch_size: int) -> torch.Tensor:
-        self._input_ids[:batch_size] = input_ids
+    def forward(self, input_ids: torch.Tensor | None, cache_manager, batch_size: int) -> torch.Tensor:
+        if input_ids is not None:
+            # 普通路径：H2D copy
+            self._input_ids[:batch_size] = input_ids
+        # input_ids=None 表示 _input_ids 已由上一步 GPU→GPU copy 预填充，直接 replay
         if batch_size not in self._graphs:
-            return self.decode(input_ids, batch_size, cache_manager, self._dummy_block_table)
+            return self.decode(self._input_ids[:batch_size], batch_size, cache_manager, self._dummy_block_table)
         self._graphs[batch_size].replay()
         return self._logits[:batch_size]

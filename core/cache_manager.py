@@ -387,6 +387,15 @@ class KVCacheManager:
         self._pre_blocks_buffer = torch.zeros(max_possible_blocks, dtype=torch.int32, device=device)
         self._offsets_buffer = torch.zeros(max_batch_size + 1, dtype=torch.int32, device=device)
 
+        # ================= Pinned CPU staging buffers（消除每步 torch.tensor() malloc）=================
+        _pin = (device == "cuda")
+        self._seqlens_cpu  = torch.empty(max_batch_size,          dtype=torch.int32, pin_memory=_pin)
+        self._flat_cpu     = torch.empty(max_possible_blocks,     dtype=torch.int32, pin_memory=_pin)
+        self._offsets_cpu  = torch.empty(max_batch_size + 1,      dtype=torch.int32, pin_memory=_pin)
+        self._seqlens_np   = self._seqlens_cpu.numpy()
+        self._flat_np      = self._flat_cpu.numpy()
+        self._offsets_np   = self._offsets_cpu.numpy()
+
     def alloc(self, seq_id: int, n_tokens: int):
         """
         📌 **分配缓存块** (预填充阶段调用)
@@ -560,18 +569,15 @@ class KVCacheManager:
 
         total_blocks = offsets[-1]
 
-        # 2. 写入 context_lens
-        self._cache_seqlens_buffer[:batch_size].copy_(
-            torch.tensor(context_lens, dtype=torch.int32)
-        )
+        # 2. 写入 context_lens（零分配：直写 pinned numpy → async H2D）
+        self._seqlens_np[:batch_size] = context_lens
+        self._cache_seqlens_buffer[:batch_size].copy_(self._seqlens_cpu[:batch_size], non_blocking=True)
 
         # 3. 批量写入辅助缓冲区
-        self._pre_blocks_buffer[:total_blocks].copy_(
-            torch.tensor(flat, dtype=torch.int32)
-        )
-        self._offsets_buffer[:batch_size + 1].copy_(
-            torch.tensor(offsets, dtype=torch.int32)
-        )
+        self._flat_np[:total_blocks] = flat
+        self._offsets_np[:batch_size + 1] = offsets
+        self._pre_blocks_buffer[:total_blocks].copy_(self._flat_cpu[:total_blocks], non_blocking=True)
+        self._offsets_buffer[:batch_size + 1].copy_(self._offsets_cpu[:batch_size + 1], non_blocking=True)
 
         # 4. 启动 Kernel 填充主表
         grid = (batch_size * self.max_seq_blocks,)
