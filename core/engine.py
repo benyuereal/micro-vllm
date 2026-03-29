@@ -2,7 +2,7 @@ import torch
 import time
 import logging
 import atexit
-from typing import List, Dict, Tuple
+from typing import List, Dict, Tuple, Optional
 from dataclasses import dataclass
 
 from . import Scheduler
@@ -12,6 +12,8 @@ from .cache_manager import KVCacheManager
 from .sequence import Sequence
 from .model_loader import load_model
 from .layer.sampler import Sampler
+from .context import DecodeContext
+
 from core.parallel_config import get_rank, setup, get_world_size, rank0
 from core.inference_context import BatchInferenceContext
 from torch.profiler import profile, ProfilerActivity
@@ -24,6 +26,14 @@ logging.basicConfig(
     handlers=[logging.FileHandler("inference_perf.log"), logging.StreamHandler()]
 )
 logger = logging.getLogger("InferenceEngine")
+
+
+@dataclass
+class StreamEvent:
+    """一步 decode 产生的待推送数据：token 列表 + 对应的流式回调。"""
+    tokens:    List[int]
+    callbacks: list
+
 
 @dataclass
 class InferenceStats:
@@ -70,6 +80,8 @@ class InferenceEngine:
         )
         self.scheduler = Scheduler(max_batch_size, max_prefill_tokens, self.tokenizer)
         self.sampler = Sampler()
+        self._decode_ctx = DecodeContext()
+        self._stream_event: Optional[StreamEvent] = None
         
         # 状态
         self.eos_token_id = self.tokenizer.eos_token_id
@@ -122,9 +134,6 @@ class InferenceEngine:
         return "cpu", torch.float32
 
     def shutdown(self):
-        """
-        清理资源，主要用于优雅退出分布式环境。
-        """
         try:
             if torch.distributed.is_initialized():
                 logger.info(f"Rank {self.rank}: Shutting down distributed process group...")
@@ -240,50 +249,41 @@ class InferenceEngine:
             logger.info(f"Prefill: Prep {stats.prep_time*1000:.1f}ms, GPU {stats.gpu_time*1000:.1f}ms, Total {stats.total_time*1000:.1f}ms | Batch {len(batch)}")
 
     def _decode(self, batch: List[Sequence]):
-
-        device = self.device
         batch_size = len(batch)
 
+        # KV Cache Append（去重，每个 seq 只 append 一次）
         seen = set()
-        mask = []
         for seq in batch:
-            mask.append(seq.seq_id not in seen)
-            seen.add(seq.seq_id)
+            if seq.seq_id not in seen:
+                self.cache_manager.append(seq.seq_id)
+                seen.add(seq.seq_id)
+        self.cache_manager.cache_batch_data(
+            [s.seq_id for s in batch], [s.current_position for s in batch]
+        )
 
-        input_ids = torch.tensor([seq.get_next_input_ids() for seq in batch], device=device).squeeze(1)
-        temps = torch.tensor([seq.temperature for seq in batch], device=device)
-        topp = torch.tensor([seq.top_p for seq in batch], device=device)
+        # 准备 input_ids，刷新 temps/topp（context 内部维护）
+        input_ids = self._decode_ctx.prepare(batch, self.device)
 
-        # 2. KV Cache Append
-        for i, seq in enumerate(batch):
-            if mask[i]: self.cache_manager.append(seq.seq_id)
-        
-        self.cache_manager.cache_batch_data([s.seq_id for s in batch], [s.current_position for s in batch])
-
-        # 3. 推理
+        # 推理（CUDA Graph replay）
         logits = self.graph_runner.forward(input_ids, self.cache_manager, batch_size)
 
-        # 4. 采样
+        # GPU 正在执行 graph，利用此窗口处理上一步暂存的流式回调
+        # 单线程执行，无 GIL 竞争，完全被 GPU 时间覆盖
         if rank0():
+            self._flush_stream()
 
-            next_tokens = self.sampler(logits, temps, topp, 50).tolist()
-            for i, seq in enumerate(batch):
-                seq._next_token = next_tokens[i]
-
-            # stats.total_time = time.time() - stats.total_time
-            # if batch and batch[0].current_position % 50 == 0:
-            #     logger.info(f"Decode: Prep {stats.prep_time*1000:.1f}ms, GPU {stats.gpu_time*1000:.1f}ms, Total {stats.total_time*1000:.1f}ms | Batch {batch_size}")
+        # 采样 + 上下文提交
+        if rank0():
+            ctx = self._decode_ctx
+            next_tokens_gpu = self.sampler(logits, ctx.temps, ctx.topp, 50)
+            ctx.commit(next_tokens_gpu, self.graph_runner._input_ids, batch_size, batch)
 
     def update_sequences(self, sequences: List[Sequence]):
         seq_dict = defaultdict(int)
-
         output_tokens = []
         callbacks_batch = []
-
-        # 局部变量缓存，减少循环内开销
         stream_callbacks = self.stream_callbacks
 
-        # --- 第一阶段：GPU 状态更新与数据收集 ---
         for seq in sequences:
             next_token = seq._next_token
             if next_token is None:
@@ -296,7 +296,6 @@ class InferenceEngine:
             seq_dict[seq_id] = seq.current_position
             seq.update_state(next_token, None)
 
-            # 收集需要回调的数据
             if rank0():
                 cb = stream_callbacks.get(seq_id)
                 if cb:
@@ -308,15 +307,23 @@ class InferenceEngine:
                 if rank0():
                     self.scheduler.mark_finished(seq)
 
-        # --- 第二阶段：批量 CPU 解码与回调 ---
-        if rank0() and callbacks_batch:
-            texts = self.tokenizer.batch_decode(
-                [[t] for t in output_tokens],
-                skip_special_tokens=True
-            )
+        if rank0():
+            self._stream_event = StreamEvent(output_tokens, callbacks_batch) if callbacks_batch else None
 
-            for cb, token, txt in zip(callbacks_batch, output_tokens, texts):
-                try:
-                    cb(token, txt)
-                except Exception:
-                    pass
+    def _flush_stream(self):
+        """
+        在 GPU 执行 graph 的空窗口内，将上一步暂存的 StreamEvent 解码并推送给流式客户端。
+        由 _decode 在 replay() 之后、sampler() 之前调用，单线程无 GIL 竞争。
+        """
+        evt = self._stream_event
+        if evt is None:
+            return
+        self._stream_event = None
+        texts = self.tokenizer.batch_decode(
+            [[t] for t in evt.tokens], skip_special_tokens=True
+        )
+        for cb, token, txt in zip(evt.callbacks, evt.tokens, texts):
+            try:
+                cb(token, txt)
+            except Exception:
+                pass

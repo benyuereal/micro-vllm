@@ -17,7 +17,7 @@
 
 ## ✨ Features
 
-* 🚀 **Continuous Batching** - Dynamic batch filling, GPU utilization ↑90%+
+* 🚀 **Continuous Batching** - Dynamic batch filling, GPU utilization **~95%** at batch=32
 * 💾 **PagedAttention** - KV cache paging management, fragmentation ↓80%
 * ⚡ **Flash Attention** - Automatic RoPE, zero-copy cache update
 * 🧠 **SwiGLU Kernel Fusion** - Fused Gate/Up projection with activation to reduce memory bandwidth usage
@@ -212,10 +212,15 @@ In single-user sequential request scenarios, micro-vllm demonstrates superior in
 
 ### Batch Concurrency (32 Requests)
 
-| Framework | Per-Request (tokens/s) | Total Throughput (tokens/s) |
-|:----------|:-----------------------|:------------------------------|
-| **This Framework** | **60** | **1920** |
-| vLLM | 62 | ~1984 |
+> **Hardware**: NVIDIA A100-PCIE-40GB &nbsp;|&nbsp; **Model**: Qwen-7B &nbsp;|&nbsp; **Batch Size**: 32 &nbsp;|&nbsp; **Total Requests**: 32 &nbsp;|&nbsp; **Total Tokens**: 9,677
+
+| Framework | Per-Request (tokens/s) | GPU Utilization | Relative Performance |
+|:----------|:-----------------------|:----------------|:---------------------|
+| **This Framework** | **63** | **~95%** | **101.6%** |
+| vLLM | ~62 | — | 100% |
+
+- Decode step latency: **~15ms** (graph=14.5ms + sample=0.27ms)
+- GPU utilization reaches **95%** (nvidia-smi) / **97%** (CUDA event measurement) at batch=32
 
 ---
 

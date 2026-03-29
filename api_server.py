@@ -1,7 +1,6 @@
 # api_server.py
 import asyncio
 import json
-import threading
 import time
 from queue import Queue
 from typing import List, Optional
@@ -60,20 +59,26 @@ class HealthResp(BaseModel):
 # ------------------------------
 async def rank0_inference_loop():
     print(f"Rank 0: Inference loop started")
+    _decode_step = 0
+
     while running:
         batch, batch_type = engine.get_next_batch()
-        
+
         if batch_type == "waiting" or not batch:
             BatchInferenceContext(0, "waiting").broadcast()
-            await asyncio.sleep(0.000)
+            await asyncio.sleep(0.0)
             continue
-        
+
         ctx = BatchInferenceContext(len(batch), batch_type, batch)
         ctx.broadcast()
         engine.step(ctx)
         ctx.broadcast()
         engine.update_sequences(ctx.sequences)
-        await asyncio.sleep(0.0)
+
+        if batch_type == "decode":
+            _decode_step += 1
+            if _decode_step % 5 == 0:
+                await asyncio.sleep(0.0)
 
 
 def non_rank0_inference_loop():

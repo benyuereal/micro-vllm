@@ -26,7 +26,7 @@ class Scheduler:
         self.waiting_queue = deque()   # 新请求
         self.running_sequences = []    # 正在运行的序列
         self.finished_sequences = []   # 已完成
-        self.batch_sizes = [1, 2, 4, 8, 16, 32]  # 已捕获的 batch_size（与 engine 一致）
+        self.batch_sizes = [1, 2, 4, 8, 16, 32, 40]  # 已捕获的 batch_size（与 engine 一致）
 
     def _get_bucket_key(self, length: int) -> int:
         """
