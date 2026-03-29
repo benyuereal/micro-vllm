@@ -11,7 +11,7 @@
   </a>
 </p>
 
-> A high-performance LLM inference engine implementing **PagedAttention + Flash Attention + SwiGLU Kernel Fusion** from scratch. Achieves **108%** of vLLM's single user performance on A100, suitable for small-scale production deployment and learning.
+> A high-performance LLM inference engine implementing **PagedAttention + Flash Attention + SwiGLU Kernel Fusion** from scratch. Achieves **110%** of vLLM's single user performance on A100, suitable for small-scale production deployment and learning.
 > 
 > 🚀 **Latest Update**: Tensor Parallelism is now supported for multi-GPU inference!
 
@@ -197,16 +197,16 @@ In single-user sequential request scenarios, micro-vllm demonstrates superior in
 
 | Metric | micro-vllm  | vLLM Official |
 |:---------|:------------|:--------------|
-| **Mean** | **81.5** ✅ | **75.88** |
+| **Mean** | **83** ✅ | **75.88** |
 | **Std Dev** | **0.07** ✅  | **1.95** |
 
-- **+6%** higher average throughput than vLLM, performance aligned with industry benchmark
+- **+9%** higher average throughput than vLLM, performance aligned with industry benchmark
 - **28x better stability** (coefficient of variation), jitter controlled within **0.09%**
 - Lightweight architecture incurs lower scheduling overhead in single-concurrency scenarios, ideal for low-latency interactive applications
 
 | Framework | tokens/sec | Relative Performance |
 |:----------|:-----------|:---------------------|
-| **This Framework (online branch)** | **81.5**  | **108%**           |
+| **This Framework (online branch)** | **83**  | **110%**           |
 | vLLM | 75.88      | 100%                 |
 | HuggingFace | 20         | 27%                  |
 
@@ -216,7 +216,7 @@ In single-user sequential request scenarios, micro-vllm demonstrates superior in
 
 | Framework | Per-Request (tokens/s) | GPU Utilization | Relative Performance |
 |:----------|:-----------------------|:----------------|:---------------------|
-| **This Framework** | **63** | **~95%** | **101.6%** |
+| **This Framework** | **64** | **~95%** | **103%** |
 | vLLM | ~62 | — | 100% |
 
 - Decode step latency: **~15ms** (graph=14.5ms + sample=0.27ms)
@@ -377,7 +377,7 @@ micro-vllm/
 
 ## 💡 Note
 
-This framework is suitable for small-to-medium scale LLM service production deployment, achieving 102% of vLLM's performance with clean code that is easy to understand and extend.
+This framework is suitable for small-to-medium scale LLM service production deployment, achieving 110% of vLLM's performance with clean code that is easy to understand and extend.
 ---
 
 ## 📄 License
