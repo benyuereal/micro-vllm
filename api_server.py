@@ -59,7 +59,6 @@ class HealthResp(BaseModel):
 # ------------------------------
 async def rank0_inference_loop():
     print(f"Rank 0: Inference loop started")
-    _decode_step = 0
 
     while running:
         batch, batch_type = engine.get_next_batch()
@@ -72,13 +71,11 @@ async def rank0_inference_loop():
         ctx = BatchInferenceContext(len(batch), batch_type, batch)
         ctx.broadcast()
         engine.step(ctx)
+        await asyncio.sleep(0.0)  # GPU 正在执行 forward，asyncio 开销被覆盖
+        engine.collect(ctx)
+
         ctx.broadcast()
         engine.update_sequences(ctx.sequences)
-
-        if batch_type == "decode":
-            _decode_step += 1
-            if _decode_step % 5 == 0:
-                await asyncio.sleep(0.0)
 
 
 def non_rank0_inference_loop():

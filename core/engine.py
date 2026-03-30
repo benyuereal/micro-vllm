@@ -166,24 +166,43 @@ class InferenceEngine:
     @torch.inference_mode()
     def step(self, ctx: BatchInferenceContext) -> bool:
         if not ctx.sequences: return False
-        
         if ctx.batch_type == "prefill":
             self._prefill(ctx.sequences)
         else:
-            # 仅包裹 Decode 阶段
-            self._decode(ctx.sequences)
-            # with profile(
-            #     activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
-            #     record_shapes=True,
-            #     # profile_memory=True
-            # ) as prof:
-            #     self._decode(ctx.sequences)
-            # # 可选：如果需要保存 profiler 结果，取消下面注释
-            # if ctx.sequences[0].current_position % 50 ==0 :
-            #    print(prof.key_averages().table(sort_by="cuda_time_total", row_limit=20))
-            # prof.export_chrome_trace(f"decode_trace_{time.time()}.json")
-        
+            self._decode(ctx)
         return True
+
+    @torch.inference_mode()
+    def launch(self, ctx: BatchInferenceContext):
+        """Decode 专用 Phase 1：append + prepare + 提交 forward，GPU 开始异步执行后立刻返回。"""
+        batch = ctx.sequences
+        batch_size = len(batch)
+        seen = set()
+        for seq in batch:
+            if seq.seq_id not in seen:
+                self.cache_manager.append(seq.seq_id)
+                seen.add(seq.seq_id)
+        input_ids = self._decode_ctx.prepare(batch, self.device, self.cache_manager)
+        ctx.logits = self.graph_runner.forward(input_ids, self.cache_manager, batch_size)
+
+    @torch.inference_mode()
+    def collect(self, ctx: BatchInferenceContext):
+        if ctx.batch_type == "prefill":
+            return
+        """Decode 专用 Phase 2：flush + seqlens+1 + sample + commit（GPU forward 已完成）。"""
+        batch, bs, logits = ctx.sequences, ctx.batch_size, ctx.logits
+        if rank0():
+            self._flush_stream()
+        if rank0():
+            dctx = self._decode_ctx
+            next_tokens_gpu = self.sampler(logits, dctx.temps, dctx.topp, 50)
+            dctx.commit(next_tokens_gpu, self.graph_runner._input_ids, bs, batch)
+
+    def _decode(self, ctx: BatchInferenceContext):
+        """同步 decode：launch + collect，供 step() 和 non-rank0 路径调用。"""
+        self.launch(ctx)
+        batch, bs, logits = ctx.sequences, ctx.batch_size, ctx.logits
+        self.cache_manager.commit(bs)
 
     def generate(self, prompts: List[str], max_tokens: int = 100) -> Dict[str, str]:
         seq_ids = [self.add_request(p, max_tokens) for p in prompts]
@@ -196,6 +215,7 @@ class InferenceEngine:
             
             ctx = BatchInferenceContext(len(batch), batch_type, batch)
             self.step(ctx)
+            self.collect(ctx)
 
         # 结果收集
         results = {}
@@ -248,35 +268,6 @@ class InferenceEngine:
             stats.total_time = time.time() - stats.total_time
             logger.info(f"Prefill: Prep {stats.prep_time*1000:.1f}ms, GPU {stats.gpu_time*1000:.1f}ms, Total {stats.total_time*1000:.1f}ms | Batch {len(batch)}")
 
-    def _decode(self, batch: List[Sequence]):
-        batch_size = len(batch)
-
-        # KV Cache Append（去重，每个 seq 只 append 一次）
-        seen = set()
-        for seq in batch:
-            if seq.seq_id not in seen:
-                self.cache_manager.append(seq.seq_id)
-                seen.add(seq.seq_id)
-        self.cache_manager.cache_batch_data(
-            [s.seq_id for s in batch], [s.current_position for s in batch]
-        )
-
-        # 准备 input_ids，刷新 temps/topp（context 内部维护）
-        input_ids = self._decode_ctx.prepare(batch, self.device)
-
-        # 推理（CUDA Graph replay）
-        logits = self.graph_runner.forward(input_ids, self.cache_manager, batch_size)
-
-        # GPU 正在执行 graph，利用此窗口处理上一步暂存的流式回调
-        # 单线程执行，无 GIL 竞争，完全被 GPU 时间覆盖
-        if rank0():
-            self._flush_stream()
-
-        # 采样 + 上下文提交
-        if rank0():
-            ctx = self._decode_ctx
-            next_tokens_gpu = self.sampler(logits, ctx.temps, ctx.topp, 50)
-            ctx.commit(next_tokens_gpu, self.graph_runner._input_ids, batch_size, batch)
 
     def update_sequences(self, sequences: List[Sequence]):
         seq_dict = defaultdict(int)
