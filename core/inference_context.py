@@ -15,6 +15,8 @@ class BatchInferenceContext:
     sequences: List[Sequence] = field(default_factory=list)
     # 设备缓存
     _device: torch.device = None
+    # launch/collect 中间状态（仅 rank0 本地使用，不参与广播）
+    logits: torch.Tensor = None
 
     def __post_init__(self):
         self._device = torch.device(f"cuda:{get_rank()}" if torch.cuda.is_available() else "cpu")

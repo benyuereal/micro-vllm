@@ -396,6 +396,9 @@ class KVCacheManager:
         self._flat_np      = self._flat_cpu.numpy()
         self._offsets_np   = self._offsets_cpu.numpy()
 
+        # 记录哪些 seq 在当前步分配了新 block（用于 decode 快速路径）
+        self._dirty_seqs: set = set()
+
     def alloc(self, seq_id: int, n_tokens: int):
         """
         📌 **分配缓存块** (预填充阶段调用)
@@ -480,6 +483,7 @@ class KVCacheManager:
             blocks.append(new_block)
             self._blocks[seq_id] = blocks  # 确保引用同步（防御性编程）
             self._pos[new_block] = 1
+            self._dirty_seqs.add(seq_id)
             return new_block * self.block_size
         print(f"❌ cache_manager.append failed for seq {seq_id}, blocks: {blocks}, current_pos: {current_pos}, block_size: {self.block_size}, _free: {len(self._free)}")
         # 情况3: 无可用Block
@@ -592,6 +596,22 @@ class KVCacheManager:
         )
 
         return self._block_table_buffer[:batch_size], self._cache_seqlens_buffer[:batch_size]
+
+    def prepare(self, seq_ids: list, context_lens: list, batch_switched: bool = False):
+        """
+        decode 每步缓存就绪检查：
+        - batch 切换 或 有新 block 分配 → 全量重建（同时修正 seqlens 绝对值）
+        - 否则完全跳过（block_table 不变，seqlens 由 commit GPU 原地维护）
+        """
+        if batch_switched or self._dirty_seqs:
+            self.cache_batch_data(seq_ids, context_lens)
+            self._dirty_seqs.clear()
+
+    def commit(self, batch_size: int):
+        """
+        decode forward 完成后调用：GPU 原地将 cache_seqlens +1，无 H2D 拷贝。
+        """
+        self._cache_seqlens_buffer[:batch_size].add_(1)
 
         # 准备推理的数据
     def get_buffer_data(self, seq_ids: list):
