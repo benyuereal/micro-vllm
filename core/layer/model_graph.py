@@ -5,9 +5,8 @@ from typing import Dict, List
 
 from core.paged_attention import PagedAttention
 from kernel.matmul import matmul_v3
-from kernel.rmsnorm_add import rmsnorm_
-from kernel.rmsnorm_residual import rmsnorm_residual_gemm as rmsnorm_residual
-from kernel.mixed_gemm import matmul_swiglu
+from kernel.rmsnorm import rmsnorm_, rmsnorm_residual_gemm as rmsnorm_residual
+from kernel.swiglu import matmul_swiglu
 from .rope import RoPE
 from core.parallel_config import get_rank, get_world_size, all_reduce
 import torch._dynamo

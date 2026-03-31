@@ -1,7 +1,7 @@
 import torch
 import logging
 from typing import List
-from kernel.rmsnorm_add import rmsnorm_residual_fused, rmsnorm
+from kernel.rmsnorm import rmsnorm_residual_fused, rmsnorm
 from core.parallel_config import all_reduce
 from .model_graph import ModelGraphRunner
 
