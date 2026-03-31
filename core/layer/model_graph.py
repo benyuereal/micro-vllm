@@ -130,36 +130,31 @@ class ModelGraphRunner:
         o_dim = _b.attn._o.shape[1]
 
         # 核心 Buffers
-        self._normed = torch.empty((max_b, self.hidden_dim), dtype=self.dtype, device=self.device)
+        # _h_buf 复用 _normed 和 _mlp_out：两者时序不重叠（rmsnorm 写 → swiglu 消费 → mlp 再写）
+        self._h_buf = torch.empty((max_b, self.hidden_dim), dtype=self.dtype, device=self.device)
         self._qkv = torch.empty(max_b, qkv_dim, dtype=self.dtype, device=self.device)
         self._attn_out = torch.empty(max_b, o_dim, dtype=self.dtype, device=self.device)
         self._residual = torch.empty((max_b, self.hidden_dim), dtype=self.dtype, device=self.device)
         self._swiglu_out = torch.empty((max_b, self.intermediate_size // 2), dtype=self.dtype, device=self.device)
-        self._mlp_out = torch.empty((max_b, self.hidden_dim), dtype=self.dtype, device=self.device)
 
-        # 预分配一个 dummy block table 用于非 Graph 模式
-        self._dummy_block_table = torch.zeros(self.max_bs, self.attention.max_blocks, dtype=torch.int32,
-                                              device=self.device)
 
-    # ==========================================
-    # 核心计算原语
-    # ==========================================
 
     def _compute_qkv(self, h, block, bs):
-        rmsnorm_(h, block.ln_1.weight, self._normed[:bs], block.ln_1.eps)
+        rmsnorm_(h, block.ln_1.weight, self._h_buf[:bs], block.ln_1.eps)
         qkv_buf = self._qkv[:bs]
-        matmul_v3(self._normed[:bs], block.attn._qkv_w, out=qkv_buf)
+        matmul_v3(self._h_buf[:bs], block.attn._qkv_w, out=qkv_buf)
         if block.attn._qkv_b is not None:
             qkv_buf.add_(block.attn._qkv_b)
         return qkv_buf
 
     def _compute_next(self, mlp_out_prev, res_prev, block_curr, bs):
+
         rmsnorm_residual(
             mlp_out_prev, res_prev, block_curr.ln_1.weight,
-            self._normed[:bs], self._residual[:bs], block_curr.ln_1.eps
+            self._h_buf[:bs], self._residual[:bs], block_curr.ln_1.eps
         )
         qkv_buf = self._qkv[:bs]
-        matmul_v3(self._normed[:bs], block_curr.attn._qkv_w, out=qkv_buf)
+        matmul_v3(self._h_buf[:bs], block_curr.attn._qkv_w, out=qkv_buf)
         if block_curr.attn._qkv_b is not None:
             qkv_buf.add_(block_curr.attn._qkv_b)
         return qkv_buf, self._residual[:bs]
@@ -185,14 +180,14 @@ class ModelGraphRunner:
     def _compute_ffn(self, attn_out, current_h, block, bs, fast_mode):
         rmsnorm_residual(
             attn_out, current_h, block.ln_2.weight,
-            self._normed[:bs], self._residual[:bs], block.ln_2.eps
+            self._h_buf[:bs], self._residual[:bs], block.ln_2.eps
         )
         if fast_mode:
-            mlp_out = self._fast_mlp(self._normed[:bs], block.mlp._gu, block.mlp._d)
+            mlp_out = self._fast_mlp(self._h_buf[:bs], block.mlp._gu, block.mlp._d)
         else:
-            matmul_swiglu(self._normed[:bs], block.mlp._gu, self._swiglu_out[:bs])
-            matmul_v3(self._swiglu_out[:bs], block.mlp._d, out=self._mlp_out[:bs])
-            mlp_out = self._mlp_out[:bs]
+            matmul_swiglu(self._h_buf[:bs], block.mlp._gu, self._swiglu_out[:bs])
+            matmul_v3(self._swiglu_out[:bs], block.mlp._d, out=self._h_buf[:bs])
+            mlp_out = self._h_buf[:bs]
         return mlp_out, self._residual[:bs]
 
     # ==========================================
@@ -202,37 +197,22 @@ class ModelGraphRunner:
     def decode(self, input_ids, bs, cache_manager, block_table):
         h = self.model.transformer.wte(input_ids)
         fast_mode = (self.world_size == 1) and (bs <= 16)
+        last = self.num_layers - 1
 
-        # 1. 预处理
-        block_0 = self.model.transformer.h[0]
-        qkv = self._compute_qkv(h, block_0, bs)
-        current_h = h
+        qkv = self._compute_qkv(h, self.model.transformer.h[0], bs)
 
-        # 2. 主循环
-        for layer_idx in range(self.num_layers - 1):
+        for layer_idx in range(self.num_layers):
             block = self.model.transformer.h[layer_idx]
-
             attn_out = self._flash_attn(qkv, block, layer_idx, bs, cache_manager, block_table[:bs])
             attn_out = all_reduce(attn_out)
-
-            mlp_out, res_next = self._compute_ffn(attn_out, current_h, block, bs, fast_mode)
+            mlp_out, res = self._compute_ffn(attn_out, h, block, bs, fast_mode)
             mlp_out = all_reduce(mlp_out)
 
-            next_block = self.model.transformer.h[layer_idx + 1]
-            qkv, current_h = self._compute_next(mlp_out, res_next, next_block, bs)
-
-        # 3. 后处理
-        last_idx = self.num_layers - 1
-        last_block = self.model.transformer.h[last_idx]
-
-        attn_out = self._flash_attn(qkv, last_block, last_idx, bs, cache_manager, block_table[:bs])
-        attn_out = all_reduce(attn_out)
-
-        mlp_out, _ = self._compute_ffn(attn_out, current_h, last_block, bs, fast_mode)
-        mlp_out = all_reduce(mlp_out)
-
-        # 最后的残差连接
-        h = mlp_out + self._residual[:bs]
+            if layer_idx < last:
+                next_block = self.model.transformer.h[layer_idx + 1]
+                qkv, h = self._compute_next(mlp_out, res, next_block, bs)
+            else:
+                h = mlp_out + res
 
         h = self.model.transformer.ln_f(h)
         return self.model.lm_head(h)
@@ -251,12 +231,15 @@ class ModelGraphRunner:
                     for _ in range(3): _ = self._fast_mlp(_x, _gu, _d)
             torch.cuda.synchronize()
 
+        # warmup 用的 dummy block table，一次性使用，不需要常驻
+        buffer = torch.zeros(self.max_bs, self.attention.max_blocks, dtype=torch.int32, device=self.device)
+
         for bs in batch_sizes:
             g = torch.cuda.CUDAGraph()
             dummy = torch.randint(0, self.vocab_size, (bs,), device=self.device)
             # Warmup
             for _ in range(3):
-                with torch.no_grad(): self.decode(dummy, bs, cache_manager, self._dummy_block_table)
+                with torch.no_grad(): self.decode(dummy, bs, cache_manager, buffer)
             torch.cuda.synchronize()
             # Capture
             with torch.no_grad(), torch.cuda.graph(g):
@@ -273,6 +256,7 @@ class ModelGraphRunner:
             self._input_ids[:batch_size] = input_ids
         # input_ids=None 表示 _input_ids 已由上一步 GPU→GPU copy 预填充，直接 replay
         if batch_size not in self._graphs:
-            return self.decode(self._input_ids[:batch_size], batch_size, cache_manager, self._dummy_block_table)
+            buffer = torch.zeros(self.max_bs, self.attention.max_blocks, dtype=torch.int32, device=self.device)
+            return self.decode(self._input_ids[:batch_size], batch_size, cache_manager, buffer)
         self._graphs[batch_size].replay()
         return self._logits[:batch_size]

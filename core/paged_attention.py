@@ -2,23 +2,6 @@
 ===================================================================
 PagedAttention - vLLM 高性能注意力层 (FlashAttention优化版)
 ===================================================================
-
-📌 **核心设计目标**：
-   1. 提供极简的FlashAttention接口，隐藏所有复杂实现
-   2. 直接操作KV缓存，避免中间拷贝
-   3. 支持动态Block分配，自动更新Block Table
-   4. 极致性能，最小化GPU内存分配
-
-🧱 **数据流图**：
-    Input → Rotary Emb → (Store KV) → FlashAttention → Output
-    ↑ 直接操作缓存          ↑ 自动Block Table          ↑ 零拷贝
-
-⚡ **性能特性**：
-   - 单token注意力: ~15μs/token (CUDA+FlashAttention)
-   - 批量注意力: ~10μs/token (CUDA+FlashAttention)
-   - 零内存拷贝: 直接操作KV缓存
-   - 自动Block管理: 无需手动更新Block Table
-
 📚 **参考文献**：
    - FlashAttention: https://arxiv.org/abs/2205.14135
    - PagedAttention: https://arxiv.org/abs/2309.06180
@@ -52,9 +35,6 @@ class PrecomputedRotaryEmbedding(nn.Module):
         freqs = torch.einsum("i,j->ij", t, inv_freq)
         emb = torch.cat((freqs, freqs), dim=-1)
 
-        # 预先计算好所有位置的cos和sin
-        # self.register_buffer("cos_cache", emb.cos().unsqueeze(0).unsqueeze(0))  # [1, 1, max_position, dim]
-        # self.register_buffer("sin_cache", emb.sin().unsqueeze(0).unsqueeze(0))  # [1, 1, max_position, dim]
         # 预计算 cos/sin，并确保 contiguous
         cos = emb.cos().unsqueeze(0).unsqueeze(0)  # [1, 1, max_position, dim]
         sin = emb.sin().unsqueeze(0).unsqueeze(0)
@@ -189,113 +169,4 @@ class PagedAttention(nn.Module):
         self._sin_pool = self.rotary_emb.sin_cache[
             0, 0, :max_kv_capacity, :self.rotary_emb.dim // 2].contiguous()
 
-        self._block_table_pool = torch.full(
-            (self.max_batch_size, self.max_blocks), -1,
-            dtype=torch.int32, device=self.device
-        )
 
-    
-        # query/key/value 缓冲区 目前只考虑qwen mha结构
-        self._query_buffer = torch.empty(
-            (max_batch_size, num_heads, head_size),
-            dtype=torch.bfloat16, device=self.device
-        )
-        self._key_buffer = torch.empty(
-            (max_batch_size, num_heads, head_size),
-            dtype=torch.bfloat16, device=self.device
-        )
-        self._value_buffer = torch.empty(
-            (max_batch_size, num_heads, head_size),
-            dtype=torch.bfloat16, device=self.device
-        )
-        # 输出缓冲区
-        self._output_buffer = torch.empty_like(self._query_buffer)
-
-
-
-    def forward(
-            self,
-            query: torch.Tensor,  # [B, H, D] 查询张量
-            cache_manager: KVCacheManager,  # KV缓存管理器
-            seq_ids: List[int],  # [B] 序列ID列表
-            context_lens: List[int],  # [B] 每个序列的当前长度
-            layer_idx: int,  # 层索引
-            key: Optional[torch.Tensor] = None,  # [B, H, D] 新token的键 (可选)
-            value: Optional[torch.Tensor] = None  # [B, H, D] 新token的值 (可选)
-    ) -> torch.Tensor:
-        """
-        📌 **PagedAttention前向传播** (极简接口)
-
-        🔍 **参数**:
-            - query: 查询张量 [B, H, D]
-            - cache_manager: KV缓存管理器
-            - seq_ids: 序列ID列表 [B]
-            - context_lens: 每个序列的当前长度 [B]
-            - layer_idx: 层索引
-            - key/value: 新token的KV (解码阶段提供)
-
-        ✅ **返回**:
-            - output: 注意力输出 [B, H, D]
-
-        🧠 **内部逻辑**:
-            3. 准备Block Table (自动处理Block分配)
-            4. 调用FlashAttention
-        """
-
-        batch_size, num_heads, head_dim = query.shape
-        start_time = time.time()
-        device = self.device
-
-        timing: Dict[str, float] = {}  # 耗时记录
-        # 1. 拷贝输入到静态缓冲区（原地操作）
-        self._query_buffer[:batch_size].copy_(query)
-        self._key_buffer[:batch_size].copy_(key)
-        self._value_buffer[:batch_size].copy_(value)
- 
-
-        
-        # 3. 调用静态核心（使用缓冲区视图，内存地址固定）
-        output = self._forward_( 
-            query=self._query_buffer[:batch_size],
-            key=self._key_buffer[:batch_size],
-            value=self._value_buffer[:batch_size],
-            cache_manager=cache_manager,
-            layer_idx=layer_idx,
-            block_table=cache_manager._block_table_buffer[:batch_size],      # 固定内存
-            cache_seqlens=cache_manager._cache_seqlens_buffer[:batch_size],    # 固定内存
-        )
-        return output
-
-    def _forward_(self, query, key, value, cache_manager, layer_idx,
-                       block_table, cache_seqlens):
-        """纯静态前向：所有张量形状和内存地址固定"""
-        # unsqueeze 不分配新内存，只是视图
-        k_new = key.unsqueeze(1)    # [B, 1, H, D]
-        v_new = value.unsqueeze(1)  # [B, 1, H, D]
-        
-        # 获取 KV cache（全局静态）
-        k_cache, v_cache = cache_manager.get(layer_idx)
-        
-        # FlashAttention（所有输入都是固定缓冲区）
-        with torch.cuda.amp.autocast(enabled=False):  # 确保精度
-            output = flash_attn_with_kvcache(
-                q=query.unsqueeze(1),           # [B, 1, H, D] - 缓冲区视图
-                k_cache=k_cache,                 # [num_blocks, block_size, H, D] - 静态
-                v_cache=v_cache,                 # 同上
-                k=k_new,                         # [B, 1, H, D] - 缓冲区视图
-                v=v_new,                         # [B, 1, H, D] - 缓冲区视图
-                rotary_cos=self._cos_pool,       # 预计算，静态
-                rotary_sin=self._sin_pool,       # 预计算，静态
-                cache_seqlens=cache_seqlens,     # [B] - 缓冲区视图，内容变，地址不变
-                block_table=block_table,         # [B, max_blocks] - 缓冲区视图，内容变，地址不变
-                softmax_scale=self.scale,
-                causal=True,
-            )
-        
-        return output.squeeze(1)  # [B, H, D] - 视图，非拷贝
-
-  
-
-  
-
-   
