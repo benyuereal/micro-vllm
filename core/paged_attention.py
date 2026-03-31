@@ -55,63 +55,6 @@ class PrecomputedRotaryEmbedding(nn.Module):
         rotated = torch.cat((-x2, x1), dim=-1)
         return x * cos + rotated * sin
 
-class RotaryEmbedding(nn.Module):
-    """
-    📌 **旋转位置编码** (极简实现)
-
-    🔍 **设计**:
-        - 使用预计算的cos/sin缓存，避免重复计算
-        - 支持动态扩展最大位置
-        - 自动匹配输入设备
-
-    ⚡ **性能**:
-        - 时间: ~1μs/token (CUDA)
-        - 空间: O(max_position * dim)
-    """
-
-    def __init__(self, dim, max_position=2048, base=10000, device=None):
-        super().__init__()
-        self.dim = dim
-        self.device = device or torch.device('cpu')
-        self.inv_freq = 1.0 / (base ** (torch.arange(0, dim, 2, device=self.device).to(torch.bfloat16) / dim))
-        self.max_seq_len = max_position
-        self._update_cos_sin_cache(max_position)
-
-    def _update_cos_sin_cache(self, seq_len):
-        self.max_seq_len = max(self.max_seq_len, seq_len)
-        t = torch.arange(self.max_seq_len, device=self.device, dtype=self.inv_freq.dtype)
-        freqs = torch.einsum("i,j->ij", t, self.inv_freq)
-        emb = torch.cat((freqs, freqs), dim=-1)
-        self.cos_cache = emb.cos()[None, None, :, :]  # [1, 1, seq_len, dim]
-        self.sin_cache = emb.sin()[None, None, :, :]  # [1, 1, seq_len, dim]
-
-    def forward(self, x, positions):
-        """
-        📌 **应用旋转位置编码**
-
-        🔍 **参数**:
-            - x: [B, H, S, D] 查询/键
-            - positions: [B, S] 位置索引
-
-        ✅ **返回**:
-            - 旋转后的x: [B, H, S, D]
-        """
-        positions = positions.to(self.device)
-        max_pos = positions.max().item() + 1
-        if max_pos > self.max_seq_len:
-            self._update_cos_sin_cache(max_pos)
-
-        # 批量获取cos/sin (向量化)
-        batch_size, num_heads, seq_len, head_size = x.shape
-        positions_flat = positions.view(-1)
-        cos = self.cos_cache[:, :, positions_flat].view(1, 1, batch_size, seq_len, head_size).permute(2, 1, 3, 0,
-                                                                                                      4).squeeze(3)
-        sin = self.sin_cache[:, :, positions_flat].view(1, 1, batch_size, seq_len, head_size).permute(2, 1, 3, 0,
-                                                                                                      4).squeeze(3)
-
-        # 旋转公式: (x * cos) + (rotated * sin)
-        x1, x2 = x[..., :self.dim // 2], x[..., self.dim // 2:]
-        return (x * cos) + (torch.cat((-x2, x1), dim=-1) * sin)
 
 # 配置日志
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
