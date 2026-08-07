@@ -19,9 +19,9 @@ from kernel.rmsnorm import rmsnorm, rmsnorm_, rmsnorm_residual_gemm as rmsnorm_r
 from .moe import moe_forward
 
 try:
-    from flash_attn import flash_attn_with_kvcache, flash_attn_func
+    from flash_attn import flash_attn_with_kvcache, flash_attn_func, flash_attn_varlen_func
 except ImportError:
-    flash_attn_with_kvcache = flash_attn_func = None
+    flash_attn_with_kvcache = flash_attn_func = flash_attn_varlen_func = None
 
 
 def _yarn_mscale(scale, mscale):
@@ -350,19 +350,27 @@ class DeepSeekAdapter(ModelAdapter):
         slots = self._decode_slots(block_table, new_pos, bs, cache_manager.block_size)
         self._store_latent_batch(latent_new, k_cache, v_cache, slots, cache_manager.block_size)
 
-        # (2) gather 每 seq 的全部 latent [0, new_pos] （共 cache_seqlens 个，含新 token）
+        # (2) 向量化 gather 每 seq 的全部 latent [0, new_pos]（共 cache_seqlens 个，含新 token）。
+        # 构造 [bs, max_len] 物理 slot 矩阵后一次 advanced-index 取 latent。
+        # graph 路径：max_len = graph._ds_graph_maxlen（固定桶，消除 .item() 同步），越界 key
+        #   经 flash_attn_varlen_func 的 cu_seqlens_k 截断，不参与 attention。
+        # eager 路径（序列超桶或未捕获 batch）：max_len = 运行时 total_lens.max()。
         total_lens = cache_lens.long()                     # = new_pos + 1
-        max_len = int(total_lens.max().item())
-        latents = torch.zeros(bs, max_len, self._latent_dim, dtype=k_cache.dtype, device=k_cache.device)
-        for i in range(bs):
-            tl = int(total_lens[i].item())
-            if tl <= 0:
-                continue
-            bt = block_table[i]
-            n_blocks = (tl + cache_manager.block_size - 1) // cache_manager.block_size
-            gathered = k_cache[bt[:n_blocks].long()]       # [n_blocks, block_size, 1, 576]
-            gathered = gathered.reshape(-1, self._latent_dim)
-            latents[i, :tl] = gathered[:tl]
+        use_graph = getattr(graph, "_use_graph_bucket", False)
+        graph_maxlen = getattr(graph, "_ds_graph_maxlen", None)
+        if use_graph and graph_maxlen is not None:
+            max_len = graph_maxlen
+        else:
+            max_len = int(total_lens.max().item())
+        block_size = cache_manager.block_size
+        bt = block_table[:bs].long()                       # [bs, max_seq_blocks]
+        t_idx = torch.arange(max_len, device=bt.device)    # [max_len]
+        blk_idx = t_idx // block_size                      # [max_len]
+        off_idx = t_idx % block_size                       # [max_len]
+        blk_id = bt[:, blk_idx]                            # [bs, max_len]
+        slots = blk_id * block_size + off_idx             # [bs, max_len]
+        k_flat = k_cache.reshape(-1, self._latent_dim)     # [n_blocks*block_size, 576]
+        latents = k_flat[slots.reshape(-1)].view(bs, max_len, self._latent_dim)
 
         # (3) 展开：compressed_kv → layernorm → kv_b_proj → per-head k_nope, v
         compressed_kv, k_pe_all = latents.split([self._kv_lora_rank, self._qk_rope], dim=-1)
@@ -376,7 +384,6 @@ class DeepSeekAdapter(ModelAdapter):
         cos_q = cos[new_pos].unsqueeze(1)                  # [bs, 1, qk_rope]
         sin_q = sin[new_pos].unsqueeze(1)
         q_pe = self._apply_rope(q_pe, cos_q, sin_q)       # [bs, H, 64]
-        # k_pe 位置 0..max_len-1（与新 token 在 new_pos=cache_seqlens-1 对齐）
         k_pos = torch.arange(max_len, device=k_pe_all.device).unsqueeze(0)  # [1, max_len]
         cos_k = cos[k_pos]                                # [1, max_len, qk_rope]
         sin_k = sin[k_pos]
@@ -385,15 +392,28 @@ class DeepSeekAdapter(ModelAdapter):
         # (5) 拼接 q=[q_nope|q_pe] [bs,H,192]；k=[k_nope|k_pe] [bs, max_len, H, 192]
         q_full = torch.cat([q_nope, q_pe], dim=-1)        # [bs, H, 192]
         k_full = torch.cat([k_nope, k_pe_rot.unsqueeze(2).expand(-1, -1, self._num_heads, -1)], dim=-1)
-
-        # (6) flash_attn_func（q 长度1，k/v 长度 max_len）。
-        # decode 单 token 是序列最后一个，应看到全部 key → causal=False
-        # （q_len=1 时 causal=True 会被 flash 当成 position 0 只看 key[0]，故必须 False）。
-        q_fa = q_full.unsqueeze(1)                        # [bs, 1, H, 192]
         v_fa = torch.nn.functional.pad(v, (0, self._q_head - self._v_head))  # [bs, max_len, H, 192]
-        attn_out = flash_attn_func(q_fa, k_full, v_fa,
-                                   softmax_scale=graph._ds_softmax_scale, causal=False)
-        attn_out = attn_out[..., :self._v_head].reshape(bs, self._num_heads * self._v_head)
+
+        # (6) attention。graph 路径用 flash_attn_varlen_func + cu_seqlens_k 截断每 seq 有效长度
+        # （越界 key 不参与，且 cu_seqlens 是 GPU tensor，graph-friendly）；eager 路径用 flash_attn_func。
+        if use_graph and graph_maxlen is not None:
+            cu_q = torch.arange(0, bs + 1, dtype=torch.int32, device=q_full.device)
+            cu_k = torch.zeros(bs + 1, dtype=torch.int32, device=q_full.device)
+            cu_k[1:] = torch.cumsum(total_lens.to(torch.int32), dim=0)
+            # varlen: q [bs,H,D], k/v [bs*max_len,H,D] 按 cu_k 截断每 seq 的 [0,L_i)
+            k_v = k_full.reshape(bs * max_len, k_full.shape[-2], k_full.shape[-1])
+            v_v = v_fa.reshape(bs * max_len, v_fa.shape[-2], v_fa.shape[-1])
+            attn_out = flash_attn_varlen_func(
+                q_full, k_v, v_v,
+                cu_seqlens_q=cu_q, cu_seqlens_k=cu_k,
+                max_seqlen_q=1, max_seqlen_k=max_len,
+                softmax_scale=graph._ds_softmax_scale, causal=False)
+            attn_out = attn_out[..., :self._v_head].reshape(bs, self._num_heads * self._v_head)
+        else:
+            q_fa = q_full.unsqueeze(1)                    # [bs, 1, H, 192]
+            attn_out = flash_attn_func(q_fa, k_full, v_fa,
+                                       softmax_scale=graph._ds_softmax_scale, causal=False)
+            attn_out = attn_out[..., :self._v_head].reshape(bs, self._num_heads * self._v_head)
 
         # (7) o_proj
         return F.linear(attn_out, attn._o_w, attn._o_b)
@@ -409,7 +429,7 @@ class DeepSeekAdapter(ModelAdapter):
             mlp_out = moe_forward(
                 x, mlp._gate_w, mlp._e_gu, mlp._e_d,
                 self._top_k, self._n_experts,
-                mlp._shared_gu, mlp._shared_d,
+                mlp._shared_gu, mlp._shared_d, decode=True,
             )
         else:
             # dense SwiGLU（DeepSeek 标准: silu(gate)*up；_dense_gu=cat([gate,up]).t()）
@@ -462,7 +482,8 @@ class DeepSeekAdapter(ModelAdapter):
         mlp = block.mlp
         if mlp._is_moe:
             mlp_out = moe_forward(h2.reshape(-1, self._hidden), mlp._gate_w, mlp._e_gu, mlp._e_d,
-                                  self._top_k, self._n_experts, mlp._shared_gu, mlp._shared_d)
+                                  self._top_k, self._n_experts, mlp._shared_gu, mlp._shared_d,
+                                  decode=False)
             mlp_out = mlp_out.view(B, S, self._hidden)
         else:
             gate_up = h2 @ mlp._dense_gu

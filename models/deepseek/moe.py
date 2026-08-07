@@ -22,14 +22,18 @@ DeepSeek MoE 推理（eager，正确性优先，CUDA-Graph 友好预留）。
 import torch
 import torch.nn.functional as F
 
+from kernel.grouped_gemv import grouped_gate_up, grouped_down
+
 
 def moe_forward(x, gate_weight, e_gu, e_d, top_k, n_experts,
-                shared_gu=None, shared_d=None):
+                shared_gu=None, shared_d=None, decode=False):
     """
     x: [N, hidden]  (N = bs for decode, 或 B*S for prefill)
     gate_weight: [n_experts, hidden]   (已 .T 备好或原始均可，内部处理)
     e_gu: [n_experts, 2*inter, hidden]  (fused gate|up, 转置好用于 x @ gu.T)
     e_d:  [n_experts, hidden, inter]
+    decode: True=decode 路径（CUDA Graph 友好，逐 token grouped GEMV，无 .item()/.tolist() 同步）；
+            False=prefill 路径（大 batch，按 expert 分段批算，合并同 expert 多 token）。
     返回: [N, hidden]
     """
     N = x.shape[0]
@@ -43,41 +47,50 @@ def moe_forward(x, gate_weight, e_gu, e_d, top_k, n_experts,
     topk_weight, topk_idx = torch.topk(scores, k=top_k, dim=-1, sorted=False)
     # norm_topk_prob=false, routed_scaling_factor=1.0 → 不归一化、不缩放
 
-    # 3. 按 expert 分段批算
-    #    把每个 (token, expert) 对展开，按 expert 排序，连续段送对应 expert
+    # 3. expert SwiGLU 计算
     flat_idx = topk_idx.reshape(-1)                # [N*k]
     flat_w = topk_weight.reshape(-1)               # [N*k]
-    # 每个 token 重复 k 次得到对应 hidden
-    x_rep = x.unsqueeze(1).expand(N, top_k, hidden).reshape(N * top_k, hidden)  # [N*k, hidden]
 
-    order = flat_idx.argsort()                      # 按 expert 分组排序
-    sorted_idx = flat_idx[order]
-    sorted_x = x_rep[order]
-    sorted_w = flat_w[order]
-
-    # 各 expert 的 token 数
-    counts = torch.bincount(sorted_idx, minlength=n_experts)  # [E]
-    # 用 bmm 批量：对每个 expert 取其段算 SwiGLU。这里用循环段（专家数 64，段内 bmm）
-    out_rep = torch.empty_like(sorted_x)            # [N*k, hidden]
-    cum = 0
-    counts_list = counts.tolist()
-    for ei, cnt in enumerate(counts_list):
-        if cnt == 0:
-            continue
-        seg = sorted_x[cum:cum + cnt]               # [cnt, hidden]
-        gu = e_gu[ei]                               # [2*inter, hidden]
-        d = e_d[ei]                                 # [hidden, inter]
-        gate_up = seg @ gu.t()                      # [cnt, 2*inter] = [gate_out | up_out]
-        gate, up = gate_up.chunk(2, dim=-1)         # gu=cat([gate_w, up_w]) → 首 gate, 次 up
-        act = F.silu(gate) * up                     # DeepSeek 标准 SwiGLU: silu(gate)*up
-        out_rep[cum:cum + cnt] = act @ d.t()        # [cnt, hidden]
-        cum += cnt
-
-    # scatter 回 (token, k) 顺序，加权求和
-    inv_order = order.argsort()
-    out_rep = out_rep[inv_order]                    # [N*k, hidden]
-    out_rep = out_rep.view(N, top_k, hidden) * sorted_w[inv_order].view(N, top_k, 1).to(out_rep.dtype)
-    out = out_rep.sum(dim=1)                        # [N, hidden]
+    if decode:
+        # ---- decode 路径（任意 N，CUDA Graph 友好）----
+        # 逐 token 调 grouped GEMV（kernel 内按 expert_idx 索引权重，无 gather、无 host 同步）。
+        # Python for range(N) 在 capture 时按固定 N 静态展开，replay 单 graph；每 iter 纯 GPU op。
+        # grouped_down 输出 [1, hidden] 是单 token 的 K expert 加权累加，故必须逐 token 独立调用。
+        out = torch.empty(N, hidden, dtype=x.dtype, device=x.device)
+        w_ones = torch.ones(top_k, dtype=x.dtype, device=x.device)
+        for i in range(N):
+            idx_i = flat_idx[i * top_k:(i + 1) * top_k].to(torch.int64)  # [K]
+            w_i = flat_w[i * top_k:(i + 1) * top_k]                      # [K]
+            gu = grouped_gate_up(x[i:i + 1], e_gu, idx_i)               # [K, 2*inter]
+            gate, up = gu.chunk(2, dim=-1)                              # [K, inter] each
+            act = F.silu(gate) * up * w_i.unsqueeze(-1).to(gu.dtype)    # [K, inter] 已含权重
+            out[i:i + 1] = grouped_down(act, e_d, idx_i, w_ones)        # [1, hidden]
+    else:
+        # ---- prefill 路径: 按 expert 分段批算（合并同 expert 多 token）----
+        x_rep = x.unsqueeze(1).expand(N, top_k, hidden).reshape(N * top_k, hidden)
+        order = flat_idx.argsort()                  # 按 expert 分组排序
+        sorted_idx = flat_idx[order]
+        sorted_x = x_rep[order]
+        sorted_w = flat_w[order]
+        counts = torch.bincount(sorted_idx, minlength=n_experts)  # [E]
+        out_rep = torch.empty_like(sorted_x)        # [N*k, hidden]
+        cum = 0
+        counts_list = counts.tolist()
+        for ei, cnt in enumerate(counts_list):
+            if cnt == 0:
+                continue
+            seg = sorted_x[cum:cum + cnt]           # [cnt, hidden]
+            gu = e_gu[ei]                           # [2*inter, hidden]
+            d = e_d[ei]                             # [hidden, inter]
+            gate_up = seg @ gu.t()                  # [cnt, 2*inter]
+            gate, up = gate_up.chunk(2, dim=-1)
+            act = F.silu(gate) * up
+            out_rep[cum:cum + cnt] = act @ d.t()
+            cum += cnt
+        inv_order = order.argsort()
+        out_rep = out_rep[inv_order]
+        out = (out_rep.view(N, top_k, hidden) *
+               sorted_w[inv_order].view(N, top_k, 1).to(out_rep.dtype)).sum(dim=1)
 
     # 4. shared experts (shared_gu: [hidden, 2*s_inter] = [gate|up].t(), shared_d: [s_inter, hidden])
     if shared_gu is not None:

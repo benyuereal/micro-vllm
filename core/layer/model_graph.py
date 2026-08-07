@@ -132,6 +132,7 @@ class ModelGraphRunner:
     def capture(self, cache_manager, batch_sizes: List[int] = [1, 2, 4, 8, 16, 32]):
         if self._is_graph_ready: return
 
+        is_deepseek = (self.adapter.model_type == "deepseek")
         logger.info("🎯 开始捕获 CUDA Graph ...")
 
         if batch_sizes:
@@ -144,22 +145,47 @@ class ModelGraphRunner:
                         for _ in range(3): _ = self._fast_mlp(_x, _gu, _d)
                 torch.cuda.synchronize()
 
-        # warmup 用的 dummy block table，一次性使用，不需要常驻
-        buffer = torch.zeros(self.max_bs, self.attention.max_blocks, dtype=torch.int32, device=self.device)
+        # capture/warmup 需要合法 cache 状态：block_table 指向有效 block、seqlens > 0。
+        # _block_table_buffer 初始化为 -1（非法 block_id），若 attention 在 seqlens>0 时读它
+        # 会 illegal access；且 graph 必须绑定这个【常驻】张量（replay 时框架往里写真实表，
+        # graph 读的就是它），不能用临时全 0 buffer。故 capture 前临时填合法 block id，
+        # capture 完恢复原值。所有架构（Qwen/DeepSeek）统一走这条路。
+        bt_buf = cache_manager._block_table_buffer
+        sl_buf = cache_manager._cache_seqlens_buffer
+        saved_bt = bt_buf[:self.max_bs].clone()
+        saved_sl = sl_buf[:self.max_bs].clone()
+        # 每 seq 占前 n_blk 个 block（block_id = i*n_blk .. (i+1)*n_blk-1），seqlens=8。
+        # 8 任意取（1..桶上界皆可），只要让 attention 真有 key 可读、且指向合法 block。
+        n_blk = (8 + cache_manager.block_size - 1) // cache_manager.block_size
+
+        # DeepSeek: 固定 max_len 桶以进 graph（消除 attention 的 .item() 同步）。
+        # 桶上界取 max_blocks*block_size 与 rotary max_position 的较小值，并限到 1024（覆盖常见对话）。
+        if is_deepseek:
+            self._ds_graph_maxlen = min(1024, self.attention.max_blocks * 256,
+                                        self.attention.rotary_emb.cos_cache.shape[2])
+            # 运行时标志：attention() 据此选择 graph(varlen+固定桶) / eager(真实 max_len) 路径。
+            # capture/warmup 期间恒为 True；forward 时按是否 replay 设定。
+            self._use_graph_bucket = True
 
         for bs in batch_sizes:
             g = torch.cuda.CUDAGraph()
             dummy = torch.randint(0, self.vocab_size, (bs,), device=self.device)
-            # Warmup
+            # 构造合法 cache 状态：每 seq 用 block i*n_blk..(i+1)*n_blk-1，seqlens=8
+            for i in range(bs):
+                bt_buf[i, :n_blk] = torch.arange(i * n_blk, (i + 1) * n_blk, dtype=torch.int32, device=self.device)
+            sl_buf[:bs] = 8
+            # Warmup + Capture 都用常驻 bt_buf（已填合法 block id）
             for _ in range(3):
-                with torch.no_grad(): self.decode(dummy, bs, cache_manager, buffer)
+                with torch.no_grad(): self.decode(dummy, bs, cache_manager, bt_buf)
             torch.cuda.synchronize()
-            # Capture
             with torch.no_grad(), torch.cuda.graph(g):
-                self._logits[:bs] = self.decode(self._input_ids[:bs], bs, cache_manager,
-                                                cache_manager._block_table_buffer)
+                self._logits[:bs] = self.decode(self._input_ids[:bs], bs, cache_manager, bt_buf)
             self._graphs[bs] = g
             logger.info(f"   - Batch size {bs} OK")
+
+        # 恢复 buffer 原值（-1 / 0），避免污染后续真实推理的首步
+        bt_buf[:self.max_bs] = saved_bt
+        sl_buf[:self.max_bs] = saved_sl
 
         self._is_graph_ready = True
 
@@ -168,11 +194,29 @@ class ModelGraphRunner:
             # 普通路径：H2D copy
             self._input_ids[:batch_size] = input_ids
         # input_ids=None 表示 _input_ids 已由上一步 GPU→GPU copy 预填充，直接 replay
-        if batch_size not in self._graphs:
-            # eager 路径（DeepSeek MLA/MoE 不进 CUDA Graph）：
+
+        is_deepseek = (self.adapter.model_type == "deepseek")
+        if is_deepseek:
+            # DeepSeek graph 桶有固定 max_len 上界。若任一 seq 实际长度超过桶，replay 会截断有效 key →
+            # 必须回退 eager（attention 用真实 max_len）。同步取 max 只发生在回退分支，不影响 replay 路径。
+            bucket = getattr(self, "_ds_graph_maxlen", None)
+            if bucket is not None and batch_size in self._graphs:
+                cur_max = int(cache_manager._cache_seqlens_buffer[:batch_size].max().item())
+                use_graph = (cur_max <= bucket)
+            else:
+                use_graph = False
+        else:
+            use_graph = batch_size in self._graphs
+
+        if not use_graph:
+            # eager 路径（未捕获的 batch_size，或 DeepSeek 序列超 graph 桶上界）：
             # 必须用 cache_manager 已建好的真实 block_table_buffer，
             # 而非全零 buffer——否则多序列会全部读到 block 0 的 KV，互相污染。
+            if is_deepseek:
+                self._use_graph_bucket = False
             return self.decode(self._input_ids[:batch_size], batch_size, cache_manager,
                                cache_manager._block_table_buffer)
+        if is_deepseek:
+            self._use_graph_bucket = True
         self._graphs[batch_size].replay()
         return self._logits[:batch_size]

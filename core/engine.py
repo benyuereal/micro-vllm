@@ -93,13 +93,15 @@ class InferenceEngine:
         self.max_position = getattr(self.config, 'max_position_embeddings', 4096)
         
         # 捕获 CUDA Graph
-        # 注意：DeepSeek MLA/MoE 路径含 data-dependent 路由与逐 seq 动态长度，首版不进 CUDA Graph。
-        if self.device == "cuda" and self.adapter.model_type != "deepseek":
+        # DeepSeek：MLA attention 用 flash_attn_varlen_func + 固定 max_len 桶（消除 .item() 同步，
+        # cu_seqlens 是 GPU tensor），MoE decode 用 Triton grouped GEMV（无 .tolist()），均 graph-friendly。
+        # 运行时序列长度超过桶上界（1024）会自动回退 eager（见 model_graph.forward）。
+        if self.device == "cuda":
             logger.info("Capturing CUDA Graphs...")
             self.graph_runner.capture(self.cache_manager, batch_sizes=[1, 2, 4, 8, 16, 32, 40])
             logger.info("CUDA Graphs captured.")
         elif self.adapter.model_type == "deepseek":
-            logger.info("DeepSeek: 跳过 CUDA Graph 捕获（MLA/MoE eager 路径）。")
+            logger.info("DeepSeek: 非 CUDA 设备，跳过 CUDA Graph 捕获（eager 路径）。")
             
         # 注册退出钩子
         atexit.register(self.shutdown)
