@@ -98,42 +98,38 @@ class Scheduler:
 
     def _get_prefill_batch(self) -> Tuple[List[Sequence], str]:
         """
-        预填充批次调度：基于桶区间的分批策略
-        
-        策略说明：
-        - 将预填充请求按长度映射到 bucket_size 大小的桶中
-        - 从最短的桶开始选择批次
-        - 同一桶内的请求长度相近，padding 最小化
-        
-        示例（bucket_size=50）：
-        - 长度 [10, 45, 52, 98, 103] 
-        - 桶分组: {0: [10, 45], 50: [52], 100: [98, 103]}
-        - 优先选择桶 0（最短）
+        预填充批次调度：按【精确长度】分组。
+
+        同一长度组内的请求 input_ids 等长，可直接拼成 [B, S] 定长 batch，
+        无需 padding。不同长度的请求分到不同组、不同批次 prefill——
+        因为 prefill_layer 用 causal flash_attn 且不带 attention mask，
+        任何 padding（如用 0 填充）都会让假 token 参与注意力、污染 KV cache，
+        对 DeepSeek（token 0 非 pad）尤其致命，对 Qwen 同样不正确。
+        与 decode 阶段按 current_position 分组保持一致。
+
+        触发条件（任一）：
+        - 该长度组凑够 max_batch_size 个；
+        - 或组内最早请求等待超过 prefill_timeout（避免短请求无限等待）。
         """
-        # 按桶区间分组
-        bucket_groups = defaultdict(list)
-        
+        # 按精确 input_ids 长度分组
+        length_groups = defaultdict(list)
         for seq in list(self.waiting_queue):
             if seq.state == "prefill":
-                length = len(seq.input_ids)
-                bucket = self._get_bucket_key(length)
-                bucket_groups[bucket].append(seq)
-        
-        if not bucket_groups:
+                length_groups[len(seq.input_ids)].append(seq)
+
+        if not length_groups:
             return [], "idle"
-        
-        # 从最短的桶开始选择（升序排列）
-        sorted_buckets = sorted(bucket_groups.keys())
-        
-        for bucket_key in sorted_buckets:
-            bucket_sequences = bucket_groups[bucket_key]
-            # 按长度降序排列（长的在前，减少padding）
-            bucket_sequences.sort(key=lambda s: len(s.input_ids), reverse=True)
-            
+
+        # 从最短的长度组开始选择（SJF，短请求优先）
+        for length in sorted(length_groups.keys()):
+            group = length_groups[length]
+            # 同长度内按到达时间排序（FIFO）
+            group.sort(key=lambda s: s.timestamp)
+
             selected = []
             total_tokens = 0
-            timestamp = None  # 记录候选序列中最早的时间戳
-            for seq in bucket_sequences:
+            timestamp = None  # 候选中最早到达时间
+            for seq in group:
                 if len(selected) >= self.max_batch_size:
                     break
                 seq_tokens = len(seq.input_ids)
@@ -141,34 +137,20 @@ class Scheduler:
                     continue
                 selected.append(seq)
                 total_tokens += seq_tokens
-                # 记录最早到达的时间戳
                 if timestamp is None or seq.timestamp < timestamp:
                     timestamp = seq.timestamp
-            
-            # 触发批次的条件：
-            # 1. 达到 max_batch_size
-            # 2. 或者候选序列中最早请求等待时间超过 prefill_timeout
-                
+
+            # 触发批次条件：达 max_batch_size 或最早请求等待超时
+            if timestamp is None:
+                continue
             wait_time = time.time() - timestamp
-            
-            # logger.info(f"selected: {len(selected)}, max_batch_size: {self.max_batch_size}, wait_time: {wait_time:.3f}s")
             if len(selected) >= self.max_batch_size or wait_time >= self.prefill_timeout:
-                # 找到最长序列的长度
-                max_len = max(len(seq.input_ids) for seq in selected)
-                
-                # 将所有序列填充到最长长度（用 0 填充）
-                for seq in selected:
-                    current_len = len(seq.input_ids)
-                    if current_len < max_len:
-                        seq.input_ids = seq.input_ids + [0] * (max_len - current_len)
-                
                 for seq in selected:
                     self.waiting_queue.remove(seq)
                     self.running_sequences.append(seq)
-                
-                logger.info(f"prefill bucket: {bucket_key}, selected: {len(selected)} sequences, max_len: {max_len}, tokens: {total_tokens}, wait_time: {wait_time:.3f}s")
+                logger.info(f"prefill len={length}, selected: {len(selected)} sequences, tokens: {total_tokens}, wait_time: {wait_time:.3f}s")
                 return selected, "prefill"
-        
+
         # 不满足批次条件，返回 waiting 让外部控制等待
         return [], "waiting"
 

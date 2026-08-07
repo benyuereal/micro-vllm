@@ -84,15 +84,24 @@ class InferenceEngine:
         self._stream_event: Optional[StreamEvent] = None
         
         # 状态
+        # eos 兜底：Qwen 旧版 tokenizer 的 eos_token_id 可能为 None，
+        # 此时从 model.generation_config 读取（如 Qwen-Chat 的 151643）
         self.eos_token_id = self.tokenizer.eos_token_id
+        if self.eos_token_id is None:
+            self.eos_token_id = getattr(self.model.generation_config, 'eos_token_id', None)
         self.stream_callbacks = {}
         self.max_position = getattr(self.config, 'max_position_embeddings', 4096)
         
         # 捕获 CUDA Graph
+        # DeepSeek：MLA attention 用 flash_attn_varlen_func + 固定 max_len 桶（消除 .item() 同步，
+        # cu_seqlens 是 GPU tensor），MoE decode 用 Triton grouped GEMV（无 .tolist()），均 graph-friendly。
+        # 运行时序列长度超过桶上界（1024）会自动回退 eager（见 model_graph.forward）。
         if self.device == "cuda":
             logger.info("Capturing CUDA Graphs...")
             self.graph_runner.capture(self.cache_manager, batch_sizes=[1, 2, 4, 8, 16, 32, 40])
             logger.info("CUDA Graphs captured.")
+        elif self.adapter.model_type == "deepseek":
+            logger.info("DeepSeek: 非 CUDA 设备，跳过 CUDA Graph 捕获（eager 路径）。")
             
         # 注册退出钩子
         atexit.register(self.shutdown)
@@ -111,19 +120,28 @@ class InferenceEngine:
         self.config = self.model.config
 
     def _init_config(self):
-        # 提取模型配置
-        self.num_layers = self.config.num_hidden_layers
-        self.num_heads = self.config.num_attention_heads
-        self.kv_num_heads = getattr(self.config, 'num_key_value_heads', self.num_heads)
-        self.head_size = getattr(self.config, 'head_dim', self.config.hidden_size // self.num_heads)
-        
-        # 张量并行切分
+        # 通过适配器提取架构相关维度（GQA vs MLA 等差异在此屏蔽）
+        from models import build_adapter
+        self.adapter = build_adapter(self.config)
+
+        self.num_layers = self.adapter.num_layers(self.config)
+        g_num_heads, g_kv_heads, cache_head_size = self.adapter.cache_dims(self.config)
+
+        # 张量并行切分（按 head 切）
         world_size = get_world_size()
-        assert self.num_heads % world_size == 0 and self.kv_num_heads % world_size == 0
-        
-        self.num_heads //= world_size
-        self.kv_num_heads //= world_size
-        self.intermediate_size = self.config.intermediate_size // world_size
+        assert g_num_heads % world_size == 0, f"num_heads {g_num_heads} 不可被 world_size {world_size} 整除"
+        # MLA: kv 是单 latent head（不可按 head 切），保持 1
+        if g_kv_heads == 1:
+            assert world_size == 1 or self.adapter.model_type != "deepseek", \
+                "DeepSeek MLA 单 latent head，TP>1 需对 latent 切分（首版仅支持 TP=1）"
+        else:
+            assert g_kv_heads % world_size == 0
+
+        self.num_heads = g_num_heads // world_size
+        self.kv_num_heads = g_kv_heads if g_kv_heads == 1 else g_kv_heads // world_size
+        # head_size = KV cache 存储维度（GQA=head_size, MLA=latent_dim）
+        self.head_size = cache_head_size
+        self.intermediate_size = self.adapter.intermediate_size(self.config, world_size)
 
     def _auto_configure(self) -> Tuple[str, torch.dtype]:
         if torch.cuda.is_available():
@@ -151,6 +169,9 @@ class InferenceEngine:
         seq = Sequence(seq_id, prompt, self.tokenizer, max_tokens)
         seq.temperature = temperature
         seq.top_p = top_p
+        # 同步 engine 解析出的 eos_token_id（覆盖 Sequence 中可能为 None 的默认值）
+        if self.eos_token_id is not None:
+            seq.eos_token_id = self.eos_token_id
         self.scheduler.add_request(seq)
         return seq_id
 
@@ -204,18 +225,31 @@ class InferenceEngine:
         batch, bs, logits = ctx.sequences, ctx.batch_size, ctx.logits
         self.cache_manager.commit(bs)
 
-    def generate(self, prompts: List[str], max_tokens: int = 100) -> Dict[str, str]:
-        seq_ids = [self.add_request(p, max_tokens) for p in prompts]
+    def generate(self, prompts: List[str], max_tokens: int = 100,
+                 temperature: float = 0.7, top_p: float = 0.9) -> Dict[str, str]:
+        seq_ids = [self.add_request(p, max_tokens, temperature=temperature, top_p=top_p) for p in prompts]
         seq_map = {sid: p for sid, p in zip(seq_ids, prompts)}
-        
-        # 简易事件循环
-        for _ in range(max_tokens * len(prompts)): # 安全上限
+        # 清理上轮残留的已完成序列，避免 get_finished_results 返回过期 seq 导致 KeyError
+        self.scheduler.finished_sequences.clear()
+
+        # 简易事件循环（对齐 api_server 的 rank0 推理循环语义）
+        for _ in range(max_tokens * len(prompts) + 64):  # 安全上限
             batch, batch_type = self.get_next_batch()
-            if not batch and not self.scheduler.running_sequences: break
-            
+
+            # waiting：请求未攒够批次，等 prefill_timeout 到期再调度
+            if batch_type == "waiting" or not batch:
+                if not self.scheduler.running_sequences and not self.scheduler.waiting_queue:
+                    break
+                time.sleep(0.001)
+                continue
+
             ctx = BatchInferenceContext(len(batch), batch_type, batch)
             self.step(ctx)
             self.collect(ctx)
+            self.update_sequences(ctx.sequences)
+
+            if not self.scheduler.running_sequences and not self.scheduler.waiting_queue:
+                break
 
         # 结果收集
         results = {}
