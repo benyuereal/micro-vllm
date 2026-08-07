@@ -1,6 +1,7 @@
 # api_server.py
 import asyncio
 import json
+import os
 import time
 from queue import Queue
 from typing import List, Optional
@@ -100,6 +101,7 @@ async def health():
     if not engine:
         raise HTTPException(503, "Model not loaded")
     return HealthResp(
+        model=engine.adapter.model_type,
         device=str(engine.device),
         running_sequences=len(engine.scheduler.running_sequences),
         waiting_sequences=len(engine.scheduler.waiting_queue)
@@ -111,7 +113,8 @@ async def generate(req: GenerateReq):
     if not engine:
         raise HTTPException(503, "Model not loaded")
     start = time.time()
-    results = engine.generate([req.prompt], req.max_tokens)
+    results = engine.generate([req.prompt], req.max_tokens,
+                              temperature=req.temperature, top_p=req.top_p)
     text = next(iter(results.values()))
     return GenerateResp(text=text, tokens=len(text), time_ms=(time.time()-start)*1000)
 
@@ -120,7 +123,8 @@ async def generate(req: GenerateReq):
 async def batch_generate(req: BatchGenerateReq):
     if not engine:
         raise HTTPException(503, "Model not loaded")
-    results = engine.generate(req.prompts, req.max_tokens)
+    results = engine.generate(req.prompts, req.max_tokens,
+                              temperature=req.temperature, top_p=req.top_p)
     return BatchGenerateResp(results=[
         GenerateResp(text=t, tokens=len(t), time_ms=0) for t in results.values()
     ])
@@ -205,6 +209,6 @@ if __name__ == "__main__":
             global running
             running = False
         
-        uvicorn.run(app, host="0.0.0.0", port=8000)
+        uvicorn.run(app, host="0.0.0.0", port=int(os.environ.get("PORT", 8000)))
     else:
         non_rank0_inference_loop()

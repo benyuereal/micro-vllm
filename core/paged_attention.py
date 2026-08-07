@@ -75,7 +75,7 @@ class PagedAttention(nn.Module):
     , kv_num_heads: int, device: str = "auto"
     , max_batch_size=16, max_blocks=32
     , max_position=4096, max_tokens=8192
-    , block_size=256
+    , block_size=256, rope_dim: int = None
     ):
         super().__init__()
         self.block_size = block_size
@@ -84,6 +84,8 @@ class PagedAttention(nn.Module):
         self.num_heads = num_heads
         self.kv_num_heads = kv_num_heads
         self.head_size = head_size
+        # RoPE 实际作用维度：GQA=head_size；MLA=qk_rope_head_dim（独立于 cache 存储维度）
+        self.rope_dim = rope_dim if rope_dim is not None else head_size
         self.scale = head_size ** -0.5  # 1/sqrt(head_size)
 
         # 自动检测设备
@@ -91,10 +93,10 @@ class PagedAttention(nn.Module):
                        torch.device('cuda') if torch.cuda.is_available() else torch.device('cpu'))
         if device != "auto": self.device = torch.device(device)
 
-        # 初始化旋转位置编码
+        # 初始化旋转位置编码（用 rope_dim，而非 cache head_size）
         max_kv_capacity = max_blocks * 256
 
-        self.rotary_emb = PrecomputedRotaryEmbedding(head_size, max_position=max_kv_capacity, device=self.device)
+        self.rotary_emb = PrecomputedRotaryEmbedding(self.rope_dim, max_position=max_kv_capacity, device=self.device)
         self.use_flash_attn = self.device.type == 'cuda' and flash_attn_with_kvcache is not None
         # ✅ 预分配缓存（关键优化）
         self._rotary_cos_cache = None
