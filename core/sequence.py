@@ -17,6 +17,7 @@ class Sequence:
         self.current_position = len(self.input_ids)
         self.temperature = 0.7
         self.top_p = 0.9
+        self.repetition_penalty = 1.0  # 1.0=禁用，>1.0 惩罚已出现 token（HF 约定）
         self.eos_token_id = tokenizer.eos_token_id
         self.priority = 0
         self.timestamp = time.time()  # 请求到达时间戳

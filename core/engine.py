@@ -163,12 +163,14 @@ class InferenceEngine:
     # 公共接口 (Public API)
     # -------------------------------------------------------------------------
 
-    def add_request(self, prompt: str, max_tokens: int = 128, 
-                    temperature: float = 0.7, top_p: float = 0.9) -> int:
+    def add_request(self, prompt: str, max_tokens: int = 128,
+                    temperature: float = 0.7, top_p: float = 0.9,
+                    repetition_penalty: float = 1.0) -> int:
         seq_id = hash(prompt + str(time.time())) % (2 ** 32)
         seq = Sequence(seq_id, prompt, self.tokenizer, max_tokens)
         seq.temperature = temperature
         seq.top_p = top_p
+        seq.repetition_penalty = repetition_penalty
         # 同步 engine 解析出的 eos_token_id（覆盖 Sequence 中可能为 None 的默认值）
         if self.eos_token_id is not None:
             seq.eos_token_id = self.eos_token_id
@@ -216,8 +218,15 @@ class InferenceEngine:
             self._flush_stream()
         if rank0():
             dctx = self._decode_ctx
-            next_tokens_gpu = self.sampler(logits, dctx.temps, dctx.topp, 50)
+            next_tokens_gpu = self.sampler(
+                logits, dctx.temps, dctx.topp, 50,
+                prev_tokens=dctx.prev_tokens, rep_penalties=dctx.rep_penalties)
             dctx.commit(next_tokens_gpu, self.graph_runner._input_ids, bs, batch)
+            # 把本步新 token 追加进 prev_tokens，供下一步 repetition penalty 使用
+            if dctx.prev_tokens is not None and torch.any(dctx.rep_penalties > 1.0):
+                new_col = next_tokens_gpu.unsqueeze(1)              # [bs, 1]
+                dctx.prev_tokens = torch.cat(
+                    [dctx.prev_tokens, new_col], dim=1)             # [bs, L+1]
 
     def _decode(self, ctx: BatchInferenceContext):
         """同步 decode：launch + collect，供 step() 和 non-rank0 路径调用。"""
@@ -226,8 +235,10 @@ class InferenceEngine:
         self.cache_manager.commit(bs)
 
     def generate(self, prompts: List[str], max_tokens: int = 100,
-                 temperature: float = 0.7, top_p: float = 0.9) -> Dict[str, str]:
-        seq_ids = [self.add_request(p, max_tokens, temperature=temperature, top_p=top_p) for p in prompts]
+                 temperature: float = 0.7, top_p: float = 0.9,
+                 repetition_penalty: float = 1.0) -> Dict[str, str]:
+        seq_ids = [self.add_request(p, max_tokens, temperature=temperature, top_p=top_p,
+                                    repetition_penalty=repetition_penalty) for p in prompts]
         seq_map = {sid: p for sid, p in zip(seq_ids, prompts)}
         # 清理上轮残留的已完成序列，避免 get_finished_results 返回过期 seq 导致 KeyError
         self.scheduler.finished_sequences.clear()
@@ -294,7 +305,17 @@ class InferenceEngine:
         # 4. 采样
         if rank0():
             stats.sample_time = time.time()
-            next_tokens = self.sampler(logits[:, -1, :], temps, topp, 1000).tolist()
+            # prefill 的 repetition penalty：用每条 seq 的 prompt token 作历史
+            rep_pen = torch.tensor(
+                [getattr(s, 'repetition_penalty', 1.0) for s in batch], device=device)
+            prev = None
+            if torch.any(rep_pen > 1.0):
+                hist = [list(s.input_ids) for s in batch]
+                max_l = max(len(h) for h in hist)
+                prev = torch.tensor(
+                    [h + [-1] * (max_l - len(h)) for h in hist], dtype=torch.long, device=device)
+            next_tokens = self.sampler(logits[:, -1, :], temps, topp, 1000,
+                                       prev_tokens=prev, rep_penalties=rep_pen).tolist()
             for i, seq in enumerate(batch):
                 seq._next_token = next_tokens[i]
             stats.sample_time = time.time() - stats.sample_time

@@ -10,20 +10,22 @@ class DecodeContext:
     - commit()：采样后调用，GPU→GPU 预填充 + D2H + 更新 seq._next_token
     """
 
-    __slots__ = ('seq_ids', 'temps', 'topp', 'next_tokens')
+    __slots__ = ('seq_ids', 'temps', 'topp', 'rep_penalties', 'prev_tokens', 'next_tokens')
 
     def __init__(self):
         self.seq_ids:     Optional[List[int]]   = None
         self.temps:       Optional[torch.Tensor] = None  # [bs] float, on device
         self.topp:        Optional[torch.Tensor] = None  # [bs] float, on device
+        self.rep_penalties: Optional[torch.Tensor] = None  # [bs] float, on device
+        self.prev_tokens: Optional[torch.Tensor] = None  # [bs, L] int, 历史token（-1 padding）
         self.next_tokens: Optional[torch.Tensor] = None  # [bs] int,   on device
 
     def prepare(self, batch, device: str, cache_manager) -> Optional[torch.Tensor]:
         """
         刷新批次状态，返回本步的 input_ids；同时驱动 cache_manager 更新缓存元数据。
 
-        - batch 不变 → 复用 temps/topp，返回 None
-        - batch 变化 → 重建 temps/topp，返回新 input_ids
+        - batch 不变 → 复用 temps/topp/rep_penalties，返回 None
+        - batch 变化 → 重建 temps/topp/rep_penalties，返回新 input_ids
         两种情况都通过 cache_manager.prepare(batch_switched) 统一处理缓存更新。
         """
         cur_ids = [seq.seq_id for seq in batch]
@@ -41,6 +43,13 @@ class DecodeContext:
         self.seq_ids = cur_ids
         self.temps = torch.tensor([seq.temperature for seq in batch], device=device)
         self.topp  = torch.tensor([seq.top_p for seq in batch], device=device)
+        self.rep_penalties = torch.tensor(
+            [getattr(seq, 'repetition_penalty', 1.0) for seq in batch], device=device)
+        # 历史_token（prompt + 已生成），用于 repetition penalty；-1 padding 到等长
+        hist = [list(seq.input_ids) + list(seq.output_ids) for seq in batch]
+        max_l = max(len(h) for h in hist)
+        padded = [h + [-1] * (max_l - len(h)) for h in hist]
+        self.prev_tokens = torch.tensor(padded, dtype=torch.long, device=device)
         return torch.tensor(
             [seq.get_next_input_ids() for seq in batch], device=device
         ).squeeze(1)

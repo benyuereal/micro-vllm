@@ -13,12 +13,36 @@ class Sampler:
             # mode="max-autotune"
         )
 
-    def __call__(self, logits, temperatures, top_ps, top_k):
-        """调用采样函数。temperature<=0 走 greedy（argmax），绕过编译路径避免 0 除。"""
+    def __call__(self, logits, temperatures, top_ps, top_k,
+                 prev_tokens=None, rep_penalties=None):
+        """调用采样函数。temperature<=0 走 greedy（argmax），绕过编译路径避免 0 除。
+
+        prev_tokens: [bs, max_prev] 已生成+prompt 的 token id（含 padding，-1 表无效），
+                     用于 repetition penalty。None 或 rep_penalties 全 1.0 时跳过惩罚。
+        rep_penalties: [bs] 每条 seq 的惩罚系数（1.0=禁用，>1.0 惩罚已出现 token）。
+        """
+        # repetition penalty（在 greedy/采样前统一施加，纯 GPU op，graph-friendly）
+        if prev_tokens is not None and rep_penalties is not None and torch.any(rep_penalties > 1.0):
+            logits = self._apply_repetition_penalty(logits, prev_tokens, rep_penalties)
+
         # greedy 短路：任一行 temperature<=0 即走 eager argmax（与 HF do_sample=False 对齐）
         if torch.any(temperatures <= 0):
             return logits.argmax(dim=-1)
         return self._compiled_sample(logits, temperatures, top_ps, top_k)
+
+    @staticmethod
+    def _apply_repetition_penalty(logits, prev_tokens, rep_penalties):
+        """HF 约定：对历史出现过的 token，logit>0 则 /p，logit<0 则 *p（p>1 降低概率）。
+        prev_tokens: [bs, L]（-1 padding）。rep_penalties: [bs]。纯 GPU，无 host 同步。"""
+        # 构造 [bs, vocab] 出现掩码：只在 valid（非 -1 padding）位置 scatter 1.0。
+        # 用 valid 作 scatter 的 value，padding 位置写 0 → 不污染。
+        valid = (prev_tokens >= 0).to(logits.dtype)      # [bs, L]
+        safe_idx = prev_tokens.clamp(min=0)              # 避免负索引
+        mask = torch.zeros_like(logits)                  # [bs, vocab]
+        mask.scatter_(1, safe_idx, valid)                # 出现=1，padding=0
+        pen = rep_penalties[:, None]                      # [bs, 1]
+        penalized = torch.where(logits > 0, logits / pen, logits * pen)
+        return torch.where(mask > 0, penalized, logits)
 
     @staticmethod
     def _sample_impl(logits, temp, top_p, top_k):

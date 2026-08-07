@@ -59,12 +59,13 @@ def extract_assistant_reply(full_text, prompt, fmt):
 
 
 # ========== 流式请求 ==========
-def stream_chat(prompt, url, max_tokens, temperature):
+def stream_chat(prompt, url, max_tokens, temperature, repetition_penalty):
     """对接 /generate_stream (SSE)。返回 (总耗时, 首字延迟, 完整生成文本)。"""
     payload = {
         "prompt": prompt,
         "max_tokens": max_tokens,
         "temperature": temperature,
+        "repetition_penalty": repetition_penalty,
         "stream": True,
     }
     headers = {"Content-Type": "application/json"}
@@ -114,6 +115,8 @@ def main():
     p.add_argument("--url", default="http://127.0.0.1:8000", help="api_server 地址")
     p.add_argument("--max-tokens", type=int, default=512)
     p.add_argument("--temperature", type=float, default=0.7)
+    p.add_argument("--repetition-penalty", type=float, default=1.15,
+                   help="repetition penalty（>1 惩罚已出现 token，缓解 base 模型重复；1.0 禁用）")
     p.add_argument("--format", choices=["deepseek", "qwen"], default="deepseek",
                    help="prompt 格式（模型类型）")
     p.add_argument("--system", default="你是一个有帮助的AI助手。", help="系统提示")
@@ -146,7 +149,7 @@ def main():
         prompt = build_prompt(history, args.format)
 
         total, first_lat, reply = stream_chat(
-            prompt, args.url, args.max_tokens, args.temperature)
+            prompt, args.url, args.max_tokens, args.temperature, args.repetition_penalty)
 
         if total is not None:
             if reply:

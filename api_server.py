@@ -32,6 +32,7 @@ class GenerateReq(BaseModel):
     max_tokens: int = 128
     temperature: float = 0.7
     top_p: float = 0.9
+    repetition_penalty: float = 1.0
     stream: bool = False
 
 class BatchGenerateReq(BaseModel):
@@ -39,6 +40,7 @@ class BatchGenerateReq(BaseModel):
     max_tokens: int = 128
     temperature: float = 0.7
     top_p: float = 0.9
+    repetition_penalty: float = 1.0
 
 class GenerateResp(BaseModel):
     text: str
@@ -115,7 +117,8 @@ async def generate(req: GenerateReq):
         raise HTTPException(503, "Model not loaded")
     start = time.time()
     results = engine.generate([req.prompt], req.max_tokens,
-                              temperature=req.temperature, top_p=req.top_p)
+                              temperature=req.temperature, top_p=req.top_p,
+                              repetition_penalty=req.repetition_penalty)
     text = next(iter(results.values()))
     return GenerateResp(text=text, tokens=len(text), time_ms=(time.time()-start)*1000)
 
@@ -125,7 +128,8 @@ async def batch_generate(req: BatchGenerateReq):
     if not engine:
         raise HTTPException(503, "Model not loaded")
     results = engine.generate(req.prompts, req.max_tokens,
-                              temperature=req.temperature, top_p=req.top_p)
+                              temperature=req.temperature, top_p=req.top_p,
+                              repetition_penalty=req.repetition_penalty)
     return BatchGenerateResp(results=[
         GenerateResp(text=t, tokens=len(t), time_ms=0) for t in results.values()
     ])
@@ -151,7 +155,8 @@ async def generate_stream(req: GenerateReq):
             req.prompt,
             req.max_tokens,
             req.temperature,
-            req.top_p
+            req.top_p,
+            req.repetition_penalty
         )
 
         def callback(token, text):
