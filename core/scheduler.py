@@ -59,8 +59,13 @@ class Scheduler:
         if self.waiting_queue:
             batch, batch_type = self._get_prefill_batch()
             # logger.info(f"batch_type: {batch_type}, batch: {len(batch)}, waiting_queue: {len(self.waiting_queue)}, running_sequences: {len(self.running_sequences)}")
-            if batch_type != "idle":
+            if batch_type == "prefill":
                 return batch, batch_type
+            # batch_type == "waiting"：有请求但未凑够 batch 且未超时。
+            # 不能在此 return —— 否则 waiting 里的请求会饿死 running 中正在 decode 的 seq
+            # （get_next_batch 提前返回空 batch，decode 分支永不执行，GPU 空转，客户端挂起）。
+            # 正确做法：fall through 到 decode 分支，让 running 的 seq 继续出 token，
+            # 等待中的请求继续等 prefill_timeout 到期再调度。
 
         # 3. 解码阶段：Padding 凑齐 batch_size
         if self.running_sequences:

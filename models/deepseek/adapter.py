@@ -340,7 +340,9 @@ class DeepSeekAdapter(ModelAdapter):
 
         k_cache, v_cache = cache_manager.get(layer_idx)    # [n_blocks, block_size, 1, 576]
         cache_lens = cache_manager._cache_seqlens_buffer[:bs]  # [bs]
-        new_pos = (cache_lens - 1).long()                  # 新 token 逻辑位置（0-indexed）
+        new_pos = (cache_lens - 1).long().clamp(min=0)     # 新 token 逻辑位置（0-indexed）
+        # 防御：极少数竞态下首步 decode seqlens 可能为 0 → new_pos=-1 → gather 负索引崩溃。
+        # 钳到 0 保证不崩（输出可能不准，但避免 device-side assert 拖垮整个 server）。
 
         # (1) 写入新 token 的 latent [compressed_kv | k_pe] 到位置 new_pos
         latent_new = torch.cat([compressed_kv_new, k_pe_new], dim=-1)  # [bs, 576]
@@ -368,7 +370,14 @@ class DeepSeekAdapter(ModelAdapter):
         blk_idx = t_idx // block_size                      # [max_len]
         off_idx = t_idx % block_size                       # [max_len]
         blk_id = bt[:, blk_idx]                            # [bs, max_len]
+        # graph 桶固定 max_len（如 1024），但序列实际只占 ceil(L/block_size) 个 block，
+        # block_table 越界列为 -1（非法 block_id）→ 负 slot → k_flat 索引越界崩溃。
+        # 将非法 blk_id 钳到 0（指向 block 0 的安全内存），越界位置随后由
+        # flash_attn_varlen_func 的 cu_seqlens_k 截断，不参与 attention。
+        n_slots = k_cache.shape[0] * block_size
+        blk_id = blk_id.clamp(min=0)
         slots = blk_id * block_size + off_idx             # [bs, max_len]
+        slots = slots.clamp(min=0, max=n_slots - 1)
         k_flat = k_cache.reshape(-1, self._latent_dim)     # [n_blocks*block_size, 576]
         latents = k_flat[slots.reshape(-1)].view(bs, max_len, self._latent_dim)
 
@@ -508,11 +517,12 @@ class DeepSeekAdapter(ModelAdapter):
         """decode 单 token 的物理 slot [bs, 1]（int32）。
         new_pos: [bs] 逻辑位置。slot = block_table[seq, new_pos//block_size]*block_size + new_pos%block_size。"""
         bt = block_table[:bs].long()                     # [bs, max_seq_blocks]
-        block_idx = (new_pos // block_size).long()       # [bs]
+        max_blk = bt.shape[1]
+        block_idx = (new_pos // block_size).long().clamp(min=0, max=max_blk - 1)  # [bs]
         offset = (new_pos % block_size).long()           # [bs]
         # gather 每 seq 对应 block 的 id
         block_id = bt.gather(1, block_idx.unsqueeze(1)).squeeze(1)  # [bs]
-        slot = block_id * block_size + offset            # [bs]
+        slot = block_id.clamp(min=0) * block_size + offset  # [bs]（防御 -1 非法 block_id）
         return slot.to(torch.int32).view(bs, 1)
 
     # -------------------- buffer 分配 --------------------

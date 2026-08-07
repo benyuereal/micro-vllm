@@ -33,6 +33,7 @@ class GenerateReq(BaseModel):
     temperature: float = 0.7
     top_p: float = 0.9
     repetition_penalty: float = 1.0
+    stop: List[str] = []
     stream: bool = False
 
 class BatchGenerateReq(BaseModel):
@@ -41,6 +42,7 @@ class BatchGenerateReq(BaseModel):
     temperature: float = 0.7
     top_p: float = 0.9
     repetition_penalty: float = 1.0
+    stop: List[str] = []
 
 class GenerateResp(BaseModel):
     text: str
@@ -118,7 +120,7 @@ async def generate(req: GenerateReq):
     start = time.time()
     results = engine.generate([req.prompt], req.max_tokens,
                               temperature=req.temperature, top_p=req.top_p,
-                              repetition_penalty=req.repetition_penalty)
+                              repetition_penalty=req.repetition_penalty, stop=req.stop)
     text = next(iter(results.values()))
     return GenerateResp(text=text, tokens=len(text), time_ms=(time.time()-start)*1000)
 
@@ -129,7 +131,7 @@ async def batch_generate(req: BatchGenerateReq):
         raise HTTPException(503, "Model not loaded")
     results = engine.generate(req.prompts, req.max_tokens,
                               temperature=req.temperature, top_p=req.top_p,
-                              repetition_penalty=req.repetition_penalty)
+                              repetition_penalty=req.repetition_penalty, stop=req.stop)
     return BatchGenerateResp(results=[
         GenerateResp(text=t, tokens=len(t), time_ms=0) for t in results.values()
     ])
@@ -156,7 +158,8 @@ async def generate_stream(req: GenerateReq):
             req.max_tokens,
             req.temperature,
             req.top_p,
-            req.repetition_penalty
+            req.repetition_penalty,
+            req.stop
         )
 
         def callback(token, text):
@@ -176,11 +179,14 @@ async def generate_stream(req: GenerateReq):
                         "token": token,
                         "text": text,
                         "full_text": full_text,
-                        "finished": token == engine.eos_token_id
+                        "finished": (token == engine.eos_token_id)
                     }
                     yield f"data: {json.dumps(data, ensure_ascii=False)}\n\n"
 
                 if engine.scheduler.is_finished(seq_id):
+                    # 推送最终的 finished 标记（覆盖 stop 串/EOS/max_tokens 三种结束情形），
+                    # 让 client 可据此断流，无需自己猜停止边界。
+                    yield f"data: {json.dumps({'token': -1, 'text': '', 'full_text': full_text, 'finished': True}, ensure_ascii=False)}\n\n"
                     end_time = time.time()
                     gen_time = end_time - start_time
                     tokens_per_sec = token_count / gen_time if gen_time > 0 else 0

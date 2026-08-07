@@ -30,10 +30,11 @@ class DecodeContext:
         """
         cur_ids = [seq.seq_id for seq in batch]
         batch_switched = (cur_ids != self.seq_ids)
+        ctx_lens = [seq.current_position for seq in batch]
 
         cache_manager.prepare(
             cur_ids,
-            [seq.current_position for seq in batch],
+            ctx_lens,
             batch_switched,
         )
 

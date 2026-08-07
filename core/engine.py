@@ -59,11 +59,17 @@ class InferenceEngine:
         
         # 核心组件初始化
         self.device, self.dtype = self._auto_configure()
-        
+
+        # 序列长度上限：对齐模型 max_position_embeddings（DeepSeek=4096）。
+        # KVCacheManager 的 max_tokens 决定 _block_table_buffer 的列数（max_seq_blocks）。
+        # 若仅用默认 1024，多轮对话 prefill+decode 超过 1024 后 block_table 列越界 → CUDA assert。
+        # graph 桶仍限 1024（短序列快速路径），超桶序列自动回退 eager，eager 可处理到 max_position。
+        self.max_position = getattr(self.config, 'max_position_embeddings', 4096)
         self.cache_manager = KVCacheManager(
             n_blocks=self.DEFAULT_MAX_BLOCKS, block_size=self.DEFAULT_BLOCK_SIZE,
             n_layers=self.num_layers, n_heads=self.kv_num_heads, head_size=self.head_size,
-            dtype=self.dtype, device=self.device, max_batch_size=max_batch_size
+            dtype=self.dtype, device=self.device, max_batch_size=max_batch_size,
+            max_tokens=self.max_position
         )
         self.graph_runner = ModelGraphRunner(
             model=self.model, num_layers=self.num_layers, num_heads=self.num_heads,
@@ -90,8 +96,7 @@ class InferenceEngine:
         if self.eos_token_id is None:
             self.eos_token_id = getattr(self.model.generation_config, 'eos_token_id', None)
         self.stream_callbacks = {}
-        self.max_position = getattr(self.config, 'max_position_embeddings', 4096)
-        
+
         # 捕获 CUDA Graph
         # DeepSeek：MLA attention 用 flash_attn_varlen_func + 固定 max_len 桶（消除 .item() 同步，
         # cu_seqlens 是 GPU tensor），MoE decode 用 Triton grouped GEMV（无 .tolist()），均 graph-friendly。
@@ -165,12 +170,13 @@ class InferenceEngine:
 
     def add_request(self, prompt: str, max_tokens: int = 128,
                     temperature: float = 0.7, top_p: float = 0.9,
-                    repetition_penalty: float = 1.0) -> int:
+                    repetition_penalty: float = 1.0, stop=None) -> int:
         seq_id = hash(prompt + str(time.time())) % (2 ** 32)
         seq = Sequence(seq_id, prompt, self.tokenizer, max_tokens)
         seq.temperature = temperature
         seq.top_p = top_p
         seq.repetition_penalty = repetition_penalty
+        seq.stop_strings = list(stop) if stop else []
         # 同步 engine 解析出的 eos_token_id（覆盖 Sequence 中可能为 None 的默认值）
         if self.eos_token_id is not None:
             seq.eos_token_id = self.eos_token_id
@@ -236,9 +242,9 @@ class InferenceEngine:
 
     def generate(self, prompts: List[str], max_tokens: int = 100,
                  temperature: float = 0.7, top_p: float = 0.9,
-                 repetition_penalty: float = 1.0) -> Dict[str, str]:
+                 repetition_penalty: float = 1.0, stop=None) -> Dict[str, str]:
         seq_ids = [self.add_request(p, max_tokens, temperature=temperature, top_p=top_p,
-                                    repetition_penalty=repetition_penalty) for p in prompts]
+                                    repetition_penalty=repetition_penalty, stop=stop) for p in prompts]
         seq_map = {sid: p for sid, p in zip(seq_ids, prompts)}
         # 清理上轮残留的已完成序列，避免 get_finished_results 返回过期 seq 导致 KeyError
         self.scheduler.finished_sequences.clear()
@@ -329,7 +335,9 @@ class InferenceEngine:
         output_tokens = []
         callbacks_batch = []
         stream_callbacks = self.stream_callbacks
+        tokenizer = self.tokenizer
 
+        finished_any = False
         for seq in sequences:
             next_token = seq._next_token
             if next_token is None:
@@ -342,19 +350,55 @@ class InferenceEngine:
             seq_dict[seq_id] = seq.current_position
             seq.update_state(next_token, None)
 
+            # 服务端停止字符串：命中即把 output 截断到停止边界并标记完成。
+            # 这避免 client 在停止边界提前断流后、server 仍继续生成导致的 seq 孤儿
+            # （下一个请求的 prefill/decode 会与孤儿 seq 共用常驻 block_table/seqlens 缓冲 → 状态错乱）。
+            if seq.stop_strings and not seq.is_finished():
+                text = tokenizer.decode(seq.output_ids, skip_special_tokens=True)
+                hit_idx = -1
+                hit_len = 0
+                for s in seq.stop_strings:
+                    i = text.find(s)
+                    if i != -1 and (hit_idx == -1 or i < hit_idx):
+                        hit_idx = i
+                        hit_len = len(s)
+                if hit_idx != -1:
+                    # 截断 output_ids：近似按字符数砍（base 模型停止串通常对齐 token 边界，
+                    # 多砍一两个 token 不影响展示，client 还会再做一次精确截断）。
+                    keep_chars = hit_idx
+                    # 反推保留的 token 数：逐 token decode 直到覆盖 keep_chars
+                    kept = 0
+                    for k in range(1, len(seq.output_ids) + 1):
+                        if len(tokenizer.decode(seq.output_ids[:k], skip_special_tokens=True)) >= keep_chars:
+                            kept = k
+                            break
+                    if kept > 0:
+                        seq.output_ids = seq.output_ids[:kept]
+                        seq.full_ids = seq.input_ids + seq.output_ids
+                        seq.current_position = len(seq.input_ids) + len(seq.output_ids)
+                    seq.state = "finished"
+                    seq._stop_hit = True
+
             if rank0():
                 cb = stream_callbacks.get(seq_id)
                 if cb:
                     output_tokens.append(next_token)
                     callbacks_batch.append(cb)
 
-            if seq.is_finished():
+            finished_this_step = seq.is_finished() or getattr(seq, "_stop_hit", False)
+            if finished_this_step:
+                finished_any = True
                 self.cache_manager.free(seq_id)
                 if rank0():
                     self.scheduler.mark_finished(seq)
 
         if rank0():
             self._stream_event = StreamEvent(output_tokens, callbacks_batch) if callbacks_batch else None
+            # 若本步有 seq 结束（EOS / stop 串 / max_tokens），seq 会被移出 running，
+            # 下一轮 get_next_batch 不再包含它 → collect() 的 _flush_stream 不会执行，
+            # 本步暂存的最后一批 token 会丢失。这里立即冲刷，保证流式 client 收到完整输出。
+            if finished_any:
+                self._flush_stream()
 
     def _flush_stream(self):
         """

@@ -17,7 +17,7 @@ Qwen-Chat 用 <|im_start|>...<|im_end|>。本 demo 默认 DeepSeek 格式，
 
 import argparse
 import json
-import sys
+import re
 import time
 
 import requests
@@ -51,21 +51,71 @@ def build_prompt(history, fmt):
         return "\n\n".join(parts)
 
 
-def extract_assistant_reply(full_text, prompt, fmt):
-    """server 返回的是从头开始的 full_text（含 prompt 前缀？否——/generate_stream
-    的 full_text 只是生成部分）。我们的 /generate_stream 每个 chunk 的 text 是该 token
-    的增量，full_text 是累计生成内容（不含 prompt），故直接用 full_text。"""
-    return full_text
+def _find_stop(full_text, fmt):
+    """在 base 模型生成的 full_text 中定位停止边界。
+    DeepSeek base 模型回答完会续写 "User: .../Assistant: ..." 伪对话，
+    需在第一个行首的 "User:"/"Assistant:" 处截断，只保留真正回答。
+    Qwen 格式在 <|im_end|> 处截断。
+    返回 (截断后的回答, 是否截断)。"""
+    if fmt == "qwen":
+        idx = full_text.find("<|im_end|>")
+        if idx != -1:
+            return full_text[:idx], True
+        return full_text, False
+    # DeepSeek base: 行首的 "User:" 或 "Assistant:" 视为续写边界
+    m = re.search(r"(?:^|\n)\s*(?:User:|Assistant:)", full_text)
+    if m:
+        return full_text[:m.start()].rstrip(), True
+    return full_text, False
+
+
+def _safe_print_len(text, fmt):
+    """计算可安全打印的长度：末尾若可能是停止序列的前缀，则先扣留，等下个 chunk 确认。
+    避免把 "\n\nUser" 打出来后才发现要截断（屏幕残留）。"""
+    if fmt == "qwen":
+        marker = "<|im_end|>"
+        # 扣留可能是 "<|im_end|>" 前缀的尾部
+        for k in range(len(marker) - 1, 0, -1):
+            if text.endswith(marker[:k]):
+                return len(text) - k
+        return len(text)
+    # DeepSeek: 停止边界是 (行首) \n\s* (User:|Assistant:)
+    # 扣留尾部「\n + 空白(含换行) + (User|Assistant 的前缀)?」整段
+    m = re.search(r"\n[ \t\r\n]*([A-Za-z]*)$", text)
+    if m:
+        partial = m.group(1)
+        for kw in ("User", "Assistant"):
+            if kw.startswith(partial) and partial:  # partial 是 kw 的前缀
+                return m.start()
+        if not partial:  # 只有 \n + 空白，仍可能是边界起始
+            return m.start()
+    return len(text)
 
 
 # ========== 流式请求 ==========
-def stream_chat(prompt, url, max_tokens, temperature, repetition_penalty):
-    """对接 /generate_stream (SSE)。返回 (总耗时, 首字延迟, 完整生成文本)。"""
+def _stop_strings(fmt):
+    """服务端停止字符串：命中即由 server 终止生成，避免 client 提前断流导致
+    server 端 seq 孤儿（孤儿 seq 会与下个请求共用常驻 block_table/seqlens 缓冲 → 状态错乱）。
+
+    注意：必须带换行前缀（\nUser: / \nAssistant:）。DeepSeek prompt 用 \n\n 分隔轮次，
+    续写边界必在行首。若用裸 "User:"/"Assistant:"，模型生成代码/正文时一旦出现这
+    两个字（变量名、注释等）就会被误判成续写边界、提前截断正常内容。"""
+    if fmt == "qwen":
+        return ["<|im_end|>"]
+    return ["\nUser:", "\nAssistant:", "\n\nUser:", "\n\nAssistant:"]
+
+
+def stream_chat(prompt, url, max_tokens, temperature, repetition_penalty, fmt):
+    """对接 /generate_stream (SSE)。返回 (总耗时, 首字延迟, 截断后的回答)。
+
+    服务端按 stop 串终止生成；client 侧仍用 _find_stop 做精确显示截断。
+    实时打印时边累加边检测停止边界，避免把续写的 "User:/Assistant:" 打到屏幕。"""
     payload = {
         "prompt": prompt,
         "max_tokens": max_tokens,
         "temperature": temperature,
         "repetition_penalty": repetition_penalty,
+        "stop": _stop_strings(fmt),
         "stream": True,
     }
     headers = {"Content-Type": "application/json"}
@@ -73,7 +123,9 @@ def stream_chat(prompt, url, max_tokens, temperature, repetition_penalty):
 
     start_time = time.time()
     first_token_time = None
-    full_response = []
+    buf = []          # 累计生成文本（未截断）
+    printed_len = 0   # 已打印到屏幕的字符数（基于截断后的文本）
+    hit_stop = False  # 是否触发了停止边界
 
     try:
         with requests.post(api, json=payload, headers=headers, stream=True) as resp:
@@ -96,14 +148,30 @@ def stream_chat(prompt, url, max_tokens, temperature, repetition_penalty):
                 if text:
                     if first_token_time is None:
                         first_token_time = time.time()
-                    print(text, end="", flush=True)
-                    full_response.append(text)
+                    buf.append(text)
+                    truncated, hit = _find_stop("".join(buf), fmt)
+                    # 只打印到「安全长度」——扣留可能是停止序列前缀的尾部
+                    safe = _safe_print_len(truncated, fmt) if not hit else len(truncated)
+                    new = truncated[printed_len:safe]
+                    if new:
+                        print(new, end="", flush=True)
+                    printed_len = safe
+                    if hit:
+                        hit_stop = True
+                        break  # 到达停止边界，丢弃后续续写
                 if chunk.get("finished"):
                     break
+            # 流结束时若仍有扣留的尾部（未触发停止边界），补打出来
+            if not hit_stop:
+                final_trunc, _ = _find_stop("".join(buf), fmt)
+                tail = final_trunc[printed_len:]
+                if tail:
+                    print(tail, end="", flush=True)
             print("\n")
             total = time.time() - start_time
             first_lat = first_token_time - start_time if first_token_time else None
-            return total, first_lat, "".join(full_response)
+            reply, _ = _find_stop("".join(buf), fmt)
+            return total, first_lat, reply
     except requests.exceptions.RequestException as e:
         print(f"\n[ERR] 请求异常: {e}", flush=True)
         return None, None, ""
@@ -149,7 +217,8 @@ def main():
         prompt = build_prompt(history, args.format)
 
         total, first_lat, reply = stream_chat(
-            prompt, args.url, args.max_tokens, args.temperature, args.repetition_penalty)
+            prompt, args.url, args.max_tokens, args.temperature,
+            args.repetition_penalty, args.format)
 
         if total is not None:
             if reply:

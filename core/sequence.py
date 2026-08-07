@@ -21,6 +21,7 @@ class Sequence:
         self.eos_token_id = tokenizer.eos_token_id
         self.priority = 0
         self.timestamp = time.time()  # 请求到达时间戳
+        self.stop_strings = []        # 服务端停止字符串（命中即结束生成，避免 client 提前断流导致 seq 孤儿）
 
     def is_finished(self):
         return (len(self.output_ids) >= self.max_tokens or
