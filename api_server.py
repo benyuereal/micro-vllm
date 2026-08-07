@@ -14,6 +14,7 @@ from pydantic import BaseModel
 import config.config as Config
 from core.engine import InferenceEngine
 from core.inference_context import BatchInferenceContext
+from core.model_loader import get_model_path_from_cli
 from core.parallel_config import get_rank, rank0, setup
 from core.sequence import Sequence
 
@@ -195,20 +196,24 @@ async def generate_stream(req: GenerateReq):
 # ------------------------------
 if __name__ == "__main__":
     setup()
-    print(f"Rank {get_rank()}: Loading model from {Config.ModelConfig.MODEL_PATH}...")
-    engine = InferenceEngine(Config.ModelConfig.MODEL_PATH)
+    # 模型路径解析：--model / --model-name (CLI) > MODEL_NAME 环境变量 > config.py 默认
+    # 既支持完整路径，也支持短名（如 Qwen-7B-Chat、deepseek）自动解析到本地模型根。
+    default_path = getattr(Config.ModelConfig, "MODEL_PATH", None)
+    model_path = get_model_path_from_cli(default=default_path)
+    print(f"Rank {get_rank()}: Loading model from {model_path}...")
+    engine = InferenceEngine(model_path)
     print(f"Rank {get_rank()}: Model loaded on {engine.device}")
 
     if rank0():
         @app.on_event("startup")
         async def _startup():
             asyncio.create_task(rank0_inference_loop())
-        
+
         @app.on_event("shutdown")
         async def _shutdown():
             global running
             running = False
-        
+
         uvicorn.run(app, host="0.0.0.0", port=int(os.environ.get("PORT", 8000)))
     else:
         non_rank0_inference_loop()
