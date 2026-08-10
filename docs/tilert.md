@@ -150,19 +150,86 @@ DeepSeek-V2-Lite MoE 在 bs=1 decode 下每个 expert 都是 GEMV（M=1）。Til
 
 ---
 
-## 四、当前形态
+## 四、已落地：MLA 前置全融合（pre-MLA fusion）
 
-每层 decode 是三个 kernel：**fused MLA attention** + **gu_silu** + **down**（MoE routed 融合）。
-gate/topk 和 shared expert 仍走 PyTorch。相比改造前的 278 launch/层，attention 段 1 个融合 kernel，
-MoE routed 段 2 个融合 kernel。attention 和 routed MoE 的 execution gap 各吃掉一截。
+### 成果
+
+在 MLA+MoE 双融合之上，把 attention kernel **之前**的零碎 PyTorch 算子（q_proj、kva_proj、
+store latent、rope(q_pe)、einsum absorb）融进 3 个 TileLang kernel，再 +8.7%：
+
+| | 吞吐 (bs=1, 200 token) | median step |
+|---|---|---|
+| baseline（flash + Triton MoE） | 74.8 tok/s | 13.40 ms |
+| TileLang 融合 MLA | 83.7 tok/s | 11.87 ms |
+| TileLang 融合 MLA + MoE | 86.6 tok/s | 11.47 ms |
+| **+ MLA 前置全融合** | **94.1 tok/s** | **10.54 ms** |
+| | **+25.8% vs baseline** | **-21.3%** |
+
+（原始复现基准 72.2 tok/s → 94.1 = **+30.3%**。）
+端到端正确性：`1+1=`→`2`、`2+3=`→`5`、`Hello`→`, I am a 16 year`、英文续写合理，
+逐 prompt 输出不同（temp=0）。集成路径 inline 对比 maxdiff q_nope=0.0 / q_pe=0.031 / A=0.016（bf16 精度内）。
+测量脚本 `bench_tl_mla_e2e.py`。
+
+### 做了什么
+
+把 pre-MLA 的 ~7 个 PyTorch op 压成 **3 个 TileLang kernel**（`kernel/pre_mla.py`），rmsnorm 保留 Triton：
+
+- **pre_qkv**：`q_proj` GEMM + rope(q_pe) epilogue。grid=(bs, 48)，每 block 算 q 的 64 输出列，
+  `(nblk%3)==2` 的 block（q_pe 列）在 epilogue 做 rope。输出 `[bs, H, 16, 192]`。
+- **pre_kva**：`kva_proj` GEMM + store epilogue。grid=(bs, 9)，epilogue 直写 paged cache
+  `K_cache[blk_id, offset, 0, col]`，消除独立 store launch。
+- **absorb**：`q_nope @ kvb_w_kn_t → A[bs, H, 512]`，复用已验证的 M=16 per-head GEMV。
+
+为什么是 3 个 kernel 而非 1 个：q_proj 与 absorb 是**串行 GEMM**（absorb 需 q_proj 输出 q_nope），
+TileLang 非 persistent kernel 无法跨 block 同步。评估过"融进每个 MLA split（4× 冗余）"——
+q_proj 100M MACs ×4 = 545M，是 attention loop 的 122×，反而更慢。故拆成紧耦合 pre-kernel + absorb。
+M=16 零填充（mma.h 要求 M%16==0），只读 row 0 真实数据，rows 1-15 恒零（GEMM 行独立，无害）。
+
+### 核心难点：RoPE 输出必须是 deinterleaved 布局
+
+HF DeepSeek 的 RoPE 用 `view_as_complex` 做**复数乘法**（interleaved 输入对 `(x[2k], x[2k+1])`），
+adapter 的 `_apply_rope` 是其等价实数展开——但内部把 `x` 重新赋值为 **deinterleave 后**的张量再
+`x*cos + rotate_half(x)*sin`，故**输出是 deinterleaved 布局**：位置 k 存旋转后的 `qpe[2k]`、
+位置 k+half 存旋转后的 `qpe[2k+1]`。
+
+第一版 kernel 误用 interleaved 输出（`out[j]=qpe[j]*cos[j]+rh[j]*sin[j]`），isolation 测试碰巧通过
+（用了错误的 manual 参照），但集成后 q_pe maxdiff=20、decode 退化成重复 token（`1+1=`→`2222`）。
+**正解**：直接做复数乘的实数展开，写 deinterleaved 输出：
+
+```
+for k in 0..half-1:
+    a, b = qpe[2k], qpe[2k+1]            # interleaved 输入对
+    out[k]      = a*cos(θ_k) - b*sin(θ_k)  → 写列 128+k
+    out[k+half] = a*sin(θ_k) + b*cos(θ_k)  → 写列 128+k+half
+```
+
+cos/sin 全宽 `cat(freqs, freqs)`，故 `cs[k]==cs[k+half]`，只需 `cs[k]`。修复后 maxdiff=0.031。
+
+### 其他集成细节
+
+- **DeepSeek q_proj/kva_proj 无 bias**：TileLang kernel 要求非 None bias，`prepare_weights` 里
+  对 None bias 分配零张量。
+- **rmsnorm strided 输出**：Triton `rmsnorm_` 直接写 `_x16[:,0,:]`（stride=16*H），省一次 pad copy。
+- **absorb 输出丢 M-pad 维**：输出 `[bs*H, kv_lora]`（不是 `[bs*H, 16, kv_lora]`），reshape 后
+  `[bs, H, kv_lora]` contiguous，stride[1]=512 符合 MLA kernel 输入要求。
+- **block_table 2D 索引**：`K_cache[blk_id, offset, 0, col]`（blk_id=block_table[b, pos//256],
+  offset=pos%256），区分 max_seq_blocks（block_table 列数=4）与 n_blocks（cache 第一维=81）。
 
 ---
 
-## 五、下一步
+## 五、当前形态
+
+每层 decode 是 **rmsnorm(Triton) + pre_qkv + pre_kva + absorb + fused MLA + gu_silu + down**。
+gate/topk 和 shared expert 仍走 PyTorch。attention 段从 ~7 个 PyTorch op 压成 4 个 TileLang kernel，
+MoE routed 段 2 个融合 kernel。pre-MLA 和 attention 内部两段 execution gap 各吃掉一截。
+
+---
+
+## 六、下一步
 
 - **single-kernel MoE（吃掉 32us 间隙）**：gu_silu 28us + down 25us 单独跑只要 53us，
   两 kernel 串行 85us，中间 32us 是 launch/sync 间隙。用 `T.sync_grid()` 两阶段 persistent kernel
   把 gate_up→silu→down 融进单 kernel，act 全程在 L2，目标 ~55us（再省 30us/层）。
 - **shared expert（58us）**：固定大 GEMM，无路由，可并入 MoE kernel 或单独融合。
-- **单层全融合 persistent kernel** = norm → [fused MLA+oproj] → norm → MoE，host 每层 1～2 launch。
+- **单层全融合 persistent kernel** = norm → [pre-MLA + fused MLA + oproj] → norm → MoE，host 每层 1～2 launch。
 - Qwen 同款适配。

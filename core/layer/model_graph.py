@@ -105,6 +105,9 @@ class ModelGraphRunner:
         self._attn_out = bufs["_attn_out"]
         self._residual = bufs["_residual"]
         self._swiglu_out = bufs.get("_swiglu_out")  # Qwen 用；DeepSeek 可能不用
+        # DeepSeek pre-MLA 全融合用：M=16 pad 的 normed x 与 absorb head 索引（Qwen 无，为 None）
+        self._x16 = bufs.get("_x16")
+        self._absorb_idx = bufs.get("_absorb_idx")
 
     # ==========================================
     # 主推理逻辑

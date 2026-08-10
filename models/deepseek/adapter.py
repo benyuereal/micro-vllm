@@ -22,6 +22,8 @@ from .moe import moe_forward
 from kernel.mla import _get_kernel as _get_mla_kernel
 # TileLang 融合 MoE decode kernel（routed experts: gate_up+silu+down，M=16 grid-parallel）。
 from kernel.moe import moe_decode_tilelang
+# TileLang MLA 前置全融合 kernel（q_proj+rope / kva_proj+store / absorb）。
+from kernel.pre_mla import get_pre_qkv_kernel, get_pre_kva_kernel, get_absorb_kernel
 
 try:
     from flash_attn import flash_attn_func
@@ -131,10 +133,13 @@ class DeepSeekAdapter(ModelAdapter):
             # QKV 路径权重（保留为矩阵，不融合——MLA 结构与 GQA 不同）
             # q_proj: [num_heads*q_head, hidden]
             attn._q_w = attn.q_proj.weight.data.clone()
-            attn._q_b = attn.q_proj.bias.data.clone() if attn.q_proj.bias is not None else None
+            # TileLang pre-kernel 需要非 None 的 bias 张量；DeepSeek q_proj/kva 无 bias → 零向量
+            attn._q_b = attn.q_proj.bias.data.clone() if attn.q_proj.bias is not None else \
+                torch.zeros(self._num_heads * self._q_head, dtype=attn._q_w.dtype, device=attn._q_w.device)
             # kv_a_proj_with_mqa: [kv_lora+qk_rope, hidden]
             attn._kva_w = attn.kv_a_proj_with_mqa.weight.data.clone()
-            attn._kva_b = attn.kv_a_proj_with_mqa.bias.data.clone() if attn.kv_a_proj_with_mqa.bias is not None else None
+            attn._kva_b = attn.kv_a_proj_with_mqa.bias.data.clone() if attn.kv_a_proj_with_mqa.bias is not None else \
+                torch.zeros(self._latent_dim, dtype=attn._kva_w.dtype, device=attn._kva_w.device)
             # kv_a_layernorm weight: [kv_lora_rank]
             attn._kva_ln_w = attn.kv_a_layernorm.weight.data.clone()
             attn._kva_ln_eps = attn.kv_a_layernorm.variance_epsilon
@@ -148,6 +153,8 @@ class DeepSeekAdapter(ModelAdapter):
                                          self._kv_lora_rank)
             attn._kvb_w_kn = _kvb_full[:, :self._qk_nope, :].contiguous()
             attn._kvb_w_v = _kvb_full[:, self._qk_nope:, :].contiguous()
+            # absorb kernel 需要转置权重 [H, kv_lora, qk_nope]（[H,k,d] 而非 [H,d,k]）
+            attn._kvb_w_kn_t = attn._kvb_w_kn.transpose(1, 2).contiguous()
             # o_proj: [hidden, num_heads*v_head]
             attn._o_w = attn.o_proj.weight.data.clone()
             attn._o_b = attn.o_proj.bias.data.clone() if attn.o_proj.bias is not None else None
@@ -307,78 +314,65 @@ class DeepSeekAdapter(ModelAdapter):
 
     # -------------------- decode 单层钩子 --------------------
     def compute_qkv(self, block, h, graph, bs):
-        # input_layernorm
-        rmsnorm_(h, block._in_ln_w, graph._h_buf[:bs], block._in_ln_eps)
-        x = graph._h_buf[:bs]
-        attn = block.self_attn
-        # q: [bs, num_heads*q_head]
-        q = F.linear(x, attn._q_w, attn._q_b)
-        # kv_a: [bs, kv_lora+qk_rope]
-        kva = F.linear(x, attn._kva_w, attn._kva_b)
-        # 拆 latent: compressed_kv [bs, kv_lora] | k_pe [bs, qk_rope]
-        compressed_kv, k_pe = kva.split([self._kv_lora_rank, self._qk_rope], dim=-1)
-        # 缓存到 block 临时槽（attention 钩子用）
-        attn._q_cache = q.view(bs, self._num_heads, self._q_head)
-        attn._compressed_kv = compressed_kv          # [bs, kv_lora]
-        attn._k_pe = k_pe                            # [bs, qk_rope]
-        return x  # 返回 normed（attention 钩子需要 residual 由调用方传）
+        # input_layernorm → normed x 写进 _x16[:,0,:]（strided view，pre-MLA kernel 读 [bs,16,hidden] row 0）
+        rmsnorm_(h, block._in_ln_w, graph._x16[:bs, 0, :], block._in_ln_eps)
+        return graph._x16[:bs, 0, :]  # normed（residual 由调用方传）
 
     def compute_next_qkv(self, block_next, mlp_out_prev, res_prev, graph, bs):
+        # rmsnorm_residual：normed 写 _x16[:,0,:]，residual 写 _residual
         rmsnorm_residual(
             mlp_out_prev, res_prev, block_next._in_ln_w,
-            graph._h_buf[:bs], graph._residual[:bs], block_next._in_ln_eps
+            graph._x16[:bs, 0, :], graph._residual[:bs], block_next._in_ln_eps
         )
-        x = graph._h_buf[:bs]
-        attn = block_next.self_attn
-        q = F.linear(x, attn._q_w, attn._q_b)
-        kva = F.linear(x, attn._kva_w, attn._kva_b)
-        compressed_kv, k_pe = kva.split([self._kv_lora_rank, self._qk_rope], dim=-1)
-        attn._q_cache = q.view(bs, self._num_heads, self._q_head)
-        attn._compressed_kv = compressed_kv
-        attn._k_pe = k_pe
-        return x, graph._residual[:bs]
+        return graph._x16[:bs, 0, :], graph._residual[:bs]
 
     def attention(self, x_normed, block, layer_idx, bs, graph, cache_manager, block_table):
-        """decode MLA attention。
+        """decode MLA attention（pre-MLA 全融合 + TileLang MLA kernel）。
 
         契约：forward 时 cache_seqlens[i] = 当前序列“下一步”的预期长度（框架在 prefill 后把
         current_position 置为 S+1，故首步 decode seqlens=S+1）。新 token 的逻辑位置 =
         cache_seqlens - 1（0-indexed），写入该 slot，RoPE 用该位置，attention 覆盖
         [0, cache_seqlens-1]（共 cache_seqlens 个 token，全部有效，无空洞）。forward 后 commit +1。
+
+        pre-MLA 全融合（kernel/pre_mla.py）替代原来的 PyTorch q_proj/kva_proj/store/rope/absorb：
+          pre_qkv  : x16 @ q_w^T → q[bs,H,16,q_head]，q_pe 列在 epilogue 做 rope。
+          pre_kva  : x16 @ kva_w^T → latent 直写 paged cache（store epilogue）。
+          absorb   : q_nope @ kvb_w_kn_t → A[bs,H,kv_lora]。
+        然后 MLA kernel（不变）读 A、qpe 做 rmsnorm+RoPE+paged flash。
         """
         attn = block.self_attn
-        q = attn._q_cache                                  # [bs, H, q_head]
-        compressed_kv_new = attn._compressed_kv            # [bs, kv_lora]
-        k_pe_new = attn._k_pe                              # [bs, qk_rope]
-
         k_cache, v_cache = cache_manager.get(layer_idx)    # [n_blocks, block_size, 1, 576]
         cache_lens = cache_manager._cache_seqlens_buffer[:bs]  # [bs]
         new_pos = (cache_lens - 1).long().clamp(min=0)     # 新 token 逻辑位置（0-indexed）
         # 防御：极少数竞态下首步 decode seqlens 可能为 0 → new_pos=-1 → gather 负索引崩溃。
         # 钳到 0 保证不崩（输出可能不准，但避免 device-side assert 拖垮整个 server）。
 
-        # (1) 写入新 token 的 latent [compressed_kv | k_pe] 到位置 new_pos
-        latent_new = torch.cat([compressed_kv_new, k_pe_new], dim=-1)  # [bs, 576]
-        latent_new = latent_new.view(bs, 1, 1, self._latent_dim)       # [bs, 1, 1head, 576]
-        # slot = block_table[seq, new_pos//block_size] * block_size + new_pos%block_size
-        # （new_pos 是逻辑位置，必须经 block_table 换算成物理 slot，跨 block 的 seq 才正确）
-        slots = self._decode_slots(block_table, new_pos, bs, cache_manager.block_size)
-        self._store_latent_batch(latent_new, k_cache, v_cache, slots, cache_manager.block_size)
-
-        # ---------- TileLang 融合 MLA decode ----------
-        # weight-absorption：A[h]=Q_nope[h]@kvb_w_kn[h] 一次；kernel 内做
-        # rmsnorm+RoPE+paged flash（K 累加到 kv_lora 空间）；combine 后 out[h]=P[h]@kvb_w_v[h]。
-        # 替代原 gather+kvb+rope+cat+flash，全程不落 [bs,1024,16,256] 中间量。
         max_len = graph._cur_bucket_maxlen
         block_size = cache_manager.block_size
-        cos, sin = self._rope_pool(graph, k_cache.device)  # [max_pos, qk_rope] 全宽
-        q_nope, q_pe = q.split([self._qk_nope, self._qk_rope], dim=-1)  # [bs,H,128],[bs,H,64]
-        cos_q = cos[new_pos].unsqueeze(1)                  # [bs,1,qk_rope]
-        sin_q = sin[new_pos].unsqueeze(1)
-        q_pe = self._apply_rope(q_pe, cos_q, sin_q)        # [bs,H,64] 已旋转
-        # 吸收：A[bs,H,kv_lora] = einsum('bhd,hdk->bhk', Q_nope, kvb_w_kn)
-        A_in = torch.einsum('bhd,hdk->bhk', q_nope.float(),
-                            attn._kvb_w_kn.float()).to(graph.dtype).contiguous()
+        cos, sin = self._rope_pool(graph, k_cache.device)  # [max_pos, qk_rope] 全宽 cat(freqs,freqs)
+        cos_q = cos[new_pos].to(graph.dtype)                # [bs, qk_rope]
+        sin_q = sin[new_pos].to(graph.dtype)
+
+        # ---------- pre-MLA 全融合（3 个 TileLang kernel）----------
+        x16 = graph._x16[:bs]                               # [bs, 16, hidden]，row 0 = normed x
+        # (1) q_proj + rope(q_pe) → q_out[bs, H, 16, q_head]
+        kq = get_pre_qkv_kernel(bs, self._hidden, self._num_heads, self._q_head,
+                                self._qk_rope, graph.dtype)
+        q_out = kq(x16, attn._q_w, attn._q_b, cos_q, sin_q)
+        q_nope16 = q_out[:, :, :, :self._qk_nope].reshape(bs * self._num_heads, 16, self._qk_nope).contiguous()
+        q_pe = q_out[:, :, 0, self._qk_nope:].contiguous()  # [bs, H, qk_rope] 已 rope
+        # (2) kva_proj + store latent → 直写 k_cache 与 v_cache 同 slot（MLA 只读 k_cache）
+        bt = block_table[:bs].contiguous()                 # [bs, max_seq_blocks]
+        kk = get_pre_kva_kernel(bs, self._hidden, self._latent_dim, block_size,
+                                bt.shape[1], k_cache.shape[0], graph.dtype)
+        kk(x16, attn._kva_w, attn._kva_b,
+           bt, new_pos.to(torch.int32), k_cache, v_cache)
+        # (3) absorb: q_nope @ kvb_w_kn_t → A[bs*H, kv_lora] → reshape [bs, H, kv_lora]（contiguous）
+        ka = get_absorb_kernel(bs, self._num_heads, self._qk_nope, self._kv_lora_rank, graph.dtype)
+        A_in = ka(q_nope16, attn._kvb_w_kn_t, graph._absorb_idx[:bs * self._num_heads])
+        A_in = A_in.reshape(bs, self._num_heads, self._kv_lora_rank)
+
+        # ---------- TileLang 融合 MLA decode（不变）----------
         k_pos = torch.arange(max_len, device=k_cache.device)  # [max_len]
         cos_k = cos[k_pos].contiguous()                    # [max_len, qk_rope]
         sin_k = sin[k_pos].contiguous()
@@ -389,7 +383,7 @@ class DeepSeekAdapter(ModelAdapter):
             self._qk_nope, self._v_head, block_size, graph._ds_softmax_scale,
             graph.dtype, n_slots, block_N=64, num_split=4)
         attn_out = kernel(
-            A_in, q_pe.contiguous(), Latent_flat,
+            A_in, q_pe, Latent_flat,
             block_table[:bs].contiguous(),
             cache_lens.to(torch.int32).contiguous(),
             attn._kva_ln_w, attn._kvb_w_v, cos_k, sin_k)
@@ -501,4 +495,10 @@ class DeepSeekAdapter(ModelAdapter):
             "_qkv": torch.empty(max_bs, hidden_dim, dtype=dtype, device=device),  # 占位
             "_attn_out": torch.empty(max_bs, hidden_dim, dtype=dtype, device=device),
             "_residual": torch.empty((max_bs, hidden_dim), dtype=dtype, device=device),
+            # M=16 零填充的 normed x：pre-MLA TileLang kernel 读 [bs,16,hidden]，row 0 真实。
+            # rmsnorm 直接写 _x16[:,0,:]（strided view），省一次 pad copy。rows 1-15 恒零
+            # （GEMM 输出 row 0 独立于其余行，垃圾/零都不影响 row 0；零更安全）。
+            "_x16": torch.zeros((max_bs, 16, hidden_dim), dtype=dtype, device=device),
+            # absorb 的 head 索引缓冲（[bs*H] % H）
+            "_absorb_idx": (torch.arange(max_bs * self._num_heads, dtype=torch.int32, device=device) % self._num_heads),
         }
