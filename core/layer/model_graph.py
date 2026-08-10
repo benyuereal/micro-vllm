@@ -64,8 +64,20 @@ class ModelGraphRunner:
         self._alloc_bufs()
 
         # CUDA Graph
-        self._graphs: Dict[int, torch.cuda.CUDAGraph] = {}
+        # graph 选择键统一为 (bs, None)——两架构都只按 batch_size 选 graph，无长度分桶。
+        # DeepSeek attention 内部把分页 KV gather 成 [bs, max_len, 576]，max_len 进张量形状。
+        # 这里固定 max_len=4096（=max_position_embeddings）通吃所有序列长度：越界 key 由
+        # flash_attn_varlen_func 的 cu_seqlens_k 截断不参与 attention。一个 graph 形状通吃，
+        # 无 if-else、无选桶、无 eager 回退——控制流对齐 v2 engine，且为 tile op 融合提供
+        # 编译期固定的形状目标（后续把 attention 内部换成 TileLang 融合 kernel 时外部不动）。
+        # 代价：短序列也按 4096 做 gather/kv_b_proj（多算），但 tile op 重构后 gather 这步
+        # 会被 tile 化重写，该代价消失。Qwen 的 flash_attn 吃 block_table 本就无 seq_len 维。
+        self._deepseek_fixed_maxlen = 4096 if self.adapter.model_type == "deepseek" else None
+        self._graphs: Dict[tuple, torch.cuda.CUDAGraph] = {}
         self._is_graph_ready = False
+        # replay 前由 forward/capture 设置：DeepSeek=4096（固定），Qwen=None（attention 不读）。
+        # attention() 据此取 max_len，不再 .item() 同步。
+        self._cur_bucket_maxlen = None
 
     def _compile_fn(self, fn):
         return torch.compile(
@@ -154,25 +166,39 @@ class ModelGraphRunner:
         sl_buf = cache_manager._cache_seqlens_buffer
         saved_bt = bt_buf[:self.max_bs].clone()
         saved_sl = sl_buf[:self.max_bs].clone()
-        # 每 seq 占前 n_blk 个 block（block_id = i*n_blk .. (i+1)*n_blk-1），seqlens=8。
-        # 8 任意取（1..桶上界皆可），只要让 attention 真有 key 可读、且指向合法 block。
-        n_blk = (8 + cache_manager.block_size - 1) // cache_manager.block_size
 
-        # DeepSeek: 固定 max_len 桶以进 graph（消除 attention 的 .item() 同步）。
-        # 桶上界取 max_blocks*block_size 与 rotary max_position 的较小值，并限到 1024（覆盖常见对话）。
+        # warmup 填充：所有 seq 的 block_table 前 n_blk_warmup 列指向 block 0..n_blk_warmup-1
+        # （共用前几个 block，warmup 数值无意义只需结构合法不越界）。
+        # DeepSeek 固定 max_len=4096，attention 内部 arange(4096)//block_size 最大读第 16 列，
+        # 故 n_blk_warmup 需 ≥16；Qwen 不 gather，只需 seqlens>0 让 flash_attn 有 key 可读。
+        block_size = cache_manager.block_size
         if is_deepseek:
-            self._ds_graph_maxlen = min(1024, self.attention.max_blocks * 256,
-                                        self.attention.rotary_emb.cos_cache.shape[2])
-            # 运行时标志：attention() 据此选择 graph(varlen+固定桶) / eager(真实 max_len) 路径。
-            # capture/warmup 期间恒为 True；forward 时按是否 replay 设定。
-            self._use_graph_bucket = True
+            n_blk_warmup = (self._deepseek_fixed_maxlen + block_size - 1) // block_size  # 4096/256=16
+            # 启动期约束：block_table 列数（max_seq_blocks）必须 ≥ n_blk_warmup，否则
+            # attention 内部 arange(fixed_maxlen)//block_size 会读越界列。满足此约束后
+            # 运行期无需任何 .item() 同步检查（forward 无长度判断）。
+            max_seq_blocks = cache_manager._block_table_buffer.shape[1]
+            assert max_seq_blocks >= n_blk_warmup, \
+                f"block_table 列数 {max_seq_blocks} 不足以支撑固定 max_len " \
+                f"{self._deepseek_fixed_maxlen}（需 ≥{n_blk_warmup}，即 max_tokens ≥ fixed_maxlen）"
+        else:
+            n_blk_warmup = (8 + block_size - 1) // block_size  # 1 个 block 够 warmup
+        # 检查 block 数足够（n_blocks=81 ≥ 16，OK）
+        assert cache_manager.n_blocks >= n_blk_warmup, \
+            f"warmup 需 {n_blk_warmup} 个 block，cache 只有 {cache_manager.n_blocks}"
+
+        # DeepSeek: 固定 max_len=4096 通吃。capture/warmup 期间设 _cur_bucket_maxlen 让
+        # attention 走固定 max_len 路径（与 forward replay 一致）。
+        if is_deepseek:
+            self._cur_bucket_maxlen = self._deepseek_fixed_maxlen
 
         for bs in batch_sizes:
             g = torch.cuda.CUDAGraph()
             dummy = torch.randint(0, self.vocab_size, (bs,), device=self.device)
-            # 构造合法 cache 状态：每 seq 用 block i*n_blk..(i+1)*n_blk-1，seqlens=8
+            # 所有 seq 共用 block 0..n_blk_warmup-1（结构合法即可，warmup 不验证数值）
+            warmup_blocks = torch.arange(n_blk_warmup, dtype=torch.int32, device=self.device)
             for i in range(bs):
-                bt_buf[i, :n_blk] = torch.arange(i * n_blk, (i + 1) * n_blk, dtype=torch.int32, device=self.device)
+                bt_buf[i, :n_blk_warmup] = warmup_blocks
             sl_buf[:bs] = 8
             # Warmup + Capture 都用常驻 bt_buf（已填合法 block id）
             for _ in range(3):
@@ -180,7 +206,7 @@ class ModelGraphRunner:
             torch.cuda.synchronize()
             with torch.no_grad(), torch.cuda.graph(g):
                 self._logits[:bs] = self.decode(self._input_ids[:bs], bs, cache_manager, bt_buf)
-            self._graphs[bs] = g
+            self._graphs[(bs, None)] = g
             logger.info(f"   - Batch size {bs} OK")
 
         # 恢复 buffer 原值（-1 / 0），避免污染后续真实推理的首步
@@ -195,28 +221,11 @@ class ModelGraphRunner:
             self._input_ids[:batch_size] = input_ids
         # input_ids=None 表示 _input_ids 已由上一步 GPU→GPU copy 预填充，直接 replay
 
-        is_deepseek = (self.adapter.model_type == "deepseek")
-        if is_deepseek:
-            # DeepSeek graph 桶有固定 max_len 上界。若任一 seq 实际长度超过桶，replay 会截断有效 key →
-            # 必须回退 eager（attention 用真实 max_len）。同步取 max 只发生在回退分支，不影响 replay 路径。
-            bucket = getattr(self, "_ds_graph_maxlen", None)
-            if bucket is not None and batch_size in self._graphs:
-                cur_max = int(cache_manager._cache_seqlens_buffer[:batch_size].max().item())
-                use_graph = (cur_max <= bucket)
-            else:
-                use_graph = False
-        else:
-            use_graph = batch_size in self._graphs
-
-        if not use_graph:
-            # eager 路径（未捕获的 batch_size，或 DeepSeek 序列超 graph 桶上界）：
-            # 必须用 cache_manager 已建好的真实 block_table_buffer，
-            # 而非全零 buffer——否则多序列会全部读到 block 0 的 KV，互相污染。
-            if is_deepseek:
-                self._use_graph_bucket = False
-            return self.decode(self._input_ids[:batch_size], batch_size, cache_manager,
-                               cache_manager._block_table_buffer)
-        if is_deepseek:
-            self._use_graph_bucket = True
-        self._graphs[batch_size].replay()
+        # 统一选 graph：两架构都按 (bs, None) 选，无 is_deepseek 分支、无选桶、无 eager 回退、
+        # 无运行期 .item() 同步。DeepSeek 固定 max_len=4096 通吃，序列长度不影响 graph 形状；
+        # 越界 key 由 cu_seqlens_k 截断。block_table 列越界由启动期 assert 保证（见 __init__）。
+        key = (batch_size, None)
+        if key not in self._graphs:
+            raise RuntimeError(f"未捕获的 batch_size={batch_size}（请在 capture 的 batch_sizes 中加入）")
+        self._graphs[key].replay()
         return self._logits[:batch_size]

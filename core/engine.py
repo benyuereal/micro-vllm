@@ -62,8 +62,8 @@ class InferenceEngine:
 
         # 序列长度上限：对齐模型 max_position_embeddings（DeepSeek=4096）。
         # KVCacheManager 的 max_tokens 决定 _block_table_buffer 的列数（max_seq_blocks）。
-        # 若仅用默认 1024，多轮对话 prefill+decode 超过 1024 后 block_table 列越界 → CUDA assert。
-        # graph 桶仍限 1024（短序列快速路径），超桶序列自动回退 eager，eager 可处理到 max_position。
+        # DeepSeek CUDA Graph 固定 max_len=4096 通吃（不分桶、无 eager 回退），故 max_tokens
+        # 必须 ≥ 4096 以保证 block_table 列数足够（capture 期 assert 校验）。
         self.max_position = getattr(self.config, 'max_position_embeddings', 4096)
         self.cache_manager = KVCacheManager(
             n_blocks=self.DEFAULT_MAX_BLOCKS, block_size=self.DEFAULT_BLOCK_SIZE,
@@ -98,9 +98,10 @@ class InferenceEngine:
         self.stream_callbacks = {}
 
         # 捕获 CUDA Graph
-        # DeepSeek：MLA attention 用 flash_attn_varlen_func + 固定 max_len 桶（消除 .item() 同步，
+        # DeepSeek：MLA attention 用 flash_attn_varlen_func + 固定 max_len=4096（消除 .item() 同步，
         # cu_seqlens 是 GPU tensor），MoE decode 用 Triton grouped GEMV（无 .tolist()），均 graph-friendly。
-        # 运行时序列长度超过桶上界（1024）会自动回退 eager（见 model_graph.forward）。
+        # 一个 graph 形状通吃所有序列长度（≤4096），无 if-else、无选桶、无 eager 回退。
+        # 序列超 4096 会因 block_table 列越界在 capture 期 assert 拦截（max_tokens≥4096 约束）。
         if self.device == "cuda":
             logger.info("Capturing CUDA Graphs...")
             self.graph_runner.capture(self.cache_manager, batch_sizes=[1, 2, 4, 8, 16, 32, 40])
