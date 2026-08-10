@@ -60,14 +60,14 @@ class InferenceEngine:
         # 核心组件初始化
         self.device, self.dtype = self._auto_configure()
 
-        # 序列长度上限：DeepSeek 固定 1024 桶（CUDA Graph 形状常量，见 model_graph）。
-        # 这里把 max_tokens 限到 1024 而非模型 max_position_embeddings(4096)：KVCacheManager 的
-        # max_tokens 决定 _block_table_buffer 列数（max_seq_blocks=ceil(1024/256)=4），且 attention
-        # 内部 arange(1024) 最多读第 4 列——列数与固定桶精确对齐。总序列长度（prompt+gen）由
-        # add_request 钳到 ≤1024，超出即截断，保证 decode 永不越界。长序列能力留待 tile op 的
+        # 序列长度上限：两架构统一固定 1024（CUDA Graph 形状常量，见 model_graph）。
+        # KVCacheManager 的 max_tokens 决定 _block_table_buffer 列数（max_seq_blocks=ceil(1024/256)=4）；
+        # DeepSeek attention 内部 arange(1024) 最多读第 4 列——列数与固定桶精确对齐。Qwen 用
+        # flash_attn_with_kvcache(block_table=...)，KV 留分页、无 seq_len 维，列数只需 ≥序列实际块数。
+        # 两架构都用固定 1024 上下文：总序列长度（prompt+gen）由 add_request 钳到 ≤1024，超出即截断，
+        # 保证 decode 永不越界。无 if-else、无选桶、无 eager 回退。长序列能力留待 tile op 的
         # paged kernel 重构后恢复（kernel 跳读真实长度，桶上限即可解除）。
-        self.max_position = 1024 if self.adapter.model_type == "deepseek" \
-            else getattr(self.config, 'max_position_embeddings', 4096)
+        self.max_position = 1024
         self.cache_manager = KVCacheManager(
             n_blocks=self.DEFAULT_MAX_BLOCKS, block_size=self.DEFAULT_BLOCK_SIZE,
             n_layers=self.num_layers, n_heads=self.kv_num_heads, head_size=self.head_size,
@@ -101,16 +101,17 @@ class InferenceEngine:
         self.stream_callbacks = {}
 
         # 捕获 CUDA Graph
-        # DeepSeek：MLA attention 用 flash_attn_varlen_func + 固定 max_len=1024（消除 .item() 同步，
-        # cu_seqlens 是 GPU tensor），MoE decode 用 Triton grouped GEMV（无 .tolist()），均 graph-friendly。
-        # 一个 graph 形状通吃所有序列长度（≤1024），无 if-else、无选桶、无 eager 回退。
-        # 序列超 1024 由 add_request 钳制（prompt+gen ≤1024），block_table 列数在 capture 期 assert 校验。
+        # 两架构统一固定 1024 上下文：DeepSeek MLA 用 flash_attn_varlen_func + 固定 max_len=1024
+        # （消除 .item() 同步，cu_seqlens 是 GPU tensor），Qwen 用 flash_attn_with_kvcache(block_table=...)
+        # （KV 留分页、无 seq_len 维）。均 graph-friendly，一个 graph 形状通吃所有序列长度（≤1024），
+        # 无 if-else、无选桶、无 eager 回退。序列超 1024 由 add_request 钳制，block_table 列数在
+        # capture 期 assert 校验。
         if self.device == "cuda":
             logger.info("Capturing CUDA Graphs...")
             self.graph_runner.capture(self.cache_manager, batch_sizes=[1, 2, 4, 8, 16, 32, 40])
             logger.info("CUDA Graphs captured.")
-        elif self.adapter.model_type == "deepseek":
-            logger.info("DeepSeek: 非 CUDA 设备，跳过 CUDA Graph 捕获（eager 路径）。")
+        else:
+            logger.info("非 CUDA 设备，跳过 CUDA Graph 捕获（eager 路径）。")
             
         # 注册退出钩子
         atexit.register(self.shutdown)
@@ -175,16 +176,16 @@ class InferenceEngine:
     def add_request(self, prompt: str, max_tokens: int = 128,
                     temperature: float = 0.7, top_p: float = 0.9,
                     repetition_penalty: float = 1.0, stop=None) -> int:
-        # DeepSeek 固定 1024 桶：总序列长度（prompt+gen）必须 ≤ max_position，否则 decode
-        # 越界。这里按 prompt 已编码长度钳 gen 的 max_tokens；prompt 本身超限则截断 prompt。
-        if self.adapter.model_type == "deepseek":
-            prompt_ids = self.tokenizer.encode(prompt, add_special_tokens=True)
-            cap = self.max_position
-            if len(prompt_ids) > cap:
-                prompt_ids = prompt_ids[:cap]
-                prompt = self.tokenizer.decode(prompt_ids, skip_special_tokens=True)
-                logger.warning(f"DeepSeek 1024 桶：prompt 过长({len(prompt_ids)}>{cap})，已截断")
-            max_tokens = max(1, min(max_tokens, cap - len(prompt_ids)))
+        # 两架构统一固定 1024 上下文：总序列长度（prompt+gen）必须 ≤ max_position，否则 decode
+        # 越界（DeepSeek gather 越界列 / Qwen block_table 列数不足）。按 prompt 已编码长度钳
+        # gen 的 max_tokens；prompt 本身超限则截断 prompt。
+        prompt_ids = self.tokenizer.encode(prompt, add_special_tokens=True)
+        cap = self.max_position
+        if len(prompt_ids) > cap:
+            prompt_ids = prompt_ids[:cap]
+            prompt = self.tokenizer.decode(prompt_ids, skip_special_tokens=True)
+            logger.warning(f"固定 {cap} 上下文：prompt 过长({len(prompt_ids)}>{cap})，已截断")
+        max_tokens = max(1, min(max_tokens, cap - len(prompt_ids)))
         seq_id = hash(prompt + str(time.time())) % (2 ** 32)
         seq = Sequence(seq_id, prompt, self.tokenizer, max_tokens)
         seq.temperature = temperature
