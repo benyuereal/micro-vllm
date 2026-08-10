@@ -21,6 +21,11 @@ import os
 _USE_TL_MOE = os.environ.get("USE_TILELANG_MOE", "0") == "1"
 if _USE_TL_MOE:
     from kernel.tilelang_moe import moe_decode_tilelang
+# TileLang 融合 MLA decode kernel（latent→rmsnorm+RoPE+paged flash，weight-absorption）。
+# 开关：USE_TILELANG_MLA=1。把 attention 的 gather+kvb+rope+cat+flash 压进单个 kernel。
+_USE_TL_MLA = os.environ.get("USE_TILELANG_MLA", "0") == "1"
+if _USE_TL_MLA:
+    from kernel.tilelang_mla import _get_kernel as _get_mla_kernel
 
 try:
     from flash_attn import flash_attn_with_kvcache, flash_attn_func, flash_attn_varlen_func
@@ -139,6 +144,15 @@ class DeepSeekAdapter(ModelAdapter):
             attn._kva_ln_eps = attn.kv_a_layernorm.variance_epsilon
             # kv_b_proj: [num_heads*(qk_nope+v_head), kv_lora_rank]
             attn._kvb_w = attn.kv_b_proj.weight.data.clone()
+            # 预拆 per-head 的 kvb 权重供 TileLang MLA weight-absorption 用：
+            #   _kvb_w_kn[h] = kvb_w[h*256 : h*256+128]   (吸收进 Q → A)
+            #   _kvb_w_v[h]  = kvb_w[h*256+128 : h*256+256] (post-multiply → out)
+            if _USE_TL_MLA:
+                _kvb_full = attn._kvb_w.view(self._num_heads,
+                                             self._qk_nope + self._v_head,
+                                             self._kv_lora_rank)
+                attn._kvb_w_kn = _kvb_full[:, :self._qk_nope, :].contiguous()
+                attn._kvb_w_v = _kvb_full[:, self._qk_nope:, :].contiguous()
             # o_proj: [hidden, num_heads*v_head]
             attn._o_w = attn.o_proj.weight.data.clone()
             attn._o_b = attn.o_proj.bias.data.clone() if attn.o_proj.bias is not None else None
@@ -355,6 +369,38 @@ class DeepSeekAdapter(ModelAdapter):
         # （new_pos 是逻辑位置，必须经 block_table 换算成物理 slot，跨 block 的 seq 才正确）
         slots = self._decode_slots(block_table, new_pos, bs, cache_manager.block_size)
         self._store_latent_batch(latent_new, k_cache, v_cache, slots, cache_manager.block_size)
+
+        # ---------- TileLang 融合 MLA 路径 ----------
+        # weight-absorption：A[h]=Q_nope[h]@kvb_w_kn[h] 一次；kernel 内做
+        # rmsnorm+RoPE+paged flash（K 累加到 kv_lora 空间）；combine 后 out[h]=P[h]@kvb_w_v[h]。
+        # 替代原 (2)gather+(3)kvb+(4)rope+(5)cat+(6)flash，全程不落 [bs,1024,16,256] 中间量。
+        if _USE_TL_MLA:
+            max_len = graph._cur_bucket_maxlen
+            block_size = cache_manager.block_size
+            cos, sin = self._rope_pool(graph, k_cache.device)  # [max_pos, qk_rope] 全宽
+            q_nope, q_pe = q.split([self._qk_nope, self._qk_rope], dim=-1)  # [bs,H,128],[bs,H,64]
+            cos_q = cos[new_pos].unsqueeze(1)                  # [bs,1,qk_rope]
+            sin_q = sin[new_pos].unsqueeze(1)
+            q_pe = self._apply_rope(q_pe, cos_q, sin_q)        # [bs,H,64] 已旋转
+            # 吸收：A[bs,H,kv_lora] = einsum('bhd,hdk->bhk', Q_nope, kvb_w_kn)
+            A_in = torch.einsum('bhd,hdk->bhk', q_nope.float(),
+                                attn._kvb_w_kn.float()).to(graph.dtype).contiguous()
+            k_pos = torch.arange(max_len, device=k_cache.device)  # [max_len]
+            cos_k = cos[k_pos].contiguous()                    # [max_len, qk_rope]
+            sin_k = sin[k_pos].contiguous()
+            Latent_flat = k_cache.reshape(-1, 1, self._latent_dim).contiguous()
+            n_slots = k_cache.shape[0] * block_size
+            kernel = _get_mla_kernel(
+                bs, self._num_heads, max_len, self._kv_lora_rank, self._qk_rope,
+                self._qk_nope, self._v_head, block_size, graph._ds_softmax_scale,
+                graph.dtype, n_slots, block_N=64, num_split=4)
+            attn_out = kernel(
+                A_in, q_pe.contiguous(), Latent_flat,
+                block_table[:bs].contiguous(),
+                cache_lens.to(torch.int32).contiguous(),
+                attn._kva_ln_w, attn._kvb_w_v, cos_k, sin_k)
+            attn_out = attn_out.reshape(bs, self._num_heads * self._v_head)
+            return F.linear(attn_out, attn._o_w, attn._o_b)
 
         # (2) 向量化 gather 每 seq 的全部 latent [0, new_pos]（共 cache_seqlens 个，含新 token）。
         # max_len 固定 = graph._cur_bucket_maxlen（1024），无 .item() 同步；越界 key 由

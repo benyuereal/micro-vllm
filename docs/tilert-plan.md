@@ -237,4 +237,97 @@ eager profile（bs=8）显示 MoE 1055us/层、attention 860us/层。但 **CUDA 
 - `USE_TILELANG_MOE=1` 开关，默认关闭（走 Triton 路径）
 - 各 prof 脚本：prof_layer/prof_moe/prof_graph_moe/prof_moe_graph_only.py
 
+## 七补、bs=1 graph 精确 profile + TileLang MLA 现成算子（2026-08-10）
+
+> 脚本：`prof_bs1_graph.py`、`prof_bs1_attn_breakdown.py`、`prof_bs1_fine.py`、`prof_bs1_cat.py`、`bench_tl_mla.py`
+> 方法：单段 CUDA graph capture + replay 计时（纯 GPU 时间，剔除 launch/同步噪声），与基准 graph 可比。
+
+### bs=1 graph 整层各段（基准场景，决定性数据）
+
+| 段 | us/层 | %MoE层 | 说明 |
+|---|---|---|---|
+| qkv | 23 | 6% | norm+q_proj+kv_a_proj |
+| **attention** | **157** | **41%** | 见下表 |
+| **ffn(MoE)** | **179** | **47%** | 见下表 |
+| next_qkv | 23 | 6% | 下一层入口 |
+| **MoE层总计** | **383** | 100% | 3 dense+24 MoE → 10.31ms / 基准 13.47ms = **77%** |
+
+**关键修正**：之前"MoE 只占 33%、attention 是瓶颈"的判断来自有缺陷的 eager 单段测量。
+graph 精确数据下，**attention(157us) 与 MoE(179us) 基本持平**。两者都是单层大头。
+
+### attention 内部细分（157us，bs=1/seq=1024）
+
+| 子段 | us | 性质 |
+|---|---|---|
+| store（写新 latent） | 19 | cache 写 |
+| gather（读全部 latent） | 15 | cache 读 |
+| **kvb**（rmsnorm+kv_b_proj） | **47** | latent→[1,1024,16,256]，HBM 落盘 |
+| rope（q_pe+k_pe） | 24 | 旋转位置编码 |
+| **k_cat+k_reshape+v_pad** | **44** | flash 输入拼接，纯内存搬运 |
+| flash | 8 | 真正的 attention 计算 |
+| oproj | 9 | 输出投影 |
+
+→ **attention 157us 里 flash 真正计算只有 8us**，其余 ~150us 全是 latent 展开/RoPE/拼接的 HBM
+round-trip + launch 开销。这正是 TileRT 文章说的 execution gap。
+
+### MoE 内部细分（179us，bs=1）
+
+| 子段 | us |
+|---|---|
+| gate+topk | 9 |
+| shared SwiGLU（2 shared expert 合并） | 58 |
+| routed（6 expert） | 117 = gate_up 25 + down 34 + 中间循环开销 58 |
+
+→ routed 真 GEMV 59us，另 58us 是 6 expert 逐 token 循环的 launch/HBM round-trip。
+shared（58us）是固定开销，数据流简单，适合融合。
+
+### 关键发现 4：TileLang 自带 paged MLA decode 算子，L20 可跑
+
+`/models/tilelang/examples/deepseek_mla/example_mla_decode_paged.py`：
+- **paged KV cache**：直接读 `block_table[batch, blk_idx]*block_size + offset`，和 micro-vllm 的 cache 逻辑一致
+- persistent kernel：`T.Kernel(sm_num)` + `T.sync_grid()` 跨 SM 归约（`example_mla_decode_persistent.py`）
+- online softmax + split-KV + logsumexp combine
+- **正确性在 L20 + V2-Lite 维度通过**（`All close`，atol/rtol=0.01）
+
+V2-Lite 维度（H=16, dv=128, dpe=64, d=192, fp16）实测：
+
+| bs | seq | TileLang graph (us) |
+|---|---|---|
+| 1 | 1024 | **24.1** |
+| 1 | 256 | 8.1 |
+| 2 | 1024 | 24.3 |
+| 4 | 1024 | 24.4 |
+| 8 | 1024 | 24.4 |
+| 16 | 1024 | 24.5 |
+
+**batch 扩展性极好**：bs=1→16 几乎不变（grid 按 (batch, H//BLOCK_H) 划分，bs=1 时 16 个 head tile
+打不满 92 SM，加 batch 用上空闲 SM）。
+
+### 关键发现 5：现成 MLA kernel 只做 flash，不含 kvb/RoPE
+
+现成 kernel 读的是 **已 split 的** `KV[..., :dv]`（k_nope/v）和 `K_pe[..., dpe]`（k_pe）。
+**kvb 展开（latent→k_nope/v）和 RoPE 仍需在 kernel 外做**，或并入 kernel。
+当前 attention 的 157us 里，kvb(47)+rope(24)+cat/pad(44) = **115us 是这个 kernel 没覆盖的**。
+→ 全融合的真正工作 = 把 kvb+RoPE 并入这个 paged MLA persistent kernel，让 latent→k/v→flash 全在片内。
+
+### 维度/layout 差异（接入要改的）
+
+| 项 | TileLang 示例 | micro-vllm 现状 | 改动 |
+|---|---|---|---|
+| d / dv / dpe | 576/512/64（V2/V3） | 192/128/64（V2-Lite） | 参数化已支持 |
+| block_size | 64 | 256 | kernel 要求 block_size≥block_N 且整除；改 block_N 或 cache block_size |
+| KV layout | [b*max_seqlen_pad, h_kv, d] flatten | [n_blocks, block_size, 1, 576] | flatten + block_table 索引逻辑对齐 |
+| dtype | fp16（写死） | bf16 | kernel dtype 参数化 |
+| RoPE | 不含 | q_pe/k_pe interleaved | 需并入 kernel |
+
+### 方向再修正（基于本次数据）
+
+1. **attention 全融合是 bs=1 的最大收益点**：157us 里 8us 是计算，融合可吃掉 ~115us 的 kvb/rope/拼接 gap。
+2. **现成 TileLang paged MLA 是地基**：flash 部分已有高性能实现（24us @ bs=1，且 batch 可扩展），
+   不用从零写。工作重心 = 把 kvb+RoPE 融进去 + 接入 micro-vllm 的 paged cache（block_size 256 / bf16）。
+3. **MoE 放第二阶段**：179us 里 shared(58us) 数据流简单可融；routed(117us) 有 data-dependent 路由，
+   且 TileLang GEMV 用不了 tensor core（M%16 限制），需 grouped GEMM 思路，复杂度高。
+4. 单层全融合最终形态：norm → [fused kvb+rope+paged-MLA+oproj] → norm → MoE，仍可分两个 kernel
+   （attention 融一个、MoE 一个），host 每层 2 launch，比现在 278 launch/层 已是质变。
+
 ## 八、原始阶段规划（保留参考，已据上方修正）
