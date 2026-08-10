@@ -45,12 +45,12 @@ attention 157us 的内部细分才是关键：
 | | 吞吐 (bs=1, 200 token) | median step |
 |---|---|---|
 | baseline（flash_attn_varlen） | 74.8 tok/s | 13.40 ms |
-| **TileLang 融合 MLA** | **83.7 tok/s** | **11.87 ms** |
+| **融合 MLA** | **83.7 tok/s** | **11.87 ms** |
 | | **+11.9%** | **-11.4%** |
 
 复现基准 72.2 tok/s（本机 74.8，prompt 差异），融合后 **+11.9%**。
 端到端正确性：同 prompt 同 temp=0 跑 136 token，baseline 与融合路径**逐 token 完全一致**。
-测量脚本 `bench_tl_mla_e2e.py`（decode 默认走 TileLang 融合路径）。
+测量脚本 `tests/bench_e2e.py`（decode 默认走融合路径）。
 
 ### 做了什么
 
@@ -101,21 +101,21 @@ per-head 的两个小 einsum 各做一次，flash 内全是标准 gemm。详见
 | | 吞吐 (bs=1, 200 token) | median step |
 |---|---|---|
 | baseline（flash + Triton MoE） | 74.8 tok/s | 13.40 ms |
-| TileLang 融合 MLA | 83.7 tok/s | 11.87 ms |
-| **TileLang 融合 MLA + MoE** | **86.6 tok/s** | **11.47 ms** |
+| 融合 MLA | 83.7 tok/s | 11.87 ms |
+| **融合 MLA + MoE** | **86.6 tok/s** | **11.47 ms** |
 | | **+15.8% vs baseline** | **-14.4%** |
 
 端到端正确性：同 prompt 同 temp=0，baseline 与 MLA+MoE 双融合路径**逐 token 完全一致**（事实问答 "北京" 等均一致）。
-测量脚本 `bench_tl_mla_e2e.py`（decode 默认走 TileLang 融合路径）。
+测量脚本 `tests/bench_e2e.py`（decode 默认走融合路径）。
 
 MoE 段微基准分解（单层，K=6, E=64, INTER=1408, H=2048）：
 
-| 段 | TileLang | Triton | 说明 |
+| 段 | 融合 kernel | Triton | 说明 |
 |---|---|---|---|
 | gate+topk | 8.8 us | 8.8 us | 留 PyTorch（占比小，graph-friendly） |
 | routed experts | **85.3 us** | 106.1 us | 2-kernel M=16 融合，1.24x |
-| shared expert | 57.8 us | 57.8 us | 留 PyTorch 大 GEMM（下阶段） |
-| **MoE 全段** | **155.5 us** | 177.5 us | **1.14x，省 22us** |
+| shared expert | **21.7 us** | 41.7 us | 2-kernel M=16 融合（gate_up + down），1.92x |
+| **MoE 全段** | **119.4 us** | 177.5 us | **1.49x，省 58us** |
 
 ### 做了什么
 
@@ -126,6 +126,15 @@ MoE 段微基准分解（单层，K=6, E=64, INTER=1408, H=2048）：
   gate/up 各一次 `T.gemm`，silu 后写 `act16[n, kid, kid, :]`。
 - **down**：grid=(N, cdiv(H,64))，每 token 一个 block，**串行 K 个 expert**，M=16 `T.gemm`
   算每个 expert 的输出，在 fp32 fragment 里累加，最后覆盖写。
+
+shared expert 是固定大 GEMM（无路由、K=1、inter 翻倍），同款 M=16 融合再叠两个 kernel：
+
+- **shared_gate_up**：grid=(N, cdiv(2*s_inter,64))，gate/up 一次 `T.gemm`（权重未转置，x@W），
+  silu 后写 `sact16[n, 0, :]`。复用 routed 的 X16 pad buffer（row 0 = x）。
+- **shared_down**：grid=(N, cdiv(H,64))，`@tilelang.jit()` 原地 `+=`——直接读改写 routed 的
+  `Out` buffer，省掉 routed/shared 之间的 PyTorch add。fp32 fragment 累加后 `Out[...] = (Out[...].astype(fp32) + out_frag).astype(bf16)`。
+- **X16 复用**：M=16 pad buffer 在 `moe_decode` 里分配一次，routed 和 shared 两个 kernel 共用，
+  避免重复 pad 的 16× H 显存与拷贝。
 
 ### 核心难点：bs=1 GEMV 不能直接用 tensor core
 
@@ -160,15 +169,16 @@ store latent、rope(q_pe)、einsum absorb）融进 3 个 TileLang kernel，再 +
 | | 吞吐 (bs=1, 200 token) | median step |
 |---|---|---|
 | baseline（flash + Triton MoE） | 74.8 tok/s | 13.40 ms |
-| TileLang 融合 MLA | 83.7 tok/s | 11.87 ms |
-| TileLang 融合 MLA + MoE | 86.6 tok/s | 11.47 ms |
-| **+ MLA 前置全融合** | **94.1 tok/s** | **10.54 ms** |
-| | **+25.8% vs baseline** | **-21.3%** |
+| 融合 MLA | 83.7 tok/s | 11.87 ms |
+| 融合 MLA + MoE | 86.6 tok/s | 11.47 ms |
+| + MLA 前置全融合 | 94.1 tok/s | 10.54 ms |
+| **+ shared expert 融合** | **95.7 tok/s** | **10.42 ms** |
+| | **+27.9% vs baseline** | **-22.2%** |
 
-（原始复现基准 72.2 tok/s → 94.1 = **+30.3%**。）
+（原始复现基准 72.2 tok/s → 95.7 = **+32.5%**。）
 端到端正确性：`1+1=`→`2`、`2+3=`→`5`、`Hello`→`, I am a 16 year`、英文续写合理，
 逐 prompt 输出不同（temp=0）。集成路径 inline 对比 maxdiff q_nope=0.0 / q_pe=0.031 / A=0.016（bf16 精度内）。
-测量脚本 `bench_tl_mla_e2e.py`。
+测量脚本 `tests/bench_e2e.py`。
 
 ### 做了什么
 
@@ -219,17 +229,17 @@ cos/sin 全宽 `cat(freqs, freqs)`，故 `cs[k]==cs[k+half]`，只需 `cs[k]`。
 
 ## 五、当前形态
 
-每层 decode 是 **rmsnorm(Triton) + pre_qkv + pre_kva + absorb + fused MLA + gu_silu + down**。
-gate/topk 和 shared expert 仍走 PyTorch。attention 段从 ~7 个 PyTorch op 压成 4 个 TileLang kernel，
-MoE routed 段 2 个融合 kernel。pre-MLA 和 attention 内部两段 execution gap 各吃掉一截。
+每层 decode 是 **rmsnorm(Triton) + pre_qkv + pre_kva + absorb + fused MLA + gu_silu + down + shared_gate_up + shared_down**。
+只剩 gate/topk 走 PyTorch。attention 段从 ~7 个 PyTorch op 压成 4 个融合 kernel，
+MoE 段 4 个融合 kernel（routed 2 + shared 2），shared_down 原地 `+=` 直接累加进 routed 输出，省掉 PyTorch add。
+pre-MLA 和 attention 内部两段 execution gap 各吃掉一截。
 
 ---
 
 ## 六、下一步
 
-- **single-kernel MoE（吃掉 32us 间隙）**：gu_silu 28us + down 25us 单独跑只要 53us，
-  两 kernel 串行 85us，中间 32us 是 launch/sync 间隙。用 `T.sync_grid()` 两阶段 persistent kernel
-  把 gate_up→silu→down 融进单 kernel，act 全程在 L2，目标 ~55us（再省 30us/层）。
-- **shared expert（58us）**：固定大 GEMM，无路由，可并入 MoE kernel 或单独融合。
+- **single-kernel MoE（吃掉 launch/sync 间隙）**：routed 的 gu_silu + down 两个 kernel 串行有 ~32us 间隙，
+  shared 的 gate_up + down 同理。用 `T.sync_grid()` 两阶段 persistent kernel 把 gate_up→silu→down 融进单 kernel，
+  act 全程在 L2，进一步压掉 launch 间隙。
 - **单层全融合 persistent kernel** = norm → [pre-MLA + fused MLA + oproj] → norm → MoE，host 每层 1～2 launch。
 - Qwen 同款适配。

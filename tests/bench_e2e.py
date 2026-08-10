@@ -4,7 +4,7 @@
 进程内直驱 engine 循环，CUDA event 计时稳态 decode（排除 prefill + 首轮热启动）。
 decode 路径已默认走融合 kernel（kernel/mla.py + kernel/moe.py + kernel/pre_mla.py），无开关。
 用法：
-  python3 bench_tl_mla_e2e.py
+  python3 tests/bench_e2e.py
 """
 import sys, time, torch
 sys.path.insert(0, "/models/micro-vllm")
