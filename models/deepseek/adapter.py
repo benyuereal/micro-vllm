@@ -353,23 +353,17 @@ class DeepSeekAdapter(ModelAdapter):
         self._store_latent_batch(latent_new, k_cache, v_cache, slots, cache_manager.block_size)
 
         # (2) 向量化 gather 每 seq 的全部 latent [0, new_pos]（共 cache_seqlens 个，含新 token）。
-        # 构造 [bs, max_len] 物理 slot 矩阵后一次 advanced-index 取 latent。
-        # max_len 固定 = graph._cur_bucket_maxlen（1024，CUDA Graph 形状常量），无 .item() 同步。
-        # 越界 key（position ≥ 实际序列长度）经 flash_attn_varlen_func 的 cu_seqlens_k 截断，
-        # 不参与 attention；其 block_table 越界列已由 capture 期 assert 保证不读非法列
-        # （blk_id 钳到 0 指向安全内存，slots 钳到合法范围）。
+        # max_len 固定 = graph._cur_bucket_maxlen（1024），无 .item() 同步；越界 key 由
+        # cu_seqlens_k 截断，越界列由 capture 期 assert 保证（blk_id/slots 钳到合法范围）。
         total_lens = cache_lens.long()                     # = new_pos + 1
-        max_len = graph._cur_bucket_maxlen                 # 固定 1024，graph 形状常量
+        max_len = graph._cur_bucket_maxlen                 # 固定 1024
         block_size = cache_manager.block_size
         bt = block_table[:bs].long()                       # [bs, max_seq_blocks]
         t_idx = torch.arange(max_len, device=bt.device)    # [max_len]
         blk_idx = t_idx // block_size                      # [max_len]
         off_idx = t_idx % block_size                       # [max_len]
         blk_id = bt[:, blk_idx]                            # [bs, max_len]
-        # graph 桶固定 max_len（如 1024），但序列实际只占 ceil(L/block_size) 个 block，
-        # block_table 越界列为 -1（非法 block_id）→ 负 slot → k_flat 索引越界崩溃。
-        # 将非法 blk_id 钳到 0（指向 block 0 的安全内存），越界位置随后由
-        # flash_attn_varlen_func 的 cu_seqlens_k 截断，不参与 attention。
+        # 越界列 blk_id=-1 → 负 slot 崩溃；钳到 0（指向安全内存），越界位由 cu_seqlens_k 截断。
         n_slots = k_cache.shape[0] * block_size
         blk_id = blk_id.clamp(min=0)
         slots = blk_id * block_size + off_idx             # [bs, max_len]
@@ -399,8 +393,7 @@ class DeepSeekAdapter(ModelAdapter):
         k_full = torch.cat([k_nope, k_pe_rot.unsqueeze(2).expand(-1, -1, self._num_heads, -1)], dim=-1)
         v_fa = torch.nn.functional.pad(v, (0, self._q_head - self._v_head))  # [bs, max_len, H, 192]
 
-        # (6) attention：flash_attn_varlen_func + cu_seqlens_k 截断每 seq 有效长度。
-        # 越界 key 不参与，cu_seqlens 是 GPU tensor（graph-friendly）。统一走 varlen，无 eager 分支。
+        # (6) attention：varlen + cu_seqlens_k 截断每 seq 有效长度（GPU tensor，graph-friendly）。
         cu_q = torch.arange(0, bs + 1, dtype=torch.int32, device=q_full.device)
         cu_k = torch.zeros(bs + 1, dtype=torch.int32, device=q_full.device)
         cu_k[1:] = torch.cumsum(total_lens.to(torch.int32), dim=0)

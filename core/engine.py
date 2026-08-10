@@ -60,13 +60,9 @@ class InferenceEngine:
         # 核心组件初始化
         self.device, self.dtype = self._auto_configure()
 
-        # 序列长度上限：两架构统一固定 1024（CUDA Graph 形状常量，见 model_graph）。
-        # KVCacheManager 的 max_tokens 决定 _block_table_buffer 列数（max_seq_blocks=ceil(1024/256)=4）；
-        # DeepSeek attention 内部 arange(1024) 最多读第 4 列——列数与固定桶精确对齐。Qwen 用
-        # flash_attn_with_kvcache(block_table=...)，KV 留分页、无 seq_len 维，列数只需 ≥序列实际块数。
-        # 两架构都用固定 1024 上下文：总序列长度（prompt+gen）由 add_request 钳到 ≤1024，超出即截断，
-        # 保证 decode 永不越界。无 if-else、无选桶、无 eager 回退。长序列能力留待 tile op 的
-        # paged kernel 重构后恢复（kernel 跳读真实长度，桶上限即可解除）。
+        # 序列长度上限：两架构统一固定 1024。max_tokens 决定 block_table 列数
+        # (max_seq_blocks=4)，与 DeepSeek attention 的 arange(1024) 精确对齐。总长
+        # prompt+gen 由 add_request 钳到 ≤1024。>1024 长序列留待 tile op 恢复。
         self.max_position = 1024
         self.cache_manager = KVCacheManager(
             n_blocks=self.DEFAULT_MAX_BLOCKS, block_size=self.DEFAULT_BLOCK_SIZE,
@@ -100,12 +96,7 @@ class InferenceEngine:
             self.eos_token_id = getattr(self.model.generation_config, 'eos_token_id', None)
         self.stream_callbacks = {}
 
-        # 捕获 CUDA Graph
-        # 两架构统一固定 1024 上下文：DeepSeek MLA 用 flash_attn_varlen_func + 固定 max_len=1024
-        # （消除 .item() 同步，cu_seqlens 是 GPU tensor），Qwen 用 flash_attn_with_kvcache(block_table=...)
-        # （KV 留分页、无 seq_len 维）。均 graph-friendly，一个 graph 形状通吃所有序列长度（≤1024），
-        # 无 if-else、无选桶、无 eager 回退。序列超 1024 由 add_request 钳制，block_table 列数在
-        # capture 期 assert 校验。
+        # 捕获 CUDA Graph：两架构均 graph-friendly，一个 graph 通吃所有 ≤1024 序列。
         if self.device == "cuda":
             logger.info("Capturing CUDA Graphs...")
             self.graph_runner.capture(self.cache_manager, batch_sizes=[1, 2, 4, 8, 16, 32, 40])
@@ -176,9 +167,7 @@ class InferenceEngine:
     def add_request(self, prompt: str, max_tokens: int = 128,
                     temperature: float = 0.7, top_p: float = 0.9,
                     repetition_penalty: float = 1.0, stop=None) -> int:
-        # 两架构统一固定 1024 上下文：总序列长度（prompt+gen）必须 ≤ max_position，否则 decode
-        # 越界（DeepSeek gather 越界列 / Qwen block_table 列数不足）。按 prompt 已编码长度钳
-        # gen 的 max_tokens；prompt 本身超限则截断 prompt。
+        # 固定 1024 上下文：钳 prompt+gen ≤ max_position，否则 decode 越界。
         prompt_ids = self.tokenizer.encode(prompt, add_special_tokens=True)
         cap = self.max_position
         if len(prompt_ids) > cap:

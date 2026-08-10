@@ -63,23 +63,14 @@ class ModelGraphRunner:
         self.adapter.prepare_weights(self.model, self.world_size, self.rank)
         self._alloc_bufs()
 
-        # CUDA Graph
-        # graph 选择键统一为 (bs, None)——两架构都只按 batch_size 选 graph，无长度分桶、
-        # 无 is_deepseek 分支、无选桶、无 eager 回退、无运行期 .item() 同步。
-        # 两架构统一固定 1024 上下文（engine.max_position=1024，add_request 钳 prompt+gen≤1024）：
-        #   - DeepSeek MLA attention 内部把分页 KV gather 成 [bs, max_len, 576]，max_len 进张量形状，
-        #     故需固定 max_len=1024（越界 key 由 flash_attn_varlen_func 的 cu_seqlens_k 截断）。
-        #   - Qwen 用 flash_attn_with_kvcache(block_table=...)，KV 留分页、输出无 seq_len 维，
-        #     不读 max_len，1024 纯由 engine 的 block_table 列数（max_seq_blocks=4）兜底。
-        # _deepseek_fixed_maxlen：DeepSeek=1024（attention 取 max_len 用），Qwen=None（不读）。
-        # 一个 graph 形状通吃所有 ≤1024 序列，为 tile op 融合提供编译期固定形状目标
-        # （后续 attention 内部换 TileLang 融合 kernel 时外部不动）。长序列能力留待 tile op
-        # 的 paged kernel 重构后恢复（kernel 跳读真实长度，桶上限即可解除）。
+        # CUDA Graph：两架构统一固定 1024 上下文，graph 选择键 (bs, None)，无选桶/无 eager
+        # 回退/无运行期 .item() 同步。DeepSeek 把分页 KV gather 成 [bs, max_len, 576]，max_len
+        # 进张量形状故需固定 1024（越界 key 由 cu_seqlens_k 截断）；Qwen 用 flash_attn_with_kvcache
+        # (block_table=...)，无 seq_len 维不读 max_len。>1024 长序列留待 tile op 恢复。
         self._deepseek_fixed_maxlen = 1024 if self.adapter.model_type == "deepseek" else None
         self._graphs: Dict[tuple, torch.cuda.CUDAGraph] = {}
         self._is_graph_ready = False
-        # replay 前由 forward/capture 设置：DeepSeek=1024（固定），Qwen=None（attention 不读）。
-        # attention() 据此取 max_len，不再 .item() 同步。
+        # replay 前 forward/capture 设置：DeepSeek=1024，Qwen=None（attention 不读）。
         self._cur_bucket_maxlen = None
 
     def _compile_fn(self, fn):
@@ -169,28 +160,21 @@ class ModelGraphRunner:
         saved_bt = bt_buf[:self.max_bs].clone()
         saved_sl = sl_buf[:self.max_bs].clone()
 
-        # warmup 填充：所有 seq 的 block_table 前 n_blk_warmup 列指向 block 0..n_blk_warmup-1
-        # （共用前几个 block，warmup 数值无意义只需结构合法不越界）。
-        # 两架构统一固定 1024 上下文：max_seq_blocks=ceil(1024/block_size)=4。DeepSeek attention
-        # 内部 arange(1024)//block_size 最大读第 4 列，故 n_blk_warmup=4；Qwen 不 gather，给 4 块
-        # 也无害（多填的不被读）。统一计算，无架构分支。
+        # warmup：block_table 前 n_blk_warmup 列填 block 0..n-1（结构合法即可，数值无意义）。
+        # 两架构统一按固定 1024 算 n_blk_warmup=ceil(1024/256)=4；Qwen 不 gather 多填无害。
         block_size = cache_manager.block_size
         fixed_maxlen = self._deepseek_fixed_maxlen if self._deepseek_fixed_maxlen is not None \
             else cache_manager._block_table_buffer.shape[1] * block_size
         n_blk_warmup = (fixed_maxlen + block_size - 1) // block_size  # 1024/256=4
-        # 启动期约束：block_table 列数（max_seq_blocks）必须 ≥ n_blk_warmup，否则 DeepSeek attention
-        # 内部 arange(fixed_maxlen)//block_size 会读越界列。满足此约束后运行期无需任何 .item() 同步
-        # 检查（forward 无长度判断）。
+        # 启动期约束：列数 max_seq_blocks 必须 ≥ n_blk_warmup，否则 arange(fixed_maxlen)//block_size
+        # 读越界列。满足后运行期无需 .item() 同步检查。
         max_seq_blocks = cache_manager._block_table_buffer.shape[1]
         assert max_seq_blocks >= n_blk_warmup, \
             f"block_table 列数 {max_seq_blocks} 不足以支撑固定 max_len " \
             f"{fixed_maxlen}（需 ≥{n_blk_warmup}，即 max_tokens ≥ fixed_maxlen）"
-        # 检查 block 数足够（n_blocks=81 ≥ 4，OK）
         assert cache_manager.n_blocks >= n_blk_warmup, \
             f"warmup 需 {n_blk_warmup} 个 block，cache 只有 {cache_manager.n_blocks}"
 
-        # _cur_bucket_maxlen：DeepSeek=1024（attention 据此取 max_len），Qwen=None（attention 不读）。
-        # 两架构统一赋值，无分支——Qwen 拿到 None 即可。
         self._cur_bucket_maxlen = self._deepseek_fixed_maxlen
 
         for bs in batch_sizes:
@@ -222,9 +206,7 @@ class ModelGraphRunner:
             self._input_ids[:batch_size] = input_ids
         # input_ids=None 表示 _input_ids 已由上一步 GPU→GPU copy 预填充，直接 replay
 
-        # 统一选 graph：两架构都按 (bs, None) 选，无 is_deepseek 分支、无选桶、无 eager 回退、
-        # 无运行期 .item() 同步。DeepSeek 固定 max_len=1024 通吃，序列长度不影响 graph 形状；
-        # 越界 key 由 cu_seqlens_k 截断。block_table 列越界由启动期 assert 保证（见 __init__）。
+        # 统一选 graph：(bs, None) 无架构分支、无选桶、无 .item() 同步。越界由启动期 assert 保证。
         key = (batch_size, None)
         if key not in self._graphs:
             raise RuntimeError(f"未捕获的 batch_size={batch_size}（请在 capture 的 batch_sizes 中加入）")
