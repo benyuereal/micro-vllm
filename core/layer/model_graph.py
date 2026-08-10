@@ -66,16 +66,17 @@ class ModelGraphRunner:
         # CUDA Graph
         # graph 选择键统一为 (bs, None)——两架构都只按 batch_size 选 graph，无长度分桶。
         # DeepSeek attention 内部把分页 KV gather 成 [bs, max_len, 576]，max_len 进张量形状。
-        # 这里固定 max_len=4096（=max_position_embeddings）通吃所有序列长度：越界 key 由
-        # flash_attn_varlen_func 的 cu_seqlens_k 截断不参与 attention。一个 graph 形状通吃，
-        # 无 if-else、无选桶、无 eager 回退——控制流对齐 v2 engine，且为 tile op 融合提供
-        # 编译期固定的形状目标（后续把 attention 内部换成 TileLang 融合 kernel 时外部不动）。
-        # 代价：短序列也按 4096 做 gather/kv_b_proj（多算），但 tile op 重构后 gather 这步
-        # 会被 tile 化重写，该代价消失。Qwen 的 flash_attn 吃 block_table 本就无 seq_len 维。
-        self._deepseek_fixed_maxlen = 4096 if self.adapter.model_type == "deepseek" else None
+        # 这里固定 max_len=1024 通吃（engine 已把序列硬限到 1024）：一个 graph 形状通吃所有
+        # 序列长度，越界 key 由 flash_attn_varlen_func 的 cu_seqlens_k 截断不参与 attention。
+        # 无 if-else、无选桶、无 eager 回退、无运行期 .item() 同步——控制流对齐 v2 engine，
+        # 且为 tile op 融合提供编译期固定的形状目标（后续把 attention 内部换成 TileLang
+        # 融合 kernel 时外部不动）。1024 而非 4096 是吞吐取舍：gather/attention 按 1024 算
+        # 比按 4096 省 4 倍，短对话场景吞吐显著更高；长序列能力由 tile op 的 paged kernel
+        # 重构后恢复（kernel 跳读真实长度，不再 gather 成定长密集）。Qwen 本就无 seq_len 维。
+        self._deepseek_fixed_maxlen = 1024 if self.adapter.model_type == "deepseek" else None
         self._graphs: Dict[tuple, torch.cuda.CUDAGraph] = {}
         self._is_graph_ready = False
-        # replay 前由 forward/capture 设置：DeepSeek=4096（固定），Qwen=None（attention 不读）。
+        # replay 前由 forward/capture 设置：DeepSeek=1024（固定），Qwen=None（attention 不读）。
         # attention() 据此取 max_len，不再 .item() 同步。
         self._cur_bucket_maxlen = None
 
@@ -169,11 +170,11 @@ class ModelGraphRunner:
 
         # warmup 填充：所有 seq 的 block_table 前 n_blk_warmup 列指向 block 0..n_blk_warmup-1
         # （共用前几个 block，warmup 数值无意义只需结构合法不越界）。
-        # DeepSeek 固定 max_len=4096，attention 内部 arange(4096)//block_size 最大读第 16 列，
-        # 故 n_blk_warmup 需 ≥16；Qwen 不 gather，只需 seqlens>0 让 flash_attn 有 key 可读。
+        # DeepSeek 固定 max_len=1024，attention 内部 arange(1024)//block_size 最大读第 4 列，
+        # 故 n_blk_warmup 需 ≥4；Qwen 不 gather，只需 seqlens>0 让 flash_attn 有 key 可读。
         block_size = cache_manager.block_size
         if is_deepseek:
-            n_blk_warmup = (self._deepseek_fixed_maxlen + block_size - 1) // block_size  # 4096/256=16
+            n_blk_warmup = (self._deepseek_fixed_maxlen + block_size - 1) // block_size  # 1024/256=4
             # 启动期约束：block_table 列数（max_seq_blocks）必须 ≥ n_blk_warmup，否则
             # attention 内部 arange(fixed_maxlen)//block_size 会读越界列。满足此约束后
             # 运行期无需任何 .item() 同步检查（forward 无长度判断）。
@@ -187,7 +188,7 @@ class ModelGraphRunner:
         assert cache_manager.n_blocks >= n_blk_warmup, \
             f"warmup 需 {n_blk_warmup} 个 block，cache 只有 {cache_manager.n_blocks}"
 
-        # DeepSeek: 固定 max_len=4096 通吃。capture/warmup 期间设 _cur_bucket_maxlen 让
+        # DeepSeek: 固定 max_len=1024 通吃。capture/warmup 期间设 _cur_bucket_maxlen 让
         # attention 走固定 max_len 路径（与 forward replay 一致）。
         if is_deepseek:
             self._cur_bucket_maxlen = self._deepseek_fixed_maxlen
@@ -222,7 +223,7 @@ class ModelGraphRunner:
         # input_ids=None 表示 _input_ids 已由上一步 GPU→GPU copy 预填充，直接 replay
 
         # 统一选 graph：两架构都按 (bs, None) 选，无 is_deepseek 分支、无选桶、无 eager 回退、
-        # 无运行期 .item() 同步。DeepSeek 固定 max_len=4096 通吃，序列长度不影响 graph 形状；
+        # 无运行期 .item() 同步。DeepSeek 固定 max_len=1024 通吃，序列长度不影响 graph 形状；
         # 越界 key 由 cu_seqlens_k 截断。block_table 列越界由启动期 assert 保证（见 __init__）。
         key = (batch_size, None)
         if key not in self._graphs:

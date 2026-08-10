@@ -354,12 +354,12 @@ class DeepSeekAdapter(ModelAdapter):
 
         # (2) 向量化 gather 每 seq 的全部 latent [0, new_pos]（共 cache_seqlens 个，含新 token）。
         # 构造 [bs, max_len] 物理 slot 矩阵后一次 advanced-index 取 latent。
-        # max_len 固定 = graph._cur_bucket_maxlen（4096，CUDA Graph 形状常量），无 .item() 同步。
+        # max_len 固定 = graph._cur_bucket_maxlen（1024，CUDA Graph 形状常量），无 .item() 同步。
         # 越界 key（position ≥ 实际序列长度）经 flash_attn_varlen_func 的 cu_seqlens_k 截断，
         # 不参与 attention；其 block_table 越界列已由 capture 期 assert 保证不读非法列
         # （blk_id 钳到 0 指向安全内存，slots 钳到合法范围）。
         total_lens = cache_lens.long()                     # = new_pos + 1
-        max_len = graph._cur_bucket_maxlen                 # 固定 4096，graph 形状常量
+        max_len = graph._cur_bucket_maxlen                 # 固定 1024，graph 形状常量
         block_size = cache_manager.block_size
         bt = block_table[:bs].long()                       # [bs, max_seq_blocks]
         t_idx = torch.arange(max_len, device=bt.device)    # [max_len]

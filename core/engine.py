@@ -60,11 +60,14 @@ class InferenceEngine:
         # 核心组件初始化
         self.device, self.dtype = self._auto_configure()
 
-        # 序列长度上限：对齐模型 max_position_embeddings（DeepSeek=4096）。
-        # KVCacheManager 的 max_tokens 决定 _block_table_buffer 的列数（max_seq_blocks）。
-        # DeepSeek CUDA Graph 固定 max_len=4096 通吃（不分桶、无 eager 回退），故 max_tokens
-        # 必须 ≥ 4096 以保证 block_table 列数足够（capture 期 assert 校验）。
-        self.max_position = getattr(self.config, 'max_position_embeddings', 4096)
+        # 序列长度上限：DeepSeek 固定 1024 桶（CUDA Graph 形状常量，见 model_graph）。
+        # 这里把 max_tokens 限到 1024 而非模型 max_position_embeddings(4096)：KVCacheManager 的
+        # max_tokens 决定 _block_table_buffer 列数（max_seq_blocks=ceil(1024/256)=4），且 attention
+        # 内部 arange(1024) 最多读第 4 列——列数与固定桶精确对齐。总序列长度（prompt+gen）由
+        # add_request 钳到 ≤1024，超出即截断，保证 decode 永不越界。长序列能力留待 tile op 的
+        # paged kernel 重构后恢复（kernel 跳读真实长度，桶上限即可解除）。
+        self.max_position = 1024 if self.adapter.model_type == "deepseek" \
+            else getattr(self.config, 'max_position_embeddings', 4096)
         self.cache_manager = KVCacheManager(
             n_blocks=self.DEFAULT_MAX_BLOCKS, block_size=self.DEFAULT_BLOCK_SIZE,
             n_layers=self.num_layers, n_heads=self.kv_num_heads, head_size=self.head_size,
@@ -98,10 +101,10 @@ class InferenceEngine:
         self.stream_callbacks = {}
 
         # 捕获 CUDA Graph
-        # DeepSeek：MLA attention 用 flash_attn_varlen_func + 固定 max_len=4096（消除 .item() 同步，
+        # DeepSeek：MLA attention 用 flash_attn_varlen_func + 固定 max_len=1024（消除 .item() 同步，
         # cu_seqlens 是 GPU tensor），MoE decode 用 Triton grouped GEMV（无 .tolist()），均 graph-friendly。
-        # 一个 graph 形状通吃所有序列长度（≤4096），无 if-else、无选桶、无 eager 回退。
-        # 序列超 4096 会因 block_table 列越界在 capture 期 assert 拦截（max_tokens≥4096 约束）。
+        # 一个 graph 形状通吃所有序列长度（≤1024），无 if-else、无选桶、无 eager 回退。
+        # 序列超 1024 由 add_request 钳制（prompt+gen ≤1024），block_table 列数在 capture 期 assert 校验。
         if self.device == "cuda":
             logger.info("Capturing CUDA Graphs...")
             self.graph_runner.capture(self.cache_manager, batch_sizes=[1, 2, 4, 8, 16, 32, 40])
@@ -172,6 +175,16 @@ class InferenceEngine:
     def add_request(self, prompt: str, max_tokens: int = 128,
                     temperature: float = 0.7, top_p: float = 0.9,
                     repetition_penalty: float = 1.0, stop=None) -> int:
+        # DeepSeek 固定 1024 桶：总序列长度（prompt+gen）必须 ≤ max_position，否则 decode
+        # 越界。这里按 prompt 已编码长度钳 gen 的 max_tokens；prompt 本身超限则截断 prompt。
+        if self.adapter.model_type == "deepseek":
+            prompt_ids = self.tokenizer.encode(prompt, add_special_tokens=True)
+            cap = self.max_position
+            if len(prompt_ids) > cap:
+                prompt_ids = prompt_ids[:cap]
+                prompt = self.tokenizer.decode(prompt_ids, skip_special_tokens=True)
+                logger.warning(f"DeepSeek 1024 桶：prompt 过长({len(prompt_ids)}>{cap})，已截断")
+            max_tokens = max(1, min(max_tokens, cap - len(prompt_ids)))
         seq_id = hash(prompt + str(time.time())) % (2 ** 32)
         seq = Sequence(seq_id, prompt, self.tokenizer, max_tokens)
         seq.temperature = temperature
