@@ -1,7 +1,7 @@
 """
 DeepSeek MoE prefill 路径（eager，按 expert 分段批算）。
 
-decode 路径已由 kernel/moe.py 的 TileLang 融合 kernel（moe_decode_tilelang）接管，
+decode 路径已由 kernel/moe.py 的融合 kernel（moe_decode）接管，
 本模块只保留 prefill 用的大 batch 分段实现。
 
 📌 设计：

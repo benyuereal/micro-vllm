@@ -1,9 +1,9 @@
-"""TileLang fused routed-MoE decode kernels for DeepSeek-V2-Lite (M=16 grid-parallel).
+"""Fused routed-MoE decode kernels for DeepSeek-V2-Lite (M=16 grid-parallel).
 
 替代原 Triton 逐 token grouped-GEMV loop（decode 路径）。
 
 📌 核心思路（M=16 grid-parallel T.gemm）：
-    bs=1 decode 下每个 expert 是 GEMV (M=1)，但 TileLang ``T.gemm`` 要求 ``M % 16 == 0``
+    bs=1 decode 下每个 expert 是 GEMV (M=1)，但 ``T.gemm`` 要求 ``M % 16 == 0``
     （tensor-core mma.h 硬约束）。解法：M=1 → M=16 零填充，让 grid 沿 K(top_k) 维并行吃掉
     padding——每个 block 算一个 (token, expert)，真实 act 在 16 行的第 ``kid`` 行，其余 15 行
     零填充无害。
@@ -150,11 +150,11 @@ def moe_routed_decode(x, e_gu, e_d, idx, w_gate):
     return out
 
 
-def moe_decode_tilelang(x, gate_weight, e_gu, e_d, top_k, n_experts,
-                        shared_gu=None, shared_d=None):
+def moe_decode(x, gate_weight, e_gu, e_d, top_k, n_experts,
+               shared_gu=None, shared_d=None):
     """完整 MoE decode（替代 moe_forward decode=True 路径）。
 
-    gate/topk/shared 留 PyTorch（小/固定），routed experts 用 TileLang M=16 全融合。
+    gate/topk/shared 留 PyTorch（小/固定），routed experts 用 M=16 全融合 kernel。
     x: [N, hidden], gate_weight: [E, hidden], e_gu: [E, 2*inter, hidden],
     e_d: [E, hidden, inter], shared_gu: [hidden, 2*s_inter], shared_d: [s_inter, hidden]
     返回: [N, hidden]
@@ -166,7 +166,7 @@ def moe_decode_tilelang(x, gate_weight, e_gu, e_d, top_k, n_experts,
     scores = logits.softmax(dim=-1, dtype=torch.float32).to(x.dtype)
     topk_weight, topk_idx = torch.topk(scores, k=top_k, dim=-1, sorted=False)  # [N, K]
 
-    # 2. routed experts（TileLang M=16 全融合）
+    # 2. routed experts（M=16 全融合）
     out = moe_routed_decode(x, e_gu, e_d, topk_idx, topk_weight)  # [N, H]
 
     # 3. shared experts（PyTorch 大 GEMM，固定无路由）

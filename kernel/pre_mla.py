@@ -1,11 +1,11 @@
 """
-MLA 前置全融合 TileLang kernel：q_proj(+rope) / kva_proj(+store) / absorb。
+MLA 前置全融合 kernel：q_proj(+rope) / kva_proj(+store) / absorb。
 
 把 MLA attention kernel 之前的零碎 PyTorch 算子（q_proj、kva_proj、store latent、
-rope(q_pe)、einsum absorb）融进 TileLang kernel，消除 bs=1 下 pre-MLA 的 execution gap。
+rope(q_pe)、einsum absorb）融进 kernel，消除 bs=1 下 pre-MLA 的 execution gap。
 
 为什么是 3 个 kernel 而非 1 个：q_proj 与 absorb 是串行 GEMM（absorb 需要 q_proj 输出
-q_nope），TileLang 非 persistent kernel 无法跨 block 同步，单 grid 内 GEMM→依赖 GEMM
+q_nope），非 persistent kernel 无法跨 block 同步，单 grid 内 GEMM→依赖 GEMM
 会竞争。评估过"融进每个 MLA split（4× 冗余）"——q_proj 100M MACs ×4 = 545M，是
 attention loop 的 122×，反而更慢。故拆成 2 个紧耦合 pre-kernel + absorb。
 

@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""端到端 decode 吞吐微基准（TileLang 融合 MLA + MoE）。
+"""端到端 decode 吞吐微基准（融合 MLA + MoE）。
 
 进程内直驱 engine 循环，CUDA event 计时稳态 decode（排除 prefill + 首轮热启动）。
-decode 路径已默认走 TileLang 融合 kernel（kernel/mla.py + kernel/moe.py），无开关。
+decode 路径已默认走融合 kernel（kernel/mla.py + kernel/moe.py + kernel/pre_mla.py），无开关。
 用法：
   python3 bench_tl_mla_e2e.py
 """
@@ -62,7 +62,7 @@ def main():
     mean = statistics.mean(times)
     tps = n / (total_ms / 1000.0)
     steady_tps = 1000.0 / med
-    print(f"\n=== TileLang MLA+MoE fused ===")
+    print(f"\n=== fused MLA + MoE ===")
     print(f"  measured tokens : {n}")
     print(f"  total wall      : {total_ms:.1f} ms")
     print(f"  mean step       : {mean:.3f} ms")

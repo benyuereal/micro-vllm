@@ -1,8 +1,8 @@
 """
-Fused MLA decode kernel（TileLang）：latent → rmsnorm + RoPE + paged flash 全融合（weight-absorption）。
+Fused MLA decode kernel：latent → rmsnorm + RoPE + paged flash 全融合（weight-absorption）。
 
 把当前 attention 的 gather(15)+kvb(47)+rope(24)+cat/pad(44)+flash(8) = 138us
-压成一个 TileLang kernel，中间的 [bs,1024,16,256] 全程不落 HBM。
+压成一个 kernel，中间的 [bs,1024,16,256] 全程不落 HBM。
 
 **关键：DeepSeek kv_b_proj 是 per-head 的**（kvb_w [H*256, 512]，每 head 独立 k_nope/v），
 不能像 example 那样跨 head 共享 KV。用 MLA weight-absorption 把 per-head kvb 权重吸收：

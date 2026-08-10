@@ -17,12 +17,12 @@ import torch.nn.functional as F
 from models.base import ModelAdapter
 from kernel.rmsnorm import rmsnorm, rmsnorm_, rmsnorm_residual_gemm as rmsnorm_residual
 from .moe import moe_forward
-# TileLang 融合 MLA decode kernel（latent→rmsnorm+RoPE+paged flash，weight-absorption）。
+# 融合 MLA decode kernel（latent→rmsnorm+RoPE+paged flash，weight-absorption）。
 # 把 attention 的 gather+kvb+rope+cat+flash 压进单个 kernel。
 from kernel.mla import _get_kernel as _get_mla_kernel
-# TileLang 融合 MoE decode kernel（routed experts: gate_up+silu+down，M=16 grid-parallel）。
-from kernel.moe import moe_decode_tilelang
-# TileLang MLA 前置全融合 kernel（q_proj+rope / kva_proj+store / absorb）。
+# 融合 MoE decode kernel（routed experts: gate_up+silu+down，M=16 grid-parallel）。
+from kernel.moe import moe_decode
+# MLA 前置全融合 kernel（q_proj+rope / kva_proj+store / absorb）。
 from kernel.pre_mla import get_pre_qkv_kernel, get_pre_kva_kernel, get_absorb_kernel
 
 try:
@@ -133,7 +133,7 @@ class DeepSeekAdapter(ModelAdapter):
             # QKV 路径权重（保留为矩阵，不融合——MLA 结构与 GQA 不同）
             # q_proj: [num_heads*q_head, hidden]
             attn._q_w = attn.q_proj.weight.data.clone()
-            # TileLang pre-kernel 需要非 None 的 bias 张量；DeepSeek q_proj/kva 无 bias → 零向量
+            # pre-kernel 需要非 None 的 bias 张量；DeepSeek q_proj/kva 无 bias → 零向量
             attn._q_b = attn.q_proj.bias.data.clone() if attn.q_proj.bias is not None else \
                 torch.zeros(self._num_heads * self._q_head, dtype=attn._q_w.dtype, device=attn._q_w.device)
             # kv_a_proj_with_mqa: [kv_lora+qk_rope, hidden]
@@ -145,7 +145,7 @@ class DeepSeekAdapter(ModelAdapter):
             attn._kva_ln_eps = attn.kv_a_layernorm.variance_epsilon
             # kv_b_proj: [num_heads*(qk_nope+v_head), kv_lora_rank]
             attn._kvb_w = attn.kv_b_proj.weight.data.clone()
-            # 预拆 per-head 的 kvb 权重供 TileLang MLA weight-absorption 用：
+            # 预拆 per-head 的 kvb 权重供 MLA weight-absorption 用：
             #   _kvb_w_kn[h] = kvb_w[h*256 : h*256+128]   (吸收进 Q → A)
             #   _kvb_w_v[h]  = kvb_w[h*256+128 : h*256+256] (post-multiply → out)
             _kvb_full = attn._kvb_w.view(self._num_heads,
@@ -327,7 +327,7 @@ class DeepSeekAdapter(ModelAdapter):
         return graph._x16[:bs, 0, :], graph._residual[:bs]
 
     def attention(self, x_normed, block, layer_idx, bs, graph, cache_manager, block_table):
-        """decode MLA attention（pre-MLA 全融合 + TileLang MLA kernel）。
+        """decode MLA attention（pre-MLA 全融合 + MLA decode kernel）。
 
         契约：forward 时 cache_seqlens[i] = 当前序列“下一步”的预期长度（框架在 prefill 后把
         current_position 置为 S+1，故首步 decode seqlens=S+1）。新 token 的逻辑位置 =
@@ -353,7 +353,7 @@ class DeepSeekAdapter(ModelAdapter):
         cos_q = cos[new_pos].to(graph.dtype)                # [bs, qk_rope]
         sin_q = sin[new_pos].to(graph.dtype)
 
-        # ---------- pre-MLA 全融合（3 个 TileLang kernel）----------
+        # ---------- pre-MLA 全融合（3 个 kernel）----------
         x16 = graph._x16[:bs]                               # [bs, 16, hidden]，row 0 = normed x
         # (1) q_proj + rope(q_pe) → q_out[bs, H, 16, q_head]
         kq = get_pre_qkv_kernel(bs, self._hidden, self._num_heads, self._q_head,
@@ -372,7 +372,7 @@ class DeepSeekAdapter(ModelAdapter):
         A_in = ka(q_nope16, attn._kvb_w_kn_t, graph._absorb_idx[:bs * self._num_heads])
         A_in = A_in.reshape(bs, self._num_heads, self._kv_lora_rank)
 
-        # ---------- TileLang 融合 MLA decode（不变）----------
+        # ---------- 融合 MLA decode（不变）----------
         k_pos = torch.arange(max_len, device=k_cache.device)  # [max_len]
         cos_k = cos[k_pos].contiguous()                    # [max_len, qk_rope]
         sin_k = sin[k_pos].contiguous()
@@ -398,7 +398,7 @@ class DeepSeekAdapter(ModelAdapter):
         x = graph._h_buf[:bs]
         mlp = block.mlp
         if mlp._is_moe:
-            mlp_out = moe_decode_tilelang(
+            mlp_out = moe_decode(
                 x, mlp._gate_w, mlp._e_gu, mlp._e_d,
                 self._top_k, self._n_experts,
                 mlp._shared_gu, mlp._shared_d,
@@ -495,7 +495,7 @@ class DeepSeekAdapter(ModelAdapter):
             "_qkv": torch.empty(max_bs, hidden_dim, dtype=dtype, device=device),  # 占位
             "_attn_out": torch.empty(max_bs, hidden_dim, dtype=dtype, device=device),
             "_residual": torch.empty((max_bs, hidden_dim), dtype=dtype, device=device),
-            # M=16 零填充的 normed x：pre-MLA TileLang kernel 读 [bs,16,hidden]，row 0 真实。
+            # M=16 零填充的 normed x：pre-MLA kernel 读 [bs,16,hidden]，row 0 真实。
             # rmsnorm 直接写 _x16[:,0,:]（strided view），省一次 pad copy。rows 1-15 恒零
             # （GEMM 输出 row 0 独立于其余行，垃圾/零都不影响 row 0；零更安全）。
             "_x16": torch.zeros((max_bs, 16, hidden_dim), dtype=dtype, device=device),
