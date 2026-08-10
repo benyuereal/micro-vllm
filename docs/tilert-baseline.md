@@ -77,6 +77,32 @@ DeepSeek 的 attention 内部 `gather → kv_b_proj → RoPE → cat → flash_a
   （gather → kv_b_proj → RoPE → cat → score → softmax → ·V，中间量留 smem/register 不落 HBM）
 - 远期：persistent kernel / heterogeneous worker（参考 TileRT 文章）
 
+## attention 内部各阶段耗时 profile
+
+> `prof_attention.py`，eager 路径，bs=8，max_len=1024，40 decode steps × 27 layers
+> CUDA event 手动计时，每层每步平均。eager 含 launch 开销，但各 op 相对占比 graph/eager 基本一致。
+
+| region | per_call (us/层) | %attn | 含义 |
+|---|---|---|---|
+| store | 47.5 | 5.1% | 写新 token latent 到 cache slot |
+| gather | 75.7 | 8.2% | `k_flat[slots]` gather 成 [bs,1024,576] |
+| **kvb** | **379.8** | **40.9%** | rmsnorm + kv_b_proj 展开 [bs,1024,16,256] |
+| **rope** | **360.0** | **38.8%** | q/k RoPE + cat 拼接 + v pad |
+| flash | 43.5 | 4.7% | flash_attn_varlen_func 真正的 attention |
+| oproj | 21.4 | 2.3% | output projection |
+
+**关键发现**：
+- `kvb` + `rope` 占 attention 的 **79.7%**，是 execution gap 的主体。
+  这两步把 latent `[bs,1024,576]` 展开成 `[bs,1024,16,192]`（k）和 `[bs,1024,16,192]`（v），
+  全部写回 HBM，再被 flash 读回——巨大的 memory round-trip。
+- 真正的 attention 计算 `flash` 只占 4.7%。
+- 印证 TileRT 文章：瓶颈不是"算得不够快"，而是 kernel 间的 memory round-trip（execution gap）。
+- **tile op 融合的核心收益**：把 kvb+rope 的中间张量 `[bs,1024,16,256]` 留在 smem/register，
+  不写回 HBM，直接喂给 attention 计算。理论上可吃掉 attention 内 79.7% 的大部分。
+
+attention 每步总耗时(eager): 25.06 ms (27 层)，每层 0.928 ms。
+（注：graph 下 launch 开销被省，attention 每步实际更低；基准 13.47ms/step 是 graph 全层含 MLP/MoE）
+
 ## 改造后对照
 
 （tile op 完成后用同样方法测，填入此表对比）
