@@ -12,6 +12,7 @@ from core.engine import InferenceEngine
 from core.inference_context import BatchInferenceContext
 
 USE_TL = os.environ.get("USE_TILELANG_MLA", "0") == "1"
+USE_MOE = os.environ.get("USE_TILELANG_MOE", "0") == "1"
 MODEL = "/models/DeepSeek-V2-Lite"
 PROMPT = "请详细解释 Transformer 架构中多头自注意力机制的完整计算流程，包括 Q K V 矩阵的生成、缩放点积注意力、softmax 归一化、多头拼接和输出投影。"
 WARMUP_GEN = 60      # 排除首轮热启动
@@ -19,7 +20,7 @@ MEASURE_GEN = 200    # 计量 token 数
 
 
 def main():
-    print(f"USE_TILELANG_MLA={USE_TL}", flush=True)
+    print(f"USE_TILELANG_MLA={USE_TL}  USE_TILELANG_MOE={USE_MOE}", flush=True)
     print("Loading engine ...", flush=True)
     engine = InferenceEngine(MODEL, max_batch_size=40)
     engine.add_request(PROMPT, max_tokens=WARMUP_GEN + MEASURE_GEN + 10, temperature=0.0)
@@ -64,7 +65,11 @@ def main():
     mean = statistics.mean(times)
     tps = n / (total_ms / 1000.0)
     steady_tps = 1000.0 / med
-    print(f"\n=== {'TileLang-MLA(fused)' if USE_TL else 'baseline(flash)'} ===")
+    tag = []
+    if USE_TL: tag.append("MLA-fused")
+    if USE_MOE: tag.append("MoE-fused")
+    tag = "+".join(tag) if tag else "baseline(flash)"
+    print(f"\n=== {tag} ===")
     print(f"  measured tokens : {n}")
     print(f"  total wall      : {total_ms:.1f} ms")
     print(f"  mean step       : {mean:.3f} ms")

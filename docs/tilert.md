@@ -92,19 +92,77 @@ per-head 的两个小 einsum 各做一次，flash 内全是标准 gemm。详见
 
 ---
 
-## 三、当前形态
+## 三、已落地：融合 MoE decode kernel（routed experts）
 
-每层 decode 仍是两个 kernel：**fused MLA attention** + **MoE**（MoE 暂未融合，走原 Triton 路径）。
-相比改造前的 278 launch/层，attention 段已压成 1 个融合 kernel。attention 的 execution gap 已吃掉一截。
+### 成果
+
+在融合 MLA 之上叠加 MoE routed-experts 融合，端到端再 +3.5%：
+
+| | 吞吐 (bs=1, 200 token) | median step |
+|---|---|---|
+| baseline（flash + Triton MoE） | 74.8 tok/s | 13.40 ms |
+| TileLang 融合 MLA | 83.7 tok/s | 11.87 ms |
+| **TileLang 融合 MLA + MoE** | **86.6 tok/s** | **11.47 ms** |
+| | **+15.8% vs baseline** | **-14.4%** |
+
+端到端正确性：同 prompt 同 temp=0，baseline 与 MLA+MoE 双融合路径**逐 token 完全一致**（事实问答 "北京" 等均一致）。
+测量脚本 `bench_tl_mla_e2e.py`，开关 `USE_TILELANG_MLA=1 USE_TILELANG_MOE=1`。
+
+MoE 段微基准分解（单层，K=6, E=64, INTER=1408, H=2048）：
+
+| 段 | TileLang | Triton | 说明 |
+|---|---|---|---|
+| gate+topk | 8.8 us | 8.8 us | 留 PyTorch（占比小，graph-friendly） |
+| routed experts | **85.3 us** | 106.1 us | 2-kernel M=16 融合，1.24x |
+| shared expert | 57.8 us | 57.8 us | 留 PyTorch 大 GEMM（下阶段） |
+| **MoE 全段** | **155.5 us** | 177.5 us | **1.14x，省 22us** |
+
+### 做了什么
+
+把 routed experts 的 `gate_up → silu·up·w → down` 三步压进**两个 TileLang kernel**
+（`kernel/tilelang_moe.py`），act 经 L2 暂存为 `[N, K, 16, INTER]`：
+
+- **gu_silu**：grid=(N, K, cdiv(INTER,64))，每 block 算一个 (token, expert) 的 64 列 act。
+  gate/up 各一次 `T.gemm`，silu 后写 `act16[n, kid, kid, :]`。
+- **down**：grid=(N, cdiv(H,64))，每 token 一个 block，**串行 K 个 expert**，M=16 `T.gemm`
+  算每个 expert 的输出，在 fp32 fragment 里累加，最后覆盖写。
+
+### 核心难点：bs=1 GEMV 不能直接用 tensor core
+
+DeepSeek-V2-Lite MoE 在 bs=1 decode 下每个 expert 都是 GEMV（M=1）。TileLang `T.gemm`
+走 tensor-core `mma.h`，硬性要求 **`M % 16 == 0`**（`M must be divisible by 16, but got 1`）。
+
+**解法：M=16 零填充 + grid 沿 K 维并行**。把 M=1 pad 成 M=16（15 行零填充无害），
+让 grid 沿 top-K 维并行吃掉 padding——每个 block 算一个 (token, expert)，真实 act 在 16 行的第 `kid` 行。
+这样能用上 tensor core，又不浪费（K=6 个 block 并行覆盖 6 个 expert）。
+
+### 核心难点：三个 TileLang 精度/竞争陷阱
+
+| 陷阱 | 现象 | 解法 |
+|---|---|---|
+| **bf16 silu 精度丢失** | `T.exp(-g)` 在 bf16 下偏差 ~1.5-1.9x，rel=1.26 完全错 | gate/up 的 shared buffer 用 **fp32**，silu 在 fp32 下算 → rel=0.012 |
+| **gate weight 乘两次** | gu_silu 乘 `wk`，down 又乘 → 输出偏大 | 只在 gu_silu 乘一次，down 不乘 |
+| **全局 `+=` 非原子 + 输出未清零** | `O[i] += val` 跨 expert block 竞争；atomic 版依赖输出清零但 jit 自动分配不保证 | 参照 TileKernels `reduce_fused`：**每 token 一个 block，block 内串行 K expert，fp32 fragment 累加，最后覆盖写**，彻底不用 atomic |
+
+第三点最关键：第一版用 `T.atomic_add` 跨 block 累加（grid 沿 K 并行），在随机数据下碰巧 rel=0.003，
+但真实 topk 数据 rel=3.89（输出未清零 + 竞争）。TileKernels 的 `reduce_fused` 给出正解——
+**累加在 block 内的 fragment 做，不在全局 tensor 做**。
 
 ---
 
-## 四、下一步：MoE 融合
+## 四、当前形态
 
-profile 数据（179us/层）：gate+topk 9us、shared SwiGLU 58us、routed 117us（真 GEMV 59us + 6 expert 逐 token 循环的 launch/HBM round-trip 58us）。
+每层 decode 是三个 kernel：**fused MLA attention** + **gu_silu** + **down**（MoE routed 融合）。
+gate/topk 和 shared expert 仍走 PyTorch。相比改造前的 278 launch/层，attention 段 1 个融合 kernel，
+MoE routed 段 2 个融合 kernel。attention 和 routed MoE 的 execution gap 各吃掉一截。
 
-- **shared expert（58us）**：数据流简单，固定开销，适合先融合。
-- **routed（117us）**：data-dependent 路由，6 expert 逐 token 循环的 launch 开销是大头；
-  TileLang GEMV 用不了 tensor core（M%16 限制），需 grouped GEMM / persistent 循环思路，复杂度高。
+---
 
-最终目标：**单层全融合 persistent kernel** = norm → [fused MLA+oproj] → norm → MoE，host 每层 1～2 launch。
+## 五、下一步
+
+- **single-kernel MoE（吃掉 32us 间隙）**：gu_silu 28us + down 25us 单独跑只要 53us，
+  两 kernel 串行 85us，中间 32us 是 launch/sync 间隙。用 `T.sync_grid()` 两阶段 persistent kernel
+  把 gate_up→silu→down 融进单 kernel，act 全程在 L2，目标 ~55us（再省 30us/层）。
+- **shared expert（58us）**：固定大 GEMM，无路由，可并入 MoE kernel 或单独融合。
+- **单层全融合 persistent kernel** = norm → [fused MLA+oproj] → norm → MoE，host 每层 1～2 launch。
+- Qwen 同款适配。

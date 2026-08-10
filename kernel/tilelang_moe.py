@@ -1,119 +1,114 @@
-"""TileLang MoE decode kernel：routed experts 全融合（gate_up + silu*up*w + down）。
+"""TileLang fused routed-MoE decode kernels for DeepSeek-V2-Lite (M=16 grid-parallel).
 
-替代 kernel/grouped_gemv.py 的 Triton 逐 token loop（16 次 kernel launch, 1055us/层）。
+替代 kernel/grouped_gemv.py 的 Triton 逐 token loop。
 
-📌 数据流（单 token, K=top_k experts）：
-    1. gate_up[k, 2*inter] = x[hidden] @ W_gu[idx[k], 2*inter, hidden].T   # K 次 GEMV
-    2. act[k, inter] = silu(gate_up[k, :inter]) * gate_up[k, inter:] * w[k]
-    3. out[hidden] += sum_k act[k, inter] @ W_d[idx[k], hidden, inter].T     # K 次加权 GEMV 累加
+📌 核心思路（M=16 grid-parallel T.gemm）：
+    bs=1 decode 下每个 expert 是 GEMV (M=1)，但 TileLang ``T.gemm`` 要求 ``M % 16 == 0``
+    （tensor-core mma.h 硬约束）。解法：M=1 → M=16 零填充，让 grid 沿 K(top_k) 维并行吃掉
+    padding——每个 block 算一个 (token, expert)，真实 act 在 16 行的第 ``kid`` 行，其余 15 行
+    零填充无害。
 
-🔑 优化点（对应 TileRT execution gap）：
-    - 16 次 kernel launch → 2 次 TileLang kernel（gate_up + down）
-    - act[N, K, inter] 落 HBM 但小（N=8: 8×6×1408×2B=135KB），L2 命中，非 round-trip
-    - expert_idx 间接寻址：e = IDX[bn]; T.copy(W[e, ...], W_shared)
-    - gate_up kernel 每 token 一个 block，不重复计算；down kernel 按输出列并行
+📌 两个 kernel，back-to-back，act 经 L2 暂存为 [N, K, 16, INTER]：
+    gu_silu : X16[N,16,H] @ W_gu[e]^T → gate/up [16,INTER]；
+              silu(gate)*up*gate_weight → act16[n, kid, kid, :]。
+              🔑 silu 必须在 fp32 下算（bf16 ``T.exp`` 精度丢失 ~1.5x）。
+    down    : act16[n,kid] @ W_d[e]^T → out[N,H]，跨 expert 用 ``T.atomic_add`` 累加到 fp32 输出。
+              🔑 全局 tensor ``+=`` 不是原子操作（6 expert block 竞争同一 O[h]），必须 atomic_add；
+              bf16 atomic 在 sm_89 不可靠，故输出 fp32。
 
-⚡ 范围：仅 routed experts。gate/router（data-dependent topk）和 shared experts 留在 PyTorch
-   （gate/topk 42us/层仅占 3.6%，shared 75us 是固定大 GEMM，下阶段融合）。
+    gate_weight 只在 gu_silu 乘一次，down 不再乘。
+
+⚡ 范围：仅 routed experts。gate/router（data-dependent topk）和 shared experts 留 PyTorch
+   （gate/topk 占比小，shared 是固定大 GEMM，下阶段融合）。
+
+📊 性能（L20, K=6, E=64, INTER=1408, H=2048, N=1）：
+    gu_silu 28.8us + down 17.0us = 79.8us serial  vs  Triton 3-step 106.5us  (1.33x)
+    correctness rel=0.014 vs Triton reference。
 """
 import torch
 import tilelang
 import tilelang.language as T
 
 
-# ============ kernel A: gate_up + silu*up*w → act[N, K, INTER] ============
-@tilelang.jit(
-    out_idx=[4],
-    pass_configs={tilelang.PassConfigKey.TL_ENABLE_FAST_MATH: True},
-)
-def moe_gate_up_kernel(N, H, INTER, E, K, BLOCK_H, BLOCK_INTER, dtype, num_stages=2):
-    """每 block 一个 token，算该 token 的 K 个 expert 的 act[K, INTER]。"""
-    accum_dtype = T.float32
+# ============ kernel A: gate_up + silu*up*w → act16[N, K, 16, INTER] ============
+@tilelang.jit(out_idx=[4])
+def moe_gate_up_kernel(N, H, INTER, E, K, dtype):
+    """grid=(N, K, cdiv(INTER,64))。每 block 算 (token n, expert kid) 的 64 列 act。
+    gate/up 各一次 M=16 T.gemm；silu 在 fp32 shared 下算；写 act16[n, kid, kid, :]。"""
+    accum = T.float32
     TWO_INTER = 2 * INTER
 
     @T.prim_func
     def main(
-        X: T.Tensor([N, H], dtype),
+        X16: T.Tensor([N, 16, H], dtype),
         W_gu: T.Tensor([E, TWO_INTER, H], dtype),
         IDX: T.Tensor([N, K], T.int32),
         W_gate: T.Tensor([N, K], dtype),
-        Act: T.Tensor([N, K, INTER], dtype),
+        Act16: T.Tensor([N, K, 16, INTER], dtype),
     ):
-        with T.Kernel(N, threads=256) as (bn,):
-            X_shared = T.alloc_shared([BLOCK_H], dtype)
-            Wg_shared = T.alloc_shared([BLOCK_INTER, BLOCK_H], dtype)
-            Wu_shared = T.alloc_shared([BLOCK_INTER, BLOCK_H], dtype)
-            gate_acc = T.alloc_fragment([BLOCK_INTER], accum_dtype)
-            up_acc = T.alloc_fragment([BLOCK_INTER], accum_dtype)
-            prod_v = T.alloc_fragment([BLOCK_INTER, BLOCK_H], accum_dtype)
-            wk = T.alloc_local([1], dtype)
-
-            for k in T.serial(K):
-                e = IDX[bn, k]
-                wk[0] = W_gate[bn, k]
-                for bi in T.serial(T.ceildiv(INTER, BLOCK_INTER)):
-                    T.fill(gate_acc, 0)
-                    T.fill(up_acc, 0)
-                    for kh in T.Pipelined(T.ceildiv(H, BLOCK_H), num_stages=num_stages):
-                        T.copy(X[bn, kh * BLOCK_H:(kh + 1) * BLOCK_H], X_shared)
-                        T.copy(
-                            W_gu[e, bi * BLOCK_INTER:(bi + 1) * BLOCK_INTER, kh * BLOCK_H:(kh + 1) * BLOCK_H],
-                            Wg_shared,
-                        )
-                        T.copy(
-                            W_gu[e, INTER + bi * BLOCK_INTER:INTER + (bi + 1) * BLOCK_INTER, kh * BLOCK_H:(kh + 1) * BLOCK_H],
-                            Wu_shared,
-                        )
-                        for i, j in T.Parallel(BLOCK_INTER, BLOCK_H):
-                            prod_v[i, j] = Wg_shared[i, j].astype(accum_dtype) * X_shared[j].astype(accum_dtype)
-                        T.reduce_sum(prod_v, gate_acc, dim=1, clear=False)
-                        for i, j in T.Parallel(BLOCK_INTER, BLOCK_H):
-                            prod_v[i, j] = Wu_shared[i, j].astype(accum_dtype) * X_shared[j].astype(accum_dtype)
-                        T.reduce_sum(prod_v, up_acc, dim=1, clear=False)
-                    for i in T.Parallel(BLOCK_INTER):
-                        g = gate_acc[i]
-                        sig = 1.0 / (1.0 + T.exp(-g))
-                        Act[bn, k, bi * BLOCK_INTER + i] = (g * sig * up_acc[i] * wk[0].astype(accum_dtype)).astype(dtype)
+        with T.Kernel(N, K, T.ceildiv(INTER, 64), threads=128) as (bn, kid, iblk):
+            X_s = T.alloc_shared([16, 128], dtype)
+            Wg_s = T.alloc_shared([64, 128], dtype)
+            Wu_s = T.alloc_shared([64, 128], dtype)
+            g_acc = T.alloc_fragment([16, 64], accum)
+            u_acc = T.alloc_fragment([16, 64], accum)
+            g_s = T.alloc_shared([16, 64], accum)   # fp32: bf16 T.exp 丢 ~1.5x 精度
+            u_s = T.alloc_shared([16, 64], accum)
+            e = IDX[bn, kid]
+            wk = W_gate[bn, kid]
+            T.clear(g_acc); T.clear(u_acc)
+            for kh in T.Pipelined(T.ceildiv(H, 128), num_stages=2):
+                T.copy(X16[bn, 0:16, kh * 128:(kh + 1) * 128], X_s)
+                T.copy(W_gu[e, iblk * 64:(iblk + 1) * 64, kh * 128:(kh + 1) * 128], Wg_s)
+                T.copy(W_gu[e, INTER + iblk * 64:INTER + (iblk + 1) * 64,
+                             kh * 128:(kh + 1) * 128], Wu_s)
+                T.gemm(X_s, Wg_s, g_acc, transpose_B=True, policy=T.GemmWarpPolicy.FullCol)
+                T.gemm(X_s, Wu_s, u_acc, transpose_B=True, policy=T.GemmWarpPolicy.FullCol)
+            T.copy(g_acc, g_s); T.copy(u_acc, u_s)
+            for j in T.Parallel(64):
+                g = g_s[0, j]
+                sig = 1.0 / (1.0 + T.exp(-g))
+                Act16[bn, kid, kid, iblk * 64 + j] = (g * sig * u_s[0, j] * wk).astype(dtype)
 
     return main
 
 
-# ============ kernel B: down GEMV → out[N, H] ============
-@tilelang.jit(
-    out_idx=[4],
-    pass_configs={tilelang.PassConfigKey.TL_ENABLE_FAST_MATH: True},
-)
-def moe_down_kernel(N, H, INTER, E, K, BLOCK_INTER, BLOCK_OUT, dtype, num_stages=2):
-    """每 block 一个 (token, 输出列段)，sum_k act[k] @ W_d[idx[k]].T。"""
-    accum_dtype = T.float32
+# ============ kernel B: down → out[N, H] (per-token block, fragment 累加) ============
+# 🔑 不用 atomic：参考 TileKernels reduce_fused，每 token 一个 block，block 内串行 K 个
+# expert，每个 expert 用 M=16 T.gemm 算出该 expert 的输出，在 fp32 fragment 里累加，
+# 最后覆盖写 Out。无竞争、不依赖输出清零、精度由 fp32 累加保证。
+@tilelang.jit(out_idx=[3])
+def moe_down_kernel(N, H, INTER, E, K, dtype):
+    """grid=(N, cdiv(H,64))。每 block 串行 K 个 expert：M=16 T.gemm → acc[16,64]，
+    取第 k 行累加到 out_frag[64]（fp32），最后写 Out[bn, hblk*64+j]。"""
+    accum = T.float32
 
     @T.prim_func
     def main(
-        Act: T.Tensor([N, K, INTER], dtype),
+        Act16: T.Tensor([N, K, 16, INTER], dtype),
         W_d: T.Tensor([E, H, INTER], dtype),
         IDX: T.Tensor([N, K], T.int32),
-        W_gate: T.Tensor([N, K], dtype),
         Out: T.Tensor([N, H], dtype),
     ):
-        with T.Kernel(N, T.ceildiv(H, BLOCK_OUT), threads=256) as (bn, bo):
-            Act_shared = T.alloc_shared([BLOCK_INTER], dtype)
-            Wd_shared = T.alloc_shared([BLOCK_OUT, BLOCK_INTER], dtype)
-            out_acc = T.alloc_fragment([BLOCK_OUT], accum_dtype)
-            prod_d = T.alloc_fragment([BLOCK_OUT, BLOCK_INTER], accum_dtype)
-
-            T.fill(out_acc, 0)
+        with T.Kernel(N, T.ceildiv(H, 64), threads=128) as (bn, hblk):
+            A_s = T.alloc_shared([16, 128], dtype)
+            W_s = T.alloc_shared([64, 128], dtype)
+            acc = T.alloc_fragment([16, 64], accum)
+            acc_s = T.alloc_shared([16, 64], accum)    # fp32 relay，单行索引避免 layout 冲突
+            out_frag = T.alloc_fragment([64], accum)    # fp32 跨 expert 累加器，无 atomic
+            T.clear(out_frag)
             for k in T.serial(K):
                 e = IDX[bn, k]
-                for ki in T.Pipelined(T.ceildiv(INTER, BLOCK_INTER), num_stages=num_stages):
-                    T.copy(Act[bn, k, ki * BLOCK_INTER:(ki + 1) * BLOCK_INTER], Act_shared)
-                    T.copy(
-                        W_d[e, bo * BLOCK_OUT:(bo + 1) * BLOCK_OUT, ki * BLOCK_INTER:(ki + 1) * BLOCK_INTER],
-                        Wd_shared,
-                    )
-                    for i, j in T.Parallel(BLOCK_OUT, BLOCK_INTER):
-                        prod_d[i, j] = Wd_shared[i, j].astype(accum_dtype) * Act_shared[j].astype(accum_dtype)
-                    T.reduce_sum(prod_d, out_acc, dim=1, clear=False)
-            T.copy(out_acc, Out[bn, bo * BLOCK_OUT:(bo + 1) * BLOCK_OUT])
+                T.clear(acc)
+                for ki in T.Pipelined(T.ceildiv(INTER, 128), num_stages=2):
+                    T.copy(Act16[bn, k, 0:16, ki * 128:(ki + 1) * 128], A_s)
+                    T.copy(W_d[e, hblk * 64:(hblk + 1) * 64, ki * 128:(ki + 1) * 128], W_s)
+                    T.gemm(A_s, W_s, acc, transpose_B=True, policy=T.GemmWarpPolicy.FullCol)
+                T.copy(acc, acc_s)
+                for j in T.Parallel(64):
+                    out_frag[j] += acc_s[k, j]          # 该 expert 输出在 acc_s 第 k 行
+            for j in T.Parallel(64):
+                Out[bn, hblk * 64 + j] = out_frag[j].astype(dtype)
 
     return main
 
@@ -128,7 +123,8 @@ _TORCH_TO_TL = {
 
 
 def moe_routed_decode(x, e_gu, e_d, idx, w_gate):
-    """x: [N, H], e_gu: [E, 2*inter, H], e_d: [E, H, inter], idx: [N, K], w_gate: [N, K] -> [N, H]"""
+    """x: [N, H], e_gu: [E, 2*inter, H], e_d: [E, H, inter],
+    idx: [N, K] int, w_gate: [N, K] -> out: [N, H]"""
     N, H = x.shape
     E, TWO_INTER, _ = e_gu.shape
     INTER = TWO_INTER // 2
@@ -138,16 +134,19 @@ def moe_routed_decode(x, e_gu, e_d, idx, w_gate):
 
     key = (N, H, INTER, E, K, x.dtype)
     if key not in _kernel_cache:
-        # smem: L20 max dynamic=100KB。Pipelined num_stages=2 会 double-buffer shared。
-        # gate_up: Wg/Wu [BI,BH]×2stages; BI=64,BH=128 → 2×64×128×2×2=64KB ✓
-        # down: Wd [BO,BI]×2; BI=64,BO=128 → 128×64×2×2=32KB ✓
         _kernel_cache[key] = (
-            moe_gate_up_kernel(N, H, INTER, E, K, BLOCK_H=128, BLOCK_INTER=64, dtype=tl_dtype, num_stages=2),
-            moe_down_kernel(N, H, INTER, E, K, BLOCK_INTER=64, BLOCK_OUT=128, dtype=tl_dtype, num_stages=2),
+            moe_gate_up_kernel(N, H, INTER, E, K, tl_dtype),
+            moe_down_kernel(N, H, INTER, E, K, tl_dtype),
         )
     k_gu, k_dn = _kernel_cache[key]
-    act = k_gu(x, e_gu, idx_i32, w_gate)   # [N, K, INTER]
-    out = k_dn(act, e_d, idx_i32, w_gate)  # [N, H]
+
+    # M=1 → M=16 零填充，真实 act 在第 0 行（kernel 内用 kid 行，对单 token kid 行 = 0 对齐）
+    # 对 N 个 token：X16[n, 0, :] = x[n]，其余行 0
+    X16 = torch.zeros(N, 16, H, dtype=x.dtype, device=x.device)
+    X16[:, 0, :] = x
+
+    act16 = k_gu(X16, e_gu, idx_i32, w_gate)   # [N, K, 16, INTER]
+    out = k_dn(act16, e_d, idx_i32)             # [N, H] (bf16, fragment fp32 累加后写出)
     return out
 
 
@@ -155,7 +154,7 @@ def moe_decode_tilelang(x, gate_weight, e_gu, e_d, top_k, n_experts,
                         shared_gu=None, shared_d=None):
     """完整 MoE decode（替代 moe_forward decode=True 路径）。
 
-    gate/topk/shared 留 PyTorch（小/固定），routed experts 用 TileLang 全融合。
+    gate/topk/shared 留 PyTorch（小/固定），routed experts 用 TileLang M=16 全融合。
     x: [N, hidden], gate_weight: [E, hidden], e_gu: [E, 2*inter, hidden],
     e_d: [E, hidden, inter], shared_gu: [hidden, 2*s_inter], shared_d: [s_inter, hidden]
     返回: [N, hidden]
@@ -167,7 +166,7 @@ def moe_decode_tilelang(x, gate_weight, e_gu, e_d, top_k, n_experts,
     scores = logits.softmax(dim=-1, dtype=torch.float32).to(x.dtype)
     topk_weight, topk_idx = torch.topk(scores, k=top_k, dim=-1, sorted=False)  # [N, K]
 
-    # 2. routed experts（TileLang 全融合）
+    # 2. routed experts（TileLang M=16 全融合）
     out = moe_routed_decode(x, e_gu, e_d, topk_idx, topk_weight)  # [N, H]
 
     # 3. shared experts（PyTorch 大 GEMM，固定无路由）
@@ -177,4 +176,3 @@ def moe_decode_tilelang(x, gate_weight, e_gu, e_d, top_k, n_experts,
         out = out + (F.silu(gate) * up) @ shared_d    # [N, H]
 
     return out
-
