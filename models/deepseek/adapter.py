@@ -17,6 +17,10 @@ import torch.nn.functional as F
 from models.base import ModelAdapter
 from kernel.rmsnorm import rmsnorm, rmsnorm_, rmsnorm_residual_gemm as rmsnorm_residual
 from .moe import moe_forward
+import os
+_USE_TL_MOE = os.environ.get("USE_TILELANG_MOE", "0") == "1"
+if _USE_TL_MOE:
+    from kernel.tilelang_moe import moe_decode_tilelang
 
 try:
     from flash_attn import flash_attn_with_kvcache, flash_attn_func, flash_attn_varlen_func
@@ -418,11 +422,18 @@ class DeepSeekAdapter(ModelAdapter):
         x = graph._h_buf[:bs]
         mlp = block.mlp
         if mlp._is_moe:
-            mlp_out = moe_forward(
-                x, mlp._gate_w, mlp._e_gu, mlp._e_d,
-                self._top_k, self._n_experts,
-                mlp._shared_gu, mlp._shared_d, decode=True,
-            )
+            if _USE_TL_MOE:
+                mlp_out = moe_decode_tilelang(
+                    x, mlp._gate_w, mlp._e_gu, mlp._e_d,
+                    self._top_k, self._n_experts,
+                    mlp._shared_gu, mlp._shared_d,
+                )
+            else:
+                mlp_out = moe_forward(
+                    x, mlp._gate_w, mlp._e_gu, mlp._e_d,
+                    self._top_k, self._n_experts,
+                    mlp._shared_gu, mlp._shared_d, decode=True,
+                )
         else:
             # dense SwiGLU（DeepSeek 标准: silu(gate)*up；_dense_gu=cat([gate,up]).t()）
             gate_up = x @ mlp._dense_gu

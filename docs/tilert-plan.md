@@ -181,10 +181,60 @@ Triton（必须改 TileLang），结构相对独立（input [bs,2048] → output
 ## 六、当前状态
 
 - [x] 基准记录（`tilert-baseline.md`）：DeepSeek 72.2 tok/s, 13.47ms/step；Qwen 45.9 tok/s, 21.19ms/step
-- [x] 整层 + attention + MoE profile 完成
+- [x] 整层 + attention + MoE profile 完成（eager, bs=8）
 - [x] 方案设计（本文档）
-- [ ] **待确认方向** → 然后开干
-- [ ] 阶段 0：TileLang MoE grouped GEMV
-- [ ] 阶段 1：attention 全融合
-- [ ] 阶段 2：单层全融合
-- [ ] 阶段 3：Qwen + 回归
+- [x] 阶段 0 尝试：TileLang MoE grouped GEMV —— **见下方关键修正**
+
+## 七、阶段 0 实测修正（2026-08-10）
+
+### 关键发现 1：eager profile 高估了 graph 下的开销
+
+eager profile（bs=8）显示 MoE 1055us/层、attention 860us/层。但 **CUDA Graph 已摊掉大部分 launch 开销**：
+- graph 单层 MoE vs eager：1334us vs 1385us（bs=8），graph 只省 4%
+- 即 graph 下 MoE 仍是 ~1334us/层（bs=8），launch 不是主因，**是 GEMV 本身的 HBM 带宽 + 串行**
+
+### 关键发现 2：基准是 bs=1，MoE 不是最大头
+
+基准 72.2 tok/s = 单请求 bs=1，13.47ms/step。graph 下 MoE 占比随 bs 变化：
+
+| bs | graph 单层 MoE | ×24 层 | 占 step 比 |
+|---|---|---|---|
+| **1** | **185us** | **4.43ms** | **33%** |
+| 2 | 421us | 10.11ms | 75% |
+| 4 | 732us | 17.56ms | 130% |
+| 8 | 1318us | 31.64ms | 235% |
+
+**bs=1（基准场景）MoE 只占 33%，attention + 其他占 67%。** eager profile 的 "MoE 51%" 是 bs=8 数字，bs=1 下 MoE 不是瓶颈。
+
+### 关键发现 3：TileLang fragment GEMV 比 Triton 慢
+
+- Triton `tl.sum(x*w, axis=1)` 单 expert GEMV：~4.3us（6 expert 一起 25.5us）
+- TileLang fragment `for i,j in T.Parallel: prod=W*X` + `reduce_sum`：12.4us/expert
+- TileLang `alloc_reducer` 模式：59.5us/expert（更慢）
+- TileLang `T.gemm` 要求 M%16==0，GEMV(M=1) 不能用
+- **端到端实测**：TileLang MoE 接入 decode = **21.2 tok/s** vs baseline 71.5 tok/s（慢 3.4×）
+
+### 根因
+
+1. TileLang 在 M=1 GEMV 场景没有 Triton 的 SIMT reduction 优化
+2. 我的 kernel 结构串行 K expert（`for k in T.serial(K)`），浪费并行性（Triton grid=K 并行）
+3. 优化目标错位：盯着 eager+bs=8 的 MoE 51%，但基准是 graph+bs=1 的 MoE 33%
+
+### 方向修正
+
+**阶段 0（MoE 优先）的前提不成立**——bs=1 下 MoE 不是最大头，且 TileLang GEMV 比 Triton 慢。
+应转向 **bs=1 下的真正瓶颈**：attention 的 kvb+rope（graph 下待测）+ 层间 HBM round-trip。
+
+下一步：
+1. 量 **bs=1 graph 下 attention 各段**真实占比（kvb/rope/flash/oproj）
+2. 量 **bs=1 graph 下整层各段**（qkv/attention/ffn）占比
+3. 据此重定阶段优先级——很可能 attention 全融合（阶段 1）才是 bs=1 的收益点
+4. MoE 若要优化，需换 grouped GEMM（tensor core）而非 GEMV，且只在 bs≥4 有意义
+
+### 保留的代码
+
+- `kernel/tilelang_moe.py`：TileLang MoE kernel（正确性通过，性能未达预期），保留备查
+- `USE_TILELANG_MOE=1` 开关，默认关闭（走 Triton 路径）
+- 各 prof 脚本：prof_layer/prof_moe/prof_graph_moe/prof_moe_graph_only.py
+
+## 八、原始阶段规划（保留参考，已据上方修正）
