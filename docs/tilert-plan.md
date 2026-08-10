@@ -1,132 +1,190 @@
-# TileRT 改造方案：DeepSeek MLA attention 全融合 TileLang kernel
+# TileRT 改造方案：单层全融合 TileLang persistent kernel
 
 > 分支：tilert | 基准见 [tilert-baseline.md](tilert-baseline.md) | TileRT 文章要点见 memory
+> 范围：把**一整层 decode** 压成**一个 TileLang persistent kernel**，不是只融 attention。
 
 ## 一、目标与依据
 
+### 确认的范围
+
+用户确认："**单层全融合 persistent kernel**"。即把一整层 decode（norm + attention + oproj
++ norm + MoE）压成**一个 TileLang persistent kernel**，层内 h 状态在 smem/register/L2 流，
+host **每层只 launch 一次**。27 层各自一个 persistent kernel。
+- 不是只融 attention（太窄，attention 只占 41.7%）；
+- 不是整个模型一个 kernel（27 层一次 launch，超出单层 scope，且捕获/调试代价过高）。
+
 ### profile 数据（execution gap 在哪）
-attention 内部各阶段占比（eager, bs=8, max_len=1024, 每层每步）：
 
-| region | us/层 | %attn | 是否落 HBM |
+整层 decode（eager, bs=8, max_len=1024, 每层每步，`prof_layer.py`+`prof_moe.py`）：
+
+| 段 | us/层 | %层 | 内部最大头 |
 |---|---|---|---|
-| store | 47.5 | 5.1% | 写 1 个 latent |
-| gather | 75.7 | 8.2% | 读 [bs,1024,576] 写 HBM |
-| **kvb** | **379.8** | **40.9%** | rmsnorm+GEMM，写 [bs,1024,16,256] 落 HBM |
-| **rope** | **360.0** | **38.8%** | RoPE+cat+pad，写 [bs,1024,16,192]×2 落 HBM |
-| flash | 43.5 | 4.7% | 真正 attention |
-| oproj | 21.4 | 2.3% | output proj |
+| qkv | 5.6 | 0.3% | norm + q_proj + kv_a_proj |
+| **attention** | **860** | **41.7%** | kvb 380 + rope 360 = 740（86%在attention内） |
+| **ffn(MoE)** | **1161** | **56.3%** | gemv_loop 1055（90%在MoE内） |
+| next_qkv | 34 | 1.7% | 下一层入口 |
+| **层总计** | **2061** | 100% | **278 kernel 边界/层** |
 
-**核心结论**：kvb + rope = 79.7%，是 execution gap 主体。这两步把 latent `[bs,1024,576]` 经 GEMM 展开 + RoPE 拼接成 `[bs,1024,16,192]`（k/v），全部写回 HBM，再被 flash 读回——巨大 memory round-trip。flash 本身只占 4.7%。
+**两个 execution gap 主体（占整层 87%）**：
+1. **MoE gemv_loop 1055us（51%）**：8 token 各调 2 个 Triton kernel = 16 次 launch + HBM round-trip。
+2. **attention kvb+rope 740us（36%）**：latent→[bs,1024,16,256] 写 HBM 再读回。
 
-### 改造目标
-用一个 TileLang kernel 融合 `gather → kv_b_proj → RoPE → score → softmax → ·V`，让 kvb/rope 的中间张量 `[bs,1024,16,256]` **留在 smem/register，不落 HBM**，直接喂给 attention 计算。理论上吃掉 attention 内 79.7% 的大部分。
+每层 **278 个 kernel 边界**。CUDA Graph 摊掉了 launch 开销，但**没省 kernel 间的 HBM
+round-trip**（一个 kernel 写 HBM，下一个再读）。全融合的收益 = 消掉层内中间张量的 HBM 落盘。
 
-## 二、当前数据流（改造前）
+### 核心约束
+- **实现语言：TileLang**（不用 Triton）。当前 MoE 的 `grouped_gemv.py` 是 Triton，必须用 TileLang 重写。
+- DeepSeek + Qwen 都要支持（本方案先做 DeepSeek，Qwen 复用框架，dense FFN 比 MoE 简单）。
+- 保持固定 1024 上下文、热路径零架构分支。
 
-```
-cache: k_cache [n_blocks, block_size, 1, 576]  (latent, paged)
-  │
-  ├─ store: 新 token latent 写入 slot
-  │
-  ├─ gather: k_flat[slots] → latents [bs, 1024, 576]          ← 落 HBM
-  │
-  ├─ kvb:  latents → split → rmsnorm(ckv[512]) → kv_b_proj
-  │        → kv [bs,1024,16,256] → k_nope[128]|v[128]         ← 落 HBM (40.9%)
-  │
-  ├─ rope: q_pe/k_pe RoPE + cat
-  │        → k_full [bs,1024,16,192], v_fa [bs,1024,16,192]   ← 落 HBM (38.8%)
-  │
-  ├─ flash: flash_attn_varlen_func(q, k_v, v_v) → attn_out    (4.7%)
-  │
-  └─ oproj: linear(attn_out, o_w) → out
-```
-
-中间张量 `[bs,1024,16,256]`、`[bs,1024,16,192]` 反复在 HBM 进出，是 gap 根源。
-
-## 三、改造后数据流（TileLang 融合 kernel）
+## 二、当前数据流（改造前，一层 decode）
 
 ```
-输入（GPU tensor, graph-friendly）:
-  Q       [bs, 16, 128]   (q_nope, 已算好)
-  Q_pe    [bs, 16, 64]    (q_pe, 已 RoPE 或 kernel 内 RoPE)
-  k_cache [n_blocks, block_size, 1, 576]   (latent, paged, 不展开)
-  kvb_w   [4096, 512]     (kv_b_proj 权重, 16*(128+128) × 512)
-  kva_ln_w, kva_ln_eps    (rmsnorm)
-  block_table [bs, max_seq_blocks]
-  cache_seqlens [bs]
-  cos/sin [max_pos, 64]   (RoPE table, interleaved)
-
-kernel 内部（每个 tile 处理一段 KV）:
-  for kv_tile in tiles(over 1024 positions):
-    1. block_table 跳读: latents_tile = k_cache[block_table[tile]]   ← smem [block_N, 576]
-    2. split: ckv_tile = latents_tile[:, :512], k_pe_tile = latents_tile[:, 512:]
-    3. rmsnorm: ckv_tile = rmsnorm(ckv_tile)                          ← fragment
-    4. kv_b_proj: kv_tile = ckv_tile @ kvb_w.T  → [block_N, 16, 256]  ← fragment (GEMM)
-    5. split: k_nope_tile = kv_tile[..., :128], v_tile = kv_tile[..., 128:]
-    6. RoPE: k_pe_tile = rope(k_pe_tile, cos[tile_pos], sin[tile_pos])← fragment
-    7. score: s = (Q @ k_nope_tile + Q_pe @ k_pe_tile) * scale        ← fragment [block_H, block_N]
-    8. online softmax: 更新 m, s_sum, acc_o                           ← fragment
-    9. ·V: acc_o += softmax(s) @ v_tile                               ← fragment [block_H, 128]
-  输出: O [bs, 16, 128]  (attn_out, 无 seq_len 维)
+h [bs,2048]                                          (层输入, HBM)
+ │
+ ├─ compute_qkv(首层)/compute_next_qkv(后续层)
+ │   ├─ rmsnorm_(h)                                   ── HBM round-trip
+ │   ├─ q  = F.linear(h, q_w)        [bs,1920]       ── GEMM, 落 HBM
+ │   └─ kva = F.linear(h, kv_a_w)    [bs,576]        ── GEMM, 落 HBM
+ │      split → q_a[bs,512], q_pe[bs,64], kv_latent[bs,512]
+ │      cache 写 slot
+ │
+ ├─ attention (逐层)
+ │   ├─ store   新 latent → slot                       ── HBM
+ │   ├─ gather  k_flat[slots] → [bs,1024,576]          ── HBM (大读)
+ │   ├─ kvb     rmsnorm + kv_b_proj → [bs,1024,16,256] ── GEMM, 落 HBM (380us, 41%attn)
+ │   ├─ rope    q/k RoPE + cat → k[bs,1024,16,192]     ── HBM (360us, 39%attn)
+ │   ├─ flash   flash_attn_varlen → [bs,16,128]        ── 落 HBM (44us, 5%attn)
+ │   └─ oproj   F.linear → [bs,2048]                   ── GEMM, 落 HBM (21us)
+ │
+ ├─ all_reduce (TP=1 时 no-op)
+ │
+ ├─ compute_ffn
+ │   ├─ rmsnorm_residual                              ── HBM
+ │   ├─ MoE (decode)
+ │   │   ├─ gate    F.linear + softmax → [bs,64]       ── HBM (32us)
+ │   │   ├─ topk    top-6 → idx[bs,6], w[bs,6]         ── HBM (10us)
+ │   │   ├─ gemv_loop for i in bs:                     ── 16 次 Triton kernel (1055us, 90%MoE!)
+ │   │   │    grouped_gate_up → silu*up*w → grouped_down
+ │   │   └─ shared  x@shared_gu → silu*up → @shared_d  ── HBM (75us)
+ │   └─ residual
+ │
+ ├─ all_reduce
+ └─ → 下一层 h [bs,2048]
 ```
 
-**关键**：步骤 4-9 全在 fragment/smem 流，`[block_N, 16, 256]` 中间量**不落 HBM**。
-这同时解决了：
-1. execution gap（kvb+rope 不落 HBM）
-2. batch 串扰（kernel 按 cache_seqlens 每条 seq 只读自己的 KV，不 gather 成定长密集）
-3. max_len 进形状（输出 `[bs,16,128]` 无 seq_len 维，桶上限可解除）
-4. gather 本身也被吃进 kernel（block_table 跳读）
+中间张量 `[bs,1024,16,256]`、`[bs,1024,16,192]`、每 token 的 `[K,2*inter]`/`[K,inter]`
+全部写回 HBM 再被下一段读回——这是 278 个 kernel 边界的主要开销。
+
+## 三、改造设计
+
+### 总体：单层 persistent kernel
+
+```
+host: for layer in 27:
+        launch single_layer_persistent_kernel(weights_l, h, kv_cache_l, ...)
+              └─ 一个 kernel 跑完整层，层内 h/中间量在 smem/register/L2
+```
+
+- grid = SM 数（L20 = 48 SM），kernel 内 `for w in T.serial(waves)` 持续处理多个 tile（persistent）。
+- 层内分阶段，阶段间用 `T.sync_grid()` / barrier 同步，中间量尽量不落 HBM。
+- host 每层一次 launch（替代当前每层 ~278 次）。
+
+### 难点与策略
+
+**难点 1：MoE 是 data-dependent 路由**（topk 每 token 选不同 expert）
+- 当前：逐 token for-loop，每 token 2 个 kernel（grouped_gate_up + grouped_down）。
+- 全融合策略：参考 TileRT 文章的 **heterogeneous worker**——一个 persistent kernel 里，
+  部分 warp/block 跑 gate→topk（产生 expert_idx），其余 worker 按 expert_idx 索引权重跑 GEMV。
+  gate/topk 结果（`idx[bs,6]`, `w[bs,6]`）小，留 shared memory 或写一小块 HBM（L2 命中）。
+  关键：**expert_idx 索引权重在 TileLang 里用 `tl.load(w_ptr + e*stride)` 风格的间接寻址**，
+  和当前 Triton `_grouped_gate_up_kernel` 里 `e = tl.load(idx_ptr+pid_k)` 一致，TileLang 支持。
+- bs=8 时 MoE 总 token-expert pair = 8×6 = 48，可一个 block 处理一个 token 的 6 个 expert，
+  8 个 block 并行（L20 48 SM 远够）。
+
+**难点 2：attention 的 kvb+rope 中间量巨大**（[bs,1024,16,256]）
+- 这个张量 bs=8×1024×16×256×2B = 64MB，放不进 smem。
+- 策略：**分 head 流式**。一个 block 处理一个 (batch, head) 的 flash 循环，kv_b_proj 只算该 head
+  需要的 256 维切片，RoPE 在 register 里做，直接进 flash 的 QK·V 累加，**不写回完整 [bs,1024,16,256]**。
+  即 kvb+rope 从"全展开再 flash"变成"按 head 边算边用"。
+- kv_b_proj 权重 [512→4096] 按 head 16 等分（每 head 256 行），分块 load。
+
+**难点 3：层间 h 仍要走 HBM**（单层 scope 内无法避免）
+- h [bs,2048] = 8×2048×2B = 32KB，放不进跨 kernel 的 smem。
+- 接受：层间 h 写 HBM（一次写一次读，2×32KB，~40us，占层 1.9%），这本来就是小头。
+- 收益全在层内 278→1 个 kernel 边界。
+
+### 阶段拆分（kernel 内部）
+
+persistent kernel 内部按 tile 调度，逻辑分 4 段，段间 `T.sync_grid()`：
+
+1. **QKV 段**：rmsnorm(h) → q_proj / kv_a_proj。h[bs,2048] 读一次，q/kva 算完留 register/smem。
+2. **ATTN 段**：store latent → 按 head 流式 (gather切片 + kvb切片 + rope + flash + oproj切片)。
+   oproj 输出 attn_out[bs,2048]。
+3. **FFN 段**：rmsnorm_residual(h, attn_out) → gate/topk（data-dependent）→ MoE GEMV + shared → mlp_out[bs,2048]。
+4. **RESIDUAL 段**：h = mlp_out + residual，写 HBM 给下一层。
+
+### 实现语言映射（PyTorch → TileLang）
+
+| 当前 PyTorch/Triton | TileLang 原语 |
+|---|---|
+| `T.Kernel(sm_num, threads=256)` + `for w in T.serial(waves)` | persistent kernel |
+| `T.Pipelined(loop, num_stages=2)` | tile pipeline（data/compute overlap） |
+| `T.sync_grid()` | 段间同步 |
+| `T.gemm(shared, shared, fragment)` | 矩阵乘 |
+| `T.copy(global, shared)` / `T.copy(fragment, global)` | HBM↔smem 搬运 |
+| `T.alloc_shared` / `T.alloc_fragment` | smem / register |
+| `tl.load(w + e*stride)` (Triton 间接寻址) | TileLang 同样支持指针算术间接寻址（MoE expert 索引） |
+| `T.use_swizzle(10)` | bank conflict 优化 |
+| warp specialization（ws 例） | data/compute warp 分离（MoE gate vs GEMV） |
 
 ## 四、分阶段实施
 
-### Phase 1：TileLang MLA decode kernel（attention 全融合）
-- 写 `kernel/tile_mla_decode.py`，TileLang 实现。
-- 输入：Q, Q_pe, k_cache(latent), kvb_w, ln 参数, block_table, cache_seqlens, cos/sin。
-- 输出：O [bs, 16, 128]。
-- 参考 `tilelang/examples/deepseek_mla/example_mla_decode_paged.py` 的 paged + split-kv 结构，
-  但把 KV 输入从"已展开 dv"改成"latent 576 + kernel 内 kv_b_proj 展开"。
-- 替换 adapter.py attention() 的 (2)~(6) 为这个 kernel 调用。
-- store(1) 和 oproj(7) 暂留外面（store 是写 cache，oproj 是 attention 后的线性层，可后续融）。
+### 阶段 0：TileLang MoE grouped GEMV（先啃最大头 51%）
 
-### Phase 2：接入 CUDA Graph
-- kernel 输入全是 GPU tensor（block_table/cache_seqlens/cos/sin 常驻），graph-friendly。
-- 验证 graph capture 成功，bs 1/2/4/8/16/32/40 全 OK。
-- 测吞吐 + 逐 token 延迟，对照基准。
+**为什么先做 MoE 而不是 attention**：MoE gemv_loop 1055us 是单层最大头（51%），且当前是
+Triton（必须改 TileLang），结构相对独立（input [bs,2048] → output [bs,2048]），可单独验证。
 
-### Phase 3：解除 1024 限制
-- kernel 输出无 seq_len 维，attention 不再依赖固定 max_len。
-- max_position 可恢复到模型真实值（4096）或更高。
-- batch 串扰 bug 随 paged kernel 自然消除。
+- 用 TileLang 重写 `grouped_gate_up` + `grouped_down`，支持 expert_idx 间接寻址。
+- 目标：把 16 次 kernel（8 token × 2）合成少量 TileLang kernel，中间 `act[K,inter]` 留 smem。
+- 先 standalone 正确性（对齐 `moe.py` 输出），再接入 decode 验吞吐。
+- **验收**：MoE 段 1055us → 目标 < 500us（消掉 launch + act 的 HBM round-trip）。
 
-### Phase 4（远期）：persistent kernel / warp specialization
-- 朝 TileRT 文章的常驻 Engine Kernel 演进，跨层融合。
+### 阶段 1：attention 全融合（kvb+rope 不落 HBM，36%）
 
-## 五、技术风险与决策点
+- TileLang kernel：gather 切片 + kv_b_proj 按 head 切片 + RoPE(register) + flash + oproj。
+- 参考 `examples/deepseek_mla/example_mla_decode_persistent.py` 的 persistent + split 结构，
+  但**输入是 latent 不是展开 KV**——kv_b_proj 要进 kernel。
+- **验收**：attention 段 860us → 目标 < 300us。
 
-### 风险1：kv_b_proj 在 kernel 内做 GEMM 的效率
-- kvb 是 `[block_N, 512] @ [512, 4096]` 的 GEMM，block_N 通常 32-128。
-- TileLang 有 gemm tile op（`T.gemm`），smem→fragment 的 MMA 应能高效。
-- 风险：小 block_N 下 GEMM 效率不如 cublas。但省掉的 HBM 往返远大于此。
-- 决策：先实现，profile 对比。若 GEMM 成瓶颈，调 block_N 或用 split。
+### 阶段 2：单层全融合（norm + attn + oproj + norm + MoE 一个 kernel）
 
-### 风险2：RoPE interleaved 在 kernel 内实现
-- DeepSeek 用 interleaved RoPE，只作用 k_pe（64 维）。
-- TileLang 需手写 interleaved rotate（even/odd 交错），cos/sin 从 table 读。
-- 决策：kernel 内对 k_pe 做 RoPE，q_pe 仍在外（q 只 1 个位置，开销小）或也并入。
+- 把阶段 0+1 用 `T.sync_grid()` 串成一个 persistent kernel，层内 h 流 smem/register/L2。
+- 处理 TP=1 no-op 的 all_reduce、residual。
+- **验收**：整层 2061us → 目标 < 900us；端到端 72.2 tok/s → 目标 > 120 tok/s。
 
-### 风险3：rmsnorm 在 kernel 内
-- kv_b_proj 前的 rmsnorm(ckv[512]) 需在 kernel 内做（reduce + scale）。
-- TileLang 有 reduce op，per-token rmsnorm 是 [512] 上的 reduce，可行。
-- 决策：并入 kernel。
+### 阶段 3：Qwen 适配 + 收尾
 
-### 风险4：graph capture 与 TileLang JIT
-- TileLang 用 `@tilelang.jit` 编译 kernel，编译产物是 CUDA kernel。
-- 需确认编译后的 kernel 能被 CUDA Graph capture（应该是普通 kernel launch，可以）。
-- 决策：Phase 2 验证。
+- Qwen 是 dense FFN（无 MoE），阶段 2 的 MoE 段换成单 MLP，更简单。
+- 全量回归测试 + 基准对照（填 `tilert-baseline.md` 改造后表）。
 
-## 六、验收标准
-- DeepSeek 吞吐 > 72.2 tok/s（基准），目标提升 30%+（>94 tok/s）。
-- DeepSeek 每步 decode 延迟 < 13.47ms（基准），目标 < 10ms。
-- batch 串扰 bug 消除（不等长 batch 正确）。
-- CUDA Graph capture 全 bs OK。
-- 正确性：输出与改造前逐 token 一致（temperature=0 对比）。
+## 五、风险与回退
+
+- **TileLang 间接寻址/动态 shape 支持**：MoE expert_idx 是 runtime 值，需确认 TileLang 0.1.9
+  支持指针间接寻址（Triton 支持，TileLang 需验证）。阶段 0 先 standalone 验证，不行则 MoE 段
+  退回"gate/topk 在外 + TileLang GEMV 内"的半融合。
+- **persistent kernel 的 smem 预算**：单层全融合要把多段 smem 复用，L20 smem 256KB/SM，
+  需精打细算。阶段 2 先做正确再压 smem。
+- **正确性**：每阶段 standalone 对齐 PyTorch 参考输出（rtol/atol），再接入。
+- **回退**：每个阶段独立提交，性能不达预期可回退到上阶段。基线 0049aa8 始终可回。
+
+## 六、当前状态
+
+- [x] 基准记录（`tilert-baseline.md`）：DeepSeek 72.2 tok/s, 13.47ms/step；Qwen 45.9 tok/s, 21.19ms/step
+- [x] 整层 + attention + MoE profile 完成
+- [x] 方案设计（本文档）
+- [ ] **待确认方向** → 然后开干
+- [ ] 阶段 0：TileLang MoE grouped GEMV
+- [ ] 阶段 1：attention 全融合
+- [ ] 阶段 2：单层全融合
+- [ ] 阶段 3：Qwen + 回归

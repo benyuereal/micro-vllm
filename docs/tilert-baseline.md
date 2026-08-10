@@ -73,11 +73,55 @@ DeepSeek 的 attention 内部 `gather → kv_b_proj → RoPE → cat → flash_a
 ## tile op 改造目标
 
 - **实现语言：TileLang**（不用 Triton）
-- 首期范围：单个 MLA attention kernel 全融合
-  （gather → kv_b_proj → RoPE → cat → score → softmax → ·V，中间量留 smem/register 不落 HBM）
-- 远期：persistent kernel / heterogeneous worker（参考 TileRT 文章）
+- **范围：单层全融合 persistent kernel**（不是只融合 attention）
+  把一整层 decode（input_norm + q_proj + kv_a_proj + gather + kv_b_proj + RoPE + flash + o_proj
+  + post_attn_norm + MoE/shared + residual）压成**一个 TileLang persistent kernel**，
+  层内 h 状态在 smem/register/L2 流，host 每层只 launch 一次。27 层各自一个 persistent kernel。
+- 详见 `docs/tilert-plan.md`。
 
-## attention 内部各阶段耗时 profile
+## 整层 decode 各段耗时 profile
+
+> `prof_layer.py` + `prof_moe.py`，eager，bs=8，max_len=1024，40 decode steps × 27 layers
+> 一层 decode = qkv → attention → ffn → next_qkv（next_qkv 是下一层入口，近似算进层内）
+
+| 段 | per_layer (us) | %层 | 说明 |
+|---|---|---|---|
+| qkv | 5.6 | 0.3% | input_norm + q_proj + kv_a_proj（首层） |
+| **attention** | **860.5** | **41.7%** | 见下表细分 |
+| **ffn (MoE)** | **1161.1** | **56.3%** | 见下表细分 |
+| next_qkv | 34.2 | 1.7% | post_attn_norm + 下一层 q_proj + kv_a_proj |
+| **层总计** | **2061** | 100% | 278 kernel 边界/层，7508 kernel/step |
+
+### MoE 内部细分（`prof_moe.py`）
+
+| region | per_layer (us) | %MoE | 说明 |
+|---|---|---|---|
+| gate | 31.7 | 2.7% | gate linear + softmax |
+| topk | 10.4 | 0.9% | top-6 选 expert |
+| **gemv_loop** | **1055.4** | **90.1%** | N=8 token × (grouped_gate_up + grouped_down) = 16 次 Triton kernel |
+| shared | 74.5 | 6.4% | 2 个 shared expert 合并的 SwiGLU |
+| **MoE 总计** | **1172** | 100% | |
+
+### attention 内部细分（`prof_attention.py`）
+
+| region | per_call (us/层) | %attn | 含义 |
+|---|---|---|---|
+| store | 47.5 | 5.1% | 写新 token latent 到 cache slot |
+| gather | 75.7 | 8.2% | `k_flat[slots]` gather 成 [bs,1024,576] |
+| **kvb** | **379.8** | **40.9%** | rmsnorm + kv_b_proj 展开 [bs,1024,16,256] |
+| **rope** | **360.0** | **38.8%** | q/k RoPE + cat 拼接 + v pad |
+| flash | 43.5 | 4.7% | flash_attn_varlen_func 真正的 attention |
+| oproj | 21.4 | 2.3% | output projection |
+
+**两个 execution gap 主体（占整层 87%）**：
+1. **MoE gemv_loop 1055us（51%）**：8 token 各调 2 个 Triton kernel，16 次 launch + HBM round-trip。
+   且当前是 **Triton**，改造必须用 TileLang 重写。
+2. **attention kvb+rope 740us（36%）**：latent→[bs,1024,16,256] 写 HBM 再读回。
+
+每层 278 个 kernel 边界 = 278 次 launch + 中间张量 HBM round-trip。
+CUDA Graph 只省了 launch 开销，**没省 kernel 间的 HBM round-trip**——这才是 tile op 全融合的收益来源。
+
+## attention 内部各阶段耗时 profile（原）
 
 > `prof_attention.py`，eager 路径，bs=8，max_len=1024，40 decode steps × 27 layers
 > CUDA event 手动计时，每层每步平均。eager 含 launch 开销，但各 op 相对占比 graph/eager 基本一致。
