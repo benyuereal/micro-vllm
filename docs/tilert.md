@@ -50,12 +50,12 @@ attention 157us 的内部细分才是关键：
 
 复现基准 72.2 tok/s（本机 74.8，prompt 差异），融合后 **+11.9%**。
 端到端正确性：同 prompt 同 temp=0 跑 136 token，baseline 与融合路径**逐 token 完全一致**。
-测量脚本 `bench_tl_mla_e2e.py`，开关 `USE_TILELANG_MLA=1`。
+测量脚本 `bench_tl_mla_e2e.py`（decode 默认走 TileLang 融合路径）。
 
 ### 做了什么
 
 把 attention 的 `gather → rmsnorm → kv_b_proj → RoPE → cat/pad → flash` 六步压进**一个 TileLang persistent kernel**
-（`kernel/tilelang_mla.py`），中间的 `[bs,1024,16,256]` 全程不落 HBM：
+（`kernel/mla.py`），中间的 `[bs,1024,16,256]` 全程不落 HBM：
 
 - **paged KV**：kernel 直接读 `block_table[batch, blk_idx]*block_size + offset`，和 micro-vllm 的 cache 逻辑一致。
 - **online softmax + split-KV + logsumexp combine**：长上下文按 split 分摊到多 program，combine 阶段加权归并。
@@ -106,7 +106,7 @@ per-head 的两个小 einsum 各做一次，flash 内全是标准 gemm。详见
 | | **+15.8% vs baseline** | **-14.4%** |
 
 端到端正确性：同 prompt 同 temp=0，baseline 与 MLA+MoE 双融合路径**逐 token 完全一致**（事实问答 "北京" 等均一致）。
-测量脚本 `bench_tl_mla_e2e.py`，开关 `USE_TILELANG_MLA=1 USE_TILELANG_MOE=1`。
+测量脚本 `bench_tl_mla_e2e.py`（decode 默认走 TileLang 融合路径）。
 
 MoE 段微基准分解（单层，K=6, E=64, INTER=1408, H=2048）：
 
@@ -120,7 +120,7 @@ MoE 段微基准分解（单层，K=6, E=64, INTER=1408, H=2048）：
 ### 做了什么
 
 把 routed experts 的 `gate_up → silu·up·w → down` 三步压进**两个 TileLang kernel**
-（`kernel/tilelang_moe.py`），act 经 L2 暂存为 `[N, K, 16, INTER]`：
+（`kernel/moe.py`），act 经 L2 暂存为 `[N, K, 16, INTER]`：
 
 - **gu_silu**：grid=(N, K, cdiv(INTER,64))，每 block 算一个 (token, expert) 的 64 列 act。
   gate/up 各一次 `T.gemm`，silu 后写 `act16[n, kid, kid, :]`。

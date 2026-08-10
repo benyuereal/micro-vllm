@@ -59,3 +59,9 @@ checkpoints/
 # Compiled extensions
 *.so
 *.pyd
+
+# Experimental test/prof/bench scripts (not part of build)
+experiments/
+
+# Plan mode temp files
+.plan

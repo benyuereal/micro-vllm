@@ -1,6 +1,6 @@
 """TileLang fused routed-MoE decode kernels for DeepSeek-V2-Lite (M=16 grid-parallel).
 
-替代 kernel/grouped_gemv.py 的 Triton 逐 token loop。
+替代原 Triton 逐 token grouped-GEMV loop（decode 路径）。
 
 📌 核心思路（M=16 grid-parallel T.gemm）：
     bs=1 decode 下每个 expert 是 GEMV (M=1)，但 TileLang ``T.gemm`` 要求 ``M % 16 == 0``
