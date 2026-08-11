@@ -71,6 +71,9 @@ class DeepSeekAdapter(ModelAdapter):
         self._norm_topk = getattr(cfg, "norm_topk_prob", False)
         self._routed_scale = getattr(cfg, "routed_scaling_factor", 1.0)
         self._q_lora_rank = getattr(cfg, "q_lora_rank", None)
+        # 固定上下文长度（与 model_graph._deepseek_fixed_maxlen 同一常量，两处均=1024）。
+        # cos/sin 表只需覆盖此长度：decode new_pos ≤ 1023、prefill S ≤ 1024。
+        self._max_pos = 1024
 
     def cache_dims(self, cfg):
         self._cfg(cfg)
@@ -271,29 +274,37 @@ class DeepSeekAdapter(ModelAdapter):
         inv_freq = freq_inter * (1 - inv_freq_mask) + freq_extra * inv_freq_mask
         return inv_freq
 
-    def _rope_pool(self, graph, device):
-        if getattr(self, "_cos_full", None) is None or self._cos_full.device != device:
-            dim = self._qk_rope
-            cfg = self._cfg_cache
-            base = getattr(cfg, "rope_theta", 10000)
-            scaling = getattr(cfg, "rope_scaling", None) or {}
-            scaling_factor = scaling.get("factor", 1.0)
-            original_max_pos = scaling.get("original_max_position_embeddings", 4096)
-            beta_fast = scaling.get("beta_fast", 32)
-            beta_slow = scaling.get("beta_slow", 1)
-            # 只需覆盖固定上下文长度（1024），不要取框架 RoPE 表的全容量
-            # （rotary_emb.cos_cache.shape[2] = max_blocks*256 = 8192，会多算 7× 的 cos/sin 行
-            # 且白占显存）。_deepseek_fixed_maxlen 在两 runner 的 __init__ 均置为 1024，
-            # prefill/decode 都够用（S ≤ 1024、new_pos ≤ 1023）。
-            max_pos = graph._deepseek_fixed_maxlen
-            inv_freq = self._yarn_inv_freq(dim, base, scaling_factor, original_max_pos,
-                                           beta_fast, beta_slow, device)
-            t = torch.arange(max_pos, device=device, dtype=torch.float32)
-            freqs = torch.outer(t, inv_freq)
-            emb = torch.cat((freqs, freqs), dim=-1)        # [max_pos, dim]
-            self._cos_full = emb.cos().to(graph.dtype).contiguous()
-            self._sin_full = emb.sin().to(graph.dtype).contiguous()
-        return self._cos_full, self._sin_full
+    def _build_rope_tables(self, dtype, device):
+        """预计算 YaRN cos/sin 全宽表 [_max_pos, qk_rope]（cat(freqs,freqs)）。
+
+        在 alloc_bufs 时一次性算好（runner __init__ 阶段，早于 capture），存进 bufs
+        作为 runner 生命周期的常驻张量。消除旧 _rope_pool 的 lazy 计算——后者依赖
+        "首次调用恰好落在 capture warmup 之外"的时序巧合，显式预计算更鲁棒。
+        max_pos 只需覆盖固定上下文（1024），不取框架 RoPE 表全容量 8192（省 7× 行 + 显存）。
+        """
+        dim = self._qk_rope
+        cfg = self._cfg_cache
+        base = getattr(cfg, "rope_theta", 10000)
+        scaling = getattr(cfg, "rope_scaling", None) or {}
+        scaling_factor = scaling.get("factor", 1.0)
+        original_max_pos = scaling.get("original_max_position_embeddings", 4096)
+        beta_fast = scaling.get("beta_fast", 32)
+        beta_slow = scaling.get("beta_slow", 1)
+        max_pos = self._max_pos
+        inv_freq = self._yarn_inv_freq(dim, base, scaling_factor, original_max_pos,
+                                       beta_fast, beta_slow, device)
+        t = torch.arange(max_pos, device=device, dtype=torch.float32)
+        freqs = torch.outer(t, inv_freq)
+        emb = torch.cat((freqs, freqs), dim=-1)            # [max_pos, dim]
+        return emb.cos().to(dtype).contiguous(), emb.sin().to(dtype).contiguous()
+
+    def _rope_tables(self, graph):
+        """返回 alloc_bufs 预算好的 cos/sin 全宽表（纯 getter，无计算）。"""
+        return graph._cos_full, graph._sin_full
+
+    def _rope_pool(self, graph, device=None):
+        """旧名兼容（tests/ 原型仍用 _rope_pool）；新代码用 _rope_tables。"""
+        return self._rope_tables(graph)
 
     def _apply_rope(self, x_pe, cos, sin):
         """interleaved RoPE（与 DeepSeek HF apply_rotary_pos_emb 完全一致）。
@@ -343,7 +354,7 @@ class DeepSeekAdapter(ModelAdapter):
 
         max_len = graph._cur_bucket_maxlen
         block_size = cache_manager.block_size
-        cos, sin = self._rope_pool(graph, k_cache.device)  # [max_pos, qk_rope] 全宽 cat(freqs,freqs)
+        cos, sin = self._rope_tables(graph)  # [max_pos, qk_rope] 全宽 cat(freqs,freqs)
         # cos/sin 的位置查找（cos[new_pos]）已移进 pre_qkv kernel 内部（省外部 gather+cast 节点）。
 
         # ---------- pre-MLA 全融合 persistent kernel ----------
@@ -421,7 +432,7 @@ class DeepSeekAdapter(ModelAdapter):
 
         # attention: 展开 + RoPE + flash_attn_func (varlen-like: 每 seq 长度 S)
         q_nope, q_pe = q.split([self._qk_nope, self._qk_rope], dim=-1)
-        cos_full, sin_full = self._rope_pool(graph, compressed_kv.device)
+        cos_full, sin_full = self._rope_tables(graph)
         cos = cos_full[:S]                                # [S, qk_rope] 全宽
         sin = sin_full[:S]
         q_pe = self._apply_rope(q_pe, cos.unsqueeze(0).unsqueeze(2), sin.unsqueeze(0).unsqueeze(2))
@@ -468,6 +479,8 @@ class DeepSeekAdapter(ModelAdapter):
 
     # -------------------- buffer 分配 --------------------
     def alloc_bufs(self, model, max_bs, hidden_dim, dtype, device):
+        # YaRN cos/sin 全宽表：alloc_bufs 时一次性预算（早于 capture），runner 生命周期常驻。
+        cos_full, sin_full = self._build_rope_tables(dtype, device)
         return {
             "_h_buf": torch.empty((max_bs, hidden_dim), dtype=dtype, device=device),
             "_attn_out": torch.empty(max_bs, hidden_dim, dtype=dtype, device=device),
@@ -478,4 +491,7 @@ class DeepSeekAdapter(ModelAdapter):
             "_x16": torch.zeros((max_bs, 16, hidden_dim), dtype=dtype, device=device),
             # absorb 的 head 索引缓冲（[bs*H] % H）
             "_absorb_idx": (torch.arange(max_bs * self._num_heads, dtype=torch.int32, device=device) % self._num_heads),
+            # RoPE cos/sin 全宽表 [_max_pos, qk_rope]（预算好的常驻张量）
+            "_cos_full": cos_full,
+            "_sin_full": sin_full,
         }

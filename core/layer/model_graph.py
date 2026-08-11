@@ -106,6 +106,9 @@ class ModelGraphRunner:
         # DeepSeek pre-MLA 全融合用：M=16 pad 的 normed x 与 absorb head 索引（Qwen 无，为 None）
         self._x16 = bufs.get("_x16")
         self._absorb_idx = bufs.get("_absorb_idx")
+        # DeepSeek RoPE cos/sin 全宽表（alloc_bufs 预算，Qwen 无，为 None）
+        self._cos_full = bufs.get("_cos_full")
+        self._sin_full = bufs.get("_sin_full")
 
     # ==========================================
     # 主推理逻辑
