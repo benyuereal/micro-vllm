@@ -82,10 +82,12 @@ def moe_gate_up_kernel(N, H, INTER, E, K, dtype):
 # 🔑 不用 atomic：参考 TileKernels reduce_fused，每 token 一个 block，block 内串行 K 个
 # expert，每个 expert 用 M=16 T.gemm 算出该 expert 的输出，在 fp32 fragment 里累加，
 # 最后覆盖写 Out。无竞争、不依赖输出清零、精度由 fp32 累加保证。
+# 🔑 BLOCK_H=32（细化 tile）：bs=1 下 grid=32→64 block，SM 占用 32→64/92，-20%。
+#    16 不可行（T.gemm warp_row_tiles≥16 约束）。
 @tilelang.jit(out_idx=[3])
-def moe_down_kernel(N, H, INTER, E, K, dtype):
-    """grid=(N, cdiv(H,64))。每 block 串行 K 个 expert：M=16 T.gemm → acc[16,64]，
-    取第 k 行累加到 out_frag[64]（fp32），最后写 Out[bn, hblk*64+j]。"""
+def moe_down_kernel(N, H, INTER, E, K, dtype, BLOCK_H=32):
+    """grid=(N, cdiv(H,BLOCK_H))。每 block 串行 K 个 expert：M=16 T.gemm → acc[16,BLOCK_H]，
+    取第 k 行累加到 out_frag[BLOCK_H]（fp32），最后写 Out[bn, hblk*BLOCK_H+j]。"""
     accum = T.float32
 
     @T.prim_func
@@ -95,25 +97,25 @@ def moe_down_kernel(N, H, INTER, E, K, dtype):
         IDX: T.Tensor([N, K], T.int32),
         Out: T.Tensor([N, H], dtype),
     ):
-        with T.Kernel(N, T.ceildiv(H, 64), threads=128) as (bn, hblk):
+        with T.Kernel(N, T.ceildiv(H, BLOCK_H), threads=128) as (bn, hblk):
             A_s = T.alloc_shared([16, 128], dtype)
-            W_s = T.alloc_shared([64, 128], dtype)
-            acc = T.alloc_fragment([16, 64], accum)
-            acc_s = T.alloc_shared([16, 64], accum)    # fp32 relay，单行索引避免 layout 冲突
-            out_frag = T.alloc_fragment([64], accum)    # fp32 跨 expert 累加器，无 atomic
+            W_s = T.alloc_shared([BLOCK_H, 128], dtype)
+            acc = T.alloc_fragment([16, BLOCK_H], accum)
+            acc_s = T.alloc_shared([16, BLOCK_H], accum)    # fp32 relay，单行索引避免 layout 冲突
+            out_frag = T.alloc_fragment([BLOCK_H], accum)    # fp32 跨 expert 累加器，无 atomic
             T.clear(out_frag)
             for k in T.serial(K):
                 e = IDX[bn, k]
                 T.clear(acc)
                 for ki in T.Pipelined(T.ceildiv(INTER, 128), num_stages=2):
                     T.copy(Act16[bn, k, 0:16, ki * 128:(ki + 1) * 128], A_s)
-                    T.copy(W_d[e, hblk * 64:(hblk + 1) * 64, ki * 128:(ki + 1) * 128], W_s)
+                    T.copy(W_d[e, hblk * BLOCK_H:(hblk + 1) * BLOCK_H, ki * 128:(ki + 1) * 128], W_s)
                     T.gemm(A_s, W_s, acc, transpose_B=True, policy=T.GemmWarpPolicy.FullCol)
                 T.copy(acc, acc_s)
-                for j in T.Parallel(64):
+                for j in T.Parallel(BLOCK_H):
                     out_frag[j] += acc_s[k, j]          # 该 expert 输出在 acc_s 第 k 行
-            for j in T.Parallel(64):
-                Out[bn, hblk * 64 + j] = out_frag[j].astype(dtype)
+            for j in T.Parallel(BLOCK_H):
+                Out[bn, hblk * BLOCK_H + j] = out_frag[j].astype(dtype)
 
     return main
 
@@ -122,9 +124,10 @@ def moe_down_kernel(N, H, INTER, E, K, dtype):
 # 与 routed 单 expert 同构，但无 topk/expert 索引/gate_weight，s_inter = inter*n_shared。
 # down kernel 直接 += 到 routed 输出 buffer（Out 同一 tensor），省掉 routed/shared 间的 PyTorch 加法。
 @tilelang.jit(out_idx=[2])
-def shared_gate_up_kernel(N, H, S_INTER, dtype):
-    """grid=(N, cdiv(S_INTER,64))。X16 @ shared_gu^T → silu(gate)*up → act16[N,16,S_INTER]。
-    shared_gu: [H, 2*S_INTER]（gate|up 拼接后 .t()），x @ shared_gu = [N, 2*S_INTER]。"""
+def shared_gate_up_kernel(N, H, S_INTER, dtype, BLOCK_I=32):
+    """grid=(N, cdiv(S_INTER,BLOCK_I))。X16 @ shared_gu^T → silu(gate)*up → act16[N,16,S_INTER]。
+    shared_gu: [H, 2*S_INTER]（gate|up 拼接后 .t()），x @ shared_gu = [N, 2*S_INTER]。
+    🔑 BLOCK_I=32（细化 tile）：grid=44→88 block，SM 占用 44→88/92，-15%。"""
     accum = T.float32
     TWO = 2 * S_INTER
 
@@ -134,33 +137,34 @@ def shared_gate_up_kernel(N, H, S_INTER, dtype):
         W_gu: T.Tensor([H, TWO], dtype),
         Act16: T.Tensor([N, 16, S_INTER], dtype),
     ):
-        with T.Kernel(N, T.ceildiv(S_INTER, 64), threads=128) as (bn, iblk):
+        with T.Kernel(N, T.ceildiv(S_INTER, BLOCK_I), threads=128) as (bn, iblk):
             X_s = T.alloc_shared([16, 128], dtype)
-            Wg_s = T.alloc_shared([128, 64], dtype)
-            Wu_s = T.alloc_shared([128, 64], dtype)
-            g_acc = T.alloc_fragment([16, 64], accum)
-            u_acc = T.alloc_fragment([16, 64], accum)
-            g_s = T.alloc_shared([16, 64], accum)   # fp32: bf16 T.exp 丢 ~1.5x 精度
-            u_s = T.alloc_shared([16, 64], accum)
+            Wg_s = T.alloc_shared([128, BLOCK_I], dtype)
+            Wu_s = T.alloc_shared([128, BLOCK_I], dtype)
+            g_acc = T.alloc_fragment([16, BLOCK_I], accum)
+            u_acc = T.alloc_fragment([16, BLOCK_I], accum)
+            g_s = T.alloc_shared([16, BLOCK_I], accum)   # fp32: bf16 T.exp 丢 ~1.5x 精度
+            u_s = T.alloc_shared([16, BLOCK_I], accum)
             T.clear(g_acc); T.clear(u_acc)
             for kh in T.Pipelined(T.ceildiv(H, 128), num_stages=2):
                 T.copy(X16[bn, 0:16, kh * 128:(kh + 1) * 128], X_s)
-                T.copy(W_gu[kh * 128:(kh + 1) * 128, iblk * 64:(iblk + 1) * 64], Wg_s)
-                T.copy(W_gu[kh * 128:(kh + 1) * 128, S_INTER + iblk * 64:S_INTER + (iblk + 1) * 64], Wu_s)
+                T.copy(W_gu[kh * 128:(kh + 1) * 128, iblk * BLOCK_I:(iblk + 1) * BLOCK_I], Wg_s)
+                T.copy(W_gu[kh * 128:(kh + 1) * 128, S_INTER + iblk * BLOCK_I:S_INTER + (iblk + 1) * BLOCK_I], Wu_s)
                 T.gemm(X_s, Wg_s, g_acc, policy=T.GemmWarpPolicy.FullCol)
                 T.gemm(X_s, Wu_s, u_acc, policy=T.GemmWarpPolicy.FullCol)
             T.copy(g_acc, g_s); T.copy(u_acc, u_s)
-            for j in T.Parallel(64):
+            for j in T.Parallel(BLOCK_I):
                 g = g_s[0, j]
                 sig = 1.0 / (1.0 + T.exp(-g))
-                Act16[bn, 0, iblk * 64 + j] = (g * sig * u_s[0, j]).astype(dtype)
+                Act16[bn, 0, iblk * BLOCK_I + j] = (g * sig * u_s[0, j]).astype(dtype)
     return main
 
 
 @tilelang.jit()
-def shared_down_kernel(N, H, S_INTER, dtype):
-    """grid=(N, cdiv(H,64))。act16[n,0,:] @ shared_d^T → += Out（routed 输出 buffer）。
-    shared_d: [S_INTER, H]（down .t()）。M=16 T.gemm 取 row 0，fp32 fragment 累加后 += Out。"""
+def shared_down_kernel(N, H, S_INTER, dtype, BLOCK_H=32):
+    """grid=(N, cdiv(H,BLOCK_H))。act16[n,0,:] @ shared_d^T → += Out（routed 输出 buffer）。
+    shared_d: [S_INTER, H]（down .t()）。M=16 T.gemm 取 row 0，fp32 fragment 累加后 += Out。
+    🔑 BLOCK_H=32（细化 tile）：grid=32→64 block，SM 占用 32→64/92，-23%。"""
     accum = T.float32
 
     @T.prim_func
@@ -169,23 +173,23 @@ def shared_down_kernel(N, H, S_INTER, dtype):
         W_d: T.Tensor([S_INTER, H], dtype),
         Out: T.Tensor([N, H], dtype),
     ):
-        with T.Kernel(N, T.ceildiv(H, 64), threads=128) as (bn, hblk):
+        with T.Kernel(N, T.ceildiv(H, BLOCK_H), threads=128) as (bn, hblk):
             A_s = T.alloc_shared([16, 128], dtype)
-            W_s = T.alloc_shared([128, 64], dtype)
-            acc = T.alloc_fragment([16, 64], accum)
-            acc_s = T.alloc_shared([16, 64], accum)
-            out_frag = T.alloc_fragment([64], accum)
+            W_s = T.alloc_shared([128, BLOCK_H], dtype)
+            acc = T.alloc_fragment([16, BLOCK_H], accum)
+            acc_s = T.alloc_shared([16, BLOCK_H], accum)
+            out_frag = T.alloc_fragment([BLOCK_H], accum)
             T.clear(out_frag)
             T.clear(acc)
             for ki in T.Pipelined(T.ceildiv(S_INTER, 128), num_stages=2):
                 T.copy(Act16[bn, 0:16, ki * 128:(ki + 1) * 128], A_s)
-                T.copy(W_d[ki * 128:(ki + 1) * 128, hblk * 64:(hblk + 1) * 64], W_s)
+                T.copy(W_d[ki * 128:(ki + 1) * 128, hblk * BLOCK_H:(hblk + 1) * BLOCK_H], W_s)
                 T.gemm(A_s, W_s, acc, policy=T.GemmWarpPolicy.FullCol)
             T.copy(acc, acc_s)
-            for j in T.Parallel(64):
+            for j in T.Parallel(BLOCK_H):
                 out_frag[j] += acc_s[0, j]
-            for j in T.Parallel(64):
-                Out[bn, hblk * 64 + j] = (Out[bn, hblk * 64 + j].astype(accum) + out_frag[j]).astype(dtype)
+            for j in T.Parallel(BLOCK_H):
+                Out[bn, hblk * BLOCK_H + j] = (Out[bn, hblk * BLOCK_H + j].astype(accum) + out_frag[j]).astype(dtype)
     return main
 
 
