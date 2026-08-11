@@ -13,9 +13,10 @@
   tag=no_attn         → attention no-op
   tag=fine_tile       → 细化 tile (BLOCK=32)，正常路径
   tag=orig_tile       → 原始 tile (BLOCK=64)，正常路径
+  tag=persist         → routed persistent kernel (USE_PERSISTENT_MOE=1)
 输出：RESULT {tag} {us} us/step
 """
-import sys, torch, time, statistics
+import sys, os, torch, time, statistics
 sys.path.insert(0, "/models/micro-vllm")
 from core.engine import InferenceEngine
 from core.inference_context import BatchInferenceContext
@@ -119,6 +120,9 @@ if TAG == "orig_tile":
     KM._kernel_cache.clear()
 
 # fine_tile = baseline（当前代码已是 32），不额外 patch
+
+if TAG == "persist":
+    os.environ["USE_PERSISTENT_MOE"] = "1"
 
 engine = InferenceEngine("/models/DeepSeek-V2-Lite", max_batch_size=40)
 engine.add_request("请详细解释 Transformer 架构中多头自注意力机制的完整计算流程。", max_tokens=120, temperature=0.0)

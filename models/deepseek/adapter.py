@@ -22,8 +22,8 @@ from .moe import moe_forward
 from kernel.mla import _get_kernel as _get_mla_kernel
 # 融合 MoE decode kernel（routed experts: gate_up+silu+down，M=16 grid-parallel）。
 from kernel.moe import moe_decode
-# MLA 前置全融合 kernel（q_proj+rope / kva_proj+store / absorb）。
-from kernel.pre_mla import get_pre_qkv_kernel, get_pre_kva_kernel, get_absorb_kernel
+# pre-MLA 全融合 persistent kernel（pre_qkv∥pre_kva→absorb 单 kernel，替代 3 个独立 kernel）。
+from kernel.pre_mla import get_premla_persistent_kernel
 
 try:
     from flash_attn import flash_attn_func
@@ -353,24 +353,21 @@ class DeepSeekAdapter(ModelAdapter):
         cos_q = cos[new_pos].to(graph.dtype)                # [bs, qk_rope]
         sin_q = sin[new_pos].to(graph.dtype)
 
-        # ---------- pre-MLA 全融合（3 个 kernel）----------
+        # ---------- pre-MLA 全融合 persistent kernel ----------
+        # pre_qkv ∥ pre_kva → absorb 折进单个 T.Kernel(NUM_SMS) persistent（+2.0%）。
         x16 = graph._x16[:bs]                               # [bs, 16, hidden]，row 0 = normed x
-        # (1) q_proj + rope(q_pe) → q_out[bs, H, 16, q_head]
-        kq = get_pre_qkv_kernel(bs, self._hidden, self._num_heads, self._q_head,
-                                self._qk_rope, graph.dtype)
-        q_out = kq(x16, attn._q_w, attn._q_b, cos_q, sin_q)
-        q_nope16 = q_out[:, :, :, :self._qk_nope].reshape(bs * self._num_heads, 16, self._qk_nope).contiguous()
-        q_pe = q_out[:, :, 0, self._qk_nope:].contiguous()  # [bs, H, qk_rope] 已 rope
-        # (2) kva_proj + store latent → 直写 k_cache 与 v_cache 同 slot（MLA 只读 k_cache）
         bt = block_table[:bs].contiguous()                 # [bs, max_seq_blocks]
-        kk = get_pre_kva_kernel(bs, self._hidden, self._latent_dim, block_size,
-                                bt.shape[1], k_cache.shape[0], graph.dtype)
-        kk(x16, attn._kva_w, attn._kva_b,
-           bt, new_pos.to(torch.int32), k_cache, v_cache)
-        # (3) absorb: q_nope @ kvb_w_kn_t → A[bs*H, kv_lora] → reshape [bs, H, kv_lora]（contiguous）
-        ka = get_absorb_kernel(bs, self._num_heads, self._qk_nope, self._kv_lora_rank, graph.dtype)
-        A_in = ka(q_nope16, attn._kvb_w_kn_t, graph._absorb_idx[:bs * self._num_heads])
+        k_pers, q_out_p = get_premla_persistent_kernel(
+            bs, self._hidden, self._num_heads, self._q_head, self._qk_rope,
+            self._qk_nope, self._kv_lora_rank, self._latent_dim, block_size,
+            bt.shape[1], k_cache.shape[0], graph.dtype)
+        # X16 = graph._x16[:bs]：row0 已由 compute_qkv 的 rmsnorm_ 预填 normed x，
+        # rows1-15 恒零（alloc zeros）。kernel 直接读，无需 H_in/phase0 copy。
+        A_in = k_pers(attn._q_w, attn._q_b, cos_q, sin_q, attn._kva_w, attn._kva_b,
+                      attn._kvb_w_kn_t, graph._absorb_idx[:bs * self._num_heads],
+                      x16, q_out_p, bt, new_pos.to(torch.int32), k_cache, v_cache)
         A_in = A_in.reshape(bs, self._num_heads, self._kv_lora_rank)
+        q_pe = q_out_p[:, :, 0, self._qk_nope:].contiguous()
 
         # ---------- 融合 MLA decode（不变）----------
         k_pos = torch.arange(max_len, device=k_cache.device)  # [max_len]
@@ -391,12 +388,12 @@ class DeepSeekAdapter(ModelAdapter):
         return F.linear(attn_out, attn._o_w, attn._o_b)
 
     def compute_ffn(self, block, attn_out, residual, graph, bs, fast_mode):
+        mlp = block.mlp
         rmsnorm_residual(
             attn_out, residual, block._post_ln_w,
             graph._h_buf[:bs], graph._residual[:bs], block._post_ln_eps
         )
         x = graph._h_buf[:bs]
-        mlp = block.mlp
         if mlp._is_moe:
             mlp_out = moe_decode(
                 x, mlp._gate_w, mlp._e_gu, mlp._e_d,
