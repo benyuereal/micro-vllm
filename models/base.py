@@ -91,19 +91,19 @@ class ModelAdapter(ABC):
     # decode 单层钩子
     # ------------------------------------------------------------------
     @abstractmethod
-    def compute_qkv(self, block, h: torch.Tensor, buf, bs: int) -> torch.Tensor:
-        """对当前 hidden 做 input_layernorm + Q/K/V 投影，返回 attention 输入。"""
+    def compute_qkv(self, block, h: torch.Tensor, graph, bs: int) -> torch.Tensor:
+        """对当前 hidden 做 input_layernorm（+ Q/K/V 投影，视架构），返回 attention 输入。"""
         ...
 
     @abstractmethod
     def compute_next_qkv(self, block_next, mlp_out_prev: torch.Tensor, res_prev: torch.Tensor,
-                         buf, bs: int) -> Tuple[torch.Tensor, torch.Tensor]:
-        """融合：下一层的 post-norm(residual) + QKV。返回 (qkv, new_residual)。"""
+                         graph, bs: int) -> Tuple[torch.Tensor, torch.Tensor]:
+        """融合：下一层的 post-norm(residual)（+ QKV，视架构）。返回 (attn_input, new_residual)。"""
         ...
 
     @abstractmethod
     def attention(self, attn_input, block, layer_idx: int, bs: int,
-                  cache_manager, block_table, rope_cos, rope_sin) -> torch.Tensor:
+                  graph, cache_manager, block_table) -> torch.Tensor:
         """对 attention 输入做 paged attention + O 投影，返回 attn_out [bs, hidden]。"""
         ...
 
@@ -118,8 +118,7 @@ class ModelAdapter(ABC):
     # ------------------------------------------------------------------
     @abstractmethod
     def prefill_layer(self, block, h: torch.Tensor, layer_idx: int,
-                      B: int, S: int, cache_manager, block_table,
-                      rope_cos, rope_sin) -> torch.Tensor:
+                      B: int, S: int, graph, cache_manager, block_table) -> torch.Tensor:
         """prefill 单层前向（含 attention 写入 paged cache + FFN），返回新 hidden。"""
         ...
 

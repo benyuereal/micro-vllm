@@ -22,14 +22,13 @@ import torch.nn.functional as F
 
 
 def moe_forward(x, gate_weight, e_gu, e_d, top_k, n_experts,
-                shared_gu=None, shared_d=None, decode=False):
+                shared_gu=None, shared_d=None):
     """prefill MoE 前向（按 expert 分段批算，合并同 expert 多 token）。
 
     x: [N, hidden]  (N = B*S for prefill)
     gate_weight: [n_experts, hidden]
     e_gu: [n_experts, 2*inter, hidden]  (fused gate|up, 转置好用于 x @ gu.T)
     e_d:  [n_experts, hidden, inter]
-    decode: 仅保留接口兼容性；True 时回退到下面的分段路径（prefill 风格，对小 N 亦正确）。
     返回: [N, hidden]
     """
     N = x.shape[0]

@@ -2,8 +2,8 @@
 """pre-MLA persistent kernel token 一致性回归测试。
 
 pre-MLA persistent 现为默认路径（无环境变量开关）。本脚本生成 N 个 token 并打印
-id 序列，供与 vLLM/参考实现 diff 比对。序列应与未融合路径（kernel/pre_mla.py 的
-3 个独立 kernel，见 tests/proto_premla_persist.py）完全一致。
+id 序列，供与 vLLM/参考实现 diff 比对。早期未融合的 3-kernel 路径已删除，一致性
+现以 vLLM 同卡输出为基准（见 vllm-fair-baseline-truth）。
 """
 import sys, torch
 sys.path.insert(0, "/models/micro-vllm")

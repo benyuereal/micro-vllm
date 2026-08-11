@@ -4,9 +4,7 @@ import torch.nn.functional as F
 from typing import Dict, List
 
 from core.paged_attention import PagedAttention
-from kernel.matmul import matmul_v3
 from kernel.rmsnorm import rmsnorm_, rmsnorm_residual_gemm as rmsnorm_residual
-from kernel.swiglu import matmul_swiglu
 from .rope import RoPE
 from core.parallel_config import get_rank, get_world_size, all_reduce
 from models import build_adapter
@@ -101,10 +99,10 @@ class ModelGraphRunner:
         # 由 adapter 决定 buffer 形状（不同架构需要不同的中间张量）
         bufs = self.adapter.alloc_bufs(self.model, max_b, self.hidden_dim, self.dtype, self.device)
         self._h_buf = bufs["_h_buf"]
-        self._qkv = bufs["_qkv"]
+        self._qkv = bufs.get("_qkv")  # Qwen 用；DeepSeek 不用（q_proj 融进 pre-MLA kernel）
         self._attn_out = bufs["_attn_out"]
         self._residual = bufs["_residual"]
-        self._swiglu_out = bufs.get("_swiglu_out")  # Qwen 用；DeepSeek 可能不用
+        self._swiglu_out = bufs.get("_swiglu_out")  # Qwen 用；DeepSeek 不用
         # DeepSeek pre-MLA 全融合用：M=16 pad 的 normed x 与 absorb head 索引（Qwen 无，为 None）
         self._x16 = bufs.get("_x16")
         self._absorb_idx = bufs.get("_absorb_idx")

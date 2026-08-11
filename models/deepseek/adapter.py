@@ -232,17 +232,6 @@ class DeepSeekAdapter(ModelAdapter):
         k_cache[block_id, offset, 0] = lv
         v_cache[block_id, offset, 0] = lv
 
-    @staticmethod
-    def _store_latent_batch(latent_b, k_cache, v_cache, slots_b, block_size):
-        """latent_b: [bs, 1, 1, latent]，slots_b: [bs, 1] int。每 seq 写 1 个 token。"""
-        bs = latent_b.shape[0]
-        slots = slots_b.reshape(bs).long()
-        block_id = slots // block_size
-        offset = slots % block_size
-        lv = latent_b[:, 0, 0, :]                       # [bs, latent]
-        k_cache[block_id, offset, 0] = lv
-        v_cache[block_id, offset, 0] = lv
-
     # -------------------- 模块访问 --------------------
     def embed(self, model):
         return model.model.embed_tokens
@@ -292,7 +281,11 @@ class DeepSeekAdapter(ModelAdapter):
             original_max_pos = scaling.get("original_max_position_embeddings", 4096)
             beta_fast = scaling.get("beta_fast", 32)
             beta_slow = scaling.get("beta_slow", 1)
-            max_pos = graph.attention.rotary_emb.cos_cache.shape[2]
+            # 只需覆盖固定上下文长度（1024），不要取框架 RoPE 表的全容量
+            # （rotary_emb.cos_cache.shape[2] = max_blocks*256 = 8192，会多算 7× 的 cos/sin 行
+            # 且白占显存）。_deepseek_fixed_maxlen 在两 runner 的 __init__ 均置为 1024，
+            # prefill/decode 都够用（S ≤ 1024、new_pos ≤ 1023）。
+            max_pos = graph._deepseek_fixed_maxlen
             inv_freq = self._yarn_inv_freq(dim, base, scaling_factor, original_max_pos,
                                            beta_fast, beta_slow, device)
             t = torch.arange(max_pos, device=device, dtype=torch.float32)
@@ -453,8 +446,7 @@ class DeepSeekAdapter(ModelAdapter):
         mlp = block.mlp
         if mlp._is_moe:
             mlp_out = moe_forward(h2.reshape(-1, self._hidden), mlp._gate_w, mlp._e_gu, mlp._e_d,
-                                  self._top_k, self._n_experts, mlp._shared_gu, mlp._shared_d,
-                                  decode=False)
+                                  self._top_k, self._n_experts, mlp._shared_gu, mlp._shared_d)
             mlp_out = mlp_out.view(B, S, self._hidden)
         else:
             gate_up = h2 @ mlp._dense_gu
@@ -474,24 +466,10 @@ class DeepSeekAdapter(ModelAdapter):
         slot = bt[:, :n_blocks][:, block_idx] * bs + offset  # [B, S]
         return slot.reshape(-1).to(torch.int32)
 
-    @staticmethod
-    def _decode_slots(block_table, new_pos, bs, block_size):
-        """decode 单 token 的物理 slot [bs, 1]（int32）。
-        new_pos: [bs] 逻辑位置。slot = block_table[seq, new_pos//block_size]*block_size + new_pos%block_size。"""
-        bt = block_table[:bs].long()                     # [bs, max_seq_blocks]
-        max_blk = bt.shape[1]
-        block_idx = (new_pos // block_size).long().clamp(min=0, max=max_blk - 1)  # [bs]
-        offset = (new_pos % block_size).long()           # [bs]
-        # gather 每 seq 对应 block 的 id
-        block_id = bt.gather(1, block_idx.unsqueeze(1)).squeeze(1)  # [bs]
-        slot = block_id.clamp(min=0) * block_size + offset  # [bs]（防御 -1 非法 block_id）
-        return slot.to(torch.int32).view(bs, 1)
-
     # -------------------- buffer 分配 --------------------
     def alloc_bufs(self, model, max_bs, hidden_dim, dtype, device):
         return {
             "_h_buf": torch.empty((max_bs, hidden_dim), dtype=dtype, device=device),
-            "_qkv": torch.empty(max_bs, hidden_dim, dtype=dtype, device=device),  # 占位
             "_attn_out": torch.empty(max_bs, hidden_dim, dtype=dtype, device=device),
             "_residual": torch.empty((max_bs, hidden_dim), dtype=dtype, device=device),
             # M=16 零填充的 normed x：pre-MLA kernel 读 [bs,16,hidden]，row 0 真实。

@@ -1,6 +1,10 @@
-"""pre-MLA 段 4-phase persistent kernel 原型（ROI 验证）。
+"""pre-MLA 段 persistent kernel 早期原型（ROI 验证用，含 phase0 rmsnorm）。
 
-融合: rmsnorm → pre_qkv ∥ pre_kva → absorb（4 个 kernel, 依赖链）。
+这是验证"pre_qkv∥pre_kva→absorb 跨依赖链 persistent 在 graph 路径有正 ROI"的早期原型。
+live 版本已沉淀进 kernel/pre_mla.py（3-phase，rmsnorm 外置由调用方 rmsnorm_ 预填 x16，
+新增 QpeOut/max_pos），本文件保留作历史参考——其内部 kernel 与 live 版已分叉。
+
+融合: rmsnorm → pre_qkv ∥ pre_kva → absorb。
 phase0: rmsnorm(h) → x16[0,:]           [1 task, SM0]
 sync_grid
 phase1: pre_qkv(x16,q_w,rope) → q_out   [144 task]  ∥
@@ -8,14 +12,6 @@ phase1: pre_kva(x16,kva_w) → k/v_cache  [9 task]     两段并行(都读 x16)
   → 用 task id 区分: task<144 是 qkv, 144≤task<153 是 kva
 sync_grid
 phase2: absorb(q_nope,kvb_kn) → A       [128 task]
-
-验证: 与独立 4-kernel 数值一致 + isolation 性能 + (后续)graph ROI。
-
-关键难点:
-1. rmsnorm 在 TileLang persistent 单 block 内做 reduce+normalize
-2. pre_qkv 的 rope epilogue 复刻
-3. pre_kva 的 paged cache store epilogue
-4. 跨 phase 全局 buffer: x16(已存在), q_out, A 需预分配传入
 """
 import sys, torch
 sys.path.insert(0, "/models/micro-vllm")
@@ -168,9 +164,11 @@ def premla_persistent_kernel(
 
 
 def test():
-    import torch.nn.functional as F
-    from kernel.pre_mla import get_pre_qkv_kernel, get_pre_kva_kernel, get_absorb_kernel
-    from kernel.rmsnorm import rmsnorm_
+    """smoke-test：验证本原型 persistent kernel 能跑通 + 输出形状正确。
+
+    早期版本用旧 3-kernel 作独立参考对比数值，但旧 3-kernel 已删除（persistent 已是
+    唯一实现且经 e2e token 一致性验证，见 cmp_premla_persist.py）。这里只做 smoke-test。
+    """
     torch.manual_seed(42)
     bs=1; H=2048; nh=16; qh=576; qkr=64; qkn=512; kvl=512; kva_out=576
     block_size=16; max_seq_blocks=64; n_blocks=512
@@ -189,38 +187,22 @@ def test():
     bt = torch.zeros(bs, max_seq_blocks, device=dev, dtype=torch.int32)
     bt[:, 0] = 0
     new_pos = torch.zeros(bs, device=dev, dtype=torch.int32)
-    k_cache = torch.zeros(n_blocks, block_size, 1, kva_out, device=dev, dtype=dtype)
-    v_cache = torch.zeros(n_blocks, block_size, 1, kva_out, device=dev, dtype=dtype)
-
-    # 独立 4-kernel 参考
-    x16_ref = torch.zeros(bs, 16, H, device=dev, dtype=dtype)
-    rmsnorm_(h_in, in_ln_w, x16_ref[:, 0, :], 1e-6)
-    kq = get_pre_qkv_kernel(bs, H, nh, qh, qkr, dtype)
-    q_out_ref = kq(x16_ref, qw, qb, cos, sin)
-    kk = get_pre_kva_kernel(bs, H, kva_out, block_size, max_seq_blocks, n_blocks, dtype)
-    kk(x16_ref, kvaw, kvab, bt, new_pos, k_cache, v_cache)
-    q_nope16_ref = q_out_ref[:, :, :, :qkn].reshape(bs*nh, 16, qkn).contiguous()
-    ka = get_absorb_kernel(bs, nh, qkn, kvl, dtype)
-    A_ref = ka(q_nope16_ref, kvb_kn, abs_idx)
-
-    # persistent kernel
-    x16_p = torch.zeros(bs, 16, H, device=dev, dtype=dtype)
-    q_out_p = torch.zeros(bs, nh, 16, qh, device=dev, dtype=dtype)
     k_cache_p = torch.zeros(n_blocks, block_size, 1, kva_out, device=dev, dtype=dtype)
     v_cache_p = torch.zeros(n_blocks, block_size, 1, kva_out, device=dev, dtype=dtype)
+
+    x16_p = torch.zeros(bs, 16, H, device=dev, dtype=dtype)
+    q_out_p = torch.zeros(bs, nh, 16, qh, device=dev, dtype=dtype)
     ker = premla_persistent_kernel(bs, H, nh, qh, qkr, qkn, kvl, kva_out, block_size, max_seq_blocks, n_blocks, tl_dt)
     A_p = ker(h_in, in_ln_w, qw, qb, cos, sin, kvaw, kvab, kvb_kn, abs_idx,
         x16_p, q_out_p, bt, new_pos, k_cache_p, v_cache_p)
 
-    print("=== 正确性 ===")
-    dx = (x16_ref[:,0,:].float() - x16_p[:,0,:].float()).abs()
-    print(f"rmsnorm x16: maxdiff={dx.max().item():.6f}")
-    dq = (q_out_ref.float() - q_out_p.float()).abs()
-    print(f"q_out:       maxdiff={dq.max().item():.6f}")
-    dk = (k_cache[:,0,0,:].float() - k_cache_p[:,0,0,:].float()).abs()
-    print(f"k_cache:     maxdiff={dk.max().item():.6f}")
-    da = (A_ref.float() - A_p.float()).abs()
-    print(f"A (absorb):  maxdiff={da.max().item():.6f}")
+    print("=== smoke-test ===")
+    print(f"A (absorb) shape: {tuple(A_p.shape)}  expect ({bs*nh}, {kvl})")
+    print(f"x16 row0 norm:    {x16_p[0,0,:].float().norm().item():.4f}  (rmsnorm 产物，非零)")
+    print(f"k_cache[0,0,0,:] norm: {k_cache_p[0,0,0,:].float().norm().item():.4f}  (store 产物)")
+    assert A_p.shape == (bs*nh, kvl), f"A shape mismatch: {A_p.shape}"
+    assert x16_p[0,0,:].float().norm().item() > 0, "x16 row0 全零，rmsnorm 未生效"
+    print("OK")
 
     print("\n=== isolation 性能(参考) ===")
     def t(fn, iters=300):
@@ -231,18 +213,10 @@ def test():
         for _ in range(iters): fn()
         e.record();torch.cuda.synchronize()
         return s.elapsed_time(e)/iters*1000
-    # 独立
-    def ref_path():
-        rmsnorm_(h_in, in_ln_w, x16_ref[:,0,:], 1e-6)
-        qo = kq(x16_ref, qw, qb, cos, sin)
-        kk(x16_ref, kvaw, kvab, bt, new_pos, k_cache, v_cache)
-        qn16 = qo[:,:,:,:qkn].reshape(bs*nh,16,qkn).contiguous()
-        ka(qn16, kvb_kn, abs_idx)
     def pers_path():
         ker(h_in, in_ln_w, qw, qb, cos, sin, kvaw, kvab, kvb_kn, abs_idx,
             x16_p, q_out_p, bt, new_pos, k_cache_p, v_cache_p)
-    print(f"独立 4-kernel: {t(ref_path):.1f} us")
-    print(f"persistent:    {t(pers_path):.1f} us")
+    print(f"persistent(含rmsnorm): {t(pers_path):.1f} us")
 
 
 if __name__ == "__main__":
