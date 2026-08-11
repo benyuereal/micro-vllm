@@ -227,19 +227,65 @@ cos/sin 全宽 `cat(freqs, freqs)`，故 `cs[k]==cs[k+half]`，只需 `cs[k]`。
 
 ---
 
-## 五、当前形态
+## 五、已落地：MLA combine 阶段 M=16 T.gemm（post-multiply v 权重）
 
-每层 decode 是 **rmsnorm(Triton) + pre_qkv + pre_kva + absorb + fused MLA + gu_silu + down + shared_gate_up + shared_down**。
-只剩 gate/topk 走 PyTorch。attention 段从 ~7 个 PyTorch op 压成 4 个融合 kernel，
-MoE 段 4 个融合 kernel（routed 2 + shared 2），shared_down 原地 `+=` 直接累加进 routed 输出，省掉 PyTorch add。
-pre-MLA 和 attention 内部两段 execution gap 各吃掉一截。
+### 成果
+
+MLA kernel 的 combine 阶段（跨 split 加权合并 + `P @ kvb_w_v^T` post-multiply）原是手写 M=1 GEMV，
+grid 只有 `(h_q=16, batch=1)=16` 个 block，在 92 SM 上严重欠载，且串行累加不走 tensor core。
+改成 M=16 零填充 `T.gemm` 后，combine 从 68us→21us/层（3.2x），端到端再 +16.6%：
+
+| | 吞吐 (bs=1, 200 token) | median step |
+|---|---|---|
+| baseline（flash + Triton MoE） | 74.8 tok/s | 13.40 ms |
+| 融合 MLA | 83.7 tok/s | 11.87 ms |
+| 融合 MLA + MoE | 86.6 tok/s | 11.47 ms |
+| + MLA 前置全融合 | 94.1 tok/s | 10.54 ms |
+| + shared expert 融合 | 95.7 tok/s | 10.42 ms |
+| **+ MLA combine M=16** | **111.5 tok/s** | **8.88 ms** |
+| | **+49.0% vs baseline** | **-33.7%** |
+
+（原始复现基准 72.2 tok/s → 111.5 = **+54.4%**。）
+**对比 vllm 0.21（TRITON_MLA + Triton MoE，104.2 tok/s）：快 7.0%。**
+端到端正确性：同 prompt 同 temp=0，新/旧 combine kernel 前 161 个 token **逐 token 完全一致**，
+第 162 个才因 bf16 累积末位差异分叉（非 bug，fp32 T.gemm 与手写 fp32 GEMV 的浮点和差异）。
+测量脚本 `tests/bench_e2e.py`。
+
+### 做了什么
+
+combine 原 grid `(h_q, batch)`，每 block 一个 head，手写 `for j: acc=0; for kk: acc += p_accum[kk]*kvb_w_v[h,j,kk]`（M=1 串行，CUDA core）。
+改成 grid `(batch, h_q, cdiv(v_head,64))`，每 block 算一个 (token, head) 的 64 个 v_head 输出列：
+
+- `p_accum[kv_lora]`（fp32 fragment，split 加权合并后）→ `p_acc_s`（shared 全宽）→ kk 切片填 `P_s[16,128]`（row 0 真实，pad 至 16 行）。
+- `W_s[128,64]` = `kvb_w_v[bh, vblk*64+j, kk*128+i]` 转置 cast fp32。
+- `T.gemm(P_s, W_s, acc[16,64])`，K_TILE=128 分块累加，取 row 0 写回 `Output[bh, vblk*64+j]`。
+
+### 核心难点：两个隐蔽 bug（单层 isolation 通过、e2e 退化）
+
+1. **P_s 越界 + 未按 kk 切片**：P_s shape `[16,128]`，但第一版在循环外 `for i in Parallel(kv_lora=512): P_s[0,i]=...`
+   越界写 384 个，且 kk 迭代时 P_s 没重填——每次 T.gemm 用的都是前 128 列。isolation 用小数值 P_partial 碰巧 maxdiff 小，
+   但 e2e 27 层累积后输出退化成重复 `\n`。**正解**：`p_accum` 先 copy 到 `p_acc_s`（shared 全宽），kk 循环内 `P_s[0,i]=p_acc_s[kk*128+i]`。
+2. **bf16 量化丢精度**：即便修好切片，若 P_s 用 bf16，`p_accum` fp32→bf16 这步在数值大时 maxdiff 达 1.1（bf16 仅 ~3 位有效十进制）。
+   27 层 feedback 累积仍会退化。**正解**：P_s/W_s 均 fp32（`T.gemm` 回退 CUDA core，但 grid 并行度高仍 3.2x 快于手写 GEMV），
+   全程 fp32 累加，maxdiff=0.004（与手写 0.002 同级）。
+
+> 教训：isolation 正确性必须跨**真实数值范围**测（多个 scale），且单层 maxdiff 小不代表 e2e 正确——
+> 27 层 feedback 会把末位差异放大到改变 argmax。bf16 模型对 post-multiply 这类"每层一次、输出反馈进下一层"的算子尤其敏感。
 
 ---
 
-## 六、下一步
+## 六、当前形态
 
-- **single-kernel MoE（吃掉 launch/sync 间隙）**：routed 的 gu_silu + down 两个 kernel 串行有 ~32us 间隙，
-  shared 的 gate_up + down 同理。用 `T.sync_grid()` 两阶段 persistent kernel 把 gate_up→silu→down 融进单 kernel，
-  act 全程在 L2，进一步压掉 launch 间隙。
+每层 decode 是 **rmsnorm(Triton) + pre_qkv + pre_kva + absorb + fused MLA(含 M=16 combine) + gu_silu + down + shared_gate_up + shared_down**。
+只剩 gate/topk 走 PyTorch。attention 段 4 个融合 kernel，MoE 段 4 个融合 kernel。
+端到端 111.5 tok/s，**已超过 vllm 0.21（104.2 tok/s）7.0%**。
+
+---
+
+## 七、下一步
+
+- **single-kernel MoE（吃掉 launch/sync 间隙）**：routed 的 gu_silu + down 两个 kernel 串行有间隙，
+  shared 的 gate_up + down 同理。用 `T.sync_grid()` 两阶段 persistent kernel 把 gate_up→silu→down 融进单 kernel。
+  ⚠️ 实测 MoE 全段仅占整步 2.1%（213us/10.3ms），收益上限 ~0.6%，优先级低于 attention 段进一步优化。
 - **单层全融合 persistent kernel** = norm → [pre-MLA + fused MLA + oproj] → norm → MoE，host 每层 1～2 launch。
 - Qwen 同款适配。

@@ -182,9 +182,16 @@ def fused_mla_decode_kernel(
             T.copy(acc_p, P_partial[bx, :, bz, :])
 
         # combine：跨 split 加权 P_partial → P_global → out = P_global @ kvb_w_v^T（per head）
-        with T.Kernel(h_q, batch, threads=128) as (by, bz):
+        # M=16 零填充 T.gemm：p_accum[1,kv_lora] pad 成 [16,kv_lora] 用 tensor core（手写 GEMV 68us→21us/层）
+        # P_s/W_s 均 fp32（kvb_w_v cast 上来），全程 fp32 不丢精度；27 层累积下 bf16 量化会退化。
+        with T.Kernel(batch, h_q, T.ceildiv(v_head, 64), threads=128) as (bb, bh, vblk):
             p_local = T.alloc_fragment([kv_lora], dtype)
             p_accum = T.alloc_fragment([kv_lora], accum_dtype)
+            p_acc_s = T.alloc_shared([kv_lora], accum_dtype)  # p_accum→shared 全宽，供 kk 切片
+            P_s = T.alloc_shared([16, 128], accum_dtype)      # fp32，pad 至 16 行，row 0 真实
+            W_s = T.alloc_shared([128, 64], accum_dtype)      # fp32，kvb_w_v[bh,..] cast 上来转置
+            acc = T.alloc_fragment([16, 64], accum_dtype)
+            acc_s = T.alloc_shared([16, 64], accum_dtype)     # fragment→shared 中转，规避 layout 冲突
             lse_local_split = T.alloc_var(accum_dtype)
             lse_logsum_local = T.alloc_var(accum_dtype)
             lse_max_local = T.alloc_var(accum_dtype)
@@ -193,26 +200,31 @@ def fused_mla_decode_kernel(
             T.clear(p_accum)
             lse_max_local = -T.infinity(accum_dtype)
             for k in T.serial(num_split):
-                lse_max_local = T.max(lse_max_local, glse[bz, by, k])
+                lse_max_local = T.max(lse_max_local, glse[bb, bh, k])
             T.clear(lse_logsum_local)
             for k in T.Pipelined(num_split, num_stages=1):
-                lse_local_split = glse[bz, by, k]
+                lse_local_split = glse[bb, bh, k]
                 lse_logsum_local += T.exp2(lse_local_split - lse_max_local)
             lse_logsum_local = T.log2(lse_logsum_local) + lse_max_local
             for k in T.serial(num_split):
                 for i in T.Parallel(kv_lora):
-                    p_local[i] = P_partial[bz, by, k, i]
-                lse_local_split = glse[bz, by, k]
+                    p_local[i] = P_partial[bb, bh, k, i]
+                lse_local_split = glse[bb, bh, k]
                 scale_local = T.exp2(lse_local_split - lse_logsum_local)
                 for i in T.Parallel(kv_lora):
                     p_accum[i] += T.cast(p_local[i], accum_dtype) * scale_local
-            # out[by] = p_accum @ kvb_w_v[by]^T  —— [1, kv_lora] @ [kv_lora, v_head]，手写累加（M=1 不能用 gemm）
-            for j in T.Parallel(v_head):
-                acc = T.alloc_var(accum_dtype)
-                acc = 0
-                for kk in T.serial(kv_lora):
-                    acc += p_accum[kk] * T.cast(kvb_w_v[by, j, kk], accum_dtype)
-                Output[bz, by, j] = T.cast(acc, dtype)
+            # out[bh] = p_accum @ kvb_w_v[bh]^T —— M=16 pad T.gemm（取 row 0），K_TILE=128 分块累加
+            T.copy(p_accum, p_acc_s)
+            T.clear(acc)
+            for kk in T.Pipelined(T.ceildiv(kv_lora, 128), num_stages=2):
+                for i in T.Parallel(128):
+                    P_s[0, i] = p_acc_s[kk * 128 + i]
+                for i, j in T.Parallel(128, 64):
+                    W_s[i, j] = T.cast(kvb_w_v[bh, vblk * 64 + j, kk * 128 + i], accum_dtype)
+                T.gemm(P_s, W_s, acc, policy=T.GemmWarpPolicy.FullCol)
+            T.copy(acc, acc_s)
+            for j in T.Parallel(64):
+                Output[bb, bh, vblk * 64 + j] = T.cast(acc_s[0, j], dtype)
 
     return main_split
 
