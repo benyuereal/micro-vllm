@@ -185,16 +185,17 @@ def absorb_kernel(batch, h_attn, qk_nope, kv_lora, dtype):
 # 4-phase persistent kernel，phase 间 T.sync_grid 屏障，中间 x16/q_out 经全局 buffer 通信。
 # 验证跨依赖 kernel 链的 persistent 在 graph 路径下能否吃 execution gap。
 @tilelang.jit(
-    out_idx=[10],
+    out_idx=[11],
     pass_configs={tilelang.PassConfigKey.TL_ENABLE_FAST_MATH: True},
 )
 def premla_persistent_kernel(
     bs, hidden, h_attn, q_head, qk_rope, qk_nope, kv_lora, kva_out,
-    block_size, max_seq_blocks, n_blocks, dtype,
+    block_size, max_seq_blocks, n_blocks, max_pos, dtype,
 ):
     """3-phase persistent: pre_qkv(144)∥pre_kva(9) → absorb(128)。
     输出 A[bs*h_attn, kv_lora]（out_idx=10）。X16 由调用方 rmsnorm_ 预填 row0（graph._x16[:bs]），
-    QOut 需预分配传入。bs>1 路径暂不支持（kernel 内硬编码 [0,...]，仅 bs=1 ROI 验证用）。"""
+    QOut 需预分配传入。bs>1 路径暂不支持（kernel 内硬编码 [0,...]，仅 bs=1 ROI 验证用）。
+    Cos/Sin 传全池 [max_pos, qk_rope]，kernel 内部按 NewPos gather（省外部 cos[new_pos] gather+cast）。"""
     accum = T.float32
     Q_OUT = h_attn * q_head
     half = qk_rope // 2
@@ -207,14 +208,15 @@ def premla_persistent_kernel(
     def main(
         QW: T.Tensor([Q_OUT, hidden], dtype),
         QB: T.Tensor([Q_OUT], dtype),
-        Cos: T.Tensor([bs, qk_rope], dtype),
-        Sin: T.Tensor([bs, qk_rope], dtype),
+        Cos: T.Tensor([max_pos, qk_rope], dtype),
+        Sin: T.Tensor([max_pos, qk_rope], dtype),
         KvaW: T.Tensor([kva_out, hidden], dtype),
         KvaB: T.Tensor([kva_out], dtype),
         KvbKn: T.Tensor([h_attn, kv_lora, qk_nope], dtype),
         AbsIdx: T.Tensor([bs * h_attn], T.int32),
         X16: T.Tensor([bs, 16, hidden], dtype),
         QOut: T.Tensor([bs, h_attn, 16, q_head], dtype),
+        QpeOut: T.Tensor([bs, h_attn, qk_rope], dtype),
         AOut: T.Tensor([bs * h_attn, kv_lora], dtype),
         BlockTable: T.Tensor([bs, max_seq_blocks], T.int32),
         NewPos: T.Tensor([bs], T.int32),
@@ -241,16 +243,24 @@ def premla_persistent_kernel(
                     is_pe = (nblk % q_head_blocks) == (q_head_blocks - 1)
                     cs = T.alloc_shared([qk_rope], dtype)
                     ss = T.alloc_shared([qk_rope], dtype)
+                    # kernel 内部按 NewPos[0] 从全池 gather cos/sin（省外部 cos[new_pos].to(dtype)）
+                    qpos = NewPos[0]
                     for j in T.Parallel(qk_rope):
-                        cs[j] = Cos[0, j]; ss[j] = Sin[0, j]
+                        cs[j] = Cos[qpos, j]; ss[j] = Sin[qpos, j]
                     if is_pe:
                         for k in T.Parallel(half):
                             pa = T.cast(acc_s[0, 2 * k], accum) + T.cast(QB[nblk * 64 + 2 * k], accum)
                             pb = T.cast(acc_s[0, 2 * k + 1], accum) + T.cast(QB[nblk * 64 + 2 * k + 1], accum)
                             ck = T.cast(cs[k], accum); sk = T.cast(ss[k], accum)
                             c0 = nblk * 64 + k; c1 = nblk * 64 + k + half
-                            QOut[0, c0 // q_head, 0, c0 % q_head] = T.cast(pa * ck - pb * sk, dtype)
-                            QOut[0, c1 // q_head, 0, c1 % q_head] = T.cast(pa * sk + pb * ck, dtype)
+                            h0 = c0 // q_head; h1 = c1 // q_head
+                            v0 = T.cast(pa * ck - pb * sk, dtype)
+                            v1 = T.cast(pa * sk + pb * ck, dtype)
+                            QOut[0, h0, 0, c0 % q_head] = v0
+                            QOut[0, h1, 0, c1 % q_head] = v1
+                            # 同时写紧凑 QpeOut[bs, h, qk_rope]（contiguous，供 MLA 直接读，省外部 slice+contiguous）
+                            QpeOut[0, h0, k] = v0
+                            QpeOut[0, h1, k + half] = v1
                     else:
                         for j in T.Parallel(64):
                             val = T.cast(acc_s[0, j], accum) + T.cast(QB[nblk * 64 + j], accum)
@@ -328,13 +338,15 @@ _premla_persist_cache = {}
 
 
 def get_premla_persistent_kernel(bs, hidden, h_attn, q_head, qk_rope, qk_nope, kv_lora,
-                                 kva_out, block_size, max_seq_blocks, n_blocks, dtype):
+                                 kva_out, block_size, max_seq_blocks, n_blocks, max_pos, dtype):
     key = (bs, hidden, h_attn, q_head, qk_rope, qk_nope, kv_lora, kva_out,
-           block_size, max_seq_blocks, n_blocks, dtype)
+           block_size, max_seq_blocks, n_blocks, max_pos, dtype)
     if key not in _premla_persist_cache:
         _premla_persist_cache[key] = (
             premla_persistent_kernel(bs, hidden, h_attn, q_head, qk_rope, qk_nope, kv_lora,
-                                     kva_out, block_size, max_seq_blocks, n_blocks, _TORCH_TO_TL[dtype]),
-            torch.empty(bs, h_attn, 16, q_head, dtype=dtype, device="cuda"),    # QOut 中间
+                                     kva_out, block_size, max_seq_blocks, n_blocks, max_pos,
+                                     _TORCH_TO_TL[dtype]),
+            torch.empty(bs, h_attn, 16, q_head, dtype=dtype, device="cuda"),    # QOut 中间（absorb 读 q_nope）
+            torch.empty(bs, h_attn, qk_rope, dtype=dtype, device="cuda"),       # QpeOut 紧凑（MLA 读）
         )
     return _premla_persist_cache[key]

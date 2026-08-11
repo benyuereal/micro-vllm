@@ -47,6 +47,49 @@ if TAG == "no_attn":
         return zshape(bs, H)
     adp.DeepSeekAdapter.attention = noop_attn
 
+# attention 内部细分: no_mla = 跳 MLA decode kernel（attn_out 填 zeros，o_proj 仍跑）
+# no_oproj = 跳 o_proj（返回 zeros[bs, hidden]），pre-MLA+MLA 仍跑
+if TAG in ("no_mla", "no_oproj"):
+    _o_attn = adp.DeepSeekAdapter.attention
+    def attn_split(self, x_normed, block, layer_idx, bs, graph, cm, block_table):
+        import torch.nn.functional as _F
+        attn = block.self_attn
+        k_cache, v_cache = cm.get(layer_idx)
+        cache_lens = cm._cache_seqlens_buffer[:bs]
+        new_pos = (cache_lens - 1).clamp(min=0)
+        max_len = graph._cur_bucket_maxlen
+        block_size = cm.block_size
+        cos, sin = self._rope_pool(graph, k_cache.device)
+        x16 = graph._x16[:bs]; bt = block_table[:bs]
+        from kernel.pre_mla import get_premla_persistent_kernel
+        k_pers, q_out_p, q_pe = get_premla_persistent_kernel(
+            bs, self._hidden, self._num_heads, self._q_head, self._qk_rope,
+            self._qk_nope, self._kv_lora_rank, self._latent_dim, block_size,
+            bt.shape[1], k_cache.shape[0], cos.shape[0], graph.dtype)
+        A_in = k_pers(attn._q_w, attn._q_b, cos, sin, attn._kva_w, attn._kva_b,
+                      attn._kvb_w_kn_t, graph._absorb_idx[:bs * self._num_heads],
+                      x16, q_out_p, q_pe, bt, new_pos, k_cache, v_cache)
+        A_in = A_in.reshape(bs, self._num_heads, self._kv_lora_rank)
+        if TAG == "no_oproj":
+            # pre-MLA + MLA 仍跑，跳 o_proj
+            cos_k = cos[:max_len]; sin_k = sin[:max_len]
+            Latent_flat = k_cache.reshape(-1, 1, self._latent_dim)
+            n_slots = k_cache.shape[0] * block_size
+            from kernel.mla import _get_kernel as _get_mla_kernel
+            kernel = _get_mla_kernel(
+                bs, self._num_heads, max_len, self._kv_lora_rank, self._qk_rope,
+                self._qk_nope, self._v_head, block_size, graph._ds_softmax_scale,
+                graph.dtype, n_slots, block_N=64, num_split=4)
+            attn_out = kernel(
+                A_in, q_pe, Latent_flat, block_table[:bs], cache_lens,
+                attn._kva_ln_w, attn._kvb_w_v, cos_k, sin_k)
+            attn_out = attn_out.reshape(bs, self._num_heads * self._v_head)
+            return zshape(bs, self._hidden)
+        # no_mla: 跳 MLA decode，o_proj 读 zeros
+        attn_out = zshape(bs, self._num_heads * self._v_head)
+        return _F.linear(attn_out, attn._o_w, attn._o_b)
+    adp.DeepSeekAdapter.attention = attn_split
+
 if TAG == "no_gate":
     # gate_gemv + softmax_topk no-op：返回固定 idx/w
     def noop_moe_decode(x, gate_weight, e_gu, e_d, top_k, n_experts, shared_gu=None, shared_d=None):
@@ -109,6 +152,44 @@ if TAG == "no_moe":
     def nomoe(x, gate_weight, e_gu, e_d, top_k, n_experts, shared_gu=None, shared_d=None):
         return zshape(x.shape[0], x.shape[1])
     adp.moe_decode = nomoe; KM.moe_decode = nomoe
+
+# routed 内部细分: no_gu = 跳 gate_up（down 读 zeros）；no_down = 跳 down（只 gate_up 写 Act16）
+if TAG in ("no_gu", "no_down"):
+    _orig_routed = KM.moe_routed_decode
+    def routed_split(x, e_gu, e_d, idx, w_gate, x16=None):
+        N, Hh = x.shape
+        E, TWO_INTER, _ = e_gu.shape; INTER = TWO_INTER // 2; K = idx.shape[1]
+        idx_i32 = idx.to(torch.int32); tl_dt = KM._TORCH_TO_TL[x.dtype]
+        if x16 is None:
+            x16 = torch.zeros(N, 16, Hh, dtype=x.dtype, device=x.device); x16[:, 0, :] = x
+        key = (N, Hh, INTER, E, K, x.dtype)
+        if key not in KM._kernel_cache:
+            KM._kernel_cache[key] = (KM.moe_gate_up_kernel(N,Hh,INTER,E,K,tl_dt), KM.moe_down_kernel(N,Hh,INTER,E,K,tl_dt))
+        k_gu, k_dn = KM._kernel_cache[key]
+        act16 = torch.zeros(N, K, 16, INTER, dtype=x.dtype, device=x.device)
+        if TAG == "no_down":
+            k_gu(x16, e_gu, idx_i32, w_gate)   # 只算 gate_up（写 act16，但不读）
+            return zshape(N, Hh)
+        # no_gu: 跳 gate_up（act16 保持 zeros），只算 down
+        out = k_dn(act16, e_d, idx_i32)
+        return out
+    def split_moe_decode(x, gate_weight, e_gu, e_d, top_k, n_experts, shared_gu=None, shared_d=None):
+        N, Hh = x.shape; K = top_k; tl_dt = KM._TORCH_TO_TL[x.dtype]
+        gkey = (N, Hh, n_experts, K, x.dtype)
+        if gkey not in KM._kernel_cache:
+            KM._kernel_cache[gkey] = (KM.gate_gemv_kernel(N,Hh,n_experts,tl_dt), KM.softmax_topk_kernel(N,n_experts,K,tl_dt))
+        k_gv, k_st = KM._kernel_cache[gkey]
+        logits = k_gv(x, gate_weight); topk_idx, topk_weight = k_st(logits)
+        out = routed_split(x, e_gu, e_d, topk_idx, topk_weight)
+        if shared_gu is not None:
+            S_INTER = shared_d.shape[0]; skey=(N,Hh,S_INTER,x.dtype)
+            if skey not in KM._kernel_cache:
+                KM._kernel_cache[skey] = (KM.shared_gate_up_kernel(N,Hh,S_INTER,tl_dt), KM.shared_down_kernel(N,Hh,S_INTER,tl_dt))
+            k_sgu, k_sdn = KM._kernel_cache[skey]
+            x16 = torch.zeros(N,16,Hh,dtype=x.dtype,device="cuda"); x16[:,0,:]=x
+            sact = k_sgu(x16, shared_gu); k_sdn(sact, shared_d, out)
+        return out
+    adp.moe_decode = split_moe_decode; KM.moe_decode = split_moe_decode
 
 if TAG == "orig_tile":
     # 强制 BLOCK=64

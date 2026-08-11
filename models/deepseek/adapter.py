@@ -342,38 +342,40 @@ class DeepSeekAdapter(ModelAdapter):
         """
         attn = block.self_attn
         k_cache, v_cache = cache_manager.get(layer_idx)    # [n_blocks, block_size, 1, 576]
-        cache_lens = cache_manager._cache_seqlens_buffer[:bs]  # [bs]
-        new_pos = (cache_lens - 1).long().clamp(min=0)     # 新 token 逻辑位置（0-indexed）
+        cache_lens = cache_manager._cache_seqlens_buffer[:bs]  # [bs] int32
+        new_pos = (cache_lens - 1).clamp(min=0)            # 新 token 逻辑位置（0-indexed，int32 全程）
         # 防御：极少数竞态下首步 decode seqlens 可能为 0 → new_pos=-1 → gather 负索引崩溃。
         # 钳到 0 保证不崩（输出可能不准，但避免 device-side assert 拖垮整个 server）。
+        # cache_lens 已 int32，clamp 在 int32 上安全；旧版 .long().to(int32) 是冗余 cast 链（每层 2 节点×27）。
 
         max_len = graph._cur_bucket_maxlen
         block_size = cache_manager.block_size
         cos, sin = self._rope_pool(graph, k_cache.device)  # [max_pos, qk_rope] 全宽 cat(freqs,freqs)
-        cos_q = cos[new_pos].to(graph.dtype)                # [bs, qk_rope]
-        sin_q = sin[new_pos].to(graph.dtype)
+        # cos/sin 的位置查找（cos[new_pos]）已移进 pre_qkv kernel 内部（省外部 gather+cast 节点）。
 
         # ---------- pre-MLA 全融合 persistent kernel ----------
         # pre_qkv ∥ pre_kva → absorb 折进单个 T.Kernel(NUM_SMS) persistent（+2.0%）。
+        # kernel 内部按 new_pos 从 cos/sin 全池 gather（省外部 cos[new_pos].to(dtype)），
+        # 并直写紧凑 QpeOut[bs, h, qk_rope]（省外部 q_pe slice+contiguous 拷贝）。
         x16 = graph._x16[:bs]                               # [bs, 16, hidden]，row 0 = normed x
-        bt = block_table[:bs].contiguous()                 # [bs, max_seq_blocks]
-        k_pers, q_out_p = get_premla_persistent_kernel(
+        bt = block_table[:bs]                               # [bs, max_seq_blocks] view（已 contiguous）
+        k_pers, q_out_p, q_pe = get_premla_persistent_kernel(
             bs, self._hidden, self._num_heads, self._q_head, self._qk_rope,
             self._qk_nope, self._kv_lora_rank, self._latent_dim, block_size,
-            bt.shape[1], k_cache.shape[0], graph.dtype)
+            bt.shape[1], k_cache.shape[0], cos.shape[0], graph.dtype)
         # X16 = graph._x16[:bs]：row0 已由 compute_qkv 的 rmsnorm_ 预填 normed x，
         # rows1-15 恒零（alloc zeros）。kernel 直接读，无需 H_in/phase0 copy。
-        A_in = k_pers(attn._q_w, attn._q_b, cos_q, sin_q, attn._kva_w, attn._kva_b,
+        A_in = k_pers(attn._q_w, attn._q_b, cos, sin, attn._kva_w, attn._kva_b,
                       attn._kvb_w_kn_t, graph._absorb_idx[:bs * self._num_heads],
-                      x16, q_out_p, bt, new_pos.to(torch.int32), k_cache, v_cache)
+                      x16, q_out_p, q_pe, bt, new_pos, k_cache, v_cache)
         A_in = A_in.reshape(bs, self._num_heads, self._kv_lora_rank)
-        q_pe = q_out_p[:, :, 0, self._qk_nope:].contiguous()
 
         # ---------- 融合 MLA decode（不变）----------
-        k_pos = torch.arange(max_len, device=k_cache.device)  # [max_len]
-        cos_k = cos[k_pos].contiguous()                    # [max_len, qk_rope]
-        sin_k = sin[k_pos].contiguous()
-        Latent_flat = k_cache.reshape(-1, 1, self._latent_dim).contiguous()
+        # cos/sin/k_cache/block_table/cache_lens 均已 contiguous，省 arange+indexing+.contiguous()
+        # 的空 kernel（graph 下仍是节点）。k_pos=arange(max_len) 后 cos[k_pos] ≡ cos[:max_len]。
+        cos_k = cos[:max_len]                              # [max_len, qk_rope] view
+        sin_k = sin[:max_len]
+        Latent_flat = k_cache.reshape(-1, 1, self._latent_dim)  # 已 contiguous，view 无拷贝
         n_slots = k_cache.shape[0] * block_size
         kernel = _get_mla_kernel(
             bs, self._num_heads, max_len, self._kv_lora_rank, self._qk_rope,
@@ -381,8 +383,8 @@ class DeepSeekAdapter(ModelAdapter):
             graph.dtype, n_slots, block_N=64, num_split=4)
         attn_out = kernel(
             A_in, q_pe, Latent_flat,
-            block_table[:bs].contiguous(),
-            cache_lens.to(torch.int32).contiguous(),
+            block_table[:bs],
+            cache_lens,
             attn._kva_ln_w, attn._kvb_w_v, cos_k, sin_k)
         attn_out = attn_out.reshape(bs, self._num_heads * self._v_head)
         return F.linear(attn_out, attn._o_w, attn._o_b)
