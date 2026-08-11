@@ -9,6 +9,9 @@ DeepSeekAdapter - DeepSeek-V2-Lite (MLA + MoE) 适配器。
     - MoE：layer 0 dense，layer 1~26 routed(64 experts top6) + shared(2)。
 
 🧩 cache 形状：KVCacheManager 存 [n_blocks, block_size, 1, 576]。
+
+📐 分区：元信息 → 权重预处理 → 模块访问 → RoPE/YaRN → latent cache 写入
+        → decode 钩子 → prefill 钩子 → buffer 分配。
 """
 import math
 import torch
@@ -50,7 +53,7 @@ class DeepSeekAdapter(ModelAdapter):
         self._q_head = None
         self._num_heads = None
 
-    # -------------------- 元信息 --------------------
+    # ==================== 元信息 ====================
     def _cfg(self, cfg):
         self._cfg_cache = cfg
         self._kv_lora_rank = cfg.kv_lora_rank               # 512
@@ -122,7 +125,7 @@ class DeepSeekAdapter(ModelAdapter):
             scaling = scaling * attention_factor
         return scaling
 
-    # -------------------- 权重预处理 --------------------
+    # ==================== 权重预处理 ====================
     def prepare_weights(self, model, world_size, rank):
         blocks = self.blocks(model)
         if getattr(blocks[0].self_attn, "_prepared", False):
@@ -220,22 +223,7 @@ class DeepSeekAdapter(ModelAdapter):
             attn._prepared = True
             torch.cuda.empty_cache()
 
-    # -------------------- latent cache 写入（PyTorch 直写，绕过 power-of-2 Triton kernel）--------------------
-    # MLA latent 维度 = 576（kv_lora 512 + qk_rope 64）非 2 的幂，框架 store_kvcache 的
-    # Triton kernel 要求 head_size 为 2 的幂（tl.arange）。这里用 PyTorch scatter 直写，
-    # decode（bs 个 token）与 prefill（B*S 个 token）开销都很小。
-    @staticmethod
-    def _store_latent(latent_flat, k_cache, v_cache, slots, block_size):
-        """latent_flat: [N, 1, latent]，slots: [N] int。写入 k_cache/v_cache 同一 latent。"""
-        slots = slots.long()
-        block_id = slots // block_size
-        offset = slots % block_size
-        # k_cache[block_id, offset, 0] = latent_flat[:, 0]
-        lv = latent_flat[:, 0, :]                       # [N, latent]
-        k_cache[block_id, offset, 0] = lv
-        v_cache[block_id, offset, 0] = lv
-
-    # -------------------- 模块访问 --------------------
+    # ==================== 模块访问 ====================
     def embed(self, model):
         return model.model.embed_tokens
 
@@ -248,7 +236,7 @@ class DeepSeekAdapter(ModelAdapter):
     def lm_head(self, model):
         return model.lm_head
 
-    # -------------------- RoPE（仅 qk_rope 维，interleaved 约定）--------------------
+    # ==================== RoPE / YaRN（仅 qk_rope 维，interleaved 约定）====================
     # DeepSeek 用 Llama 风格 interleaved RoPE + YaRN 频率缩放：
     #   cos/sin 全宽 [qk_rope]（cat(freqs,freqs)），旋转用 view(d//2,2).transpose + rotate_half。
     #   inv_freq 用 YaRN 的 extra/inter 混合（与 HF DeepseekV2YarnRotaryEmbedding 完全一致）。
@@ -302,10 +290,6 @@ class DeepSeekAdapter(ModelAdapter):
         """返回 alloc_bufs 预算好的 cos/sin 全宽表（纯 getter，无计算）。"""
         return graph._cos_full, graph._sin_full
 
-    def _rope_pool(self, graph, device=None):
-        """旧名兼容（tests/ 原型仍用 _rope_pool）；新代码用 _rope_tables。"""
-        return self._rope_tables(graph)
-
     def _apply_rope(self, x_pe, cos, sin):
         """interleaved RoPE（与 DeepSeek HF apply_rotary_pos_emb 完全一致）。
         x_pe: [..., qk_rope]，cos/sin: [..., qk_rope]（全宽，cat(freqs,freqs)）。
@@ -316,7 +300,22 @@ class DeepSeekAdapter(ModelAdapter):
         rotate_half = torch.cat((-x[..., d // 2:], x[..., : d // 2]), dim=-1)
         return x * cos + rotate_half * sin
 
-    # -------------------- decode 单层钩子 --------------------
+    # ==================== latent cache 写入（PyTorch 直写，绕过 power-of-2 Triton kernel）====================
+    # MLA latent 维度 = 576（kv_lora 512 + qk_rope 64）非 2 的幂，框架 store_kvcache 的
+    # Triton kernel 要求 head_size 为 2 的幂（tl.arange）。这里用 PyTorch scatter 直写，
+    # decode（bs 个 token）与 prefill（B*S 个 token）开销都很小。
+    @staticmethod
+    def _store_latent(latent_flat, k_cache, v_cache, slots, block_size):
+        """latent_flat: [N, 1, latent]，slots: [N] int。写入 k_cache/v_cache 同一 latent。"""
+        slots = slots.long()
+        block_id = slots // block_size
+        offset = slots % block_size
+        # k_cache[block_id, offset, 0] = latent_flat[:, 0]
+        lv = latent_flat[:, 0, :]                       # [N, latent]
+        k_cache[block_id, offset, 0] = lv
+        v_cache[block_id, offset, 0] = lv
+
+    # ==================== decode 单层钩子 ====================
     def compute_qkv(self, block, h, graph, bs):
         # input_layernorm → normed x 写进 _x16[:,0,:]（strided view，pre-MLA kernel 读 [bs,16,hidden] row 0）
         rmsnorm_(h, block._in_ln_w, graph._x16[:bs, 0, :], block._in_ln_eps)
@@ -379,14 +378,14 @@ class DeepSeekAdapter(ModelAdapter):
         # 的空 kernel（graph 下仍是节点）。k_pos=arange(max_len) 后 cos[k_pos] ≡ cos[:max_len]。
         cos_k = cos[:max_len]                              # [max_len, qk_rope] view
         sin_k = sin[:max_len]
-        Latent_flat = k_cache.reshape(-1, 1, self._latent_dim)  # 已 contiguous，view 无拷贝
+        latent_flat = k_cache.reshape(-1, 1, self._latent_dim)  # 已 contiguous，view 无拷贝
         n_slots = k_cache.shape[0] * block_size
         kernel = _get_mla_kernel(
             bs, self._num_heads, max_len, self._kv_lora_rank, self._qk_rope,
             self._qk_nope, self._v_head, block_size, graph._ds_softmax_scale,
             graph.dtype, n_slots, block_N=64, num_split=4)
         attn_out = kernel(
-            A_in, q_pe, Latent_flat,
+            A_in, q_pe, latent_flat,
             block_table[:bs],
             cache_lens,
             attn._kva_ln_w, attn._kvb_w_v, cos_k, sin_k)
@@ -413,7 +412,7 @@ class DeepSeekAdapter(ModelAdapter):
             mlp_out = (F.silu(gate) * up) @ mlp._dense_d
         return mlp_out, graph._residual[:bs]
 
-    # -------------------- prefill 单层钩子 --------------------
+    # ==================== prefill 单层钩子 ====================
     def prefill_layer(self, block, h, layer_idx, B, S, graph, cache_manager, block_table):
         # input_layernorm
         x = rmsnorm(h, block._in_ln_w, block._in_ln_eps)
@@ -477,7 +476,7 @@ class DeepSeekAdapter(ModelAdapter):
         slot = bt[:, :n_blocks][:, block_idx] * bs + offset  # [B, S]
         return slot.reshape(-1).to(torch.int32)
 
-    # -------------------- buffer 分配 --------------------
+    # ==================== buffer 分配 ====================
     def alloc_bufs(self, model, max_bs, hidden_dim, dtype, device):
         # YaRN cos/sin 全宽表：alloc_bufs 时一次性预算（早于 capture），runner 生命周期常驻。
         cos_full, sin_full = self._build_rope_tables(dtype, device)

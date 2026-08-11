@@ -37,7 +37,7 @@ def attn_patch(self, x_normed, block, layer_idx, bs, graph, cm, block_table):
         new_pos = (cache_lens - 1).clamp(min=0)            # int32 全程，省 .long()+.to(int32)
     max_len = graph._cur_bucket_maxlen
     block_size = cm.block_size
-    cos, sin = self._rope_pool(graph, k_cache.device)
+    cos, sin = self._rope_tables(graph)
     x16 = graph._x16[:bs]
     if TAG in ("full", "clean"):
         bt = block_table[:bs].contiguous()

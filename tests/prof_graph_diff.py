@@ -59,7 +59,7 @@ if TAG in ("no_mla", "no_oproj"):
         new_pos = (cache_lens - 1).clamp(min=0)
         max_len = graph._cur_bucket_maxlen
         block_size = cm.block_size
-        cos, sin = self._rope_pool(graph, k_cache.device)
+        cos, sin = self._rope_tables(graph)
         x16 = graph._x16[:bs]; bt = block_table[:bs]
         from kernel.pre_mla import get_premla_persistent_kernel
         k_pers, q_out_p, q_pe = get_premla_persistent_kernel(

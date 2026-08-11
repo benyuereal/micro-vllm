@@ -29,7 +29,7 @@ def patched_attn(self, x_normed, block, layer_idx, bs, graph, cm, block_table):
     new_pos = (cache_lens - 1).long().clamp(min=0)
     max_len = graph._cur_bucket_maxlen
     block_size = cm.block_size
-    cos, sin = self._rope_pool(graph, k_cache.device)
+    cos, sin = self._rope_tables(graph)
     cos_q = cos[new_pos].to(graph.dtype); sin_q = sin[new_pos].to(graph.dtype)
     x16 = graph._x16[:bs]; bt = block_table[:bs].contiguous()
     k_pers, q_out_p = get_premla_persistent_kernel(
