@@ -88,9 +88,6 @@ class DeepSeekAdapter(ModelAdapter):
         # DeepSeek 用 MoE，dense 层的 intermediate_size；MoE expert 尺寸单独处理
         return getattr(cfg, "intermediate_size", cfg.moe_intermediate_size) // world_size
 
-    def num_layers(self, cfg):
-        return cfg.num_hidden_layers
-
     def rope_dim(self, cfg):
         self._cfg(cfg)
         return self._qk_rope

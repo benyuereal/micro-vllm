@@ -42,9 +42,9 @@ class ModelAdapter(ABC):
         """单卡 intermediate_size（已按 TP 切分）。"""
         ...
 
-    @abstractmethod
     def num_layers(self, cfg) -> int:
-        ...
+        """decoder 层数。标准模型即 cfg.num_hidden_layers。"""
+        return cfg.num_hidden_layers
 
     def rope_dim(self, cfg) -> int:
         """RoPE 实际作用的维度。GQA = head_size；MLA = qk_rope_head_dim。"""

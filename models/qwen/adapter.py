@@ -32,13 +32,6 @@ class QwenAdapter(ModelAdapter):
     def intermediate_size(self, cfg, world_size):
         return cfg.intermediate_size // world_size
 
-    def num_layers(self, cfg):
-        return cfg.num_hidden_layers
-
-    def rope_dim(self, cfg):
-        # Qwen: RoPE 作用于整个 head_size
-        return self.cache_dims(cfg)[2]
-
     # -------------------- 权重预处理 --------------------
     def prepare_weights(self, model, world_size, rank):
         # 幂等：已处理则跳过（标志位 w1 is None）
