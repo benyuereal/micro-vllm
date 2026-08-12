@@ -1,6 +1,5 @@
 import logging
 import torch
-import torch.nn.functional as F
 from typing import Dict, List
 
 from core.paged_attention import PagedAttention
@@ -54,9 +53,6 @@ class ModelGraphRunner:
                                         rope_dim=self.adapter.rope_dim(model.config))
         self.rope = RoPE()
 
-        # 编译函数
-        self._fast_mlp = self._compile_fn(self._mlp)
-
         # 初始化
         self.adapter.prepare_weights(self.model, self.world_size, self.rank)
         self._alloc_bufs()
@@ -70,26 +66,6 @@ class ModelGraphRunner:
         self._is_graph_ready = False
         # replay 前 forward/capture 设置：DeepSeek=1024，Qwen=None（attention 不读）。
         self._cur_bucket_maxlen = None
-
-    def _compile_fn(self, fn):
-        return torch.compile(
-            fn,
-            fullgraph=True,
-            backend="inductor",
-            options={
-                "max_autotune": True,
-                "max_autotune_gemm": True,
-                "triton.cudagraphs": False,
-                "triton.cudagraph_trees": False,
-            }
-        )
-
-    @staticmethod
-    def _mlp(x, gu_weight, d_weight):
-        gate_up = x @ gu_weight
-        up, gate = gate_up.chunk(2, dim=-1)
-        activated = F.silu(gate) * up
-        return activated @ d_weight
 
     def _alloc_bufs(self):
         max_b = self.max_bs
@@ -143,16 +119,6 @@ class ModelGraphRunner:
         if self._is_graph_ready: return
 
         logger.info("🎯 开始捕获 CUDA Graph ...")
-
-        if batch_sizes:
-            _block0 = self.adapter.blocks(self.model)[0]
-            _gu, _d = getattr(_block0.mlp, "_gu", None), getattr(_block0.mlp, "_d", None)
-            if _gu is not None and _d is not None:
-                with torch.no_grad():
-                    for bs in batch_sizes:
-                        _x = torch.randn(bs, self.hidden_dim, dtype=self.dtype, device=self.device)
-                        for _ in range(3): _ = self._fast_mlp(_x, _gu, _d)
-                torch.cuda.synchronize()
 
         # capture/warmup 需要合法 cache 状态：block_table 指向有效 block、seqlens > 0。
         # _block_table_buffer 初始化为 -1（非法 block_id），若 attention 在 seqlens>0 时读它

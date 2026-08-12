@@ -10,6 +10,7 @@ import torch.nn.functional as F
 from models.base import ModelAdapter
 from kernel.matmul import matmul_v3
 from kernel.rmsnorm import rmsnorm_, rmsnorm_residual_gemm as rmsnorm_residual
+from kernel.dense_mlp import dense_swiglu
 from kernel.swiglu import matmul_swiglu
 
 try:
@@ -139,7 +140,7 @@ class QwenAdapter(ModelAdapter):
             graph._h_buf[:bs], graph._residual[:bs], block.ln_2.eps
         )
         if fast_mode:
-            mlp_out = graph._fast_mlp(graph._h_buf[:bs], block.mlp._gu, block.mlp._d)
+            mlp_out = dense_swiglu(graph._h_buf[:bs], block.mlp._gu, block.mlp._d)
         else:
             matmul_swiglu(graph._h_buf[:bs], block.mlp._gu, graph._swiglu_out[:bs])
             matmul_v3(graph._swiglu_out[:bs], block.mlp._d, out=graph._h_buf[:bs])
@@ -171,7 +172,7 @@ class QwenAdapter(ModelAdapter):
 
         out = torch.matmul(attn.view(B, S, -1), w_o)
         normed, residual = rmsnorm_residual_fused(out, h, block.ln_2.weight, block.ln_2.eps)
-        mlp_out = graph._fast_mlp(normed, block.mlp._gu, block.mlp._d)
+        mlp_out = dense_swiglu(normed, block.mlp._gu, block.mlp._d)
         return mlp_out + residual
 
     # -------------------- buffer 分配 --------------------

@@ -19,6 +19,7 @@ import torch.nn.functional as F
 
 from models.base import ModelAdapter
 from kernel.rmsnorm import rmsnorm, rmsnorm_, rmsnorm_residual_gemm as rmsnorm_residual
+from kernel.dense_mlp import dense_swiglu
 from .moe import moe_forward
 # 融合 MLA decode kernel（latent→rmsnorm+RoPE+paged flash，weight-absorption）。
 # 把 attention 的 gather+kvb+rope+cat+flash 压进单个 kernel。
@@ -174,8 +175,10 @@ class DeepSeekAdapter(ModelAdapter):
             # FFN 权重
             mlp = block.mlp
             if li < self._first_k_dense:
-                # dense MLP (SwiGLU: gate_proj + up_proj + down_proj)
-                gu = torch.cat([mlp.gate_proj.weight.data, mlp.up_proj.weight.data], dim=0).contiguous()
+                # dense MLP (SwiGLU: silu(gate)*up)。gu 列布局 [up|gate]（与 Qwen _gu 统一，
+                # 供 kernel.dense_mlp.dense_swiglu 复用）。注意 MoE expert 权重另用 [gate|up]，
+                # 由 TileLang moe kernel 内部写死，与此独立。
+                gu = torch.cat([mlp.up_proj.weight.data, mlp.gate_proj.weight.data], dim=0).contiguous()
                 mlp._dense_gu = gu.t().contiguous()        # [2*inter, hidden] → [hidden, 2*inter]
                 mlp._dense_d = mlp.down_proj.weight.data.t().contiguous()  # [inter, hidden] → [hidden, inter]
                 mlp._is_moe = False
@@ -406,10 +409,8 @@ class DeepSeekAdapter(ModelAdapter):
                 mlp._shared_gu, mlp._shared_d,
             )
         else:
-            # dense SwiGLU（DeepSeek 标准: silu(gate)*up；_dense_gu=cat([gate,up]).t()）
-            gate_up = x @ mlp._dense_gu
-            gate, up = gate_up.chunk(2, dim=-1)
-            mlp_out = (F.silu(gate) * up) @ mlp._dense_d
+            # dense SwiGLU（_dense_gu=[up|gate]，与 Qwen 共用 kernel.dense_mlp.dense_swiglu）
+            mlp_out = dense_swiglu(x, mlp._dense_gu, mlp._dense_d)
         return mlp_out, graph._residual[:bs]
 
     # ==================== prefill 单层钩子 ====================
@@ -459,9 +460,7 @@ class DeepSeekAdapter(ModelAdapter):
                                   self._top_k, self._n_experts, mlp._shared_gu, mlp._shared_d)
             mlp_out = mlp_out.view(B, S, self._hidden)
         else:
-            gate_up = h2 @ mlp._dense_gu
-            gate, up = gate_up.chunk(2, dim=-1)
-            mlp_out = (F.silu(gate) * up) @ mlp._dense_d
+            mlp_out = dense_swiglu(h2, mlp._dense_gu, mlp._dense_d)
         return mlp_out + out + res
 
     def _build_prefill_slots(self, cache_manager, block_table, B, S):
