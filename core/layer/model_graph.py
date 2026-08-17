@@ -78,7 +78,6 @@ class ModelGraphRunner:
         self._qkv = bufs.get("_qkv")  # Qwen 用；DeepSeek 不用（q_proj 融进 pre-MLA kernel）
         self._attn_out = bufs["_attn_out"]
         self._residual = bufs["_residual"]
-        self._swiglu_out = bufs.get("_swiglu_out")  # Qwen 用；DeepSeek 不用
         # DeepSeek pre-MLA 全融合用：M=16 pad 的 normed x 与 absorb head 索引（Qwen 无，为 None）
         self._x16 = bufs.get("_x16")
         self._absorb_idx = bufs.get("_absorb_idx")
@@ -94,7 +93,6 @@ class ModelGraphRunner:
         embed = self.adapter.embed(self.model)
         blocks = self.adapter.blocks(self.model)
         h = embed(input_ids)
-        fast_mode = (self.world_size == 1) and (bs <= 16)
         last = self.num_layers - 1
 
         qkv = self.adapter.compute_qkv(blocks[0], h, self, bs)
@@ -103,7 +101,7 @@ class ModelGraphRunner:
             block = blocks[layer_idx]
             attn_out = self.adapter.attention(qkv, block, layer_idx, bs, self, cache_manager, block_table[:bs])
             attn_out = all_reduce(attn_out)
-            mlp_out, res = self.adapter.compute_ffn(block, attn_out, h, self, bs, fast_mode)
+            mlp_out, res = self.adapter.compute_ffn(block, attn_out, h, self, bs)
             mlp_out = all_reduce(mlp_out)
 
             if layer_idx < last:

@@ -392,7 +392,7 @@ class DeepSeekAdapter(ModelAdapter):
         attn_out = attn_out.reshape(bs, self._num_heads * self._v_head)
         return F.linear(attn_out, attn._o_w, attn._o_b)
 
-    def compute_ffn(self, block, attn_out, residual, graph, bs, fast_mode):
+    def compute_ffn(self, block, attn_out, residual, graph, bs):
         mlp = block.mlp
         rmsnorm_residual(
             attn_out, residual, block._post_ln_w,

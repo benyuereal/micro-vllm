@@ -8,10 +8,8 @@ import torch
 import torch.nn.functional as F
 
 from models.base import ModelAdapter
-from kernel.matmul import matmul_v3
 from kernel.rmsnorm import rmsnorm_, rmsnorm_residual_gemm as rmsnorm_residual
 from kernel.dense_mlp import dense_swiglu
-from kernel.swiglu import matmul_swiglu
 
 try:
     from flash_attn import flash_attn_with_kvcache
@@ -92,7 +90,7 @@ class QwenAdapter(ModelAdapter):
     def compute_qkv(self, block, h, graph, bs):
         rmsnorm_(h, block.ln_1.weight, graph._h_buf[:bs], block.ln_1.eps)
         qkv_buf = graph._qkv[:bs]
-        matmul_v3(graph._h_buf[:bs], block.attn._qkv_w, out=qkv_buf)
+        torch.matmul(graph._h_buf[:bs], block.attn._qkv_w, out=qkv_buf)
         if block.attn._qkv_b is not None:
             qkv_buf.add_(block.attn._qkv_b)
         return qkv_buf
@@ -103,7 +101,7 @@ class QwenAdapter(ModelAdapter):
             graph._h_buf[:bs], graph._residual[:bs], block_next.ln_1.eps
         )
         qkv_buf = graph._qkv[:bs]
-        matmul_v3(graph._h_buf[:bs], block_next.attn._qkv_w, out=qkv_buf)
+        torch.matmul(graph._h_buf[:bs], block_next.attn._qkv_w, out=qkv_buf)
         if block_next.attn._qkv_b is not None:
             qkv_buf.add_(block_next.attn._qkv_b)
         return qkv_buf, graph._residual[:bs]
@@ -124,20 +122,15 @@ class QwenAdapter(ModelAdapter):
         ).squeeze(1)
 
         out_buf = graph._attn_out[:bs]
-        matmul_v3(attn.reshape(bs, -1), block.attn._o, out=out_buf)
+        torch.matmul(attn.reshape(bs, -1), block.attn._o, out=out_buf)
         return out_buf
 
-    def compute_ffn(self, block, attn_out, residual, graph, bs, fast_mode):
+    def compute_ffn(self, block, attn_out, residual, graph, bs):
         rmsnorm_residual(
             attn_out, residual, block.ln_2.weight,
             graph._h_buf[:bs], graph._residual[:bs], block.ln_2.eps
         )
-        if fast_mode:
-            mlp_out = dense_swiglu(graph._h_buf[:bs], block.mlp._gu, block.mlp._d)
-        else:
-            matmul_swiglu(graph._h_buf[:bs], block.mlp._gu, graph._swiglu_out[:bs])
-            matmul_v3(graph._swiglu_out[:bs], block.mlp._d, out=graph._h_buf[:bs])
-            mlp_out = graph._h_buf[:bs]
+        mlp_out = dense_swiglu(graph._h_buf[:bs], block.mlp._gu, block.mlp._d)
         return mlp_out, graph._residual[:bs]
 
     # -------------------- prefill 单层钩子 --------------------
@@ -173,12 +166,9 @@ class QwenAdapter(ModelAdapter):
         _b = model.transformer.h[0]
         qkv_dim = _b.attn._qkv_w.shape[1]
         o_dim = _b.attn._o.shape[1]
-        # intermediate_size for swiglu out: 从 _gu 推 (gu = 2 * inter/2 已合并 → inter/2 = _gu.shape[1]/2)
-        swiglu_out_dim = _b.mlp._gu.shape[1] // 2
         return {
             "_h_buf": torch.empty((max_bs, hidden_dim), dtype=dtype, device=device),
             "_qkv": torch.empty(max_bs, qkv_dim, dtype=dtype, device=device),
             "_attn_out": torch.empty(max_bs, o_dim, dtype=dtype, device=device),
             "_residual": torch.empty((max_bs, hidden_dim), dtype=dtype, device=device),
-            "_swiglu_out": torch.empty((max_bs, swiglu_out_dim), dtype=dtype, device=device),
         }

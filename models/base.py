@@ -109,7 +109,7 @@ class ModelAdapter(ABC):
 
     @abstractmethod
     def compute_ffn(self, block, attn_out: torch.Tensor, residual: torch.Tensor,
-                    graph, bs: int, fast_mode: bool) -> Tuple[torch.Tensor, torch.Tensor]:
+                    graph, bs: int) -> Tuple[torch.Tensor, torch.Tensor]:
         """post_attention_layernorm + FFN，返回 (mlp_out, new_residual)。"""
         ...
 
