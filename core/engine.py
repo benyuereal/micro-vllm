@@ -16,7 +16,6 @@ from .context import DecodeContext
 
 from core.parallel_config import get_rank, setup, get_world_size, rank0
 from core.inference_context import BatchInferenceContext
-from torch.profiler import profile, ProfilerActivity
 from collections import defaultdict
 
 # Configure logging

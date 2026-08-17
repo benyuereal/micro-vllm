@@ -1,57 +1,14 @@
-"""
-===================================================================
-KVCacheManager - vLLM 高效内存管理模块 (4D Block-Slot-Tensor结构)
-===================================================================
+"""KVCacheManager：4D Block-Slot-Tensor paged KV 缓存管理。
 
-📌 **核心设计目标**：
-   1. 支持动态分配/释放KV缓存块，最大化GPU内存利用率
-   2. 使用Triton+CUDA实现纳秒级KV存储
-   3. 提供极简API，隐藏所有复杂内存管理细节
-   4. 支持自动混合精度(AMP)、碎片监控、热重置
-
-🧱 **内存结构图** (以 block_size=16 为例)：
-
-    +---------------------+  ← num_blocks (如1024) 
-    | [Block 0]           |     每个Block可存 block_size (如16) 个token的KV
-    | ┌─┬─┬─┬─┬─┬─┬─┬─┬─┐ |     每个Block的每个Slot存储 [num_heads, head_size] 的KV向量
-    | │0│1│2│3│4│5│6│7│...| |     例如：num_heads=16, head_size=128 → 每个Slot = 16x128张量
-    | └─┴─┴─┴─┴─┴─┴─┴─┴─┘ |
-    +---------------------+  ↑ 
-    | [Block 1]           |  |  每个KV缓存张量形状: [num_blocks, block_size, num_heads, head_size]
-    | ┌─┬─┬─┬─┬─┬─┬─┬─┬─┐ |  |  例如: [1024, 16, 16, 128]
-    | │0│1│2│3│4│5│6│7│...| |  |
-    | └─┴─┴─┴─┴─┴─┴─┴─┴─┘ |  |
-    +---------------------+  |  每个Token的KV数据通过 slot_mapping 映射到具体Slot
-    | ...                 |  |
-    +---------------------+  ↓
-    | [Block N]           |
-    | ┌─┬─┬─┬─┬─┬─┬─┬─┬─┐ |
-    | │0│1│2│3│4│5│6│7│...| |
-    | └─┴─┴─┴─┴─┴─┴─┴─┴─┘ |
-    +---------------------+
-
-🔗 **关键概念关系**：
-   - 1 Token → 1 Slot (通过 slot_mapping 定位)
-   - 1 Block → block_size 个 Slots (如16个)
-   - 1 Sequence → 多个Blocks (动态增长，按需分配)
-   - 1 KV Cache → num_layers 个 [num_blocks, block_size, num_heads, head_size] 张量
-
-⚡ **性能特性**：
-   - 分配/释放: O(1) 使用 collections.deque
-   - KV存储: 使用Triton核函数，比PyTorch快5-10x
-   - 内存碎片: <10% (实测)
-   - 支持设备: CUDA (Triton), macOS (MPS), CPU (fallback)
-
-📚 **参考文献**：
-   - vLLM: https://arxiv.org/abs/2309.06180
-   - PagedAttention: https://arxiv.org/abs/2309.06180
-   - FlashAttention: https://arxiv.org/abs/2205.14135
+KV 缓存张量形状 [num_blocks, block_size, num_heads, head_size]，每层一份。
+1 Token → 1 Slot（slot_mapping 定位）；1 Block → block_size 个 Slot；
+1 Sequence → 动态增长的多个 Block。分配/释放 O(1)（deque 空闲块列表）。
+参考：vLLM / PagedAttention (arxiv 2309.06180)。
 """
 from typing import List
 
 import torch
 import collections
-import itertools  # 仅用于stats计算
 
 try:
     import triton
@@ -62,14 +19,10 @@ except ImportError:
 
 
 def is_macos():
-    """检测是否运行在macOS MPS设备上"""
     return torch.backends.mps.is_available()
 
 
-# =============================================================================
-# 🚀 Triton核函数: block_table 填充 (CUDA Only)
-# =============================================================================
-
+# block_table 填充 kernel：一个线程写 block_table[i, j] 一个位置
 if not is_macos() and torch.cuda.is_available():
     @triton.jit
     def _block_table_kernel(
@@ -104,35 +57,8 @@ if not is_macos() and torch.cuda.is_available():
             tl.store(block_table_ptr + offset, block_id)
 
 
-# =============================================================================
-# 🧠 KVCacheManager 主类
-# =============================================================================
-
 class KVCacheManager:
-    """
-    📌 **KV缓存管理器** - vLLM核心组件
-
-    🔍 **设计哲学**:
-        1. **极简接口**: 仅6个核心方法，隐藏所有复杂内存管理
-        2. **极致性能**: 分配/释放O(1)，KV存储纳秒级
-        3. **生产就绪**: 支持AMP、碎片监控、热重置
-        4. **零依赖**: 仅依赖PyTorch，兼容所有设备
-
-    🧪 **典型用法**:
-        manager = KVCacheManager(n_blocks=1024, block_size=16, n_layers=32, n_heads=16, head_size=128)
-
-        # 预填充阶段
-        success, slot_map = manager.alloc(seq_id=0, n_tokens=100)
-        manager.put(seq_id=0, key=keys, value=values, layer=0, slot_map=slot_map)
-
-        # 解码阶段
-        for _ in range(100):
-            new_slot = manager.append(seq_id=0)  # 动态增长
-            manager.put(seq_id=0, key=new_k, value=new_v, layer=0, slot_map=torch.tensor([new_slot]))
-
-        # 释放
-        manager.free(seq_id=0)
-    """
+    """Paged KV 缓存管理器：alloc/append/free O(1)，按 seq_id 管理动态增长的 block 列表。"""
 
     def __init__(self,
                  n_blocks: int,  # 总Block数 (如1024)
@@ -141,145 +67,72 @@ class KVCacheManager:
                  n_heads: int,  # 注意力头数 (如16)
                  head_size: int,  # 每个头的维度 (如128)
                  dtype=torch.float16,  # 数据类型
-                 device="cuda", 
+                 device="cuda",
                  max_tokens: int = 1024,
-                 max_batch_size: int = 32): 
-        """
-        📌 **初始化**:
-            1. 创建KV缓存张量 (ParameterList支持AMP)
-            2. 初始化空闲块列表 (deque实现O(1)分配)
-            3. 初始化块位置计数器 (用于append操作)
-        """
-        # 参数保存
+                 max_batch_size: int = 32):
         self.n_blocks, self.block_size, self.n_layers = n_blocks, block_size, n_layers
         self.dtype, self.device = dtype, device
 
-        # 创建KV缓存 (使用ParameterList支持自动混合精度AMP)
-        # 形状: [n_layers, n_blocks, block_size, n_heads, head_size]
-        # 为每一层分配KV缓存 [num_blocks, block_size, num_heads, head_size]
-        self.k_caches = []
-        self.v_caches = []
+        # 每层一份 KV 缓存 [num_blocks, block_size, num_heads, head_size]
+        self.k_caches, self.v_caches = [], []
         for _ in range(n_layers):
-            k_cache = torch.zeros(
-                (n_blocks, block_size, n_heads, head_size),
-                dtype=dtype, device=device
-            )
-            v_cache = torch.zeros(
-                (n_blocks, block_size, n_heads, head_size),
-                dtype=dtype, device=device
-            )
-            self.k_caches.append(k_cache)
-            self.v_caches.append(v_cache)
+            shape = (n_blocks, block_size, n_heads, head_size)
+            self.k_caches.append(torch.zeros(shape, dtype=dtype, device=device))
+            self.v_caches.append(torch.zeros(shape, dtype=dtype, device=device))
 
-        # 内存管理数据结构 (所有均为私有成员，外部不可见)
-        # 1. 空闲块队列 (使用deque实现O(1)分配/释放)
+        # 空闲块队列（deque O(1)）；seq_id → 已分配 blocks；block_id → 已用 slot 数
         self._free = collections.deque(range(n_blocks))
-
-        # 2. 已分配块字典 (seq_id → [block_id1, block_id2, ...])
         self._blocks = {}
-
-        # 3. 块位置计数器 (block_id → 当前已用slot数)
         self._pos = {}
-        
-        # 4. block table 
-    
-        self.cache_seqlens = torch.tensor([1], dtype=torch.int32, device=self.device)
 
-            # 计算单序列最大块数
+        self.cache_seqlens = torch.tensor([1], dtype=torch.int32, device=self.device)
         self.max_tokens = max_tokens
         self.max_seq_blocks = (max_tokens + block_size - 1) // block_size
-        # 静态缓冲区（关键改造）
+        # 常驻静态缓冲区（graph 绑定，replay 时框架往里写真实表）
         self._block_table_buffer = torch.full(
-            (max_batch_size, self.max_seq_blocks), -1,
-            dtype=torch.int32, device=device
-        )
-        self._cache_seqlens_buffer = torch.zeros(
-            max_batch_size, dtype=torch.int32, device=device
-        )
+            (max_batch_size, self.max_seq_blocks), -1, dtype=torch.int32, device=device)
+        self._cache_seqlens_buffer = torch.zeros(max_batch_size, dtype=torch.int32, device=device)
 
-        # ================= 为 Triton Kernel 准备的临时缓冲区 =================
+        # block_table kernel 的输入暂存
         max_possible_blocks = max_batch_size * self.max_seq_blocks
         self._pre_blocks_buffer = torch.zeros(max_possible_blocks, dtype=torch.int32, device=device)
         self._offsets_buffer = torch.zeros(max_batch_size + 1, dtype=torch.int32, device=device)
 
-        # ================= Pinned CPU staging buffers（消除每步 torch.tensor() malloc）=================
+        # Pinned CPU staging（消除每步 torch.tensor() malloc）
         _pin = (device == "cuda")
-        self._seqlens_cpu  = torch.empty(max_batch_size,          dtype=torch.int32, pin_memory=_pin)
-        self._flat_cpu     = torch.empty(max_possible_blocks,     dtype=torch.int32, pin_memory=_pin)
-        self._offsets_cpu  = torch.empty(max_batch_size + 1,      dtype=torch.int32, pin_memory=_pin)
-        self._seqlens_np   = self._seqlens_cpu.numpy()
-        self._flat_np      = self._flat_cpu.numpy()
-        self._offsets_np   = self._offsets_cpu.numpy()
+        self._seqlens_cpu = torch.empty(max_batch_size, dtype=torch.int32, pin_memory=_pin)
+        self._flat_cpu = torch.empty(max_possible_blocks, dtype=torch.int32, pin_memory=_pin)
+        self._offsets_cpu = torch.empty(max_batch_size + 1, dtype=torch.int32, pin_memory=_pin)
+        self._seqlens_np = self._seqlens_cpu.numpy()
+        self._flat_np = self._flat_cpu.numpy()
+        self._offsets_np = self._offsets_cpu.numpy()
 
-        # 记录哪些 seq 在当前步分配了新 block（用于 decode 快速路径）
+        # 当前步分配了新 block 的 seq（decode 快速路径：dirty 才重建 block_table）
         self._dirty_seqs: set = set()
 
     def alloc(self, seq_id: int, n_tokens: int):
-        """
-        📌 **分配缓存块** (预填充阶段调用)
-
-        🔍 **参数**:
-            - seq_id: 序列ID (唯一标识)
-            - n_tokens: 需要缓存的token数
-
-        ✅ **返回**:
-            - success: 是否分配成功 (False表示OOM)
-            - slot_mapping: slot映射张量 [n_tokens] (每个token的目标slot)
-
-        🧠 **内部逻辑**:
-            1. 计算所需Block数: (n_tokens + block_size - 1) // block_size
-            2. 从_free队列批量分配
-            3. 初始化块位置计数器 (最后一个块可能不满)
-            4. 生成slot_mapping (线性映射到Block)
-        """
-        # 计算所需Block数 (向上取整)
+        """预填充阶段分配块，返回 (success, slot_mapping[n_tokens])。OOM 返回 (False, None)。"""
         n_needed = (n_tokens + self.block_size - 1) // self.block_size
-
-        # OOM检查
         if len(self._free) < n_needed:
             return False, None
 
-        # 批量分配Block (deque.popleft() O(1))
         blocks = [self._free.popleft() for _ in range(n_needed)]
-
-        # 更新空闲队列
-        self._free = self._free  # 触发deque的内存优化
-
-        # 初始化块位置计数器
-        # 最后一个块可能不满，其他块满
+        # 块位置计数器：除最后一块外都满，最后一块可能不满
         self._pos.update({
             b: n_tokens % self.block_size if i == len(blocks) - 1 else self.block_size
             for i, b in enumerate(blocks)
         })
-
-        # 记录已分配块
         self._blocks[seq_id] = blocks
 
-        # 生成slot_mapping (每个token的目标slot)
-        # 线性映射: token_idx → block_id * block_size + offset_in_block
+        # slot_mapping: token_idx → block_id * block_size + offset_in_block
         slot_mapping = torch.tensor([
             blocks[i // self.block_size] * self.block_size + i % self.block_size
             for i in range(n_tokens)
         ], dtype=torch.int32, device=self.device)
-
         return True, slot_mapping
 
     def append(self, seq_id: int):
-        """
-        📌 **追加token** (解码阶段调用)
-
-        🔍 **参数**:
-            - seq_id: 序列ID
-
-        ✅ **返回**:
-            - slot: 分配的slot (失败返回-1)
-
-        🧠 **内部逻辑**:
-            1. 检查序列是否存在
-            2. 如果最后一个Block有空间，使用当前Block
-            3. 否则分配新Block
-            4. 更新块位置计数器
-        """
+        """解码阶段追加一个 token 的 slot（无可用块返回 -1）。"""
         if seq_id not in self._blocks:
             return -1
 
@@ -287,21 +140,17 @@ class KVCacheManager:
         last_block = blocks[-1]
         current_pos = self._pos[last_block]
 
-        # 情况1: 当前块还有空间
-        if current_pos < self.block_size - 1:
+        if current_pos < self.block_size - 1:           # 当前块还有空间
             self._pos[last_block] += 1
             return last_block * self.block_size + current_pos
-
-        # 情况2: 需要新Block
-        elif self._free:
+        elif self._free:                                # 分配新块
             new_block = self._free.popleft()
             blocks.append(new_block)
-            self._blocks[seq_id] = blocks  # 确保引用同步（防御性编程）
             self._pos[new_block] = 1
             self._dirty_seqs.add(seq_id)
             return new_block * self.block_size
-        print(f"❌ cache_manager.append failed for seq {seq_id}, blocks: {blocks}, current_pos: {current_pos}, block_size: {self.block_size}, _free: {len(self._free)}")
-        # 情况3: 无可用Block
+        print(f"❌ cache_manager.append failed for seq {seq_id}, "
+              f"blocks:{blocks} pos:{current_pos} bs:{self.block_size} free:{len(self._free)}")
         return -1
 
     def get(self, layer: int, block_id: int = None):
@@ -310,7 +159,6 @@ class KVCacheManager:
         v_cache = self.v_caches[layer]
         return (k_cache[block_id], v_cache[block_id]) if block_id is not None else (k_cache, v_cache)
 
-    # 准备推理的数据
     def cache_batch_data(self, seq_ids: list, context_lens: list):
         batch_size = len(seq_ids)
         if batch_size == 0:
@@ -367,23 +215,11 @@ class KVCacheManager:
         self._cache_seqlens_buffer[:batch_size].add_(1)
 
     def free(self, seq_id: int):
-        """
-        📌 **释放缓存块** (必须调用，避免内存泄漏)
-
-        🔍 **参数**:
-            - seq_id: 序列ID
-
-        🧠 **内部逻辑**:
-            1. 检查序列是否存在
-            2. 将块加入_free队列
-            3. 清理块位置计数器
-            4. 删除序列记录
-        """
+        """释放 seq 的所有块回空闲队列（避免内存泄漏，必须调用）。"""
         if seq_id in self._blocks:
-            # 批量释放块
             for block_id in self._blocks[seq_id]:
-                self._free.append(block_id)  # O(1)
-                self._pos.pop(block_id, None)  # 清理计数器
+                self._free.append(block_id)
+                self._pos.pop(block_id, None)
 
             # 删除序列记录
             del self._blocks[seq_id]

@@ -1,17 +1,11 @@
-"""
-DeepSeekAdapter - DeepSeek-V2-Lite (MLA + MoE) 适配器。
+"""DeepSeekAdapter - DeepSeek-V2-Lite (MLA + MoE) 适配器。
 
-🔑 架构要点：
-    - MLA 注意力：KV cache 存【压缩 latent】(kv_lora_rank 512 + qk_rope 64 = 576)，
-      非 per-head 展开。attention 时 kv_b_proj 展开成 per-head k_nope/v。
-    - RoPE 只作用 q_pe/k_pe（qk_rope_head_dim=64），需外部旋转后再进 flash_attn_func。
-    - softmax_scale = q_head_dim**-0.5 * mscale^2（yarn mscale_all_dim）。
-    - MoE：layer 0 dense，layer 1~26 routed(64 experts top6) + shared(2)。
-
-🧩 cache 形状：KVCacheManager 存 [n_blocks, block_size, 1, 576]。
-
-📐 分区：元信息 → 权重预处理 → 模块访问 → RoPE/YaRN → latent cache 写入
-        → decode 钩子 → prefill 钩子 → buffer 分配。
+架构要点：
+- MLA 注意力：KV cache 存【压缩 latent】(kv_lora_rank 512 + qk_rope 64 = 576)，非 per-head
+  展开；attention 时 kv_b_proj 展开成 per-head k_nope/v（weight-absorption）。
+- RoPE 只作用 q_pe/k_pe（qk_rope=64），interleaved 约定，需外部旋转后再进 flash_attn_func。
+- softmax_scale = q_head_dim**-0.5 * attention_factor（yarn mscale）。
+- MoE：layer 0 dense，layer 1~26 routed(64 experts top6) + shared(2)。cache 存 [.,.,1,576]。
 """
 import math
 import torch
@@ -93,19 +87,10 @@ class DeepSeekAdapter(ModelAdapter):
         return self._qk_rope
 
     def softmax_scale(self, cfg):
-        """与 transformers>=4.56 native DeepseekV2 的 attention_scaling 约定对齐。
-
-        native（modeling_rope_utils）:
-            scaling        = qk_head_dim ** -0.5           # 纯
-            attention_factor = get_mscale(factor, mscale)
-                              / get_mscale(factor, mscale_all_dim)   # mscale 与 mscale_all_dim 都设
-                            = get_mscale(factor)            # 仅 mscale_all_dim（兼容旧公式）
-            有效 softmax scale = scaling * attention_factor
-            cos/sin 再乘 attention_factor（此处等价为直接乘进 scale，结果相同）。
-
-        DeepSeek-V2-Lite 的 mscale==mscale_all_dim==0.707 → attention_factor=1.0
-        → 有效 scale = qk_head**-0.5 = 0.0722。
-        旧实现误乘 mscale_all_dim^2（=1.59），导致 softmax 过锐、多步生成出乱码。
+        """与 transformers>=4.56 native DeepseekV2 对齐：scaling=q_head**-0.5；
+        attention_factor = mscale(mscale)/mscale(mscale_all_dim)（都设）/ mscale(mscale_all_dim)
+        （仅 all_dim）/ 1.0（都没设）。有效 scale = scaling*attention_factor。
+        DeepSeek-V2-Lite mscale==mscale_all_dim==0.707 → factor=1.0 → scale=q_head**-0.5。
         """
         self._cfg(cfg)
         scaling = self._q_head ** -0.5
@@ -264,12 +249,7 @@ class DeepSeekAdapter(ModelAdapter):
 
     def _build_rope_tables(self, dtype, device):
         """预计算 YaRN cos/sin 全宽表 [_max_pos, qk_rope]（cat(freqs,freqs)）。
-
-        在 alloc_bufs 时一次性算好（runner __init__ 阶段，早于 capture），存进 bufs
-        作为 runner 生命周期的常驻张量。消除旧 _rope_pool 的 lazy 计算——后者依赖
-        "首次调用恰好落在 capture warmup 之外"的时序巧合，显式预计算更鲁棒。
-        max_pos 只需覆盖固定上下文（1024），不取框架 RoPE 表全容量 8192（省 7× 行 + 显存）。
-        """
+        alloc_bufs 时一次性算好（早于 capture）作常驻张量，max_pos 只覆盖固定上下文 1024。"""
         dim = self._qk_rope
         cfg = self._cfg_cache
         base = getattr(cfg, "rope_theta", 10000)
@@ -300,10 +280,8 @@ class DeepSeekAdapter(ModelAdapter):
         rotate_half = torch.cat((-x[..., d // 2:], x[..., : d // 2]), dim=-1)
         return x * cos + rotate_half * sin
 
-    # ==================== latent cache 写入（PyTorch 直写，绕过 power-of-2 Triton kernel）====================
-    # MLA latent 维度 = 576（kv_lora 512 + qk_rope 64）非 2 的幂，框架 store_kvcache 的
-    # Triton kernel 要求 head_size 为 2 的幂（tl.arange）。这里用 PyTorch scatter 直写，
-    # decode（bs 个 token）与 prefill（B*S 个 token）开销都很小。
+    # ==================== latent cache 写入 ====================
+    # MLA latent=576 非 2 的幂，PyTorch scatter 直写（绕过要求 head_size 为 2 的幂的 Triton kernel）。
     @staticmethod
     def _store_latent(latent_flat, k_cache, v_cache, slots, block_size):
         """latent_flat: [N, 1, latent]，slots: [N] int。写入 k_cache/v_cache 同一 latent。"""
@@ -332,50 +310,39 @@ class DeepSeekAdapter(ModelAdapter):
     def attention(self, x_normed, block, layer_idx, bs, graph, cache_manager, block_table):
         """decode MLA attention（pre-MLA 全融合 + MLA decode kernel）。
 
-        契约：forward 时 cache_seqlens[i] = 当前序列“下一步”的预期长度（框架在 prefill 后把
-        current_position 置为 S+1，故首步 decode seqlens=S+1）。新 token 的逻辑位置 =
-        cache_seqlens - 1（0-indexed），写入该 slot，RoPE 用该位置，attention 覆盖
-        [0, cache_seqlens-1]（共 cache_seqlens 个 token，全部有效，无空洞）。forward 后 commit +1。
-
-        pre-MLA 全融合（kernel/pre_mla.py）替代原来的 PyTorch q_proj/kva_proj/store/rope/absorb：
-          pre_qkv  : x16 @ q_w^T → q[bs,H,16,q_head]，q_pe 列在 epilogue 做 rope。
-          pre_kva  : x16 @ kva_w^T → latent 直写 paged cache（store epilogue）。
-          absorb   : q_nope @ kvb_w_kn_t → A[bs,H,kv_lora]。
-        然后 MLA kernel（不变）读 A、qpe 做 rmsnorm+RoPE+paged flash。
+        契约：cache_seqlens[i] = 序列下一步预期长度（prefill 后 = S+1）。新 token 逻辑位置 =
+        seqlens-1（0-indexed），写入该 slot，RoPE 用该位置，attention 覆盖 [0,seqlens-1]，forward 后 commit +1。
+        pre-MLA kernel 替代 PyTorch q_proj/kva_proj/store/rope/absorb：
+          pre_qkv: x16@q_w^T→q[bs,H,16,q_head]（q_pe 列 epilogue 做 rope）；
+          pre_kva: x16@kva_w^T→latent 直写 paged cache（store epilogue）；
+          absorb: q_nope@kvb_w_kn_t→A[bs,H,kv_lora]。MLA kernel 读 A、qpe 做 rmsnorm+RoPE+paged flash。
         """
         attn = block.self_attn
         k_cache, v_cache = cache_manager.get(layer_idx)    # [n_blocks, block_size, 1, 576]
         cache_lens = cache_manager._cache_seqlens_buffer[:bs]  # [bs] int32
-        new_pos = (cache_lens - 1).clamp(min=0)            # 新 token 逻辑位置（0-indexed，int32 全程）
-        # 防御：极少数竞态下首步 decode seqlens 可能为 0 → new_pos=-1 → gather 负索引崩溃。
-        # 钳到 0 保证不崩（输出可能不准，但避免 device-side assert 拖垮整个 server）。
-        # cache_lens 已 int32，clamp 在 int32 上安全；旧版 .long().to(int32) 是冗余 cast 链（每层 2 节点×27）。
+        new_pos = (cache_lens - 1).clamp(min=0)            # 新 token 逻辑位置（0-indexed）
+        # 防御：首步 decode seqlens 竞态下可能为 0 → new_pos=-1 → gather 负索引崩溃，钳到 0 保不崩。
 
         max_len = graph._cur_bucket_maxlen
         block_size = cache_manager.block_size
         cos, sin = self._rope_tables(graph)  # [max_pos, qk_rope] 全宽 cat(freqs,freqs)
-        # cos/sin 的位置查找（cos[new_pos]）已移进 pre_qkv kernel 内部（省外部 gather+cast 节点）。
 
         # ---------- pre-MLA 全融合 persistent kernel ----------
         # pre_qkv ∥ pre_kva → absorb 折进单个 T.Kernel(NUM_SMS) persistent（+2.0%）。
-        # kernel 内部按 new_pos 从 cos/sin 全池 gather（省外部 cos[new_pos].to(dtype)），
-        # 并直写紧凑 QpeOut[bs, h, qk_rope]（省外部 q_pe slice+contiguous 拷贝）。
+        # kernel 内按 new_pos 从 cos/sin 全池 gather，并直写紧凑 QpeOut[bs,h,qk_rope]。
         x16 = graph._x16[:bs]                               # [bs, 16, hidden]，row 0 = normed x
         bt = block_table[:bs]                               # [bs, max_seq_blocks] view（已 contiguous）
         k_pers, q_out_p, q_pe = get_premla_persistent_kernel(
             bs, self._hidden, self._num_heads, self._q_head, self._qk_rope,
             self._qk_nope, self._kv_lora_rank, self._latent_dim, block_size,
             bt.shape[1], k_cache.shape[0], cos.shape[0], graph.dtype)
-        # X16 = graph._x16[:bs]：row0 已由 compute_qkv 的 rmsnorm_ 预填 normed x，
-        # rows1-15 恒零（alloc zeros）。kernel 直接读，无需 H_in/phase0 copy。
+        # X16 row0 已由 compute_qkv 的 rmsnorm_ 预填 normed x，rows1-15 恒零。kernel 直接读。
         A_in = k_pers(attn._q_w, attn._q_b, cos, sin, attn._kva_w, attn._kva_b,
                       attn._kvb_w_kn_t, graph._absorb_idx[:bs * self._num_heads],
                       x16, q_out_p, q_pe, bt, new_pos, k_cache, v_cache)
         A_in = A_in.reshape(bs, self._num_heads, self._kv_lora_rank)
 
-        # ---------- 融合 MLA decode（不变）----------
-        # cos/sin/k_cache/block_table/cache_lens 均已 contiguous，省 arange+indexing+.contiguous()
-        # 的空 kernel（graph 下仍是节点）。k_pos=arange(max_len) 后 cos[k_pos] ≡ cos[:max_len]。
+        # ---------- 融合 MLA decode（latent→rmsnorm+RoPE+paged flash）----------
         cos_k = cos[:max_len]                              # [max_len, qk_rope] view
         sin_k = sin[:max_len]
         latent_flat = k_cache.reshape(-1, 1, self._latent_dim)  # 已 contiguous，view 无拷贝

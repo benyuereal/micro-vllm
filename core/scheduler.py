@@ -22,21 +22,10 @@ class Scheduler:
         self.max_batch_size = max_batch_size
         self.max_prefill_tokens = max_prefill_tokens
         self.prefill_timeout = prefill_timeout
-        self.bucket_size = 50  # 预填充长度分桶区间大小
         self.waiting_queue = deque()   # 新请求
         self.running_sequences = []    # 正在运行的序列
         self.finished_sequences = []   # 已完成
         self.batch_sizes = [1, 2, 4, 8, 16, 32, 40]  # 已捕获的 batch_size（与 engine 一致）
-
-    def _get_bucket_key(self, length: int) -> int:
-        """
-        将长度映射到桶区间
-        例如 bucket_size=50:
-        - 长度 0-49   → bucket 0
-        - 长度 50-99  → bucket 50
-        - 长度 100-149 → bucket 100
-        """
-        return (length // self.bucket_size) * self.bucket_size
 
     def add_request(self, seq: Sequence):
         self.waiting_queue.append(seq)

@@ -30,7 +30,6 @@
     routed: gu_silu 28.8us + down 17.0us = 79.8us serial  vs  Triton 3-step 106.5us  (1.33x)
     correctness rel=0.014 vs Triton reference。
 """
-import os
 import torch
 import tilelang
 import tilelang.language as T
@@ -118,90 +117,6 @@ def moe_down_kernel(N, H, INTER, E, K, dtype, BLOCK_H=32):
             for j in T.Parallel(BLOCK_H):
                 Out[bn, hblk * BLOCK_H + j] = out_frag[j].astype(dtype)
 
-    return main
-
-
-# ============ persistent kernel: routed gate_up + down 单 kernel（92 SM 驻留）============
-# 把 gate_up(132 task) + down(64 task) 折进一个 T.Kernel(NUM_SMS) persistent kernel，
-# 阶段间用 T.sync_grid() 屏障，中间 act16 经全局 buffer 通信（cross-SM 不能用 shared memory）。
-# 收益：消除 gate_up→down 间的 kernel launch gap + 让 92 SM 全程驻留（down 阶段原 grid=64
-# 只占 64/92 SM，persistent 把 64 task 分给全部 SM 且阶段间零间隙）。
-# 隔离下与 2-kernel 持平（SM 无空窗），真实收益在 graph 路径差分法下体现。
-# gate_gemv/softmax_topk 仍是独立 kernel（gate 阶段 SM 占用低，并入 persistent ROI 小）。
-NUM_SMS = 92
-
-
-@tilelang.jit(out_idx=[6])
-def routed_persistent_kernel(N, H, INTER, E, K, dtype, BLOCK_H=32):
-    """persistent: phase1 routed_gate_up(132 task) → sync_grid → phase2 routed_down(64 task)。
-    输入: X16[N,16,H], Egu[E,2*INTER,H], Ed[E,H,INTER], IDX[N,K] int32, WG[N,K], Act16[N,K,16,INTER]
-    输出: Out[N,H]。Act16 是跨阶段中间 buffer（外部预分配，每步复用）。
-    grid=(NUM_SMS,), threads=128。每 SM 用 T.serial(sm_idx, n_task, NUM_SMS) 吃任务。"""
-    accum = T.float32
-    TWO_INTER = 2 * INTER
-    N_GU = K * T.ceildiv(INTER, 64)      # 132
-    N_DN = T.ceildiv(H, BLOCK_H)          # 64
-
-    @T.prim_func
-    def main(
-        X16: T.Tensor([N, 16, H], dtype),
-        Egu: T.Tensor([E, TWO_INTER, H], dtype),
-        Ed: T.Tensor([E, H, INTER], dtype),
-        IDX: T.Tensor([N, K], T.int32),
-        WG: T.Tensor([N, K], dtype),
-        Act16: T.Tensor([N, K, 16, INTER], dtype),
-        Out: T.Tensor([N, H], dtype),
-    ):
-        with T.Kernel(NUM_SMS, threads=128) as (sm_idx,):
-            # ===== phase1: routed_gate_up（132 task: kid × iblk）=====
-            for task in T.serial(sm_idx, N_GU, NUM_SMS):
-                nblk = T.ceildiv(INTER, 64)
-                kid = task // nblk
-                iblk = task % nblk
-                e = IDX[0, kid]
-                wk = WG[0, kid]
-                X_s = T.alloc_shared([16, 128], dtype)
-                Wg_s = T.alloc_shared([64, 128], dtype)
-                Wu_s = T.alloc_shared([64, 128], dtype)
-                g_acc = T.alloc_fragment([16, 64], accum)
-                u_acc = T.alloc_fragment([16, 64], accum)
-                g_s = T.alloc_shared([16, 64], accum)
-                u_s = T.alloc_shared([16, 64], accum)
-                T.clear(g_acc); T.clear(u_acc)
-                for kh in T.Pipelined(T.ceildiv(H, 128), num_stages=2):
-                    T.copy(X16[0, 0:16, kh * 128:(kh + 1) * 128], X_s)
-                    T.copy(Egu[e, iblk * 64:(iblk + 1) * 64, kh * 128:(kh + 1) * 128], Wg_s)
-                    T.copy(Egu[e, INTER + iblk * 64:INTER + (iblk + 1) * 64,
-                               kh * 128:(kh + 1) * 128], Wu_s)
-                    T.gemm(X_s, Wg_s, g_acc, transpose_B=True, policy=T.GemmWarpPolicy.FullCol)
-                    T.gemm(X_s, Wu_s, u_acc, transpose_B=True, policy=T.GemmWarpPolicy.FullCol)
-                T.copy(g_acc, g_s); T.copy(u_acc, u_s)
-                for j in T.Parallel(64):
-                    g = g_s[0, j]
-                    sig = 1.0 / (1.0 + T.exp(-g))
-                    Act16[0, kid, kid, iblk * 64 + j] = (g * sig * u_s[0, j] * wk).astype(dtype)
-            T.sync_grid()
-            # ===== phase2: routed_down（64 task: hblk）=====
-            for task in T.serial(sm_idx, N_DN, NUM_SMS):
-                hblk = task
-                A_s = T.alloc_shared([16, 128], dtype)
-                W_s = T.alloc_shared([BLOCK_H, 128], dtype)
-                acc = T.alloc_fragment([16, BLOCK_H], accum)
-                acc_s = T.alloc_shared([16, BLOCK_H], accum)
-                out_frag = T.alloc_fragment([BLOCK_H], accum)
-                T.clear(out_frag)
-                for k in T.serial(K):
-                    e = IDX[0, k]
-                    T.clear(acc)
-                    for ki in T.Pipelined(T.ceildiv(INTER, 128), num_stages=2):
-                        T.copy(Act16[0, k, 0:16, ki * 128:(ki + 1) * 128], A_s)
-                        T.copy(Ed[e, hblk * BLOCK_H:(hblk + 1) * BLOCK_H, ki * 128:(ki + 1) * 128], W_s)
-                        T.gemm(A_s, W_s, acc, transpose_B=True, policy=T.GemmWarpPolicy.FullCol)
-                    T.copy(acc, acc_s)
-                    for j in T.Parallel(BLOCK_H):
-                        out_frag[j] += acc_s[k, j]
-                for j in T.Parallel(BLOCK_H):
-                    Out[0, hblk * BLOCK_H + j] = out_frag[j].astype(dtype)
     return main
 
 
@@ -391,18 +306,6 @@ def moe_routed_decode(x, e_gu, e_d, idx, w_gate, x16=None):
     if x16 is None:
         x16 = torch.zeros(N, 16, H, dtype=x.dtype, device=x.device)
         x16[:, 0, :] = x
-
-    use_persistent = os.environ.get("USE_PERSISTENT_MOE", "0") == "1"
-    if use_persistent:
-        pkey = ("persist", N, H, INTER, E, K, x.dtype)
-        if pkey not in _kernel_cache:
-            _kernel_cache[pkey] = (
-                routed_persistent_kernel(N, H, INTER, E, K, tl_dtype),
-                torch.empty(N, K, 16, INTER, dtype=x.dtype, device=x.device),  # Act16 跨阶段 buffer
-            )
-        k_pers, act16 = _kernel_cache[pkey]
-        out = k_pers(x16, e_gu, e_d, idx_i32, w_gate, act16)   # persistent 单 kernel
-        return out
 
     key = (N, H, INTER, E, K, x.dtype)
     if key not in _kernel_cache:
