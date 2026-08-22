@@ -14,7 +14,7 @@ class PagedAttention(nn.Module):
     def __init__(self, num_heads: int, head_size: int, kv_num_heads: int,
                  device: str = "auto", max_batch_size=16, max_blocks=32,
                  max_position=4096, max_tokens=8192, block_size=256,
-                 rope_dim: int = None):
+                 rope_dim: int = None, rope_theta: float = 10000.0):
         super().__init__()
         self.block_size = block_size
         self.max_tokens = max_tokens
@@ -35,7 +35,7 @@ class PagedAttention(nn.Module):
         # 预计算 RoPE cos/sin pool（half-split：取前 dim//2 列）
         max_kv_capacity = max_blocks * 256
         dim = self.rope_dim
-        base = 10000
+        base = float(rope_theta)
         inv_freq = 1.0 / (base ** (torch.arange(0, dim, 2, device=self.device).to(torch.bfloat16) / dim))
         t = torch.arange(max_kv_capacity, device=self.device, dtype=inv_freq.dtype)
         freqs = torch.einsum("i,j->ij", t, inv_freq)

@@ -50,6 +50,10 @@ class ModelAdapter(ABC):
         """RoPE 实际作用的维度。GQA = head_size；MLA = qk_rope_head_dim。"""
         return self.cache_dims(cfg)[2]
 
+    def rope_theta(self, cfg) -> float:
+        """RoPE base frequency。默认 10000；Qwen3=1e6 等。"""
+        return getattr(cfg, "rope_theta", None) or 10000.0
+
     def softmax_scale(self, cfg) -> float:
         """attention softmax 缩放。"""
         head_dim = self.cache_dims(cfg)[2]

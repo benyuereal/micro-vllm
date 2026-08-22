@@ -14,6 +14,8 @@ MODEL_NAME_ALIASES = {
     "qwen": "Qwen-7B-Chat",
     "qwen-7b": "Qwen-7B-Chat",
     "qwen-7b-chat": "Qwen-7B-Chat",
+    "qwen3": "Qwen3-0.6B",
+    "qwen3-0.6b": "Qwen3-0.6B",
 }
 
 
