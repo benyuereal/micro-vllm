@@ -59,6 +59,12 @@ class ModelAdapter(ABC):
         head_dim = self.cache_dims(cfg)[2]
         return head_dim ** -0.5
 
+    def supports_chunked_prefill(self, cfg) -> bool:
+        """该架构的 prefill_layer 是否支持 chunked 续写（第 N chunk 的 attention 能读到
+        cache 中前 N-1 chunk 的 KV）。GQA + flash_attn_with_kvcache 支持；MLA prefill
+        用 flash_attn_func（自包含，不读 cache 前缀）暂不支持。默认 False（保守）。"""
+        return False
+
     # ------------------------------------------------------------------
     # 权重预处理
     # ------------------------------------------------------------------

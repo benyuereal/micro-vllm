@@ -50,6 +50,12 @@ class Qwen3Adapter(ModelAdapter):
     def rope_theta(self, cfg) -> float:
         return getattr(cfg, "rope_theta", None) or 10000.0
 
+    def supports_chunked_prefill(self, cfg) -> bool:
+        # Qwen3 prefill_layer 用 flash_attn_with_kvcache(cache_seqlens=position_offsets)，
+        # 第 N chunk 的 attention 能读到 cache 中前 N-1 chunk 的 KV；RoPE 按 per-seq offset
+        # 从 cos/sin pool gather 正确位置。已验证 chunked vs 非 chunked 输出完全一致。
+        return True
+
     # -------------------- 权重预处理 --------------------
     def prepare_weights(self, model, world_size, rank):
         first = self.blocks(model)[0]
@@ -206,11 +212,29 @@ class Qwen3Adapter(ModelAdapter):
         # QK-Norm on head_dim 维（rmsnorm 把最后一维 head_dim 当 hidden 归一，逐 head 独立）
         q = rmsnorm(q, attn._q_norm_w, attn._q_norm_eps)
         k = rmsnorm(k, attn._k_norm_w, attn._k_norm_eps)
-        # RoPE (half-split，与 Qwen-1 同构；cos/sin pool 已用 rope_theta=1e6 预计算)
-        q, k = graph.rope.forward(q, k, graph.attention._cos_pool, graph.attention._sin_pool)
 
         k_cache, v_cache = cache_manager.get(layer_idx)
         cache_lens = cache_manager._cache_seqlens_buffer[:B]
+
+        # RoPE (half-split)。chunked prefill 时 cache_lens 非 0 = 该 chunk 在原 prompt
+        # 的起始位置；按 per-seq offset 从 cos/sin pool gather 正确行，保证长 prompt
+        # 分块续写时位置连续。全 0 走快路径（取 cos[:S]，原一次性 prefill 行为）。
+        cos_pool = graph.attention._cos_pool
+        sin_pool = graph.attention._sin_pool
+        if bool(cache_lens.any()):
+            # per-seq offset：pos[b,t] = cache_lens[b] + t
+            pos = cache_lens.to(torch.long).unsqueeze(1) + torch.arange(S, device=cache_lens.device).unsqueeze(0)  # [B,S]
+            cos = cos_pool[pos]   # [B, S, dim//2]
+            sin = sin_pool[pos]
+            cos = cos[:, :, None, :]   # [B,S,1,dim//2]
+            sin = sin[:, :, None, :]
+            q1, q2 = q.chunk(2, dim=-1)
+            k1, k2 = k.chunk(2, dim=-1)
+            q = torch.cat([q1 * cos - q2 * sin, q2 * cos + q1 * sin], dim=-1)
+            k = torch.cat([k1 * cos - k2 * sin, k2 * cos + k1 * sin], dim=-1)
+        else:
+            q, k = graph.rope.forward(q, k, cos_pool, sin_pool)
+
         attn_out = flash_attn_with_kvcache(
             q=q, k_cache=k_cache, v_cache=v_cache, k=k, v=v,
             cache_seqlens=cache_lens, block_table=block_table, causal=True
