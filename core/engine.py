@@ -131,7 +131,10 @@ class InferenceEngine:
             self._warmup_sampler(cap_sizes)
             # 预热 prefill eager 路径：cuBLAS/flash 首次跑每个 (B,S) shape 会选算法/编译，
             # 首个真实多 batch prefill 多耗 ~100-200ms。用短 dummy prompt 在主 batch size 跑一次。
-            self._warmup_prefill(cap_sizes)
+            # 仅对支持 chunked prefill 的架构（Qwen3 GQA）——DeepSeek MLA prefill 用
+            # flash_attn_func 自包含路径，dummy prefill 触发 cudaErrorAssert，跳过。
+            if self.adapter.supports_chunked_prefill(self.config):
+                self._warmup_prefill(cap_sizes)
         else:
             logger.info("非 CUDA 设备，跳过 CUDA Graph 捕获（eager 路径）。")
 
