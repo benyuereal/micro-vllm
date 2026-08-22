@@ -20,6 +20,7 @@ import torch
 from models.base import ModelAdapter
 from kernel.rmsnorm import (
     rmsnorm_, rmsnorm, rmsnorm_residual_gemm as rmsnorm_residual, rmsnorm_residual_fused,
+    qk_norm_inplace,
 )
 from kernel.dense_mlp import dense_swiglu
 
@@ -144,15 +145,18 @@ class Qwen3Adapter(ModelAdapter):
         return qkv_buf, graph._residual[:bs]
 
     def _apply_qk_norm(self, qkv_buf, attn, graph, bs):
-        """对融合 qkv buffer 的 q 段、k 段原地做 QK-Norm。"""
+        """对融合 qkv buffer 的 q 段、k 段原地做 QK-Norm（per-head RMSNorm on head_dim）。
+
+        单个 Triton kernel 直接在 qkv_buf 上原地 norm（每个 program 处理一个 head，
+        两遍顺序执行原地安全），替代旧 PyTorch 原生 op 的碎片 kernel
+        （cast/pow/mean/rsqrt/mul 共 ~6 个 elementwise+reduce kernel/层/head）。
+        """
         q_dim = graph.num_heads * graph.head_size
         kv_dim = graph.kv_num_heads * graph.head_size
-        q = qkv_buf[:, :q_dim]
-        k = qkv_buf[:, q_dim:q_dim + kv_dim]
-        q_n = self._qk_norm_decode(q, attn._q_norm_w, attn._q_norm_eps, graph.num_heads, graph.head_size)
-        k_n = self._qk_norm_decode(k, attn._k_norm_w, attn._k_norm_eps, graph.kv_num_heads, graph.head_size)
-        qkv_buf[:, :q_dim] = q_n
-        qkv_buf[:, q_dim:q_dim + kv_dim] = k_n
+        qk_norm_inplace(qkv_buf, bs, q_dim, kv_dim,
+                        attn._q_norm_w, attn._k_norm_w,
+                        graph.num_heads, graph.kv_num_heads, graph.head_size,
+                        attn._q_norm_eps)
 
     def attention(self, qkv, block, layer_idx, bs, graph, cache_manager, block_table):
         q_dim = graph.num_heads * graph.head_size
