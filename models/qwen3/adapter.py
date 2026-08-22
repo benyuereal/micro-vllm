@@ -15,6 +15,7 @@
   复用 PagedAttention 的 _cos_pool/_sin_pool（已按 adapter.rope_theta 用 1e6 预计算）。
 - tie_word_embeddings=true：lm_head.weight is embed_tokens.weight。
 """
+import os
 import torch
 
 from models.base import ModelAdapter
@@ -23,6 +24,7 @@ from kernel.rmsnorm import (
     qk_norm_inplace,
 )
 from kernel.dense_mlp import dense_swiglu
+from kernel.qwen3_decode_attn import qwen3_decode_attn
 
 try:
     from flash_attn import flash_attn_with_kvcache
@@ -173,6 +175,19 @@ class Qwen3Adapter(ModelAdapter):
 
         k_cache, v_cache = cache_manager.get(layer_idx)
         cache_lens = cache_manager._cache_seqlens_buffer[:bs]
+        out_buf = graph._attn_out[:bs]
+
+        # TileLang 轻量 decode attention（bs=1）：单 kernel Q旋转+QK+softmax+PV+存新K/V。
+        # 图下实测比 flash 慢（GQA 每 q-head 一 block 致 KV 双读 + 串行 reduce），
+        # 暂用 flash；kernel 代码保留待优化（合并 2 q-head/块 + warp reduce 后再启用）。
+        if bs == 1 and os.environ.get("MICRO_TILELANG_ATTN"):
+            attn_pre = graph._attn_pre[:bs]
+            qwen3_decode_attn(
+                qkv, k_cache, v_cache, block_table, cache_lens,
+                graph.attention._cos_pool, graph.attention._sin_pool,
+                graph.num_heads, graph.kv_num_heads, graph.head_size, out=attn_pre)
+            torch.matmul(attn_pre, block.self_attn._o_w, out=out_buf)
+            return out_buf
 
         # flash_attn GQA：q 头数(16) 可被 kv 头数(8) 整除，连续分组（head 0,1→kv0）。
         # RoPE 由 flash_attn 按 cache_seqlens 内部旋转（rotary_cos/sin half-split, interleaved=False）。
@@ -188,7 +203,6 @@ class Qwen3Adapter(ModelAdapter):
             num_splits=1 if bs == 1 else (0 if bs >= 32 else max(1, 32 // max(1, bs * 4)))
         ).squeeze(1)
 
-        out_buf = graph._attn_out[:bs]
         torch.matmul(attn.reshape(bs, -1), block.self_attn._o_w, out=out_buf)
         return out_buf
 
@@ -252,9 +266,13 @@ class Qwen3Adapter(ModelAdapter):
         _b = self.blocks(model)[0]
         qkv_dim = _b.self_attn._qkv_w.shape[1]
         o_dim = _b.self_attn._o_w.shape[1]
+        # q_dim = num_heads*head_size（o_proj 输入维 = _o_w.shape[0]）
+        q_dim = _b.self_attn._o_w.shape[0]
         return {
             "_h_buf": torch.empty((max_bs, hidden_dim), dtype=dtype, device=device),
             "_qkv": torch.empty(max_bs, qkv_dim, dtype=dtype, device=device),
+            # TileLang decode attn 输出（o_proj 前，= num_heads*head_size=2048）；flash 路径不用
+            "_attn_pre": torch.empty(max_bs, q_dim, dtype=dtype, device=device),
             "_attn_out": torch.empty(max_bs, o_dim, dtype=dtype, device=device),
             "_residual": torch.empty((max_bs, hidden_dim), dtype=dtype, device=device),
         }

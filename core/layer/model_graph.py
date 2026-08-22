@@ -1,4 +1,5 @@
 import logging
+import os
 import torch
 from typing import Dict, List
 
@@ -79,6 +80,8 @@ class ModelGraphRunner:
         self._qkv = bufs.get("_qkv")  # Qwen 用；DeepSeek 不用（q_proj 融进 pre-MLA kernel）
         self._attn_out = bufs["_attn_out"]
         self._residual = bufs["_residual"]
+        # Qwen3 TileLang decode attn 输出（o_proj 前）；其他架构不用（None）
+        self._attn_pre = bufs.get("_attn_pre")
         # DeepSeek pre-MLA 全融合用：M=16 pad 的 normed x 与 absorb head 索引（Qwen 无，为 None）
         self._x16 = bufs.get("_x16")
         self._absorb_idx = bufs.get("_absorb_idx")
@@ -174,6 +177,13 @@ class ModelGraphRunner:
             # 普通路径：H2D copy
             self._input_ids[:batch_size] = input_ids
         # input_ids=None 表示 _input_ids 已由上一步 GPU→GPU copy 预填充，直接 replay
+
+        # DEBUG eager 路径（不走 graph），用于定位 kernel 正确性
+        if os.environ.get("MICRO_EAGER_DECODE"):
+            with torch.no_grad():
+                self._logits[:batch_size] = self.decode(self._input_ids[:batch_size], batch_size,
+                                                        cache_manager, cache_manager._block_table_buffer)
+            return self._logits[:batch_size]
 
         # 统一选 graph：(bs, None) 无架构分支、无选桶、无 .item() 同步。越界由启动期 assert 保证。
         key = (batch_size, None)

@@ -14,19 +14,32 @@ class Sampler:
         )
 
     def __call__(self, logits, temperatures, top_ps, top_k,
-                 prev_tokens=None, rep_penalties=None):
+                 prev_tokens=None, rep_penalties=None,
+                 all_greedy=None, any_rep_pen=None):
         """调用采样函数。temperature<=0 走 greedy（argmax），绕过编译路径避免 0 除。
 
         prev_tokens: [bs, max_prev] 已生成+prompt 的 token id（含 padding，-1 表无效），
                      用于 repetition penalty。None 或 rep_penalties 全 1.0 时跳过惩罚。
         rep_penalties: [bs] 每条 seq 的惩罚系数（1.0=禁用，>1.0 惩罚已出现 token）。
+        all_greedy: CPU bool，调用方预判 temperatures 全 <=0（避免 torch.any GPU→CPU 同步）。
+        any_rep_pen: CPU bool，调用方预判 rep_penalties 存在 >1.0（避免 torch.any 同步）。
         """
         # repetition penalty（在 greedy/采样前统一施加，纯 GPU op，graph-friendly）
-        if prev_tokens is not None and rep_penalties is not None and torch.any(rep_penalties > 1.0):
+        # 优先用 CPU 侧预判标志避免 torch.any 同步；无标志时回退 GPU 检查。
+        if any_rep_pen is not None:
+            need_pen = any_rep_pen
+        else:
+            need_pen = (prev_tokens is not None and rep_penalties is not None
+                        and bool(torch.any(rep_penalties > 1.0)))
+        if need_pen:
             logits = self._apply_repetition_penalty(logits, prev_tokens, rep_penalties)
 
         # greedy 短路：任一行 temperature<=0 即走 eager argmax（与 HF do_sample=False 对齐）
-        if torch.any(temperatures <= 0):
+        if all_greedy is not None:
+            is_greedy = all_greedy
+        else:
+            is_greedy = bool(torch.any(temperatures <= 0))
+        if is_greedy:
             return logits.argmax(dim=-1)
         return self._compiled_sample(logits, temperatures, top_ps, top_k)
 

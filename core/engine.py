@@ -274,7 +274,8 @@ class InferenceEngine:
             dctx = self._decode_ctx
             next_tokens_gpu = self.sampler(
                 logits, dctx.temps, dctx.topp, 50,
-                prev_tokens=dctx.prev_tokens, rep_penalties=dctx.rep_penalties)
+                prev_tokens=dctx.prev_tokens, rep_penalties=dctx.rep_penalties,
+                all_greedy=dctx.all_greedy, any_rep_pen=dctx.any_rep_pen)
             dctx.commit(next_tokens_gpu, self.graph_runner._input_ids, bs, batch)
             # 把本步新 token 追加进 prev_tokens，供下一步 repetition penalty 使用
             if dctx.prev_tokens is not None and torch.any(dctx.rep_penalties > 1.0):
@@ -371,18 +372,22 @@ class InferenceEngine:
             sample_idx = [i for i, ns in enumerate(need_sample) if ns]
             if sample_idx:
                 sample_batch = [batch[i] for i in sample_idx]
-                temps = torch.tensor([s.temperature for s in sample_batch], device=device)
+                temps_list = [s.temperature for s in sample_batch]
+                rep_list = [getattr(s, 'repetition_penalty', 1.0) for s in sample_batch]
+                temps = torch.tensor(temps_list, device=device)
                 topp = torch.tensor([s.top_p for s in sample_batch], device=device)
-                rep_pen = torch.tensor(
-                    [getattr(s, 'repetition_penalty', 1.0) for s in sample_batch], device=device)
+                rep_pen = torch.tensor(rep_list, device=device)
+                any_rep = any(r > 1.0 for r in rep_list)
+                all_greedy = all(t <= 0 for t in temps_list)
                 prev = None
-                if torch.any(rep_pen > 1.0):
+                if any_rep:
                     hist = [list(s.input_ids) for s in sample_batch]
                     max_l = max(len(h) for h in hist)
                     prev = torch.tensor(
                         [h + [-1] * (max_l - len(h)) for h in hist], dtype=torch.long, device=device)
                 next_tokens = self.sampler(logits[sample_idx, -1, :], temps, topp, 1000,
-                                           prev_tokens=prev, rep_penalties=rep_pen).tolist()
+                                           prev_tokens=prev, rep_penalties=rep_pen,
+                                           all_greedy=all_greedy, any_rep_pen=any_rep).tolist()
                 for j, seq in enumerate(sample_batch):
                     # 最后 chunk：先把 prefill_done/current_position 推进到整个 prompt 末尾，
                     # 随后 update_sequences 的 update_state(+1) 才能给出正确的 decode 位置。
