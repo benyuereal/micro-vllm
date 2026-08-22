@@ -167,3 +167,46 @@ def rmsnorm_residual_gemm(x: torch.Tensor, residual: torch.Tensor, weight: torch
         hidden_dim, eps, BLOCK_SIZE=BLOCK_SIZE,
     )
     return out_normed_buffer, out_residual_buffer
+
+
+# ---- QK-Norm：对融合 qkv buffer 的 q 段/k 段原地 per-head RMSNorm（Qwen3 专用）----
+@triton.jit
+def _qk_norm_kernel(QKV, W, stride_qkv_row, seg_offset, head_size: tl.constexpr,
+                    num_heads: tl.constexpr, eps, BLOCK_SIZE: tl.constexpr):
+    """每个 program 处理一个 (batch, head)。
+    pid = batch_idx * num_heads + head_idx
+    该 head 在 qkv_buf 中的起始 = batch_idx*stride_qkv_row + seg_offset + head_idx*head_size
+    两遍：先算 mean_sq 再写归一结果（原地安全，同 program 内顺序执行）。
+    """
+    pid = tl.program_id(0)
+    batch_idx = pid // num_heads
+    head_idx = pid % num_heads
+    base = batch_idx * stride_qkv_row + seg_offset + head_idx * head_size
+
+    mean_sq = tl.zeros([BLOCK_SIZE], dtype=tl.float32)
+    cols = tl.arange(0, BLOCK_SIZE)
+    mask = cols < head_size
+    x = tl.load(QKV + base + cols, mask=mask, other=0.0).to(tl.float32)
+    mean_sq = x * x
+    rrms = tl.rsqrt(tl.sum(mean_sq, axis=0) / head_size + eps)
+
+    w = tl.load(W + cols, mask=mask, other=0.0).to(tl.float32)
+    tl.store(QKV + base + cols, (x * rrms * w).to(tl.bfloat16), mask=mask)
+
+
+def qk_norm_inplace(qkv_buf: torch.Tensor, bs: int, q_dim: int, kv_dim: int,
+                    q_weight: torch.Tensor, k_weight: torch.Tensor,
+                    num_heads: int, kv_num_heads: int, head_size: int,
+                    eps: float = 1e-6):
+    """对 [max_bs, q_dim+2*kv_dim] 融合 qkv buffer 的 q 段、k 段原地做 per-head RMSNorm。
+
+    decode graph 路径用：直接在 qkv_buf 上原地 norm，无需额外 buffer，无需 reshape（支持
+    qkv_buf 行 stride != q_dim 的非连续情况）。替代旧 PyTorch 原生 op 的 ~6 个碎片 kernel。
+    """
+    BLOCK_SIZE = triton.next_power_of_2(head_size)
+    # q 段：seg_offset=0, num_heads
+    _qk_norm_kernel[(bs * num_heads,)](
+        qkv_buf, q_weight, qkv_buf.stride(0), 0, head_size, num_heads, eps, BLOCK_SIZE=BLOCK_SIZE)
+    # k 段：seg_offset=q_dim, kv_num_heads
+    _qk_norm_kernel[(bs * kv_num_heads,)](
+        qkv_buf, k_weight, qkv_buf.stride(0), q_dim, head_size, kv_num_heads, eps, BLOCK_SIZE=BLOCK_SIZE)
