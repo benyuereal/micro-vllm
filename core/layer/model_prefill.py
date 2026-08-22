@@ -17,9 +17,12 @@ class ModelPrefillRunner(ModelGraphRunner):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
 
-    def forward(self, input_ids: torch.Tensor, cache_manager, batch_size: int) -> torch.Tensor:
-        """
-        定长 Prefill 前向传播 (batch, seq_len)
+    def forward(self, input_ids: torch.Tensor, cache_manager, batch_size: int,
+                position_offsets: torch.Tensor = None) -> torch.Tensor:
+        """定长/分块 Prefill 前向传播 (batch, seq_len)。
+
+        position_offsets: [B] int tensor，每条 seq 已 prefill 的 token 数（chunked prefill
+            续写偏移）。None 或全 0 等价于一次性 prefill（原行为）。
         通过 adapter 钩子驱动任意架构。
         """
         B, S = input_ids.shape
@@ -27,8 +30,12 @@ class ModelPrefillRunner(ModelGraphRunner):
         blocks = self.adapter.blocks(self.model)
         h = embed(input_ids)
 
-        # 初始化 cache 状态：cache_seqlens 一次性置 0，逐层 flash 写入 paged cache
-        cache_lens = cache_manager._cache_seqlens_buffer[:batch_size].zero_()
+        # 初始化 cache 状态：cache_seqlens = position_offsets（chunked 续写 KV 起始位置）
+        cache_lens = cache_manager._cache_seqlens_buffer[:batch_size]
+        if position_offsets is not None:
+            cache_lens.copy_(position_offsets)
+        else:
+            cache_lens.zero_()
         block_table = cache_manager._block_table_buffer[:batch_size]
 
         for layer_idx in range(self.num_layers):

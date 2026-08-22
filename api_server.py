@@ -118,10 +118,14 @@ async def generate(req: GenerateReq):
     if not engine:
         raise HTTPException(503, "Model not loaded")
     start = time.time()
-    results = engine.generate([req.prompt], req.max_tokens,
-                              temperature=req.temperature, top_p=req.top_p,
-                              repetition_penalty=req.repetition_penalty, stop=req.stop)
-    text = next(iter(results.values()))
+    # 走后台 rank0_inference_loop 的 continuous batching：add_request 入队，
+    # await 完成 Future。多个并发 /generate 共享同一个 scheduler batch，
+    # 而非各自跑 engine.generate() 串行循环。
+    seq_id = engine.add_request(req.prompt, req.max_tokens,
+                                temperature=req.temperature, top_p=req.top_p,
+                                repetition_penalty=req.repetition_penalty, stop=req.stop)
+    fut = engine.new_completion_future(seq_id)
+    text = await fut
     return GenerateResp(text=text, tokens=len(text), time_ms=(time.time()-start)*1000)
 
 
@@ -129,12 +133,19 @@ async def generate(req: GenerateReq):
 async def batch_generate(req: BatchGenerateReq):
     if not engine:
         raise HTTPException(503, "Model not loaded")
-    results = engine.generate(req.prompts, req.max_tokens,
-                              temperature=req.temperature, top_p=req.top_p,
-                              repetition_penalty=req.repetition_penalty, stop=req.stop)
-    return BatchGenerateResp(results=[
-        GenerateResp(text=t, tokens=len(t), time_ms=0) for t in results.values()
-    ])
+    start = time.time()
+    # 全部入队后统一 await：所有 prompt 进同一批 continuous batching。
+    futs = []
+    for p in req.prompts:
+        sid = engine.add_request(p, req.max_tokens,
+                                 temperature=req.temperature, top_p=req.top_p,
+                                 repetition_penalty=req.repetition_penalty, stop=req.stop)
+        futs.append((p, engine.new_completion_future(sid)))
+    results = []
+    for p, fut in futs:
+        text = await fut
+        results.append(GenerateResp(text=text, tokens=len(text), time_ms=0))
+    return BatchGenerateResp(results=results)
 
 
 @app.post("/generate_stream")

@@ -22,14 +22,31 @@ class Sequence:
         self.priority = 0
         self.timestamp = time.time()  # 请求到达时间戳
         self.stop_strings = []        # 服务端停止字符串（命中即结束生成，避免 client 提前断流导致 seq 孤儿）
+        # chunked prefill：已 prefill 的 token 数（KV 已写入 cache 的前缀长度）。
+        # 0=尚未 prefill；==len(input_ids)=prefill 完成可转 decode。中间值=长 prompt 分块中。
+        self.prefill_done = 0
+        # 本 step 要 prefill 的 chunk 长度（由 scheduler 设置，engine _prefill 读取切片）。
+        # 0 表示该 seq 本 step 不参与 prefill。
+        self._chunk_len = 0
+        # 本 chunk 是否是该 prompt 的最后一块（prefill_done + _chunk_len == len(input_ids)）。
+        # 最后一块才采样首 token 并转 decode；中间块只写 KV、推进 prefill_done。
+        self._chunk_is_last = True
 
     def is_finished(self):
         return (len(self.output_ids) >= self.max_tokens or
                 (self.output_ids and self.output_ids[-1] == self.eos_token_id))
 
+    @property
+    def prefill_remaining(self) -> int:
+        """尚未 prefill 的 prompt token 数。"""
+        return len(self.input_ids) - self.prefill_done
+
     def get_next_input_ids(self):
         if self.state == "prefill":
-            return self.input_ids
+            # chunked prefill：返回本 step 的 chunk（prefill_done 起的 _chunk_len 个 token）。
+            # scheduler 已设好 _chunk_len；若为 0（未切），退化为返回剩余全部（原一次性 prefill）。
+            end = self.prefill_done + (self._chunk_len or (len(self.input_ids) - self.prefill_done))
+            return self.input_ids[self.prefill_done:end]
         elif self.state == "decode":
             return [self.output_ids[-1]]
         return None
@@ -48,6 +65,18 @@ class Sequence:
         elif self.state == "prefill":
             self.state = "decode"
 
+    def advance_prefill(self, chunk_len: int):
+        """chunked prefill 完成一个 chunk 后推进 prefill_done。
+
+        - 不产生新 token，仅记录已写入 cache 的前缀长度。
+        - prefill_done 达到 prompt 长度时，prefill 完成：本方法返回后由 scheduler
+          在下一步将 seq 推入 decode（prefill 完成的最后一步会由 prefill_runner
+          产生首 token 并调用 update_state 转 decode，所以这里只推进中间 chunk）。
+        """
+        self.prefill_done = min(self.prefill_done + chunk_len, len(self.input_ids))
+        # current_position 反映已处理位置；chunked 期间它等于 prefill_done（KV 已写到此处）
+        self.current_position = self.prefill_done
+
     def to_dict(self) -> dict:
         """
         提取推理必需的轻量字段，自动过滤不可序列化/大对象
@@ -64,6 +93,7 @@ class Sequence:
             # 状态控制字段
             "state": self.state,
             "current_position": self.current_position,
+            "prefill_done": self.prefill_done,
             # 采样参数
             "temperature": self.temperature,
             "top_p": self.top_p,
@@ -100,6 +130,7 @@ class Sequence:
         # 覆盖其他状态字段
         seq.state = data["state"]
         seq.current_position = data["current_position"]
+        seq.prefill_done = data.get("prefill_done", 0)
         seq.temperature = data["temperature"]
         seq.top_p = data["top_p"]
         seq.eos_token_id = data["eos_token_id"]

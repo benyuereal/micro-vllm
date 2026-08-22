@@ -10,7 +10,8 @@ class DecodeContext:
     - commit()：采样后调用，GPU→GPU 预填充 + D2H + 更新 seq._next_token
     """
 
-    __slots__ = ('seq_ids', 'temps', 'topp', 'rep_penalties', 'prev_tokens', 'next_tokens')
+    __slots__ = ('seq_ids', 'temps', 'topp', 'rep_penalties', 'prev_tokens', 'next_tokens',
+                 'all_greedy', 'any_rep_pen')
 
     def __init__(self):
         self.seq_ids:     Optional[List[int]]   = None
@@ -19,6 +20,9 @@ class DecodeContext:
         self.rep_penalties: Optional[torch.Tensor] = None  # [bs] float, on device
         self.prev_tokens: Optional[torch.Tensor] = None  # [bs, L] int, 历史token（-1 padding）
         self.next_tokens: Optional[torch.Tensor] = None  # [bs] int,   on device
+        # CPU 侧预判标志（避免 sampler 里 torch.any 的 GPU→CPU 同步）
+        self.all_greedy: bool = False
+        self.any_rep_pen: bool = False
 
     def prepare(self, batch, device: str, cache_manager) -> Optional[torch.Tensor]:
         """
@@ -42,15 +46,24 @@ class DecodeContext:
             return None
 
         self.seq_ids = cur_ids
-        self.temps = torch.tensor([seq.temperature for seq in batch], device=device)
+        temps_list = [seq.temperature for seq in batch]
+        rep_list = [getattr(seq, 'repetition_penalty', 1.0) for seq in batch]
+        self.temps = torch.tensor(temps_list, device=device)
         self.topp  = torch.tensor([seq.top_p for seq in batch], device=device)
-        self.rep_penalties = torch.tensor(
-            [getattr(seq, 'repetition_penalty', 1.0) for seq in batch], device=device)
-        # 历史_token（prompt + 已生成），用于 repetition penalty；-1 padding 到等长
-        hist = [list(seq.input_ids) + list(seq.output_ids) for seq in batch]
-        max_l = max(len(h) for h in hist)
-        padded = [h + [-1] * (max_l - len(h)) for h in hist]
-        self.prev_tokens = torch.tensor(padded, dtype=torch.long, device=device)
+        self.rep_penalties = torch.tensor(rep_list, device=device)
+        # CPU 侧预判（避免 sampler torch.any 同步）：全 greedy / 有 rep penalty
+        self.all_greedy = all(t <= 0 for t in temps_list)
+        self.any_rep_pen = any(r > 1.0 for r in rep_list)
+        # 历史 token（prompt + 已生成），仅当任一 seq 启用 repetition penalty 时才构造
+        # （[bs, L] tensor 构造 + H2D 开销可观，greedy/无惩罚场景跳过）。-1 padding 到等长。
+        # 用 CPU 侧 any_rep_pen 避免 rep_penalties.max() 的 GPU→CPU 同步。
+        if self.any_rep_pen:
+            hist = [list(seq.input_ids) + list(seq.output_ids) for seq in batch]
+            max_l = max(len(h) for h in hist)
+            padded = [h + [-1] * (max_l - len(h)) for h in hist]
+            self.prev_tokens = torch.tensor(padded, dtype=torch.long, device=device)
+        else:
+            self.prev_tokens = None
         return torch.tensor(
             [seq.get_next_input_ids() for seq in batch], device=device
         ).squeeze(1)
