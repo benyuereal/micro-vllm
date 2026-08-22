@@ -24,6 +24,7 @@ from kernel.rmsnorm import (
     qk_norm_inplace,
 )
 from kernel.dense_mlp import dense_swiglu
+from kernel.gemv import gemv_v2, gemv_available
 from kernel.qwen3_decode_attn import qwen3_decode_attn
 
 try:
@@ -73,26 +74,28 @@ class Qwen3Adapter(ModelAdapter):
         for block in self.blocks(model):
             attn = block.self_attn
             mlp = block.mlp
-            # Q/K/V：HF Qwen3 分立 Linear [out, in]，单卡 world_size=1 → .t() 成 [in, out]
-            w_q = attn.q_proj.weight.data.chunk(world_size, dim=0)[rank].t().contiguous()  # [hidden, q_dim]
-            w_k = attn.k_proj.weight.data.chunk(world_size, dim=0)[rank].t().contiguous()  # [hidden, kv_dim]
-            w_v = attn.v_proj.weight.data.chunk(world_size, dim=0)[rank].t().contiguous()  # [hidden, kv_dim]
-            attn._qkv_w = torch.cat([w_q, w_k, w_v], dim=1).contiguous()  # [hidden, q_dim+2*kv_dim]
+            # 权重统一存 [N,K]=[out,in]（HF 原始布局，不 .t()）：GEMV 友好（每输出行连续 K），
+            # 手写 gemv_v2 kernel 直接读；torch.matmul 路径用 W.t()（opT，裸 cuBLAS 无损）。
+            # Q/K/V：HF [out,in]，cat 沿输出维 dim=0 → [q_dim+2*kv_dim, hidden]
+            w_q = attn.q_proj.weight.data.chunk(world_size, dim=0)[rank]  # [q_dim, hidden]
+            w_k = attn.k_proj.weight.data.chunk(world_size, dim=0)[rank]  # [kv_dim, hidden]
+            w_v = attn.v_proj.weight.data.chunk(world_size, dim=0)[rank]  # [kv_dim, hidden]
+            attn._qkv_w = torch.cat([w_q, w_k, w_v], dim=0).contiguous()  # [q_dim+2*kv_dim, hidden]
             attn._qkv_b = None  # attention_bias=false
-            # O 投影
-            attn._o_w = attn.o_proj.weight.data.chunk(world_size, dim=1)[rank].t().contiguous()  # [q_dim, hidden]
+            # O 投影：[hidden, q_dim]（HF o_proj.weight = [out=hidden, in=q_dim]）
+            attn._o_w = attn.o_proj.weight.data.chunk(world_size, dim=1)[rank].contiguous()  # [hidden, q_dim]
             # QK-Norm 权重（RMSNorm on head_dim，shape [head_dim]）
             attn._q_norm_w = attn.q_norm.weight.data.clone()
             attn._k_norm_w = attn.k_norm.weight.data.clone()
             attn._q_norm_eps = getattr(attn.q_norm, "eps", None) or getattr(attn.q_norm, "variance_epsilon", cfg.rms_norm_eps)
             attn._k_norm_eps = getattr(attn.k_norm, "eps", None) or getattr(attn.k_norm, "variance_epsilon", cfg.rms_norm_eps)
 
-            # MLP: dense_swiglu 约定 gu_w = cat([up, gate]).t()（前半 up、后半 gate）。
-            # Qwen3 HF: gate_proj=gate, up_proj=up → cat([up_proj, gate_proj]) 对齐。
-            w_up = mlp.up_proj.weight.data.chunk(world_size, dim=0)[rank]
-            w_gate = mlp.gate_proj.weight.data.chunk(world_size, dim=0)[rank]
-            mlp._gu = torch.cat([w_up, w_gate], dim=0).t().contiguous()  # [hidden, 2*inter]
-            mlp._d = mlp.down_proj.weight.data.chunk(world_size, dim=1)[rank].t().contiguous()  # [hidden, inter]
+            # MLP: dense_swiglu 约定 gu_w 输出维 [up|gate] 顺序（前半 up、后半 gate）。
+            # [N,K] 布局：cat 沿输出维 dim=0 → [2*inter, hidden]，前半 up、后半 gate。
+            w_up = mlp.up_proj.weight.data.chunk(world_size, dim=0)[rank]    # [inter, hidden]
+            w_gate = mlp.gate_proj.weight.data.chunk(world_size, dim=0)[rank]  # [inter, hidden]
+            mlp._gu = torch.cat([w_up, w_gate], dim=0).contiguous()  # [2*inter, hidden]
+            mlp._d = mlp.down_proj.weight.data.chunk(world_size, dim=1)[rank].contiguous()  # [hidden, inter]
 
             # RMSNorm 权重 + eps
             block._in_ln_w = block.input_layernorm.weight.data.clone()
@@ -138,7 +141,12 @@ class Qwen3Adapter(ModelAdapter):
     def compute_qkv(self, block, h, graph, bs):
         rmsnorm_(h, block._in_ln_w, graph._h_buf[:bs], block._in_ln_eps)
         qkv_buf = graph._qkv[:bs]
-        torch.matmul(graph._h_buf[:bs], block.self_attn._qkv_w, out=qkv_buf)
+        h_in = graph._h_buf[:bs]
+        w = block.self_attn._qkv_w  # [N,K]
+        if bs == 1 and gemv_available() and os.environ.get("MICRO_GEMV_QKV", "1") != "0":
+            gemv_v2(h_in, w, out=qkv_buf)
+        else:
+            torch.matmul(h_in, w.t(), out=qkv_buf)
         self._apply_qk_norm(qkv_buf, block.self_attn, graph, bs)
         return qkv_buf
 
@@ -148,7 +156,12 @@ class Qwen3Adapter(ModelAdapter):
             graph._h_buf[:bs], graph._residual[:bs], block_next._in_ln_eps
         )
         qkv_buf = graph._qkv[:bs]
-        torch.matmul(graph._h_buf[:bs], block_next.self_attn._qkv_w, out=qkv_buf)
+        h_in = graph._h_buf[:bs]
+        w = block_next.self_attn._qkv_w  # [N,K]
+        if bs == 1 and gemv_available() and os.environ.get("MICRO_GEMV_QKV", "1") != "0":
+            gemv_v2(h_in, w, out=qkv_buf)
+        else:
+            torch.matmul(h_in, w.t(), out=qkv_buf)
         self._apply_qk_norm(qkv_buf, block_next.self_attn, graph, bs)
         return qkv_buf, graph._residual[:bs]
 
@@ -186,7 +199,11 @@ class Qwen3Adapter(ModelAdapter):
                 qkv, k_cache, v_cache, block_table, cache_lens,
                 graph.attention._cos_pool, graph.attention._sin_pool,
                 graph.num_heads, graph.kv_num_heads, graph.head_size, out=attn_pre)
-            torch.matmul(attn_pre, block.self_attn._o_w, out=out_buf)
+            w = block.self_attn._o_w  # [N,K]
+            if gemv_available():
+                gemv_v2(attn_pre, w, out=out_buf)
+            else:
+                torch.matmul(attn_pre, w.t(), out=out_buf)
             return out_buf
 
         # flash_attn GQA：q 头数(16) 可被 kv 头数(8) 整除，连续分组（head 0,1→kv0）。
@@ -203,7 +220,12 @@ class Qwen3Adapter(ModelAdapter):
             num_splits=1 if bs == 1 else (0 if bs >= 32 else max(1, 32 // max(1, bs * 4)))
         ).squeeze(1)
 
-        torch.matmul(attn.reshape(bs, -1), block.self_attn._o_w, out=out_buf)
+        attn_flat = attn.reshape(bs, -1)
+        w = block.self_attn._o_w  # [N,K]
+        if bs == 1 and gemv_available() and os.environ.get("MICRO_GEMV_O", "1") != "0":
+            gemv_v2(attn_flat, w, out=out_buf)
+        else:
+            torch.matmul(attn_flat, w.t(), out=out_buf)
         return out_buf
 
     def compute_ffn(self, block, attn_out, residual, graph, bs):
@@ -211,7 +233,8 @@ class Qwen3Adapter(ModelAdapter):
             attn_out, residual, block._post_ln_w,
             graph._h_buf[:bs], graph._residual[:bs], block._post_ln_eps
         )
-        mlp_out = dense_swiglu(graph._h_buf[:bs], block.mlp._gu, block.mlp._d)
+        # dense_swiglu：Qwen3 权重 [N,K] 布局（w_is_nk=True），M=1 decode 走 gemv_v2
+        mlp_out = dense_swiglu(graph._h_buf[:bs], block.mlp._gu, block.mlp._d, bs, w_is_nk=True)
         return mlp_out, graph._residual[:bs]
 
     # -------------------- prefill 单层钩子 --------------------
@@ -219,7 +242,7 @@ class Qwen3Adapter(ModelAdapter):
         attn = block.self_attn
         normed = rmsnorm(h, block._in_ln_w, block._in_ln_eps)
 
-        qkv = torch.matmul(normed, attn._qkv_w)            # [B, S, q_dim+2*kv_dim]
+        qkv = torch.matmul(normed, attn._qkv_w.t())            # [B, S, q_dim+2*kv_dim]（W=[N,K]）
         q_dim = graph.num_heads * graph.head_size
         kv_dim = graph.kv_num_heads * graph.head_size
         q = qkv[..., :q_dim].reshape(B, S, graph.num_heads, graph.head_size).contiguous()
@@ -256,18 +279,19 @@ class Qwen3Adapter(ModelAdapter):
             cache_seqlens=cache_lens, block_table=block_table, causal=True
         )
 
-        out = torch.matmul(attn_out.view(B, S, -1), attn._o_w)
+        out = torch.matmul(attn_out.view(B, S, -1), attn._o_w.t())
         normed, residual = rmsnorm_residual_fused(out, h, block._post_ln_w, block._post_ln_eps)
-        mlp_out = dense_swiglu(normed, block.mlp._gu, block.mlp._d)
+        mlp_out = dense_swiglu(normed, block.mlp._gu, block.mlp._d, B * S, w_is_nk=True)
         return mlp_out + residual
 
     # -------------------- buffer 分配 --------------------
     def alloc_bufs(self, model, max_bs, hidden_dim, dtype, device):
         _b = self.blocks(model)[0]
-        qkv_dim = _b.self_attn._qkv_w.shape[1]
-        o_dim = _b.self_attn._o_w.shape[1]
-        # q_dim = num_heads*head_size（o_proj 输入维 = _o_w.shape[0]）
-        q_dim = _b.self_attn._o_w.shape[0]
+        # 权重 [N,K]=[out,in] 布局：shape[0]=out(N), shape[1]=in(K=hidden)
+        qkv_dim = _b.self_attn._qkv_w.shape[0]   # q_dim+2*kv_dim
+        o_dim = _b.self_attn._o_w.shape[0]       # hidden（o_proj 输出维）
+        # q_dim = num_heads*head_size（o_proj 输入维 = _o_w.shape[1]=K）
+        q_dim = _b.self_attn._o_w.shape[1]
         return {
             "_h_buf": torch.empty((max_bs, hidden_dim), dtype=dtype, device=device),
             "_qkv": torch.empty(max_bs, qkv_dim, dtype=dtype, device=device),
