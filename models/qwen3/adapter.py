@@ -183,7 +183,9 @@ class Qwen3Adapter(ModelAdapter):
             cache_seqlens=cache_lens, block_table=block_table,
             causal=True, window_size=(-1, -1), rotary_interleaved=False,
             alibi_slopes=None,
-            num_splits=0 if bs >= 32 else max(1, 32 // max(1, bs * 4))
+            # num_splits：bs=1 短 KV 无需 split（split=1 省 split+combine 两轮 kernel）；
+            # 小 batch 按 32//bs*4 给 splits 充分并行；大 batch(≥32) 让 flash 自动选(0)。
+            num_splits=1 if bs == 1 else (0 if bs >= 32 else max(1, 32 // max(1, bs * 4)))
         ).squeeze(1)
 
         out_buf = graph._attn_out[:bs]
