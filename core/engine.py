@@ -349,7 +349,8 @@ class InferenceEngine:
                 all_greedy=dctx.all_greedy, any_rep_pen=dctx.any_rep_pen)
             dctx.commit(next_tokens_gpu, self.graph_runner._input_ids, bs, batch)
             # 把本步新 token 追加进 prev_tokens，供下一步 repetition penalty 使用
-            if dctx.prev_tokens is not None and torch.any(dctx.rep_penalties > 1.0):
+            # 用 CPU 侧 any_rep_pen 标志避免 torch.any GPU→CPU 同步
+            if dctx.prev_tokens is not None and dctx.any_rep_pen:
                 new_col = next_tokens_gpu.unsqueeze(1)              # [bs, 1]
                 dctx.prev_tokens = torch.cat(
                     [dctx.prev_tokens, new_col], dim=1)             # [bs, L+1]

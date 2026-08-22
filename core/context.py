@@ -56,7 +56,8 @@ class DecodeContext:
         self.any_rep_pen = any(r > 1.0 for r in rep_list)
         # 历史 token（prompt + 已生成），仅当任一 seq 启用 repetition penalty 时才构造
         # （[bs, L] tensor 构造 + H2D 开销可观，greedy/无惩罚场景跳过）。-1 padding 到等长。
-        if float(self.rep_penalties.max()) > 1.0:
+        # 用 CPU 侧 any_rep_pen 避免 rep_penalties.max() 的 GPU→CPU 同步。
+        if self.any_rep_pen:
             hist = [list(seq.input_ids) + list(seq.output_ids) for seq in batch]
             max_l = max(len(h) for h in hist)
             padded = [h + [-1] * (max_l - len(h)) for h in hist]
