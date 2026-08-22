@@ -50,7 +50,8 @@ class ModelGraphRunner:
         # PagedAttention 的 head 维度 = KV cache 存储维度（GQA=head_size, MLA=latent_dim）
         # rope_dim = RoPE 实际作用维度（GQA=head_size, MLA=qk_rope_head_dim）
         self.attention = PagedAttention(num_heads, head_size, kv_num_heads, device, max_batch_size,
-                                        rope_dim=self.adapter.rope_dim(model.config))
+                                        rope_dim=self.adapter.rope_dim(model.config),
+                                        rope_theta=self.adapter.rope_theta(model.config))
         self.rope = RoPE()
 
         # 初始化
