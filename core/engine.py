@@ -114,15 +114,20 @@ class InferenceEngine:
         # 捕获 CUDA Graph：两架构均 graph-friendly，一个 graph 通吃所有 ≤1024 序列。
         if self.device == "cuda":
             logger.info("Capturing CUDA Graphs...")
-            # 离散捕获到 max_batch_size：小 bs 密集（1,2,4,8,16,32），大 bs 按 2 倍（64,128,256）。
-            # replay 时向下取整到 >= 实际 bs 的最小捕获值，padding 复用已有 seq。
+            # 离散捕获到 max_batch_size：小 bs 密集（1,2,4,8,16,32），大 bs 按 1.5x 增长
+            # （48,64,96,128...），使 replay 向上取整的 padding 率 ≤1.33x（旧 2x 档在 bs=48
+            # 时 padding 到 64 浪费 33%）。replay 时向下取整到 >= 实际 bs 的最小捕获值。
             cap_sizes = [b for b in [1, 2, 4, 8, 16, 32] if b <= max_batch_size]
-            b = 64
+            b = 48
             while b <= max_batch_size:
                 cap_sizes.append(b)
-                b *= 2
+                b = (b * 3 + 1) // 2  # 1.5x 向上取整：48→72→108... 但夹到 max_batch_size
             if not cap_sizes or cap_sizes[-1] < max_batch_size:
                 cap_sizes.append(max_batch_size)
+            cap_sizes = sorted(set(cap_sizes))
+            # 同步 scheduler 的 pad 档位：decode batch 向上取整 padding 必须落到已捕获的
+            # graph batch_size，否则 graph key 不命中。单一来源 = engine 的 cap_sizes。
+            self.scheduler.batch_sizes = cap_sizes
             self.graph_runner.capture(self.cache_manager, batch_sizes=cap_sizes)
             logger.info("CUDA Graphs captured.")
             # 预热 sampler 编译路径（torch.compile reduce-overhead 首次调用每个 shape

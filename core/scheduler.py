@@ -37,8 +37,9 @@ class Scheduler:
         self.waiting_queue = deque()   # 新请求
         self.running_sequences = []    # 正在 decode 的序列
         self.finished_sequences = []   # 已完成
-        # 已捕获的 batch_size（与 engine graph capture 一致）
-        self.batch_sizes = [1, 2, 4, 8, 16, 32, 64, 128, 256]
+        # 已捕获的 batch_size（engine 初始化后会被覆写为真实 cap_sizes，保持单一来源）。
+        # 默认值仅作 fallback：小 bs 密集，大 bs 按 1.5x（padding 率 ≤1.33x）。
+        self.batch_sizes = [1, 2, 4, 8, 16, 32, 48, 64, 96, 128, 192, 256]
 
     def add_request(self, seq: Sequence):
         self.waiting_queue.append(seq)
