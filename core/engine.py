@@ -554,6 +554,43 @@ class InferenceEngine:
 
 
     def update_sequences(self, sequences: List[Sequence]):
+        # decode 稳态快速路径：无流式 client、无 stop 串、全 decode seq 时，
+        # 每步 512 seq 循环里 rank0()/dict.get()/方法调用等 ~10 个 Python 操作全是浪费
+        # （实测 0.75ms/步）。快速路径只做 append+position+finished 判断；
+        # 发现任何慢路径条件（流式/stop串/prefill seq）立即回退完整路径重跑。
+        if not self.stream_callbacks and rank0():
+            # 先扫条件再应用：中途回退完整路径时不能留下已修改的 seq（否则 double append）
+            fast = True
+            for seq in sequences:
+                if seq._next_token is None or seq.state != "decode" or seq.stop_strings:
+                    fast = False
+                    break
+            if fast:
+                finished_any = False
+                seen = set()  # decode batch 含循环复制的 pad 重复 seq，须去重（对齐完整路径 seq_dict）
+                for seq in sequences:
+                    if seq.seq_id in seen:
+                        continue
+                    seen.add(seq.seq_id)
+                    next_token = seq._next_token
+                    seq.output_ids.append(next_token)
+                    seq.full_ids.append(next_token)
+                    seq.current_position += 1
+                    if len(seq.output_ids) >= seq.max_tokens or next_token == seq.eos_token_id:
+                        seq._finished = True
+                        seq.state = "finished"
+                        finished_any = True
+                if finished_any:
+                    freed = set()  # padded batch 含重复 seq，须去重（否则 mark_finished 多次→finished 重复）
+                    for seq in sequences:
+                        if seq.state == "finished" and seq.seq_id not in freed:
+                            freed.add(seq.seq_id)
+                            self.cache_manager.free(seq.seq_id)
+                            self.scheduler.mark_finished(seq)
+                            self._complete_seq(seq)
+                    self._ctx_batch_dirty = True
+                    self._flush_stream()
+                return
         seq_dict = defaultdict(int)
         output_tokens = []
         callbacks_batch = []
