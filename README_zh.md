@@ -208,6 +208,23 @@ activated = swiglu_fused(gate_up)  # 一步完成融合计算
 - 三方均支持连续批处理，batch=64 时系统总吞吐均破万 tok/s
 - micro-vllm 定位清晰：**低并发延迟敏感场景**（手写 GEMV + 整图 Graph 摊薄 kernel 固定开销），而非高并发吞吐场景
 
+### 连续批处理 · 1000 请求（L20 / Qwen3-0.6B）
+
+1000 条混合请求（max_tokens 40-80 随机，temp=0.6，ignore_eos），全部入队后排空——真实高并发服务场景：
+
+> **硬件**：NVIDIA L20 &nbsp;|&nbsp; **模型**：Qwen3-0.6B (bf16) &nbsp;|&nbsp; **方法**：三轮稳定值
+
+| 框架 | 吞吐 (tok/s) | 步数 |
+|:-----|:-----------:|:----:|
+| **micro-vllm** | **28,110** | 130 |
+| nano-vllm | 27,638 | 153 |
+
+- micro-vllm 领先 nano-vllm **+1.7%**；bs=512 单步 GPU 时间也更低（14.33ms vs 14.36ms）
+- 近期优化：采样器去 `reduce-overhead`（省 155MB logits DtoD 拷贝，410us/步）、QK-Norm+RoPE 单 kernel 融合、`prepare()` 脏标志（稳态 CPU 0.88ms→0）、final-norm 融合
+- 单批次（同 prompt，500 out，全量 prefill+decode）：bs=32 **7,060** vs 6,465（+9.2%）、bs=64 **9,864** vs 9,332（+5.7%）
+
+压测脚本见 [`benchmark/`](benchmark/README.md)。
+
 
 
 ---

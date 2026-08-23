@@ -208,6 +208,23 @@ As concurrency rises, the bottleneck shifts from kernel launch overhead to memor
 - At bs=1 micro-vllm leads vLLM by **+5.0%**; as concurrency grows vLLM overtakes via compiled tensor-core GEMM
 - micro-vllm's positioning is clear: **low-concurrency, latency-sensitive** serving (single-user / few-user interactive scenarios), not high-concurrency aggregate throughput
 
+### Continuous Batching · 1000 Requests (L20 / Qwen3-0.6B)
+
+1000 mixed requests (max_tokens 40-80 random, temp=0.6, ignore_eos), all enqueued then drained — the realistic high-concurrency serving scenario:
+
+> **Hardware**: NVIDIA L20 &nbsp;|&nbsp; **Model**: Qwen3-0.6B (bf16) &nbsp;|&nbsp; **Method**: 3-run stable values
+
+| Framework | Throughput (tok/s) | Steps |
+|:-----|:----------------:|:-----:|
+| **micro-vllm** | **28,110** | 130 |
+| nano-vllm | 27,638 | 153 |
+
+- micro-vllm leads nano-vllm by **+1.7%**; per-step GPU time at bs=512 is also lower (14.33ms vs 14.36ms)
+- Recent wins: sampler `reduce-overhead` removal (saves a 155MB logits DtoD copy, 410us/step), QK-Norm+RoPE single-kernel fusion, `prepare()` dirty-flag (steady-state CPU 0.88ms→0), final-norm fusion
+- Single-batch (same prompt, 500 out, full prefill+decode): bs=32 **7,060** vs 6,465 (+9.2%), bs=64 **9,864** vs 9,332 (+5.7%)
+
+Benchmark scripts live in [`benchmark/`](benchmark/README.md).
+
 ---
 
 
