@@ -24,14 +24,24 @@ class DecodeContext:
         self.all_greedy: bool = False
         self.any_rep_pen: bool = False
 
-    def prepare(self, batch, device: str, cache_manager) -> Optional[torch.Tensor]:
+    def prepare(self, batch, device: str, cache_manager,
+                batch_dirty: bool = True) -> Optional[torch.Tensor]:
         """
         刷新批次状态，返回本步的 input_ids；同时驱动 cache_manager 更新缓存元数据。
 
         - batch 不变 → 复用 temps/topp/rep_penalties，返回 None
         - batch 变化 → 重建 temps/topp/rep_penalties，返回新 input_ids
         两种情况都通过 cache_manager.prepare(batch_switched) 统一处理缓存更新。
+
+        batch_dirty 由 engine 维护的脏标志（避免每步重建 512 元素 cur_ids/ctx_lens
+        列表 + 列表比较的 ~1.2ms CPU 开销）：稳定 decode 下每步 batch 成员与顺序
+        完全不变，仅当有序列完成 / prefill 新进 / append 跨 block 分配时才置脏。
         """
+        if not batch_dirty and not cache_manager._dirty_seqs:
+            # 稳态：batch 不变且无新 block 分配 → block_table 不变、seqlens 由
+            # commit GPU 原地维护，无需任何列表构建或 cache_manager 更新。
+            return None
+
         cur_ids = [seq.seq_id for seq in batch]
         batch_switched = (cur_ids != self.seq_ids)
         ctx_lens = [seq.current_position for seq in batch]

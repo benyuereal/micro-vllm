@@ -3,14 +3,14 @@ import torch
 
 class Sampler:
     def __init__(self):
-        # 编译采样函数（静态形状）
+        # 编译采样函数（静态形状）。
+        # 注意：不用 mode="reduce-overhead"——该模式会对采样器单独捕获 CUDA Graph，
+        # 需把 [bs,vocab]=155MB logits copy 进静态图输入 buffer（bs=512 时 410us/step D2D），
+        # 远大于省下的 launch 开销。默认编译模式仅融合 kernel 不捕图，与 nano-vllm 采样器一致。
         self._compiled_sample = torch.compile(
             self._sample_impl,
             fullgraph=True,
             dynamic=True,  # batch_size 固定
-            mode="reduce-overhead",
-
-            # mode="max-autotune"
         )
 
     def __call__(self, logits, temperatures, top_ps, top_k,
@@ -65,7 +65,7 @@ class Sampler:
         return torch.where(mask > 0, penalized, logits)
 
     @staticmethod
-    @torch.compile(fullgraph=True, dynamic=True, mode="reduce-overhead")
+    @torch.compile(fullgraph=True, dynamic=True)
     def _gumbel_sample(logits, temp):
         """Gumbel-max 采样（等价于按 softmax(logits/temp) 分布采样）。
         softmax(logits/temp) / Exp(1) 的 argmax ≈ 按概率采样，单 fused kernel，无 topk/sort。

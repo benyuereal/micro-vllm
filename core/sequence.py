@@ -31,10 +31,12 @@ class Sequence:
         # 本 chunk 是否是该 prompt 的最后一块（prefill_done + _chunk_len == len(input_ids)）。
         # 最后一块才采样首 token 并转 decode；中间块只写 KV、推进 prefill_done。
         self._chunk_is_last = True
+        # is_finished 缓存：output_ids 只在 update_state 增长，故在那里算一次缓存，
+        # 其余调用点（scheduler listcomp / update_sequences）直接读缓存避免重复调用。
+        self._finished = False
 
     def is_finished(self):
-        return (len(self.output_ids) >= self.max_tokens or
-                (self.output_ids and self.output_ids[-1] == self.eos_token_id))
+        return self._finished
 
     @property
     def prefill_remaining(self) -> int:
@@ -60,7 +62,10 @@ class Sequence:
         self.past_key_values = new_past_key_values
         self.current_position += 1
 
-        if self.is_finished():
+        # 缓存 is_finished（output_ids 仅此处增长）
+        self._finished = (len(self.output_ids) >= self.max_tokens or
+                          next_token == self.eos_token_id)
+        if self._finished:
             self.state = "finished"
         elif self.state == "prefill":
             self.state = "decode"
@@ -137,6 +142,7 @@ class Sequence:
         seq.priority = data["priority"]
         seq.timestamp = data["timestamp"]
         seq._next_token = data["_next_token"]
+        seq._finished = (seq.state == "finished")
 
         # 非主Rank不需要past_key_values，保持None即可，不影响推理
         return seq

@@ -5,6 +5,7 @@ from typing import Dict, List
 
 from core.paged_attention import PagedAttention
 from kernel.rmsnorm import rmsnorm_, rmsnorm_residual_gemm as rmsnorm_residual
+from kernel.rotary import compute_slot_mapping
 from .rope import RoPE
 from core.parallel_config import get_rank, get_world_size, all_reduce
 from models import build_adapter
@@ -46,6 +47,11 @@ class ModelGraphRunner:
         self.adapter = build_adapter(model.config)
         # 架构相关标量（DeepSeek MLA 的 softmax_scale 等）
         self._ds_softmax_scale = self.adapter.softmax_scale(model.config)
+        # final_norm 权重 + eps：缓存以用融合 rmsnorm_ 替代 HF 原生 RMSNorm
+        # （HF 原生 .float()/.to(dtype) 产生 2 个 D2D copy，bs=512 时 ~410us/step）。
+        _fn = self.adapter.final_norm(self.model)
+        self._final_norm_w = _fn.weight.data
+        self._final_norm_eps = getattr(_fn, "variance_epsilon", getattr(_fn, "eps", 1e-6))
 
         # 通用模块
         # PagedAttention 的 head 维度 = KV cache 存储维度（GQA=head_size, MLA=latent_dim）
@@ -77,6 +83,15 @@ class ModelGraphRunner:
         max_b = self.max_bs
         self._input_ids = torch.empty(max_b, dtype=torch.long, device=self.device)
         self._logits = torch.empty(max_b, self.vocab_size, dtype=self.dtype, device=self.device)
+        # 最终 hidden（final_norm 输出，lm_head 之前）。graph 捕获到此为止，lm_head 在
+        # replay 后 eager 跑——避免把 lm_head 的 [bs,vocab] 输出 copy 进 graph buffer
+        # （bs=512 vocab=151936 bf16 = 155MB D2D copy，profiled 409us/step，是落后 nano
+        # 的 0.41ms gap 主因之一）。hidden 仅 [bs, hidden]=1MB，copy 可忽略。
+        self._hidden = torch.empty(max_b, self.hidden_dim, dtype=self.dtype, device=self.device)
+        # 当前步各 seq 写入 paged KV 的 slot（prerope+store 路径用）。每步 decode 开头算一次。
+        self._slot_mapping = torch.empty(max_b, dtype=torch.int32, device=self.device)
+        # flash 读取长度 = cache_seqlens + 1（含当前 token）。prerope 路径专用。
+        self._flash_seqlens = torch.empty(max_b, dtype=torch.int32, device=self.device)
 
         # 由 adapter 决定 buffer 形状（不同架构需要不同的中间张量）；统一挂到 self 上。
         # 架构无关的 key（_h_buf/_qkv/_attn_out/_residual）各 adapter 必返回，
@@ -96,6 +111,16 @@ class ModelGraphRunner:
         h = embed(input_ids)
         last = self.num_layers - 1
 
+        # prerope+store 路径：每步算一次 slot_mapping（当前 token 写入位置），
+        # 供各层 store_kvcache 用。GPU 原地算，graph 友好。
+        # 同时算 flash_seqlens = cache_seqlens + 1（含当前 token，flash 读取长度）：
+        # micro 的 cache_seqlens 在 commit() 里 +1（forward 后），故 forward 内是旧值，
+        # 需 +1 让 flash 读到刚 store 的当前 token（对齐 nano：context_lens 是新长度）。
+        if getattr(self.adapter, "use_prerope_decode", False):
+            compute_slot_mapping(block_table, cache_manager._cache_seqlens_buffer[:bs],
+                                 cache_manager.block_size, self._slot_mapping[:bs])
+            torch.add(cache_manager._cache_seqlens_buffer[:bs], 1, out=self._flash_seqlens[:bs])
+
         qkv = self.adapter.compute_qkv(blocks[0], h, self, bs)
 
         for layer_idx in range(self.num_layers):
@@ -111,8 +136,10 @@ class ModelGraphRunner:
             else:
                 h = mlp_out + res
 
-        h = self.adapter.final_norm(self.model)(h)
-        return self.adapter.lm_head(self.model)(h)
+        # final_norm 用融合 rmsnorm_ 直写 _hidden（省 HF 原生 RMSNorm 的 2 个 bf16↔fp32 D2D copy，
+        # 且省 _hidden[:bs]=h 的 1MB copy）。图捕获时 _hidden[:bs] 即此 kernel 输出，无需额外赋值。
+        rmsnorm_(h, self._final_norm_w, self._hidden[:bs], self._final_norm_eps)
+        return self._hidden[:bs]  # lm_head 移出 graph（见 forward），避免 155MB logits D2D copy
 
     def capture(self, cache_manager, batch_sizes: List[int] = [1, 2, 4, 8, 16, 32]):
         if self._is_graph_ready: return
@@ -159,7 +186,7 @@ class ModelGraphRunner:
                 with torch.no_grad(): self.decode(dummy, bs, cache_manager, bt_buf)
             torch.cuda.synchronize()
             with torch.no_grad(), torch.cuda.graph(g):
-                self._logits[:bs] = self.decode(self._input_ids[:bs], bs, cache_manager, bt_buf)
+                self.decode(self._input_ids[:bs], bs, cache_manager, bt_buf)  # 直写 _hidden
             self._graphs[(bs, None)] = g
             logger.info(f"   - Batch size {bs} OK")
 
@@ -168,6 +195,15 @@ class ModelGraphRunner:
         sl_buf[:self.max_bs] = saved_sl
 
         self._is_graph_ready = True
+
+    def _compute_logits(self, bs) -> torch.Tensor:
+        """lm_head：hidden → logits。在 graph 外 eager 跑（graph 只捕获到 hidden）。
+
+        对齐 nano-vllm：lm_head 是 [bs,vocab] 大 GEMM，输出 155MB（bs=512）。
+        若把它放进 graph，需把输出 copy 进常驻 _logits buffer（D2D 155MB=409us/step）；
+        放 graph 外直接 F.linear 返回新 tensor 给 sampler，省掉这次 copy。
+        lm_head 本身是单 kernel（1.4ms），graph 外多一次 launch 开销可忽略。"""
+        return self.adapter.lm_head(self.model)(self._hidden[:bs])
 
     def forward(self, input_ids: torch.Tensor | None, cache_manager, batch_size: int) -> torch.Tensor:
         if input_ids is not None:
@@ -178,13 +214,14 @@ class ModelGraphRunner:
         # DEBUG eager 路径（不走 graph），用于定位 kernel 正确性
         if os.environ.get("MICRO_EAGER_DECODE"):
             with torch.no_grad():
-                self._logits[:batch_size] = self.decode(self._input_ids[:batch_size], batch_size,
-                                                        cache_manager, cache_manager._block_table_buffer)
-            return self._logits[:batch_size]
+                self.decode(self._input_ids[:batch_size], batch_size,
+                            cache_manager, cache_manager._block_table_buffer)  # 直写 _hidden
+            return self._compute_logits(batch_size)
 
         # 统一选 graph：(bs, None) 无架构分支、无选桶、无 .item() 同步。越界由启动期 assert 保证。
         key = (batch_size, None)
         if key not in self._graphs:
             raise RuntimeError(f"未捕获的 batch_size={batch_size}（请在 capture 的 batch_sizes 中加入）")
         self._graphs[key].replay()
-        return self._logits[:batch_size]
+        # lm_head 在 graph 外 eager 跑（省 155MB logits D2D copy）
+        return self._compute_logits(batch_size)

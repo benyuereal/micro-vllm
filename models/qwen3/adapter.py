@@ -24,6 +24,7 @@ from kernel.rmsnorm import (
 )
 from kernel.dense_mlp import dense_swiglu
 from kernel.gemv import gemv_or_matmul
+from kernel.rotary import qk_norm_rope_inplace
 
 try:
     from flash_attn import flash_attn_with_kvcache, flash_attn_varlen_func
@@ -36,6 +37,10 @@ from core.cache_manager import store_kvcache
 
 class Qwen3Adapter(ModelAdapter):
     model_type = "qwen3"
+
+    # decode attention 路径：True=prerope+store+pure-flash（对齐 nano，省 50us/层）；
+    # False=flash internal-rotary+k=/v=（旧逻辑 fallback）。
+    use_prerope_decode = True
 
     # -------------------- 元信息 --------------------
     def supports_chunked_prefill(self, cfg) -> bool:
@@ -102,10 +107,13 @@ class Qwen3Adapter(ModelAdapter):
 
     # -------------------- decode 单层钩子 --------------------
     def _project_qkv(self, attn, graph, bs):
-        """normed h（graph._h_buf[:bs]）→ QKV 投影 → QK-Norm，写 graph._qkv[:bs]。"""
+        """normed h（graph._h_buf[:bs]）→ QKV 投影，写 graph._qkv[:bs]。
+        QK-Norm：prerope 路径在 attention 里与 RoPE 融合（qk_norm_rope_inplace），
+        internal-rotary 路径在此处单独做（_apply_qk_norm）。"""
         qkv_buf = graph._qkv[:bs]
         gemv_or_matmul(graph._h_buf[:bs], attn._qkv_w, qkv_buf, "MICRO_GEMV_QKV")
-        self._apply_qk_norm(qkv_buf, attn, graph, bs)
+        if not getattr(self, "use_prerope_decode", False):
+            self._apply_qk_norm(qkv_buf, attn, graph, bs)
         return qkv_buf
 
     def compute_qkv(self, block, h, graph, bs):
@@ -144,19 +152,42 @@ class Qwen3Adapter(ModelAdapter):
         cache_lens = cache_manager._cache_seqlens_buffer[:bs]
         out_buf = graph._attn_out[:bs]
 
-        # flash_attn GQA：q 头数(16) 可被 kv 头数(8) 整除，连续分组（head 0,1→kv0）。
-        # RoPE 由 flash_attn 按 cache_seqlens 内部旋转（rotary_cos/sin half-split, interleaved=False）。
-        attn = flash_attn_with_kvcache(
-            q=q.unsqueeze(1), k_cache=k_cache, v_cache=v_cache,
-            k=k.unsqueeze(1), v=v.unsqueeze(1),
-            rotary_cos=graph.attention._cos_pool, rotary_sin=graph.attention._sin_pool,
-            cache_seqlens=cache_lens, block_table=block_table,
-            causal=True, window_size=(-1, -1), rotary_interleaved=False,
-            alibi_slopes=None,
-            # num_splits：bs=1 短 KV 无需 split（split=1 省 split+combine 两轮 kernel）；
-            # 小 batch 按 32//bs*4 给 splits 充分并行；大 batch(≥32) 让 flash 自动选(0)。
-            num_splits=1 if bs == 1 else (0 if bs >= 32 else max(1, 32 // max(1, bs * 4)))
-        ).squeeze(1)
+        # prerope+store 路径（对齐 nano-vllm，省 50us/层）：flash 前显式旋转 q/k、
+        # store k/v，flash 跑纯 attention（无 rotary_cos/sin、无 k=/v=）。
+        # internal-rotary 路径保留为 fallback（旧逻辑）。
+        if getattr(self, "use_prerope_decode", False):
+            # QK-Norm + RoPE 融合（prerope 路径）：对 q 段、k 段原地 norm+rotate，
+            # 替代分离的 _apply_qk_norm + apply_rope_decode（省中间读+写）。
+            sa = block.self_attn
+            qk_norm_rope_inplace(qkv, bs, 0, graph.num_heads, graph.head_size,
+                                 sa._q_norm_w, graph.attention._cos_pool,
+                                 graph.attention._sin_pool, cache_lens, sa._q_norm_eps)
+            qk_norm_rope_inplace(qkv, bs, q_dim, graph.kv_num_heads, graph.head_size,
+                                 sa._k_norm_w, graph.attention._cos_pool,
+                                 graph.attention._sin_pool, cache_lens, sa._k_norm_eps)
+            # q/k 视图已在上面建好（共享 qkv 存储），融合 kernel 原地改了 q/k，视图随之更新
+            store_kvcache(k, v, k_cache, v_cache, graph._slot_mapping[:bs])
+            # flash 读 cache_seqlens+1（含刚 store 的当前 token）
+            attn = flash_attn_with_kvcache(
+                q=q.unsqueeze(1), k_cache=k_cache, v_cache=v_cache,
+                cache_seqlens=graph._flash_seqlens[:bs], block_table=block_table,
+                causal=True, window_size=(-1, -1), alibi_slopes=None,
+                num_splits=1 if bs == 1 else (0 if bs >= 32 else max(1, 32 // max(1, bs * 4)))
+            ).squeeze(1)
+        else:
+            # flash_attn GQA：q 头数(16) 可被 kv 头数(8) 整除，连续分组（head 0,1→kv0）。
+            # RoPE 由 flash_attn 按 cache_seqlens 内部旋转（rotary_cos/sin half-split, interleaved=False）。
+            attn = flash_attn_with_kvcache(
+                q=q.unsqueeze(1), k_cache=k_cache, v_cache=v_cache,
+                k=k.unsqueeze(1), v=v.unsqueeze(1),
+                rotary_cos=graph.attention._cos_pool, rotary_sin=graph.attention._sin_pool,
+                cache_seqlens=cache_lens, block_table=block_table,
+                causal=True, window_size=(-1, -1), rotary_interleaved=False,
+                alibi_slopes=None,
+                # num_splits：bs=1 短 KV 无需 split（split=1 省 split+combine 两轮 kernel）；
+                # 小 batch 按 32//bs*4 给 splits 充分并行；大 batch(≥32) 让 flash 自动选(0)。
+                num_splits=1 if bs == 1 else (0 if bs >= 32 else max(1, 32 // max(1, bs * 4)))
+            ).squeeze(1)
 
         return gemv_or_matmul(attn.reshape(bs, -1), block.self_attn._o_w, out_buf, "MICRO_GEMV_O")
 

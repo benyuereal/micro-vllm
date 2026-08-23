@@ -17,8 +17,40 @@ DeepSeek MoE expert 权重 _e_gu 另用 [gate|up]，TileLang moe kernel 内部�
 import os
 import torch
 import torch.nn.functional as F
+import triton
+import triton.language as tl
 
 from kernel.gemv import gemv_or_matmul
+
+
+@triton.jit
+def _silu_mul_kernel(GU, OUT, M, INTER, stride_gu_m, stride_out_m,
+                     BLOCK: tl.constexpr):
+    """融合 silu(gate)*up：读 gate_up[:, :inter]=up, gate_up[:, inter:]=gate，
+    写 out[:, :inter] = silu(gate)*up。一个 program 处理一行的一块。"""
+    row = tl.program_id(0)
+    col = tl.program_id(1)
+    offs = col * BLOCK + tl.arange(0, BLOCK)
+    mask = offs < INTER
+    up = tl.load(GU + row * stride_gu_m + offs, mask=mask, other=0.0)
+    gate = tl.load(GU + row * stride_gu_m + INTER + offs, mask=mask, other=0.0)
+    # silu(x) = x * sigmoid(x)；bf16 下 tl.sigmoid 需 fp32，提升后乘 up 再回 bf16
+    gate_f = gate.to(tl.float32)
+    act = (gate_f * tl.sigmoid(gate_f) * up.to(tl.float32)).to(OUT.dtype.element_ty)
+    tl.store(OUT + row * stride_out_m + offs, act, mask=mask)
+
+
+def silu_mul_fused(gate_up: torch.Tensor, M: int, inter: int) -> torch.Tensor:
+    """gate_up [M, 2*inter]（前半 up、后半 gate）→ act [M, inter] = silu(gate)*up。
+
+    融合 silu+mul 单 kernel，替代 F.silu(gate)*up 的两个 elementwise kernel
+    （profiled 5.9ms vs nano 融合 2.3ms/20 步，省 ~0.18ms/step）。"""
+    out = torch.empty(M, inter, dtype=gate_up.dtype, device=gate_up.device)
+    BLOCK = 1024
+    grid = (M, triton.cdiv(inter, BLOCK))
+    _silu_mul_kernel[grid](gate_up, out, M, inter,
+                           gate_up.stride(0), out.stride(0), BLOCK=BLOCK)
+    return out
 
 
 def dense_swiglu(x, gu_w, d_w, m=None, w_is_nk=False):
@@ -42,8 +74,8 @@ def dense_swiglu(x, gu_w, d_w, m=None, w_is_nk=False):
         M = m if m is not None else x2.shape[0]
         gate_up = torch.empty(M, gu_w.shape[0], dtype=x.dtype, device=x.device)
         gemv_or_matmul(x2, gu_w, gate_up, "MICRO_GEMV_FFN")
-        up, gate = gate_up.chunk(2, dim=-1)
-        act = F.silu(gate) * up
+        inter = gu_w.shape[0] // 2
+        act = silu_mul_fused(gate_up, M, inter)
         out = torch.empty(M, d_w.shape[0], dtype=x.dtype, device=x.device)
         out = gemv_or_matmul(act, d_w, out, "MICRO_GEMV_FFN")
         return out.reshape(*lead, d_w.shape[0]) if len(lead) > 1 else out

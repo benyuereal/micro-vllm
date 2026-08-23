@@ -115,6 +115,10 @@ class InferenceEngine:
         self.sampler = Sampler()
         self._decode_ctx = DecodeContext()
         self._stream_event: Optional[StreamEvent] = None
+        # decode batch 脏标志：True 时 prepare() 重建元数据。稳定 decode 每步 batch
+        # 成员/顺序不变，仅当有序列完成 / prefill 新进 / append 跨 block 分配时置脏，
+        # 避免每步构建 512 元素列表 + 比较的 ~1.2ms CPU 开销（见 DecodeContext.prepare）。
+        self._ctx_batch_dirty = True
         
         # 状态
         # eos 兜底：Qwen 旧版 tokenizer 的 eos_token_id 可能为 None，
@@ -131,16 +135,12 @@ class InferenceEngine:
 
         # 捕获 CUDA Graph：两架构均 graph-friendly，一个 graph 通吃所有 ≤1024 序列。
         logger.info("Capturing CUDA Graphs...")
-        # 离散捕获到 max_batch_size：小 bs 密集（1,2,4,8,16,32），大 bs 按 1.5x 增长
-        # （48,64,96,128...），使 replay 向上取整的 padding 率 ≤1.33x（旧 2x 档在 bs=48
-        # 时 padding 到 64 浪费 33%）。replay 时向下取整到 >= 实际 bs 的最小捕获值。
-        cap_sizes = [b for b in [1, 2, 4, 8, 16, 32] if b <= max_batch_size]
-        b = 48
-        while b <= max_batch_size:
-            cap_sizes.append(b)
-            b = (b * 3 + 1) // 2  # 1.5x 向上取整：48→72→108... 但夹到 max_batch_size
-        if not cap_sizes or cap_sizes[-1] < max_batch_size:
-            cap_sizes.append(max_batch_size)
+        # 细粒度桶（对齐 nano-vllm）：1,2,4,8 + 16 步等差到 max_batch_size。
+        # padding 率恒 ≤15/bs（bs=256 时最多 pad 到 272，约 6%），变长 batch 收尾无大浪费。
+        # 旧 1.5x 粗桶（48,72,108,162,243,365,512）在 bs=256 时 pad 到 365 浪费 42%、
+        # bs=388 时 pad 到 512 浪费 32%，是 1000 请求吞吐落后 nano 的主因之一。
+        cap_sizes = [b for b in [1, 2, 4, 8] if b <= max_batch_size]
+        cap_sizes += list(range(16, max_batch_size + 1, 16))
         cap_sizes = sorted(set(cap_sizes))
         # 同步 scheduler 的 pad 档位：decode batch 向上取整 padding 必须落到已捕获的
         # graph batch_size，否则 graph key 不命中。单一来源 = engine 的 cap_sizes。
@@ -333,6 +333,8 @@ class InferenceEngine:
         if not ctx.sequences: return False
         if ctx.batch_type == "prefill":
             self._prefill(ctx.sequences)
+            # prefill 产出新 seq 进入 decode → 下一步 decode batch 成员变化，置脏
+            self._ctx_batch_dirty = True
         else:
             self._decode(ctx)
         return True
@@ -347,7 +349,12 @@ class InferenceEngine:
             if seq.seq_id not in seen:
                 self.cache_manager.append(seq.seq_id)
                 seen.add(seq.seq_id)
-        input_ids = self._decode_ctx.prepare(batch, self.device, self.cache_manager)
+        # append 跨 block 边界分配新块时标记 _dirty_seqs → 下一步 prepare 需重建 block_table
+        if self.cache_manager._dirty_seqs:
+            self._ctx_batch_dirty = True
+        input_ids = self._decode_ctx.prepare(batch, self.device, self.cache_manager,
+                                             batch_dirty=self._ctx_batch_dirty)
+        self._ctx_batch_dirty = False  # 本步已处理；后续 append/finished 会按需重新置脏
         ctx.logits = self.graph_runner.forward(input_ids, self.cache_manager, batch_size)
 
     @torch.inference_mode()
@@ -598,6 +605,7 @@ class InferenceEngine:
                         seq.current_position = len(seq.input_ids) + len(seq.output_ids)
                     seq.state = "finished"
                     seq._stop_hit = True
+                    seq._finished = True
 
             if rank0():
                 cb = stream_callbacks.get(seq_id)
@@ -620,6 +628,7 @@ class InferenceEngine:
             # 下一轮 get_next_batch 不再包含它 → collect() 的 _flush_stream 不会执行，
             # 本步暂存的最后一批 token 会丢失。这里立即冲刷，保证流式 client 收到完整输出。
             if finished_any:
+                self._ctx_batch_dirty = True  # batch 成员变化 → 下一步 prepare 重建
                 self._flush_stream()
 
     def _flush_stream(self):
