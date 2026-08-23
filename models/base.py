@@ -67,6 +67,12 @@ class ModelAdapter(ABC):
         用 flash_attn_func（自包含，不读 cache 前缀）暂不支持。默认 False（保守）。"""
         return False
 
+    def context_length_limit(self, cfg) -> int:
+        """该架构支持的上下文长度硬上限（cos/sin 表覆盖范围 / kernel 静态 shape 约束）。
+        返回 None 表示无架构侧限制，由 engine 构造参数 max_context_length 决定。
+        MLA 等 max_len 进静态 shape 的架构 override 为固定值（如 1024）。"""
+        return None
+
     # ------------------------------------------------------------------
     # 权重预处理
     # ------------------------------------------------------------------

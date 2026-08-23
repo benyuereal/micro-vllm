@@ -82,6 +82,12 @@ class DeepSeekAdapter(ModelAdapter):
         # DeepSeek 用 MoE，dense 层的 intermediate_size；MoE expert 尺寸单独处理
         return getattr(cfg, "intermediate_size", cfg.moe_intermediate_size) // world_size
 
+    def context_length_limit(self, cfg):
+        # MLA decode kernel 把 max_len 进静态 shape（block_table 列数 / cos_k 行数），
+        # cos/sin 表只覆盖 1024。即使 engine max_context_length 设更大，DeepSeek 仍钳到 1024。
+        self._cfg(cfg)  # 确保 _max_pos 已初始化（cache_dims 通常已先调用，此处幂等保险）
+        return self._max_pos
+
     def rope_dim(self, cfg):
         self._cfg(cfg)
         return self._qk_rope

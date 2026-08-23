@@ -51,7 +51,8 @@ class InferenceEngine:
     # 预设配置 (简化为仅保留关键逻辑，硬编码CUDA最优实践)
     DEFAULT_BLOCK_SIZE = 256
 
-    def __init__(self, model_path: str, max_batch_size: int = 256, max_prefill_tokens: int = 2048):
+    def __init__(self, model_path: str, max_batch_size: int = 256, max_prefill_tokens: int = 2048,
+                 max_context_length: int = 1024):
         self._init_distributed()
         self._init_model(model_path)
         self._init_config()
@@ -59,12 +60,15 @@ class InferenceEngine:
         # 核心组件初始化
         self.device, self.dtype = self._auto_configure()
 
-        # 序列长度上限：两架构统一固定 1024。max_tokens 决定 block_table 列数
-        # (max_seq_blocks=4)，与 DeepSeek attention 的 arange(1024) 精确对齐。总长
-        # prompt+gen 由 add_request 钳到 ≤1024。>1024 长序列留待 tile op 恢复。
-        self.max_position = 1024
+        # 序列长度上限：可配（构造参数 max_context_length）。DeepSeek MLA decode kernel
+        # 把 max_len 进静态 shape（block_table 列数 / cos_k 行数），故 DeepSeek 固定 1024
+        #（见 model_graph._deepseek_fixed_maxlen）；Qwen3 用 flash_attn_with_kvcache，
+        # seq_len 不进 kernel shape（cache_seqlens per-seq 截断），可放开到任意配置值。
+        # 架构侧硬上限（adapter.context_length_limit）优先：DeepSeek 钳到 1024，
+        # Qwen3 返回 None（无架构限制，取配置值）。
+        arch_limit = self.adapter.context_length_limit(self.config)
+        self.max_position = min(max_context_length, arch_limit) if arch_limit else max_context_length
         # n_blocks 动态算：max_batch_size 序列各占满 max_position + prefill 余量。
-        # 每序列最多 ceil(1024/256)=4 block。余量给 prefill 临时分配（同长度组一次性 prefill）。
         max_seq_blocks = (self.max_position + self.DEFAULT_BLOCK_SIZE - 1) // self.DEFAULT_BLOCK_SIZE
         n_blocks = max_batch_size * max_seq_blocks + max_batch_size  # +1 block/序列余量
         self.cache_manager = KVCacheManager(
@@ -77,14 +81,16 @@ class InferenceEngine:
             model=self.model, num_layers=self.num_layers, num_heads=self.num_heads,
             head_size=self.head_size, kv_num_heads=self.kv_num_heads,
             hidden_dim=self.config.hidden_size, intermediate_size=self.intermediate_size,
-            device=self.device, max_batch_size=max_batch_size, dtype=self.dtype
+            device=self.device, max_batch_size=max_batch_size, dtype=self.dtype,
+            max_context_length=self.max_position
         )
 
         self.prefill_runner = ModelPrefillRunner(
             model=self.model, num_layers=self.num_layers, num_heads=self.num_heads,
             head_size=self.head_size, kv_num_heads=self.kv_num_heads,
             hidden_dim=self.config.hidden_size, intermediate_size=self.intermediate_size,
-            device=self.device, max_batch_size=max_batch_size, dtype=self.dtype
+            device=self.device, max_batch_size=max_batch_size, dtype=self.dtype,
+            max_context_length=self.max_position
         )
         self.scheduler = Scheduler(max_batch_size, max_prefill_tokens, self.tokenizer)
         # chunked prefill 仅对支持的架构启用（Qwen3 GQA+with_kvcache），默认 chunk=512。
@@ -267,13 +273,13 @@ class InferenceEngine:
     def add_request(self, prompt: str, max_tokens: int = 128,
                     temperature: float = 0.7, top_p: float = 0.9,
                     repetition_penalty: float = 1.0, stop=None) -> int:
-        # 固定 1024 上下文：钳 prompt+gen ≤ max_position，否则 decode 越界。
+        # 上下文上限：钳 prompt+gen ≤ max_position（可配，DeepSeek 钳到 1024）。
         prompt_ids = self.tokenizer.encode(prompt, add_special_tokens=True)
         cap = self.max_position
         if len(prompt_ids) > cap:
             prompt_ids = prompt_ids[:cap]
             prompt = self.tokenizer.decode(prompt_ids, skip_special_tokens=True)
-            logger.warning(f"固定 {cap} 上下文：prompt 过长({len(prompt_ids)}>{cap})，已截断")
+            logger.warning(f"上下文上限 {cap}：prompt 过长({len(prompt_ids)}>{cap})，已截断")
         max_tokens = max(1, min(max_tokens, cap - len(prompt_ids)))
         seq_id = hash(prompt + str(time.time())) % (2 ** 32)
         seq = Sequence(seq_id, prompt, self.tokenizer, max_tokens)

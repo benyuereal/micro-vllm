@@ -32,13 +32,16 @@ class PagedAttention(nn.Module):
         if device != "auto":
             self.device = torch.device(device)
 
-        # 预计算 RoPE cos/sin pool（half-split：取前 dim//2 列）
+        # 预计算 RoPE cos/sin pool（half-split：取前 dim//2 列）。
+        # 关键：inv_freq / freqs 用 fp32 计算再转 bf16 存储。若全程 bf16 计算，base**(i/dim)
+        # 在 bf16 下误差随位置累积（pos=400 时 cos 偏差达 0.33），长上下文下翻转 argmax
+        # 导致输出退化。fp32 计算仅余 bf16 存储精度（~0.002），长上下文正确。
         max_kv_capacity = max_blocks * 256
         dim = self.rope_dim
         base = float(rope_theta)
-        inv_freq = 1.0 / (base ** (torch.arange(0, dim, 2, device=self.device).to(torch.bfloat16) / dim))
-        t = torch.arange(max_kv_capacity, device=self.device, dtype=inv_freq.dtype)
+        inv_freq = 1.0 / (base ** (torch.arange(0, dim, 2, device=self.device, dtype=torch.float32) / dim))
+        t = torch.arange(max_kv_capacity, device=self.device, dtype=torch.float32)
         freqs = torch.einsum("i,j->ij", t, inv_freq)
         emb = torch.cat((freqs, freqs), dim=-1)
-        self._cos_pool = emb.cos()[:max_kv_capacity, :dim // 2].contiguous()
-        self._sin_pool = emb.sin()[:max_kv_capacity, :dim // 2].contiguous()
+        self._cos_pool = emb.cos()[:max_kv_capacity, :dim // 2].to(torch.bfloat16).contiguous()
+        self._sin_pool = emb.sin()[:max_kv_capacity, :dim // 2].to(torch.bfloat16).contiguous()

@@ -25,7 +25,7 @@ class ModelGraphRunner:
     def __init__(self, model, num_layers: int, num_heads: int, head_size: int,
                  kv_num_heads: int, hidden_dim: int, intermediate_size: int,
                  device: str, max_batch_size: int = 32, dtype: torch.dtype = torch.bfloat16,
-                 top_k: int = 1000):
+                 top_k: int = 1000, max_context_length: int = 1024):
         self.model = model
         self.num_layers = num_layers
         self.rank, self.world_size = get_rank(), get_world_size()
@@ -50,7 +50,11 @@ class ModelGraphRunner:
         # 通用模块
         # PagedAttention 的 head 维度 = KV cache 存储维度（GQA=head_size, MLA=latent_dim）
         # rope_dim = RoPE 实际作用维度（GQA=head_size, MLA=qk_rope_head_dim）
+        # cos/sin pool 长度需覆盖 max_context_length（Qwen3 用此池做 RoPE）。
+        block_size = 256
+        max_blocks_for_pool = (max_context_length + block_size - 1) // block_size
         self.attention = PagedAttention(num_heads, head_size, kv_num_heads, device, max_batch_size,
+                                        max_blocks=max_blocks_for_pool,
                                         rope_dim=self.adapter.rope_dim(model.config),
                                         rope_theta=self.adapter.rope_theta(model.config))
         self.rope = RoPE()
