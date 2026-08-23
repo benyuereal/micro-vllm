@@ -74,20 +74,13 @@ class ModelGraphRunner:
         self._input_ids = torch.empty(max_b, dtype=torch.long, device=self.device)
         self._logits = torch.empty(max_b, self.vocab_size, dtype=self.dtype, device=self.device)
 
-        # 由 adapter 决定 buffer 形状（不同架构需要不同的中间张量）
+        # 由 adapter 决定 buffer 形状（不同架构需要不同的中间张量）；统一挂到 self 上。
+        # 架构无关的 key（_h_buf/_qkv/_attn_out/_residual）各 adapter 必返回，
+        # 架构专属的（_x16/_absorb_idx/_cos_full/_sin_full，仅 DeepSeek）缺省为 None。
         bufs = self.adapter.alloc_bufs(self.model, max_b, self.hidden_dim, self.dtype, self.device)
-        self._h_buf = bufs["_h_buf"]
-        self._qkv = bufs.get("_qkv")  # Qwen 用；DeepSeek 不用（q_proj 融进 pre-MLA kernel）
-        self._attn_out = bufs["_attn_out"]
-        self._residual = bufs["_residual"]
-        # Qwen3 TileLang decode attn 输出（o_proj 前）；其他架构不用（None）
-        self._attn_pre = bufs.get("_attn_pre")
-        # DeepSeek pre-MLA 全融合用：M=16 pad 的 normed x 与 absorb head 索引（Qwen 无，为 None）
-        self._x16 = bufs.get("_x16")
-        self._absorb_idx = bufs.get("_absorb_idx")
-        # DeepSeek RoPE cos/sin 全宽表（alloc_bufs 预算，Qwen 无，为 None）
-        self._cos_full = bufs.get("_cos_full")
-        self._sin_full = bufs.get("_sin_full")
+        for name in ("_h_buf", "_qkv", "_attn_out", "_residual",
+                     "_x16", "_absorb_idx", "_cos_full", "_sin_full"):
+            setattr(self, name, bufs.get(name))
 
     # ==========================================
     # 主推理逻辑
