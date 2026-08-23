@@ -24,9 +24,10 @@ from kernel.moe import moe_decode
 from kernel.pre_mla import get_premla_persistent_kernel
 
 try:
-    from flash_attn import flash_attn_func
+    from flash_attn import flash_attn_func, flash_attn_varlen_func
 except ImportError:
     flash_attn_func = None
+    flash_attn_varlen_func = None
 
 
 def _yarn_mscale(scale, mscale):
@@ -81,6 +82,12 @@ class DeepSeekAdapter(ModelAdapter):
     def intermediate_size(self, cfg, world_size):
         # DeepSeek 用 MoE，dense 层的 intermediate_size；MoE expert 尺寸单独处理
         return getattr(cfg, "intermediate_size", cfg.moe_intermediate_size) // world_size
+
+    def supports_varlen_prefill(self, cfg) -> bool:
+        # MLA prefill 用 flash_attn_varlen_func（cu_seqlens 掩码各 seq 边界），k/v 是本步算出
+        # 的完整 prompt（自包含，不读 cache 前缀），latent 另按 slot_mapping 写 paged cache。
+        # 故支持同 batch 内不同 seq 长度变长拼接；但不支持 chunked 续写（见 supports_chunked_prefill）。
+        return True
 
     def context_length_limit(self, cfg):
         # MLA decode kernel 把 max_len 进静态 shape（block_table 列数 / cos_k 行数），
@@ -372,42 +379,45 @@ class DeepSeekAdapter(ModelAdapter):
             mlp_out = dense_swiglu(x, mlp._dense_gu, mlp._dense_d)
         return mlp_out, graph._residual[:bs]
 
-    # ==================== prefill 单层钩子 ====================
-    def prefill_layer(self, block, h, layer_idx, B, S, graph, cache_manager, block_table):
+    # ==================== prefill 单层钩子（变长：h=[total_tokens, hidden]）====================
+    def prefill_layer(self, block, h, layer_idx, graph, cache_manager, meta):
         # input_layernorm
         x = rmsnorm(h, block._in_ln_w, block._in_ln_eps)
         attn = block.self_attn
-        q = F.linear(x, attn._q_w, attn._q_b).view(B, S, self._num_heads, self._q_head)
+        T = x.shape[0]                                       # total_tokens
+        q = F.linear(x, attn._q_w, attn._q_b).view(T, self._num_heads, self._q_head)
         kva = F.linear(x, attn._kva_w, attn._kva_b)
         compressed_kv, k_pe = kva.split([self._kv_lora_rank, self._qk_rope], dim=-1)
-        # 写入 paged cache: latent [B, S, 576]
-        latent = torch.cat([compressed_kv, k_pe], dim=-1).view(B, S, 1, self._latent_dim)
-        # 构造 slot_mapping: 每个 token 在其 seq 的连续位置 0..S-1
-        # block_table 已建好，slot = block_id * block_size + offset
-        slots = self._build_prefill_slots(cache_manager, block_table, B, S)
-        self._store_latent(latent.reshape(B * S, 1, self._latent_dim),
+        # 写入 paged cache: latent [total, 576]（按 meta.slot_mapping scatter）
+        latent = torch.cat([compressed_kv, k_pe], dim=-1).view(T, 1, self._latent_dim)
+        self._store_latent(latent,
                            cache_manager.k_caches[layer_idx], cache_manager.v_caches[layer_idx],
-                           slots, cache_manager.block_size)
+                           meta.slot_mapping, cache_manager.block_size)
 
-        # attention: 展开 + RoPE + flash_attn_func (varlen-like: 每 seq 长度 S)
+        # attention: 展开 + RoPE（按 per-token position_ids）+ flash_attn_varlen_func
         q_nope, q_pe = q.split([self._qk_nope, self._qk_rope], dim=-1)
         cos_full, sin_full = self._rope_tables(graph)
-        cos = cos_full[:S]                                # [S, qk_rope] 全宽
-        sin = sin_full[:S]
-        q_pe = self._apply_rope(q_pe, cos.unsqueeze(0).unsqueeze(2), sin.unsqueeze(0).unsqueeze(2))
-        # k_pe: [B, S, qr] (3D，单 head) → cos 广播为 [1, S, qr]
-        k_pe_rot = self._apply_rope(k_pe, cos.unsqueeze(0), sin.unsqueeze(0))
+        # per-token 位置 gather cos/sin：[total, qk_rope]
+        pos = meta.position_ids.long()
+        cos = cos_full[pos]                                  # [total, qk_rope]
+        sin = sin_full[pos]
+        q_pe = self._apply_rope(q_pe, cos.unsqueeze(1), sin.unsqueeze(1))    # [total, H, qr]
+        k_pe_rot = self._apply_rope(k_pe, cos, sin)                            # [total, qr]
         # kv_b_proj 展开
-        ckv = rmsnorm(compressed_kv.reshape(-1, self._kv_lora_rank), attn._kva_ln_w, attn._kva_ln_eps)
-        kv = F.linear(ckv, attn._kvb_w).view(B, S, self._num_heads, self._qk_nope + self._v_head)
+        ckv = rmsnorm(compressed_kv, attn._kva_ln_w, attn._kva_ln_eps)
+        kv = F.linear(ckv, attn._kvb_w).view(T, self._num_heads, self._qk_nope + self._v_head)
         k_nope, v = kv.split([self._qk_nope, self._v_head], dim=-1)
-        q_full = torch.cat([q_nope, q_pe], dim=-1)       # [B, S, H, 192]
-        k_full = torch.cat([k_nope, k_pe_rot.unsqueeze(2).expand(-1, -1, self._num_heads, -1)], dim=-1)
-        # flash: [B, S, H, D]
+        q_full = torch.cat([q_nope, q_pe], dim=-1)          # [total, H, q_head]
+        k_full = torch.cat([k_nope, k_pe_rot.unsqueeze(1).expand(-1, self._num_heads, -1)], dim=-1)
+        # flash varlen：cu_seqlens 掩码各 seq 边界（DeepSeek prefill 自包含，k/v=本步算出，不读 cache 前缀）
         v_pad = torch.nn.functional.pad(v, (0, self._q_head - self._v_head))
         scale = graph._ds_softmax_scale
-        attn_out = flash_attn_func(q_full, k_full, v_pad, softmax_scale=scale, causal=True)
-        attn_out = attn_out[..., :self._v_head].reshape(B, S, self._num_heads * self._v_head)
+        attn_out = flash_attn_varlen_func(
+            q_full, k_full, v_pad,
+            cu_seqlens_q=meta.cu_seqlens_q, cu_seqlens_k=meta.cu_seqlens_k,
+            max_seqlen_q=meta.max_seqlen_q, max_seqlen_k=meta.max_seqlen_k,
+            softmax_scale=scale, causal=True)
+        attn_out = attn_out[..., :self._v_head].reshape(T, self._num_heads * self._v_head)
         out = F.linear(attn_out, attn._o_w, attn._o_b)
 
         # FFN
@@ -415,24 +425,11 @@ class DeepSeekAdapter(ModelAdapter):
         h2 = rmsnorm(out + res, block._post_ln_w, block._post_ln_eps)
         mlp = block.mlp
         if mlp._is_moe:
-            mlp_out = moe_forward(h2.reshape(-1, self._hidden), mlp._gate_w, mlp._e_gu, mlp._e_d,
+            mlp_out = moe_forward(h2, mlp._gate_w, mlp._e_gu, mlp._e_d,
                                   self._top_k, self._n_experts, mlp._shared_gu, mlp._shared_d)
-            mlp_out = mlp_out.view(B, S, self._hidden)
         else:
             mlp_out = dense_swiglu(h2, mlp._dense_gu, mlp._dense_d)
         return mlp_out + out + res
-
-    def _build_prefill_slots(self, cache_manager, block_table, B, S):
-        """构造 prefill 的 slot_mapping [B*S]：token (b, t) → block_table[b, t//block_size]*block_size + t%block_size"""
-        bs = cache_manager.block_size
-        bt = block_table[:B].long()                      # [B, max_seq_blocks]
-        n_blocks = (S + bs - 1) // bs
-        # 每 token 的 block 索引和 offset
-        t = torch.arange(S, device=bt.device)
-        block_idx = t // bs                              # [S]
-        offset = t % bs
-        slot = bt[:, :n_blocks][:, block_idx] * bs + offset  # [B, S]
-        return slot.reshape(-1).to(torch.int32)
 
     # ==================== buffer 分配 ====================
     def alloc_bufs(self, model, max_bs, hidden_dim, dtype, device):

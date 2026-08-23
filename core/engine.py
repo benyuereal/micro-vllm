@@ -51,7 +51,7 @@ class InferenceEngine:
     # 预设配置 (简化为仅保留关键逻辑，硬编码CUDA最优实践)
     DEFAULT_BLOCK_SIZE = 256
 
-    def __init__(self, model_path: str, max_batch_size: int = 256, max_prefill_tokens: int = 2048,
+    def __init__(self, model_path: str, max_batch_size: int = 512, max_prefill_tokens: int = 8192,
                  max_context_length: int = 1024):
         self._init_distributed()
         self._init_model(model_path)
@@ -68,9 +68,21 @@ class InferenceEngine:
         # Qwen3 返回 None（无架构限制，取配置值）。
         arch_limit = self.adapter.context_length_limit(self.config)
         self.max_position = min(max_context_length, arch_limit) if arch_limit else max_context_length
-        # n_blocks 动态算：max_batch_size 序列各占满 max_position + prefill 余量。
         max_seq_blocks = (self.max_position + self.DEFAULT_BLOCK_SIZE - 1) // self.DEFAULT_BLOCK_SIZE
-        n_blocks = max_batch_size * max_seq_blocks + max_batch_size  # +1 block/序列余量
+        # n_blocks 按显存预算推导，与 max_batch_size 解耦（vLLM V2 思路：固定停车位总数
+        # 由可用显存决定，而非 max_batch × max_position 全量预分配——后者在 max_batch=512
+        # 时需 75GB 直接 OOM）。预算 = 剩余显存 - 余量（权重/graph buffer/activation）。
+        # 单 block 全层 K+V 显存 = 2(K+V) × block_size × kv_heads × head × n_layers × dtype。
+        free, _ = torch.cuda.mem_get_info()
+        per_block_bytes = (2 * 2 * self.DEFAULT_BLOCK_SIZE * self.kv_num_heads
+                           * self.head_size * self.num_layers * torch.finfo(self.dtype).bits // 8)
+        # 余量：权重(模型 bf16 ~1.2GB) + graph/logits buffer(max_batch×vocab) + activation。
+        # max_batch=512 时 _logits buffer ≈ 155MB，graph workspace 等，保守留 6GB。
+        kv_budget = max(free - 6 * (1 << 30), per_block_bytes * 16)
+        n_blocks = max(int(kv_budget // per_block_bytes),
+                       max_batch_size * 2)  # 至少够 max_batch 条短请求各 2 block
+        logger.info(f"KV 预算: free={free/1e9:.1f}GB 留6GB → n_blocks={n_blocks} "
+                    f"({n_blocks*self.DEFAULT_BLOCK_SIZE} tokens, 可跑 {n_blocks//max_seq_blocks} 条满{self.max_position}上下文)")
         self.cache_manager = KVCacheManager(
             n_blocks=n_blocks, block_size=self.DEFAULT_BLOCK_SIZE,
             n_layers=self.num_layers, n_heads=self.kv_num_heads, head_size=self.head_size,
@@ -118,36 +130,33 @@ class InferenceEngine:
         self._completion_results: Dict[int, str] = {}
 
         # 捕获 CUDA Graph：两架构均 graph-friendly，一个 graph 通吃所有 ≤1024 序列。
-        if self.device == "cuda":
-            logger.info("Capturing CUDA Graphs...")
-            # 离散捕获到 max_batch_size：小 bs 密集（1,2,4,8,16,32），大 bs 按 1.5x 增长
-            # （48,64,96,128...），使 replay 向上取整的 padding 率 ≤1.33x（旧 2x 档在 bs=48
-            # 时 padding 到 64 浪费 33%）。replay 时向下取整到 >= 实际 bs 的最小捕获值。
-            cap_sizes = [b for b in [1, 2, 4, 8, 16, 32] if b <= max_batch_size]
-            b = 48
-            while b <= max_batch_size:
-                cap_sizes.append(b)
-                b = (b * 3 + 1) // 2  # 1.5x 向上取整：48→72→108... 但夹到 max_batch_size
-            if not cap_sizes or cap_sizes[-1] < max_batch_size:
-                cap_sizes.append(max_batch_size)
-            cap_sizes = sorted(set(cap_sizes))
-            # 同步 scheduler 的 pad 档位：decode batch 向上取整 padding 必须落到已捕获的
-            # graph batch_size，否则 graph key 不命中。单一来源 = engine 的 cap_sizes。
-            self.scheduler.batch_sizes = cap_sizes
-            self.graph_runner.capture(self.cache_manager, batch_sizes=cap_sizes)
-            logger.info("CUDA Graphs captured.")
-            # 预热 sampler 编译路径（torch.compile reduce-overhead 首次调用每个 shape
-            # 会捕获 CUDA Graph ~1-2s）。不预热时首个多 batch prefill/decode 会卡秒级。
-            # 对所有 cap_sizes 用 temp>0 路径（触发 _compiled_sample）各跑一次。
-            self._warmup_sampler(cap_sizes)
-            # 预热 prefill eager 路径：cuBLAS/flash 首次跑每个 (B,S) shape 会选算法/编译，
-            # 首个真实多 batch prefill 多耗 ~100-200ms。用短 dummy prompt 在主 batch size 跑一次。
-            # 仅对支持 chunked prefill 的架构（Qwen3 GQA）——DeepSeek MLA prefill 用
-            # flash_attn_func 自包含路径，dummy prefill 触发 cudaErrorAssert，跳过。
-            if self.adapter.supports_chunked_prefill(self.config):
-                self._warmup_prefill(cap_sizes)
-        else:
-            logger.info("非 CUDA 设备，跳过 CUDA Graph 捕获（eager 路径）。")
+        logger.info("Capturing CUDA Graphs...")
+        # 离散捕获到 max_batch_size：小 bs 密集（1,2,4,8,16,32），大 bs 按 1.5x 增长
+        # （48,64,96,128...），使 replay 向上取整的 padding 率 ≤1.33x（旧 2x 档在 bs=48
+        # 时 padding 到 64 浪费 33%）。replay 时向下取整到 >= 实际 bs 的最小捕获值。
+        cap_sizes = [b for b in [1, 2, 4, 8, 16, 32] if b <= max_batch_size]
+        b = 48
+        while b <= max_batch_size:
+            cap_sizes.append(b)
+            b = (b * 3 + 1) // 2  # 1.5x 向上取整：48→72→108... 但夹到 max_batch_size
+        if not cap_sizes or cap_sizes[-1] < max_batch_size:
+            cap_sizes.append(max_batch_size)
+        cap_sizes = sorted(set(cap_sizes))
+        # 同步 scheduler 的 pad 档位：decode batch 向上取整 padding 必须落到已捕获的
+        # graph batch_size，否则 graph key 不命中。单一来源 = engine 的 cap_sizes。
+        self.scheduler.batch_sizes = cap_sizes
+        self.graph_runner.capture(self.cache_manager, batch_sizes=cap_sizes)
+        logger.info("CUDA Graphs captured.")
+        # 预热 sampler 编译路径（torch.compile reduce-overhead 首次调用每个 shape
+        # 会捕获 CUDA Graph ~1-2s）。不预热时首个多 batch prefill/decode 会卡秒级。
+        # 对所有 cap_sizes 用 temp>0 路径（触发 _compiled_sample）各跑一次。
+        self._warmup_sampler(cap_sizes)
+        # 预热 prefill eager 路径：cuBLAS/flash 首次跑每个 (B,S) shape 会选算法/编译，
+        # 首个真实多 batch prefill 多耗 ~100-200ms。用短 dummy prompt 在主 batch size 跑一次。
+        # 仅对支持 chunked prefill 的架构（Qwen3 GQA）——DeepSeek MLA prefill 用
+        # flash_attn_func 自包含路径，dummy prefill 触发 cudaErrorAssert，跳过。
+        if self.adapter.supports_chunked_prefill(self.config):
+            self._warmup_prefill(cap_sizes)
 
         # 注册退出钩子
         atexit.register(self.shutdown)
@@ -216,9 +225,8 @@ class InferenceEngine:
     def _init_distributed(self):
         setup()
         self.rank = get_rank()
-        if torch.cuda.is_available():
-            torch.cuda.set_device(self.rank)
-        self.device_str = f"cuda:{self.rank}" if torch.cuda.is_available() else "cpu"
+        torch.cuda.set_device(self.rank)
+        self.device_str = f"cuda:{self.rank}"
 
     def _init_model(self, model_path: str):
         logger.info(f"Loading model {model_path} on rank {self.rank}")
@@ -251,12 +259,10 @@ class InferenceEngine:
         self.intermediate_size = self.adapter.intermediate_size(self.config, world_size)
 
     def _auto_configure(self) -> Tuple[str, torch.dtype]:
-        if torch.cuda.is_available():
-            dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
-            if dtype == torch.bfloat16:
-                self.model.to(torch.bfloat16)
-            return "cuda", dtype
-        return "cpu", torch.float32
+        dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
+        if dtype == torch.bfloat16:
+            self.model.to(torch.bfloat16)
+        return "cuda", dtype
 
     def shutdown(self):
         try:
@@ -418,43 +424,95 @@ class InferenceEngine:
     def _prefill(self, batch: List[Sequence]):
         stats = InferenceStats(total_time=time.time())
 
-        # 1. 准备
+        # 1. 准备：变长拼接。每条 seq 取本 step 的 chunk，拼成 1D input_ids [total_tokens]。
         stats.prep_time = time.time()
         device = self.device
+        from models.base import PrefillMeta
 
-        # chunked prefill：每条 seq 取本 step 的 chunk（get_next_input_ids 按 prefill_done+_chunk_len 切片）
-        input_ids = torch.tensor([seq.get_next_input_ids() for seq in batch], dtype=torch.long, device=device)
-        seq_lens = [len(ids) for ids in input_ids]
-        # position_offsets：每条 seq 已 prefill 的 token 数（KV 续写起始位置 / RoPE 位置偏移）
-        position_offsets = torch.tensor([s.prefill_done for s in batch], dtype=torch.int32, device=device)
-        # 本 step 是否产生 token：仅最后 chunk（或完整短 prompt）采样
+        # 每条 seq 的本 chunk token + 起始 offset（已 prefill 的 token 数）
+        chunk_tokens = [seq.get_next_input_ids() for seq in batch]
+        chunk_lens = [len(t) for t in chunk_tokens]
+        offsets = [s.prefill_done for s in batch]
         need_sample = [s._chunk_is_last for s in batch]
+        n_seqs = len(batch)
 
         # 2. KV Cache 分配：仅第一次 prefill（prefill_done==0）按整个 prompt 长度预分配 block；
-        #    续切 chunk 复用已分配 block，不重新 alloc。
+        #    续切 chunk 复用已分配 block。
         for seq in batch:
             if seq.prefill_done == 0:
                 ok, _ = self.cache_manager.alloc(seq.seq_id, len(seq.input_ids))
                 if not ok:
                     raise RuntimeError("OOM: prefill alloc failed")
 
-        # 重建 block_table + 设 cache_seqlens=position_offsets（chunked 续写位置）
-        self.cache_manager.cache_batch_data(
-            [s.seq_id for s in batch], [int(o) for o in position_offsets.tolist()])
+        # 3. 组装变长元数据（cu_seqlens / position_ids / slot_mapping / block_table）。
+        #    cu_seqlens/offsets 在 CPU 算好后一次 H2D；slot_mapping 经 block_table 矩阵索引
+        #    在 GPU 向量化算（无逐 token Python 循环，512 seqs 时省 ~20ms）。
+        total_tokens = sum(chunk_lens)
+        cm = self.cache_manager
+        block_size = cm.block_size
+
+        # cu_seqlens_q/k + offsets（CPU 列表 → tensor）
+        cu_q = [0]
+        cu_k = [0]
+        for off, clen in zip(offsets, chunk_lens):
+            cu_q.append(cu_q[-1] + clen)
+            cu_k.append(cu_k[-1] + off + clen)
+        cu_seqlens_q = torch.tensor(cu_q, dtype=torch.int32, device=device)
+        cu_seqlens_k = torch.tensor(cu_k, dtype=torch.int32, device=device)
+        max_seqlen_q = max(chunk_lens)
+        max_seqlen_k = max((o + c for o, c in zip(offsets, chunk_lens)), default=0)
+
+        # block_table：复用 cache_manager 的 triton kernel 填充（context_lens=kv_len 仅用于建表）
+        block_table = cm._block_table_buffer[:n_seqs]
+        cm.cache_batch_data([s.seq_id for s in batch], [cu_k[i + 1] - cu_k[i] for i in range(n_seqs)])
+
+        # input_ids + position_ids：numpy 拼接（比 Python list extend + torch.tensor 快）后一次 H2D
+        import numpy as np
+        ids_np = np.empty(total_tokens, dtype=np.int64)
+        pos_np = np.empty(total_tokens, dtype=np.int64)
+        p = 0
+        for toks, off, clen in zip(chunk_tokens, offsets, chunk_lens):
+            ids_np[p:p + clen] = toks
+            pos_np[p:p + clen] = np.arange(off, off + clen)
+            p += clen
+        input_ids = torch.from_numpy(ids_np).to(device)
+        position_ids = torch.from_numpy(pos_np).to(device)
+
+        # slot_mapping：向量化。每 token 的 seq 归属 = searchsorted(cu_seqlens_q)；
+        # abs_pos = offset[seq] + (token - cu_q[seq])；slot = bt[seq, abs//bs]*bs + abs%bs。
+        offsets_gpu = torch.tensor(offsets, dtype=torch.int32, device=device)
+        token_idx = torch.arange(total_tokens, device=device)
+        seq_of_token = torch.searchsorted(cu_seqlens_q[1:], token_idx, right=True)
+        local_pos = token_idx - cu_seqlens_q[seq_of_token]
+        abs_pos = offsets_gpu[seq_of_token].long() + local_pos
+        block_idx = abs_pos // block_size
+        offset_in_block = abs_pos % block_size
+        slot_mapping = (block_table[seq_of_token, block_idx] * block_size
+                        + offset_in_block).to(torch.int32)
+
+        meta = PrefillMeta(
+            cu_seqlens_q=cu_seqlens_q, cu_seqlens_k=cu_seqlens_k,
+            position_ids=position_ids, slot_mapping=slot_mapping,
+            block_table=block_table, n_seqs=n_seqs,
+            max_seqlen_q=max_seqlen_q, max_seqlen_k=max_seqlen_k,
+        )
         stats.prep_time = time.time() - stats.prep_time
 
-        # 3. 推理
+        # 4. 推理（变长：input_ids 1D，logits 末 token 用于采样）
         stats.gpu_time = time.time()
-        logits = self.prefill_runner.forward(input_ids, self.cache_manager, len(batch),
-                                             position_offsets=position_offsets)
+        logits = self.prefill_runner.forward(input_ids, self.cache_manager, meta)
         stats.gpu_time = time.time() - stats.gpu_time
 
-        # 4. 采样：仅对最后 chunk（need_sample）采样首 token；中间 chunk 不采样、不转 decode
+        # 5. 采样：仅对最后 chunk（need_sample）采样首 token；中间 chunk 不采样、不转 decode。
+        #    logits 是 [total_tokens, vocab]，每条 seq 取其本 chunk 末 token（cu_q 边界）。
         if rank0():
             stats.sample_time = time.time()
             sample_idx = [i for i, ns in enumerate(need_sample) if ns]
             if sample_idx:
                 sample_batch = [batch[i] for i in sample_idx]
+                # 每条 sample seq 在 1D logits 中的末 token 位置 = cu_q[i+1] - 1
+                last_pos = [int(cu_q[i + 1]) - 1 for i in sample_idx]
+                last_logits = logits[last_pos, :]
                 temps_list = [s.temperature for s in sample_batch]
                 rep_list = [getattr(s, 'repetition_penalty', 1.0) for s in sample_batch]
                 temps = torch.tensor(temps_list, device=device)
@@ -468,12 +526,10 @@ class InferenceEngine:
                     max_l = max(len(h) for h in hist)
                     prev = torch.tensor(
                         [h + [-1] * (max_l - len(h)) for h in hist], dtype=torch.long, device=device)
-                next_tokens = self.sampler(logits[sample_idx, -1, :], temps, topp, 1000,
+                next_tokens = self.sampler(last_logits, temps, topp, 1000,
                                            prev_tokens=prev, rep_penalties=rep_pen,
                                            all_greedy=all_greedy, any_rep_pen=any_rep).tolist()
                 for j, seq in enumerate(sample_batch):
-                    # 最后 chunk：先把 prefill_done/current_position 推进到整个 prompt 末尾，
-                    # 随后 update_sequences 的 update_state(+1) 才能给出正确的 decode 位置。
                     seq.advance_prefill(seq._chunk_len)
                     seq._next_token = next_tokens[j]
                     seq._chunk_sampled = True
@@ -486,8 +542,8 @@ class InferenceEngine:
 
             stats.total_time = time.time() - stats.total_time
             logger.info(f"Prefill: Prep {stats.prep_time*1000:.1f}ms, GPU {stats.gpu_time*1000:.1f}ms, "
-                        f"Total {stats.total_time*1000:.1f}ms | Batch {len(batch)} chunks={seq_lens} "
-                        f"offsets={position_offsets.tolist()} sample={sum(need_sample)}")
+                        f"Total {stats.total_time*1000:.1f}ms | n_seqs={n_seqs} total_tokens={total_tokens} "
+                        f"chunks={chunk_lens} offsets={offsets} sample={sum(need_sample)}")
 
 
     def update_sequences(self, sequences: List[Sequence]):

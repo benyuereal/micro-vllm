@@ -18,14 +18,51 @@ except ImportError:
     print('Please install flash-attn from https://www.flash-attn.org')
 
 
-def is_macos():
-    return torch.backends.mps.is_available()
+# 把本步算出的 k/v 按 slot_mapping scatter 写入 paged KV cache。
+# slot_mapping[t] = block_id * block_size + offset_in_block，定位该 token 在
+# [n_blocks*block_size, n_heads, head_size] 视图中的行。一个线程写一个 token 的一个 head。
+@triton.jit
+def _store_kvcache_kernel(
+            k_ptr, v_ptr,          # [total_tokens, n_heads, head_size]
+            k_stride_t, k_stride_h,# token 维 stride, head 维 stride
+            v_stride_t, v_stride_h,
+            kc_ptr, vc_ptr,        # paged cache [n_blocks*block_size, n_heads, head_size]
+            slot_ptr,              # [total_tokens]
+            N_HEAD: tl.constexpr,
+            HEAD_DIM: tl.constexpr,
+            H_STRIDE: tl.constexpr,
+    ):
+        t = tl.program_id(0)       # token index
+        slot = tl.load(slot_ptr + t)
+        offs_h = tl.arange(0, N_HEAD)
+        offs_d = tl.arange(0, HEAD_DIM)
+        # 源：k[t, :, :] → [N_HEAD, HEAD_DIM]
+        src_k = tl.load(k_ptr + t * k_stride_t + offs_h[:, None] * k_stride_h + offs_d[None, :])
+        src_v = tl.load(v_ptr + t * v_stride_t + offs_h[:, None] * v_stride_h + offs_d[None, :])
+        # 目的：cache[slot, :, :]
+        dst = slot * H_STRIDE + offs_h[:, None] * HEAD_DIM + offs_d[None, :]
+        tl.store(kc_ptr + dst, src_k)
+        tl.store(vc_ptr + dst, src_v)
+
+
+def store_kvcache(k, v, k_cache, v_cache, slot_mapping):
+    """把 [total_tokens, n_heads, head_size] 的 k/v 按 slot_mapping 写入 paged cache。
+
+    k/v 须 contiguous on last dim（head_dim）。slot_mapping[t] 定位 token t 在
+    [n_blocks*block_size, n_heads, head_size] 视图中的行。"""
+    total_tokens, n_heads, head_dim = k.shape
+    kc = k_cache.reshape(-1, n_heads, head_dim)
+    vc = v_cache.reshape(-1, n_heads, head_dim)
+    _store_kvcache_kernel[(total_tokens,)](
+        k, v, k.stride(0), k.stride(1), v.stride(0), v.stride(1),
+        kc, vc, slot_mapping,
+        N_HEAD=n_heads, HEAD_DIM=head_dim, H_STRIDE=kc.stride(0),
+    )
 
 
 # block_table 填充 kernel：一个线程写 block_table[i, j] 一个位置
-if not is_macos() and torch.cuda.is_available():
-    @triton.jit
-    def _block_table_kernel(
+@triton.jit
+def _block_table_kernel(
             flat_blocks_ptr,  # [total_blocks] 所有的 block id 展平
             flat_offsets_ptr,  # [batch_size+1] 每个序列的起始偏移
             block_table_ptr,  # [max_batch, max_seq_blocks] 目标表
@@ -99,10 +136,9 @@ class KVCacheManager:
         self._offsets_buffer = torch.zeros(max_batch_size + 1, dtype=torch.int32, device=device)
 
         # Pinned CPU staging（消除每步 torch.tensor() malloc）
-        _pin = (device == "cuda")
-        self._seqlens_cpu = torch.empty(max_batch_size, dtype=torch.int32, pin_memory=_pin)
-        self._flat_cpu = torch.empty(max_possible_blocks, dtype=torch.int32, pin_memory=_pin)
-        self._offsets_cpu = torch.empty(max_batch_size + 1, dtype=torch.int32, pin_memory=_pin)
+        self._seqlens_cpu = torch.empty(max_batch_size, dtype=torch.int32, pin_memory=True)
+        self._flat_cpu = torch.empty(max_possible_blocks, dtype=torch.int32, pin_memory=True)
+        self._offsets_cpu = torch.empty(max_batch_size + 1, dtype=torch.int32, pin_memory=True)
         self._seqlens_np = self._seqlens_cpu.numpy()
         self._flat_np = self._flat_cpu.numpy()
         self._offsets_np = self._offsets_cpu.numpy()

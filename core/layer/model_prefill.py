@@ -4,6 +4,7 @@ from typing import List
 from kernel.rmsnorm import rmsnorm_residual_fused, rmsnorm
 from core.parallel_config import all_reduce
 from .model_graph import ModelGraphRunner
+from models.base import PrefillMeta
 
 try:
     from flash_attn import flash_attn_with_kvcache
@@ -17,30 +18,17 @@ class ModelPrefillRunner(ModelGraphRunner):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
 
-    def forward(self, input_ids: torch.Tensor, cache_manager, batch_size: int,
-                position_offsets: torch.Tensor = None) -> torch.Tensor:
-        """定长/分块 Prefill 前向传播 (batch, seq_len)。
-
-        position_offsets: [B] int tensor，每条 seq 已 prefill 的 token 数（chunked prefill
-            续写偏移）。None 或全 0 等价于一次性 prefill（原行为）。
-        通过 adapter 钩子驱动任意架构。
-        """
-        B, S = input_ids.shape
+    def forward(self, input_ids: torch.Tensor, cache_manager, meta: PrefillMeta) -> torch.Tensor:
+        """变长 Prefill 前向：input_ids 为 1D [total_tokens]，batch 内各 seq 长度可不同。
+        用 cu_seqlens 掩码（flash_attn_varlen_func）+ block_table 读 paged cache。
+        通过 adapter.prefill_layer 钩子驱动任意架构。"""
         embed = self.adapter.embed(self.model)
         blocks = self.adapter.blocks(self.model)
-        h = embed(input_ids)
-
-        # 初始化 cache 状态：cache_seqlens = position_offsets（chunked 续写 KV 起始位置）
-        cache_lens = cache_manager._cache_seqlens_buffer[:batch_size]
-        if position_offsets is not None:
-            cache_lens.copy_(position_offsets)
-        else:
-            cache_lens.zero_()
-        block_table = cache_manager._block_table_buffer[:batch_size]
+        h = embed(input_ids)  # [total_tokens, hidden]
 
         for layer_idx in range(self.num_layers):
             block = blocks[layer_idx]
-            h = self.adapter.prefill_layer(block, h, layer_idx, B, S, self, cache_manager, block_table)
+            h = self.adapter.prefill_layer(block, h, layer_idx, self, cache_manager, meta)
 
         h = self.adapter.final_norm(self.model)(h)
         return self.adapter.lm_head(self.model)(h)

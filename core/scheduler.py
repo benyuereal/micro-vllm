@@ -1,4 +1,4 @@
-from collections import deque, defaultdict
+from collections import deque
 from typing import List, Tuple, Dict, Optional
 from transformers import AutoTokenizer
 from .sequence import Sequence
@@ -9,16 +9,19 @@ logger = logging.getLogger(__name__)
 
 
 class Scheduler:
-    """连续批处理调度器（参考 vLLM V2：decode 优先、消除 idle、prefill 立即调度）。
+    """连续批处理调度器（prefill 优先，借鉴 nano-vllm：快速填满 running 再 decode）。
 
     核心不变量：
-    - running 非空时每步必出 decode batch（GPU 永不因等 prefill 而空转）
-    - running 空 + waiting 非空时立即 prefill（单条也 prefill，不等攒满/不等超时）
-    - 真无工作才返回 idle
+    - waiting 非空（或有 chunked prefill 在途）时优先 prefill，尽快把请求推进 running，
+      使 decode batch 尽快长到 max_batch_size —— prefill 被饿死会导致 batch 长不大、吞吐低。
+    - 无 prefill 可做时 decode（最短序列优先 SJF：短序列先完成释放 slot）。
+    - prefill 选不出 batch（如 KV block 不足）时 fallthrough 到 decode，decode 释放 block 后
+      下步再 prefill —— 兼具 OOM 自愈。
+    - 真无工作才返回 idle。
 
-    对比旧调度器消除的气泡：
-    - 旧：waiting 有请求但没攒够同长度 batch 且没超 prefill_timeout → 返回 idle → GPU 空转
-    - 新：waiting 有请求且 running 空 → 立即 prefill；running 非空 → 持续 decode
+    对比 decode-优先策略：decode-优先下 running 一旦非空就持续 decode，prefill 被推迟到
+    running 清空才执行，running 在 admission 与 completion 间稳态平衡，batch 远小于
+    max_batch_size；prefill-优先下连续 prefill 把 running 推满，decode batch 接近上限。
     """
 
     def __init__(self, max_batch_size: int = 32, max_prefill_tokens: int = 2048,
@@ -45,9 +48,12 @@ class Scheduler:
         self.waiting_queue.append(seq)
 
     def get_next_batch(self) -> Tuple[List[Sequence], str]:
-        """连续批处理调度。返回 (batch, batch_type)。
+        """连续批处理调度（prefill 优先，借鉴 nano-vllm）。返回 (batch, batch_type)。
 
         batch_type: "decode" / "prefill" / "idle"
+        - waiting 非空（或有 chunked prefill 在途）时优先 prefill，尽快把 running 推满；
+        - 无 prefill 可做时 decode（SJF 最短序列优先）；
+        - prefill 选不出（如 KV block 不足）时 fallthrough 到 decode，decode 释放 block 后下步再 prefill。
         decode batch 会 pad 到已捕获的 graph batch_size。
         """
         # 1. 剔除已完成的 running
@@ -56,14 +62,7 @@ class Scheduler:
             if not s.is_finished()
         ]
 
-        # 2. 【decode 优先】running 有 decode seq 就持续 decode，绝不让 GPU 等 prefill
-        if self.running_sequences:
-            batch = self._get_decode_batch()
-            if batch:
-                return batch, "decode"
-
-        # 3. 无 decode 可做时尝试 prefill：waiting 有新请求，或 running 中有
-        #    chunked prefill 进行中的 seq（prefill_done>0 且未完成）需续切。
+        # 2. 【prefill 优先】有新请求或在途 chunked prefill 就先 prefill，快速填满 running
         has_pending_prefill = (
             bool(self.waiting_queue) or
             any(s.state == "prefill" and s.prefill_remaining > 0 for s in self.running_sequences)
@@ -73,6 +72,11 @@ class Scheduler:
             if batch:
                 return batch, "prefill"
 
+        # 3. 无 prefill 可做（waiting 空 / block 不足选不出）时 decode
+        batch = self._get_decode_batch()
+        if batch:
+            return batch, "decode"
+
         # 4. 真无工作
         return [], "idle"
 
@@ -80,17 +84,15 @@ class Scheduler:
         """从 running 选 decode batch：所有 decode seq 进同一 batch（mixed-length），
         pad 到已捕获的 graph batch_size。
 
-        取消同长度分组：decode 走 flash_attn_with_kvcache(block_table, cache_seqlens)，
-        cache_seqlens 是 per-seq 的，同批不同长度完全正确（每条独立 seqlen/位置）。
-        同长度分组是大 batch 吞吐杀手——变长场景分组后每组仅 1-2 条，decode 退化为串行。
-        mixed-length 让所有 decode seq 同步推进，充分利用 batch 算力。
+        decode 走 flash_attn_with_kvcache(block_table, cache_seqlens)，cache_seqlens 是 per-seq
+        的，同批不同长度完全正确。SJF 最短序列优先（先完成释放 slot）。
         """
         selected = [s for s in self.running_sequences
                     if s.state == "decode" and not s.is_finished()]
         if not selected:
             return []
 
-        # SJF 排序：短请求优先（先完成释放 slot），但全部进 batch（不再只取一组）
+        # SJF 排序：短请求优先（先完成释放 slot），但全部进 batch
         selected.sort(key=lambda s: s.current_position)
         selected = selected[:self.max_batch_size]
         if not selected:
@@ -108,20 +110,15 @@ class Scheduler:
         return padded
 
     def _get_prefill_batch(self) -> List[Sequence]:
-        """取 prefill batch，支持 chunked prefill。
+        """取变长 prefill batch（cu_seqlens 掩码，无需等长分组/padding）。
 
         seq 归属：chunked 进行中的 seq（state==prefill, prefill_done>0）留在 running，
-        由本方法从 running 续切；新 prompt 从 waiting 取。这样 running 同时含 decode seq
-        与 prefill-in-progress seq，但 _get_decode_batch 只选 state==decode 的，故 decode
-        优先不变；无 decode seq 时 fallthrough 到此续切 prefill。
+        由本方法从 running 续切；新 prompt 从 waiting 取。
 
-        两种模式（同一 step 不混，保证 prefill_runner 等长 [B,S] 约束）：
-        1) 短 prompt 等长批量：按精确长度分组（prefill 无 attention mask，padding 污染 KV），
-           取最短长度组整条 prefill（offset=0, is_last=True）。原行为。
-        2) 长 prompt 分块：单条剩余 > max_chunk_tokens 时切一块（batch=1, offset=prefill_done,
-           is_last=(chunk_len==remaining)）。切块期间 seq 留在 running，下步优先续切。
-
-        立即 prefill：running 无 decode 时 GPU 本就空转，有请求就 prefill。
+        变长一次性 prefill：从 waiting（或在途 chunk）按 FIFO 取尽可能多的 seq，受
+        max_batch_size（并发数上限）和 max_prefill_tokens（单步 prefill 总 token 预算）约束。
+        各 seq 长度可不同——prefill_runner 用 cu_seqlens 掩码处理，不再要求等长分组。
+        长 prompt（剩余 > max_chunk_tokens）仍分块，单条切块期间留在 running 下步续切。
         """
         # ---- 优先续切 running 中已开始的 chunked prefill（公平：先做完已开始的）----
         in_progress = [s for s in self.running_sequences
@@ -139,44 +136,41 @@ class Scheduler:
         if not waiting:
             return []
 
-        # ---- 短 prompt 等长批量（offset=0, 整条 prefill）----
-        length_groups = defaultdict(list)
+        # ---- 变长一次性 prefill：FIFO 取尽可能多 seq，受并发数 + 总 token 预算约束 ----
+        # 注：不限制 running 总数（允许 running > max_batch，decode 仅取前 max_batch 条 SJF）。
+        # 这样 prefill 快速清空 waiting 进入纯 decode 稳态，比零散穿插 prefill 吞吐更高
+        #（显存由 KV 预算 n_blocks 兜底，block 不足时 alloc 失败由上层处理）。
+        waiting.sort(key=lambda s: s.timestamp)  # FIFO
+        selected = []
+        total_tokens = 0
         for seq in waiting:
-            if seq.prefill_remaining <= self.max_chunk_tokens:
-                length_groups[seq.prefill_remaining].append(seq)
-        for length in sorted(length_groups.keys()):
-            group = length_groups[length]
-            group.sort(key=lambda s: s.timestamp)  # FIFO
-
-            selected = []
-            total_tokens = 0
-            for seq in group:
-                if len(selected) >= self.max_batch_size:
-                    break
-                seq_tokens = length
-                if total_tokens + seq_tokens > self.max_prefill_tokens:
-                    continue
-                selected.append(seq)
-                total_tokens += seq_tokens
-
-            if not selected:
+            if len(selected) >= self.max_batch_size:
+                break
+            remaining = seq.prefill_remaining
+            # 短 prompt（≤ max_chunk_tokens）整条 prefill；长 prompt 走下方分块分支
+            if remaining > self.max_chunk_tokens:
                 continue
+            if total_tokens + remaining > self.max_prefill_tokens:
+                # 预算满：若已选了若干就停，否则（首条就超预算）仍放行首条避免饿死
+                if selected:
+                    break
+            selected.append(seq)
+            total_tokens += remaining
 
+        if selected:
             for seq in selected:
                 seq._chunk_len = seq.prefill_remaining
                 seq._chunk_is_last = True
                 self.waiting_queue.remove(seq)
                 self.running_sequences.append(seq)
-            logger.info(f"prefill len={length}, selected: {len(selected)}, "
-                        f"tokens: {total_tokens}, waiting_left: {len(self.waiting_queue)}")
+            logger.info(f"prefill selected: {len(selected)}, tokens: {total_tokens}, "
+                        f"waiting_left: {len(self.waiting_queue)}")
             return selected
 
         # ---- 长 prompt 开始切块（batch=1）----
-        long_seqs = sorted(
-            [s for s in waiting if s.prefill_remaining > self.max_chunk_tokens],
-            key=lambda s: s.timestamp)
+        long_seqs = [s for s in waiting if s.prefill_remaining > self.max_chunk_tokens]
         if long_seqs:
-            seq = long_seqs[0]
+            seq = sorted(long_seqs, key=lambda s: s.timestamp)[0]
             chunk = self._make_chunk(seq)
             self._activate_chunk(seq, chunk)
             logger.info(f"chunked prefill start seq={seq.seq_id} total={len(seq.input_ids)} "

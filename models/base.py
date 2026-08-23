@@ -22,8 +22,30 @@ ModelAdapter - 多架构适配器抽象基类
     - runner 不再硬编码任何模型字段名，全部经 adapter 访问。
 """
 from abc import ABC, abstractmethod
+from dataclasses import dataclass
 from typing import Tuple, List
 import torch
+
+
+@dataclass
+class PrefillMeta:
+    """变长 prefill 的批元数据（同一 batch 内各 seq 长度可不同，cu_seqlens 掩码处理）。
+
+    约定：所有 seq 的本 chunk token 拼成 1D（按 seq 顺序），total_tokens = cu_seqlens_q[-1]。
+    - cu_seqlens_q[c:c+1] = 第 c 条 seq 本 chunk 的 query 长度（= 本 chunk token 数）
+    - cu_seqlens_k[c:c+1] = 第 c 条 seq 的 KV 长度（已 cache 前缀 + 本 chunk；完整 prefill 时 = q 长度）
+    - position_ids[t] = token t 在原 prompt 的绝对位置（chunked 续写从 prefill_done 起）
+    - slot_mapping[t] = token t 写入 paged cache 的 slot（block_id*block_size + offset）
+    - block_table[c] = 第 c 条 seq 的 block id 列表（flash varlen 用其读 paged cache）
+    """
+    cu_seqlens_q: torch.Tensor   # [n_seqs+1] int32
+    cu_seqlens_k: torch.Tensor   # [n_seqs+1] int32
+    position_ids: torch.Tensor   # [total_tokens] long
+    slot_mapping: torch.Tensor   # [total_tokens] int32
+    block_table: torch.Tensor    # [n_seqs, max_seq_blocks] int32
+    n_seqs: int
+    max_seqlen_q: int
+    max_seqlen_k: int
 
 
 class ModelAdapter(ABC):
@@ -65,6 +87,14 @@ class ModelAdapter(ABC):
         """该架构的 prefill_layer 是否支持 chunked 续写（第 N chunk 的 attention 能读到
         cache 中前 N-1 chunk 的 KV）。GQA + flash_attn_with_kvcache 支持；MLA prefill
         用 flash_attn_func（自包含，不读 cache 前缀）暂不支持。默认 False（保守）。"""
+        return False
+
+    def supports_varlen_prefill(self, cfg) -> bool:
+        """该架构是否支持变长一次性 prefill（同一 batch 内不同 seq 长度，用 cu_seqlens
+        掩码 + block_table 读 paged cache，无需等长分组/padding）。Qwen3 GQA +
+        flash_attn_varlen_func(block_table=...) 支持；DeepSeek MLA prefill 用定长
+        flash_attn_func 自包含（k/v 是本步算出的完整 prompt），改 varlen 不带 block_table
+        即可，latent 另写 paged cache。默认 False（保守）。"""
         return False
 
     def context_length_limit(self, cfg) -> int:
@@ -130,12 +160,12 @@ class ModelAdapter(ABC):
         ...
 
     # ------------------------------------------------------------------
-    # prefill 单层钩子
+    # prefill 单层钩子（变长：h 为 1D [total_tokens, hidden]，各 seq 长度由 meta.cu_seqlens 掩码）
     # ------------------------------------------------------------------
     @abstractmethod
     def prefill_layer(self, block, h: torch.Tensor, layer_idx: int,
-                      B: int, S: int, graph, cache_manager, block_table) -> torch.Tensor:
-        """prefill 单层前向（含 attention 写入 paged cache + FFN），返回新 hidden。"""
+                      graph, cache_manager, meta: "PrefillMeta") -> torch.Tensor:
+        """变长 prefill 单层前向（含 attention 写入 paged cache + FFN），返回新 hidden [total_tokens, hidden]。"""
         ...
 
     # ------------------------------------------------------------------

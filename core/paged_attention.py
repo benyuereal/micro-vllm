@@ -12,7 +12,7 @@ class PagedAttention(nn.Module):
     """分页注意力层。当前仅用作 RoPE cos/sin pool 的载体。"""
 
     def __init__(self, num_heads: int, head_size: int, kv_num_heads: int,
-                 device: str = "auto", max_batch_size=16, max_blocks=32,
+                 device: str = "cuda", max_batch_size=16, max_blocks=32,
                  max_position=4096, max_tokens=8192, block_size=256,
                  rope_dim: int = None, rope_theta: float = 10000.0):
         super().__init__()
@@ -26,11 +26,7 @@ class PagedAttention(nn.Module):
         self.rope_dim = rope_dim if rope_dim is not None else head_size
         self.scale = head_size ** -0.5
 
-        # 自动检测设备
-        self.device = (torch.device('mps') if torch.backends.mps.is_available() else
-                       torch.device('cuda') if torch.cuda.is_available() else torch.device('cpu'))
-        if device != "auto":
-            self.device = torch.device(device)
+        self.device = torch.device(device)
 
         # 预计算 RoPE cos/sin pool（half-split：取前 dim//2 列）。
         # 关键：inv_freq / freqs 用 fp32 计算再转 bf16 存储。若全程 bf16 计算，base**(i/dim)
