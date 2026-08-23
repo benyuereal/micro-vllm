@@ -67,21 +67,22 @@ async def rank0_inference_loop():
     print(f"Rank 0: Inference loop started")
 
     while running:
-        batch, batch_type = engine.get_next_batch()
+        dec_batch, pre_batch, batch_type = engine.get_next_batch()
 
-        if batch_type == "waiting" or not batch:
+        if batch_type == "idle" or (not dec_batch and not pre_batch):
             BatchInferenceContext(0, "waiting").broadcast()
             await asyncio.sleep(0.0)
             continue
 
-        ctx = BatchInferenceContext(len(batch), batch_type, batch)
+        ctx = BatchInferenceContext(len(dec_batch), batch_type, dec_batch, prefill_sequences=pre_batch)
         ctx.broadcast()
         engine.step(ctx)
         await asyncio.sleep(0.0)  # GPU 正在执行 forward，asyncio 开销被覆盖
         engine.collect(ctx)
 
         ctx.broadcast()
-        engine.update_sequences(ctx.sequences)
+        all_seqs = ctx.sequences + ctx.prefill_sequences
+        engine.update_sequences(all_seqs)
 
 
 def non_rank0_inference_loop():
@@ -95,7 +96,7 @@ def non_rank0_inference_loop():
         
         engine.step(ctx)
         ctx = BatchInferenceContext.receive(tokenizer)
-        engine.update_sequences(ctx.sequences)
+        engine.update_sequences(ctx.sequences + ctx.prefill_sequences)
 
 
 # ------------------------------

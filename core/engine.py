@@ -197,11 +197,14 @@ class InferenceEngine:
                 self.scheduler.add_request(seq)
             # 跑 prefill + 1 decode（触发该 batch_size 的 prefill GEMM/flash + decode graph replay）
             for _ in range(20):
-                b, bt = self.get_next_batch()
+                dec_b, pre_b, bt = self.get_next_batch()
+                b = dec_b + pre_b
                 if not b:
                     break
-                ctx = BatchInferenceContext(len(b), bt, b)
-                self.step(ctx); self.collect(ctx); self.update_sequences(ctx.sequences)
+                ctx = BatchInferenceContext(len(dec_b), bt, dec_b, prefill_sequences=pre_b)
+                self.step(ctx); self.collect(ctx)
+                all_seqs = ctx.sequences + ctx.prefill_sequences
+                self.update_sequences(all_seqs)
                 if not self.scheduler.running_sequences and not self.scheduler.waiting_queue:
                     break
             # 清理 dummy seq 的 KV（释放 block）
@@ -319,14 +322,18 @@ class InferenceEngine:
         if fut is not None and not fut.done():
             fut.set_result(text)
 
-    def get_next_batch(self) -> Tuple[List[Sequence], str]:
+    def get_next_batch(self) -> Tuple[List[Sequence], List[Sequence], str]:
         return self.scheduler.get_next_batch()
 
     @torch.inference_mode()
     def step(self, ctx: BatchInferenceContext) -> bool:
-        if not ctx.sequences: return False
-        if ctx.batch_type == "prefill":
-            self._prefill(ctx.sequences)
+        if not ctx.sequences and not ctx.prefill_sequences: return False
+        if ctx.batch_type == "hybrid":
+            # piecewise：段A decode + 段B prefill，同一 step 顺序执行，decode 不等 prefill
+            self._hybrid(ctx.sequences, ctx.prefill_sequences)
+        elif ctx.batch_type == "prefill":
+            # 纯 prefill：序列在 ctx.prefill_sequences（ctx.sequences 为空）
+            self._prefill(ctx.prefill_sequences)
         else:
             self._decode(ctx)
         return True
@@ -346,7 +353,9 @@ class InferenceEngine:
 
     @torch.inference_mode()
     def collect(self, ctx: BatchInferenceContext):
-        if ctx.batch_type == "prefill":
+        if ctx.batch_type in ("prefill", "hybrid"):
+            # prefill/hybrid 的采样在 step 的 _prefill/_hybrid 内完成（需在段B覆盖 buffer 前
+            # 采段A decode token），collect 不再做。
             return
         """Decode 专用 Phase 2：flush + seqlens+1 + sample + commit（GPU forward 已完成）。"""
         batch, bs, logits = ctx.sequences, ctx.batch_size, ctx.logits
@@ -372,6 +381,46 @@ class InferenceEngine:
         batch, bs, logits = ctx.sequences, ctx.batch_size, ctx.logits
         self.cache_manager.commit(bs)
 
+    def _hybrid(self, decode_seqs: List[Sequence], prefill_seqs: List[Sequence]):
+        """piecewise 混批执行：段A decode + 段B prefill，同一 step 顺序执行。
+
+        段A：decode seq 走已捕获 graph replay（复用 launch），但需在段B 覆盖常驻
+        block_table/cache_seqlens buffer 前完成采样 → 同步 + 内联采样 + commit。
+        段B：prefill seq 走 prefill_runner（当前 eager，phase3 再进 graph），复用 _prefill。
+        两段共用同一常驻 buffer 的 [0:bs] 区，顺序填+顺序执行，graph replay 读最新内容。
+        decode 不再因等 prefill 闲置 → 提升连续到达场景的批处理算力利用率。
+        """
+        # ---- 段A：decode（graph replay + 内联采样）----
+        dec_ctx = BatchInferenceContext(len(decode_seqs), "decode", decode_seqs)
+        self.launch(dec_ctx)
+        bs, logits = dec_ctx.batch_size, dec_ctx.logits
+        # 段B 会覆盖 buffer，故段A 必须在此同步并完成采样（不能延迟到 collect）
+        if rank0():
+            self._flush_stream()
+            dctx = self._decode_ctx
+            next_tokens_gpu = self.sampler(
+                logits, dctx.temps, dctx.topp, 50,
+                prev_tokens=dctx.prev_tokens, rep_penalties=dctx.rep_penalties,
+                all_greedy=dctx.all_greedy, any_rep_pen=dctx.any_rep_pen)
+            dctx.commit(next_tokens_gpu, self.graph_runner._input_ids, bs, decode_seqs)
+            if dctx.prev_tokens is not None and dctx.any_rep_pen:
+                new_col = next_tokens_gpu.unsqueeze(1)
+                dctx.prev_tokens = torch.cat([dctx.prev_tokens, new_col], dim=1)
+        self.cache_manager.commit(bs)
+
+        # ---- 段B：prefill（eager）----
+        # 段B 的 cache_batch_data 会覆盖常驻 buffer 的 [0:bs_pre] 区（与段A decode
+        # 复用 [0:bs_dec]）。段A 的 graph replay 已完成、seqlens 已 +1，但下一 hybrid
+        # step 的段A 若 decode batch 不变，prepare() 走 batch_switched=False 快路径
+        # 不会重建 buffer → 误读段B 残留。故在此保存段A buffer 区、段B 后还原，
+        # 使 buffer 始终保持段A decode 的正确 block_table/seqlens。
+        cm = self.cache_manager
+        saved_bt = cm._block_table_buffer[:bs].clone()
+        saved_sq = cm._cache_seqlens_buffer[:bs].clone()
+        self._prefill(prefill_seqs)
+        cm._block_table_buffer[:bs].copy_(saved_bt)
+        cm._cache_seqlens_buffer[:bs].copy_(saved_sq)
+
     def generate(self, prompts: List[str], max_tokens: int = 100,
                  temperature: float = 0.7, top_p: float = 0.9,
                  repetition_penalty: float = 1.0, stop=None) -> Dict[str, str]:
@@ -383,19 +432,22 @@ class InferenceEngine:
 
         # 简易事件循环（对齐 api_server 的 rank0 推理循环语义）
         for _ in range(max_tokens * len(prompts) + 64):  # 安全上限
-            batch, batch_type = self.get_next_batch()
+            dec_batch, pre_batch, batch_type = self.get_next_batch()
 
-            # waiting：请求未攒够批次，等 prefill_timeout 到期再调度
-            if batch_type == "waiting" or not batch:
+            # waiting/idle：无工作
+            if batch_type == "idle" or (not dec_batch and not pre_batch):
                 if not self.scheduler.running_sequences and not self.scheduler.waiting_queue:
                     break
                 time.sleep(0.001)
                 continue
 
-            ctx = BatchInferenceContext(len(batch), batch_type, batch)
+            ctx = BatchInferenceContext(len(dec_batch), batch_type, dec_batch, prefill_sequences=pre_batch)
             self.step(ctx)
             self.collect(ctx)
-            self.update_sequences(ctx.sequences)
+            # prefill 段序列在 ctx.prefill_sequences；decode 段在 ctx.sequences。
+            # decode/prefill/hybrid 都需更新两段（对应段为空时无害）。
+            all_seqs = ctx.sequences + ctx.prefill_sequences
+            self.update_sequences(all_seqs)
 
             if not self.scheduler.running_sequences and not self.scheduler.waiting_queue:
                 break
