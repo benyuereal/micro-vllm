@@ -192,6 +192,22 @@ activated = swiglu_fused(gate_up)  # 一步完成融合计算
 - 三引擎 7 轮测量标准差均 < 1 token/s，性能稳定可复现
 - 优势来源：手写 CUDA GEMV + CUDA Graph 在 M=1 decode 下摊薄 kernel 固定开销
 
+### 三方对比 · 批次吞吐（L20 / Qwen3-0.6B）
+
+并发吞吐随 batch 变化的趋势（单用户是 micro-vllm 优势区，batch 增大后 vLLM 的 inductor 编译 + tensor core GEMM 反超）：
+
+> **硬件**：NVIDIA L20 &nbsp;|&nbsp; **模型**：Qwen3-0.6B (bf16) &nbsp;|&nbsp; **输入**：128 tokens &nbsp;|&nbsp; **输出**：256 tokens &nbsp;|&nbsp; **采样**：temperature=0.01 &nbsp;|&nbsp; **各引擎独占一张 GPU**
+
+| 并发数 | micro-vllm | vLLM 0.21.0 | nano-vllm |
+|:------:|:----------:|:-----------:|:---------:|
+| 1      | **405.8**  | 386.4       | 335.8     |
+| 32     | 8,090      | **8,597**   | 7,238     |
+| 64     | 10,716     | **13,256**  | 11,672    |
+
+- 单用户（bs=1）micro-vllm 领先 vLLM +5.0%；并发增大后 vLLM 凭借编译优化与 tensor core GEMM 反超
+- 三方均支持连续批处理，batch=64 时系统总吞吐均破万 tok/s
+- micro-vllm 定位清晰：**低并发延迟敏感场景**（手写 GEMV + 整图 Graph 摊薄 kernel 固定开销），而非高并发吞吐场景
+
 
 
 ---

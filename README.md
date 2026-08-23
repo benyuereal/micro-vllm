@@ -193,6 +193,21 @@ Fair comparison against vLLM and nano-vllm under fully aligned conditions (short
 - All three engines show < 1 token/s standard deviation across 7 runs — stable and reproducible
 - Edge comes from hand-written CUDA GEMV + CUDA Graph amortizing kernel fixed overhead at M=1 decode
 
+### Three-Way Comparison · Batch Throughput (L20 / Qwen3-0.6B)
+
+As concurrency rises, the bottleneck shifts from kernel launch overhead to memory bandwidth and tensor-core GEMM, where vLLM's inductor compilation pays off:
+
+> **Hardware**: NVIDIA L20 &nbsp;|&nbsp; **Model**: Qwen3-0.6B (bf16) &nbsp;|&nbsp; **Input**: 128 tokens &nbsp;|&nbsp; **Output**: 256 tokens &nbsp;|&nbsp; **Sampling**: temperature=0.01
+
+| Concurrency | micro-vllm | vLLM 0.21.0 | nano-vllm |
+|:------:|:----------:|:-----------:|:---------:|
+| 1      | **405.8**  | 386.4       | 335.8     |
+| 32     | 8,090      | **8,597**   | 7,238     |
+| 64     | 10,716     | **13,256**  | 11,672    |
+
+- At bs=1 micro-vllm leads vLLM by **+5.0%**; as concurrency grows vLLM overtakes via compiled tensor-core GEMM
+- micro-vllm's positioning is clear: **low-concurrency, latency-sensitive** serving (single-user / few-user interactive scenarios), not high-concurrency aggregate throughput
+
 ---
 
 
