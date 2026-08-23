@@ -44,20 +44,11 @@ class Scheduler:
     def add_request(self, seq: Sequence):
         self.waiting_queue.append(seq)
 
-    def get_next_batch(self) -> Tuple[List[Sequence], List[Sequence], str]:
-        """连续批处理调度。返回 (decode_batch, prefill_batch, batch_type)。
+    def get_next_batch(self) -> Tuple[List[Sequence], str]:
+        """连续批处理调度。返回 (batch, batch_type)。
 
-        batch_type:
-        - "decode"  : 仅 decode_batch 非空（纯 decode，走已捕获 graph）
-        - "prefill" : 仅 prefill_batch 非空（无 decode 时 prefill，原行为）
-        - "hybrid"  : 两者都非空（同一步既推进 decode 又推进 prefill chunk，
-                      piecewise 执行：段A decode graph replay + 段B prefill，
-                      decode 不再因等 prefill 闲置，GPU 算力不浪费）
-        - "idle"    : 都空
-
-        decode_batch 会 pad 到已捕获的 graph batch_size（由 engine 处理）。
-        prefill_batch 取满 chunk（chunk_len==max_chunk_tokens）优先；最后不满 chunk
-        的块在无 decode 时按原 prefill 逻辑处理（hybrid 不混入不满 chunk，保证段B shape 规整）。
+        batch_type: "decode" / "prefill" / "idle"
+        decode batch 会 pad 到已捕获的 graph batch_size。
         """
         # 1. 剔除已完成的 running
         self.running_sequences = [
@@ -65,26 +56,25 @@ class Scheduler:
             if not s.is_finished()
         ]
 
-        # 2. decode batch：所有 decode seq（mixed-length，pad 到 graph 档位）
-        decode_batch = self._get_decode_batch() if self.running_sequences else []
+        # 2. 【decode 优先】running 有 decode seq 就持续 decode，绝不让 GPU 等 prefill
+        if self.running_sequences:
+            batch = self._get_decode_batch()
+            if batch:
+                return batch, "decode"
 
-        # 3. prefill batch：waiting 新请求 + running 中 chunked 进行中的 seq。
-        #    hybrid 模式仅取【满 chunk】（chunk_len==max_chunk_tokens）保证段B shape 规整；
-        #    不满的最后一块留给纯 prefill 步（无 decode 时）处理。
+        # 3. 无 decode 可做时尝试 prefill：waiting 有新请求，或 running 中有
+        #    chunked prefill 进行中的 seq（prefill_done>0 且未完成）需续切。
         has_pending_prefill = (
             bool(self.waiting_queue) or
             any(s.state == "prefill" and s.prefill_remaining > 0 for s in self.running_sequences)
         )
-        prefill_batch = self._get_prefill_batch(hybrid=bool(decode_batch)) if has_pending_prefill else []
+        if has_pending_prefill:
+            batch = self._get_prefill_batch()
+            if batch:
+                return batch, "prefill"
 
-        # 4. 组装返回
-        if decode_batch and prefill_batch:
-            return decode_batch, prefill_batch, "hybrid"
-        if decode_batch:
-            return decode_batch, [], "decode"
-        if prefill_batch:
-            return [], prefill_batch, "prefill"
-        return [], [], "idle"
+        # 4. 真无工作
+        return [], "idle"
 
     def _get_decode_batch(self) -> List[Sequence]:
         """从 running 选 decode batch：所有 decode seq 进同一 batch（mixed-length），
@@ -117,11 +107,13 @@ class Scheduler:
             idx += 1
         return padded
 
-    def _get_prefill_batch(self, hybrid: bool = False) -> List[Sequence]:
+    def _get_prefill_batch(self) -> List[Sequence]:
         """取 prefill batch，支持 chunked prefill。
 
         seq 归属：chunked 进行中的 seq（state==prefill, prefill_done>0）留在 running，
-        由本方法从 running 续切；新 prompt 从 waiting 取。
+        由本方法从 running 续切；新 prompt 从 waiting 取。这样 running 同时含 decode seq
+        与 prefill-in-progress seq，但 _get_decode_batch 只选 state==decode 的，故 decode
+        优先不变；无 decode seq 时 fallthrough 到此续切 prefill。
 
         两种模式（同一 step 不混，保证 prefill_runner 等长 [B,S] 约束）：
         1) 短 prompt 等长批量：按精确长度分组（prefill 无 attention mask，padding 污染 KV），
@@ -129,8 +121,7 @@ class Scheduler:
         2) 长 prompt 分块：单条剩余 > max_chunk_tokens 时切一块（batch=1, offset=prefill_done,
            is_last=(chunk_len==remaining)）。切块期间 seq 留在 running，下步优先续切。
 
-        hybrid=True：本步同时有 decode seq（hybrid 执行）。段B prefill 当前走 eager（phase2），
-        形状无需静态，故 prefill 选择逻辑不变；phase3 段B 进 graph 时会限制仅取满 chunk。
+        立即 prefill：running 无 decode 时 GPU 本就空转，有请求就 prefill。
         """
         # ---- 优先续切 running 中已开始的 chunked prefill（公平：先做完已开始的）----
         in_progress = [s for s in self.running_sequences

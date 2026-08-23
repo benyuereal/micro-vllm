@@ -10,11 +10,9 @@ from core.sequence import Sequence
 class BatchInferenceContext:
     # 批次基础信息
     batch_size: int
-    batch_type: str  # 直接用字符串："waiting" / "prefill" / "decode" / "hybrid"
-    # 直接携带Sequence对象列表（decode 序列；hybrid 时仅为 decode 段）
+    batch_type: str  # 直接用字符串："waiting" / "prefill" / "decode"
+    # 直接携带Sequence对象列表
     sequences: List[Sequence] = field(default_factory=list)
-    # hybrid 模式下的 prefill 段序列（piecewise 执行的段B）
-    prefill_sequences: List[Sequence] = field(default_factory=list)
     # 设备缓存
     _device: torch.device = None
     # launch/collect 中间状态（仅 rank0 本地使用，不参与广播）
@@ -37,8 +35,7 @@ class BatchInferenceContext:
         # 1. 打包所有基础元信息，一次性广播（变量名已优化）
         batch_size_meta = {
             "batch_size": self.batch_size,
-            "batch_type": self.batch_type,
-            "prefill_size": len(self.prefill_sequences),
+            "batch_type": self.batch_type
         }
         dist.broadcast_object_list([batch_size_meta], src=0)
 
@@ -46,14 +43,9 @@ class BatchInferenceContext:
         if self.batch_type == "waiting":
             return
 
-        # 2. 广播Sequence序列化后的字典列表（decode 段）
+        # 2. 广播Sequence序列化后的字典列表
         seq_dict_list = [seq.to_dict() for seq in self.sequences]
         dist.broadcast_object_list(seq_dict_list, src=0)
-
-        # 3. prefill 段序列（pure prefill 与 hybrid 均可能携带）
-        if self.prefill_sequences:
-            prefill_dict_list = [seq.to_dict() for seq in self.prefill_sequences]
-            dist.broadcast_object_list(prefill_dict_list, src=0)
 
     # ------------------------------
     # 非主Rank接收：和broadcast一一对应，成对调用
@@ -73,22 +65,15 @@ class BatchInferenceContext:
         batch_size_meta = batch_size_meta_container[0]
         batch_size = batch_size_meta["batch_size"]
         batch_type = batch_size_meta["batch_type"]
-        prefill_size = batch_size_meta.get("prefill_size", 0)
 
         # 初始化上下文
         ctx = cls(batch_size=batch_size, batch_type=batch_type)
         if batch_type == "waiting":
             return ctx
 
-        # 2. 接收Sequence字典列表（decode 段），批量还原
+        # 2. 接收Sequence字典列表，批量还原
         seq_dict_list = [None] * batch_size
         dist.broadcast_object_list(seq_dict_list, src=0)
         ctx.sequences = [Sequence.from_dict(seq_dict, _tokenizer) for seq_dict in seq_dict_list]
-
-        # 3. prefill 段序列（pure prefill 与 hybrid 均可能携带）
-        if prefill_size > 0:
-            prefill_dict_list = [None] * prefill_size
-            dist.broadcast_object_list(prefill_dict_list, src=0)
-            ctx.prefill_sequences = [Sequence.from_dict(d, _tokenizer) for d in prefill_dict_list]
 
         return ctx
