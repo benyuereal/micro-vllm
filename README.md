@@ -11,9 +11,9 @@
   </a>
 </p>
 
-> A high-performance LLM inference engine implementing **PagedAttention + Flash Attention + SwiGLU Kernel Fusion** from scratch. Achieves **110%** of vLLM's single user performance on A100, suitable for small-scale production deployment and learning.
+> A high-performance LLM inference engine implementing **PagedAttention + Flash Attention + Hand-written CUDA GEMV + SwiGLU Kernel Fusion** from scratch. Achieves **105%** of vLLM and **121%** of nano-vllm single-user throughput on L20, suitable for small-scale production deployment and learning.
 > 
-> 🚀 **Latest Update**: Tensor Parallelism is now supported for multi-GPU inference!
+> 🚀 **Latest Update**: Hand-written CUDA GEMV integrated into the decode hot path, single-user throughput up another **+3.8%**!
 
 ## ✨ Features
 
@@ -177,51 +177,36 @@ Supports multi-GPU distributed inference, breaking single-GPU memory limits:
 
 ## 📊 Performance Benchmark
 
-### Test Configuration
+### Three-Way Comparison · Single-User Throughput (L20 / Qwen3-0.6B)
 
-- **Hardware**: NVIDIA A100 40GB
-- **Model**: Qwen-7B-Chat
-- **Input Length**: 128-512 tokens
-- **Output Length**: 500 tokens
+Fair comparison against vLLM and nano-vllm under fully aligned conditions (short context is micro-vllm's sweet spot):
 
-### Single User Throughput
+> **Hardware**: NVIDIA L20 &nbsp;|&nbsp; **Model**: Qwen3-0.6B (bf16) &nbsp;|&nbsp; **Input**: 8 tokens &nbsp;|&nbsp; **Output**: 200 tokens &nbsp;|&nbsp; **Sampling**: temperature=0.01 &nbsp;|&nbsp; **Method**: median of 7 runs, each engine on a dedicated GPU
 
+| Framework | Throughput (tokens/s) | Relative |
+|:-----|:----------------:|:--------:|
+| **micro-vllm** | **405.8** | **1.21×** |
+| vLLM 0.21.0 | 386.4 | 1.15× |
+| nano-vllm | 335.8 | 1.00× |
 
----
+- micro-vllm leads vLLM by **+5.0%** and nano-vllm by **+20.9%** in single-user throughput
+- All three engines show < 1 token/s standard deviation across 7 runs — stable and reproducible
+- Edge comes from hand-written CUDA GEMV + CUDA Graph amortizing kernel fixed overhead at M=1 decode
 
-## 📈 Performance Validation
+### Three-Way Comparison · Batch Throughput (L20 / Qwen3-0.6B)
 
-### Single-User Throughput (vs. Official vLLM)
+As concurrency rises, the bottleneck shifts from kernel launch overhead to memory bandwidth and tensor-core GEMM, where vLLM's inductor compilation pays off:
 
-In single-user sequential request scenarios, micro-vllm demonstrates superior inference efficiency and stability:
+> **Hardware**: NVIDIA L20 &nbsp;|&nbsp; **Model**: Qwen3-0.6B (bf16) &nbsp;|&nbsp; **Input**: 128 tokens &nbsp;|&nbsp; **Output**: 256 tokens &nbsp;|&nbsp; **Sampling**: temperature=0.01
 
-| Metric | micro-vllm  | vLLM Official |
-|:---------|:------------|:--------------|
-| **Mean** | **83** ✅ | **75.88** |
-| **Std Dev** | **0.07** ✅  | **1.95** |
+| Concurrency | micro-vllm | vLLM 0.21.0 | nano-vllm |
+|:------:|:----------:|:-----------:|:---------:|
+| 1      | **405.8**  | 386.4       | 335.8     |
+| 32     | 8,090      | **8,597**   | 7,238     |
+| 64     | 10,716     | **13,256**  | 11,672    |
 
-- **+9%** higher average throughput than vLLM, performance aligned with industry benchmark
-- **28x better stability** (coefficient of variation), jitter controlled within **0.09%**
-- Lightweight architecture incurs lower scheduling overhead in single-concurrency scenarios, ideal for low-latency interactive applications
-
-| Framework | tokens/sec | Relative Performance |
-|:----------|:-----------|:---------------------|
-| **This Framework (online branch)** | **83**  | **110%**           |
-| vLLM | 75.88      | 100%                 |
-| HuggingFace | 20         | 27%                  |
-
-### Batch Concurrency (32 Requests)
-
-> **Hardware**: NVIDIA A100-PCIE-40GB &nbsp;|&nbsp; **Model**: Qwen-7B &nbsp;|&nbsp; **Batch Size**: 32 &nbsp;|&nbsp; **Total Requests**: 32 &nbsp;|&nbsp; **Total Tokens**: 9,677
-
-| Framework | Per-Request (tokens/s) | GPU Utilization | Relative Performance |
-|:----------|:-----------------------|:----------------|:---------------------|
-| **This Framework** | **66** | **~99%** | **106%** |
-| vLLM | ~62 | — | 100% |
-
-- Decode step latency: **~15ms** (graph=14.5ms + sample=0.27ms)
-- GPU utilization reaches **99%** (nvidia-smi) at batch=32
-- Total system throughput: **2,112 tokens/s** (32 concurrent × 66 tokens/s)
+- At bs=1 micro-vllm leads vLLM by **+5.0%**; as concurrency grows vLLM overtakes via compiled tensor-core GEMM
+- micro-vllm's positioning is clear: **low-concurrency, latency-sensitive** serving (single-user / few-user interactive scenarios), not high-concurrency aggregate throughput
 
 ---
 
@@ -320,11 +305,11 @@ curl -X POST "http://localhost:8000/generate_stream" \
 
 ```bash
 python -m vllm.entrypoints.openapi.api_server \
-    --model /path/to/Qwen-7B-Chat \
+    --model /path/to/Qwen3-0.6B \
     --host 0.0.0.0 \
     --port 8000 \
     --trust-remote-code \
-    --served-model-name Qwen-7B-Chat
+    --served-model-name Qwen3-0.6B
 ```
 
 ### Test Request
@@ -333,7 +318,7 @@ python -m vllm.entrypoints.openapi.api_server \
 curl http://localhost:8000/v1/completions \
     -H "Content-Type: application/json" \
     -d '{
-        "model": "Qwen-7B-Chat",
+        "model": "Qwen3-0.6B",
         "prompt": "Hello, write a Java file upload code",
         "max_tokens": 1000,
         "temperature": 0.7,
@@ -378,7 +363,7 @@ micro-vllm/
 
 ## 💡 Note
 
-This framework is suitable for small-to-medium scale LLM service production deployment, achieving 110% of vLLM's performance with clean code that is easy to understand and extend.
+This framework is suitable for small-to-medium scale LLM service production deployment, achieving 105% of vLLM's single-user throughput with clean code that is easy to understand and extend.
 ---
 
 ## 📄 License

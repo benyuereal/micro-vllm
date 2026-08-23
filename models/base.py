@@ -32,15 +32,17 @@ class ModelAdapter(ABC):
     # ------------------------------------------------------------------
     # 元信息
     # ------------------------------------------------------------------
-    @abstractmethod
     def cache_dims(self, cfg) -> Tuple[int, int, int]:
-        """返回 (n_heads, kv_n_heads, head_size) 用于 KVCacheManager 分配。"""
-        ...
+        """返回 (n_heads, kv_n_heads, head_size) 用于 KVCacheManager 分配。
+        GQA 通用默认：head_size 取 cfg.head_dim，否则 hidden/heads。MLA 等特殊架构 override。"""
+        num_heads = cfg.num_attention_heads
+        kv_heads = getattr(cfg, "num_key_value_heads", num_heads)
+        head_size = getattr(cfg, "head_dim", cfg.hidden_size // num_heads)
+        return num_heads, kv_heads, head_size
 
-    @abstractmethod
     def intermediate_size(self, cfg, world_size: int) -> int:
-        """单卡 intermediate_size（已按 TP 切分）。"""
-        ...
+        """单卡 intermediate_size（已按 TP 切分）。MoE 等特殊架构 override。"""
+        return cfg.intermediate_size // world_size
 
     def num_layers(self, cfg) -> int:
         """decoder 层数。标准模型即 cfg.num_hidden_layers。"""
@@ -77,25 +79,23 @@ class ModelAdapter(ABC):
     # ------------------------------------------------------------------
     # 模块访问（统一命名）
     # ------------------------------------------------------------------
-    @abstractmethod
+    # HF 风格默认实现（model.model.{embed_tokens,layers,norm} + model.lm_head）。
+    # 老 Qwen 用 model.transformer.* 命名，override 这几个方法。
     def embed(self, model) -> torch.Tensor:
         """返回 embedding 查表（callable: input_ids → hidden）。"""
-        ...
+        return model.model.embed_tokens
 
-    @abstractmethod
     def blocks(self, model) -> List:
         """返回 decoder layer 列表。"""
-        ...
+        return model.model.layers
 
-    @abstractmethod
     def final_norm(self, model):
         """返回最终 RMSNorm 层。"""
-        ...
+        return model.model.norm
 
-    @abstractmethod
     def lm_head(self, model):
         """返回 lm_head（callable: hidden → logits）。"""
-        ...
+        return model.lm_head
 
     # ------------------------------------------------------------------
     # decode 单层钩子

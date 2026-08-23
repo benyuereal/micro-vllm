@@ -208,18 +208,7 @@ class DeepSeekAdapter(ModelAdapter):
             attn._prepared = True
             torch.cuda.empty_cache()
 
-    # ==================== 模块访问 ====================
-    def embed(self, model):
-        return model.model.embed_tokens
-
-    def blocks(self, model):
-        return model.model.layers
-
-    def final_norm(self, model):
-        return model.model.norm
-
-    def lm_head(self, model):
-        return model.lm_head
+    # ==================== 模块访问（embed/blocks/final_norm/lm_head 用 base HF 默认实现）====================
 
     # ==================== RoPE / YaRN（仅 qk_rope 维，interleaved 约定）====================
     # DeepSeek 用 Llama 风格 interleaved RoPE + YaRN 频率缩放：

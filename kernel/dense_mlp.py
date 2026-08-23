@@ -18,7 +18,7 @@ import os
 import torch
 import torch.nn.functional as F
 
-from kernel.gemv import gemv_v2, gemv_available
+from kernel.gemv import gemv_or_matmul
 
 
 def dense_swiglu(x, gu_w, d_w, m=None, w_is_nk=False):
@@ -34,15 +34,19 @@ def dense_swiglu(x, gu_w, d_w, m=None, w_is_nk=False):
     Returns:
         out:     [M, hidden]
     """
-    if m is None:
-        m = x.shape[0]
-    use_gemv = (m == 1 and gemv_available() and os.environ.get("MICRO_GEMV_FFN", "1") != "0")
     if w_is_nk:
-        # [N,K] 布局：M=1 走 gemv_v2（W 直接读），否则 x @ W.t()
-        gate_up = gemv_v2(x, gu_w) if use_gemv else x @ gu_w.t()
+        # [N,K] 布局：M=1 走 gemv_v2（W 直接读），否则 x @ W.t()。
+        # x 可能是 3D（prefill [B,S,hidden]）→ 先展平 [M,hidden]，末尾 reshape 回原形。
+        lead = x.shape[:-1]
+        x2 = x.reshape(-1, x.shape[-1])
+        M = m if m is not None else x2.shape[0]
+        gate_up = torch.empty(M, gu_w.shape[0], dtype=x.dtype, device=x.device)
+        gemv_or_matmul(x2, gu_w, gate_up, "MICRO_GEMV_FFN")
         up, gate = gate_up.chunk(2, dim=-1)
         act = F.silu(gate) * up
-        return gemv_v2(act, d_w) if use_gemv else act @ d_w.t()
+        out = torch.empty(M, d_w.shape[0], dtype=x.dtype, device=x.device)
+        out = gemv_or_matmul(act, d_w, out, "MICRO_GEMV_FFN")
+        return out.reshape(*lead, d_w.shape[0]) if len(lead) > 1 else out
     else:
         # [K,N] 旧布局：x @ W（DeepSeek/老 Qwen 不变）
         gate_up = x @ gu_w

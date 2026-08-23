@@ -66,3 +66,14 @@ def gemv_v2(x: torch.Tensor, w: torch.Tensor, out: torch.Tensor = None) -> torch
         return torch.matmul(x, w.t(), out=out)
     _mod.gemv_v2(x, w, out)
     return out
+
+
+def gemv_or_matmul(x, w, out, env="MICRO_GEMV"):
+    """统一 GEMV/matmul 分派：M=1 且手写 kernel 可用且 env 开关开启 → gemv_v2，
+    否则 x @ w.t()。w 为 [N,K] 布局。替代各 adapter 里重复的 if bs==1 and gemv_available()...。
+    env：环境变量名（"MICRO_GEMV_QKV"/"MICRO_GEMV_O"/"MICRO_GEMV_FFN"），默认 "1" 开启。"""
+    if x.shape[0] == 1 and gemv_available() and os.environ.get(env, "1") != "0":
+        _mod.gemv_v2(x, w, out)
+    else:
+        torch.matmul(x, w.t(), out=out)
+    return out

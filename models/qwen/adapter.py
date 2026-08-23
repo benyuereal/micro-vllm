@@ -20,16 +20,6 @@ except ImportError:
 class QwenAdapter(ModelAdapter):
     model_type = "qwen"
 
-    # -------------------- 元信息 --------------------
-    def cache_dims(self, cfg):
-        num_heads = cfg.num_attention_heads
-        kv_heads = getattr(cfg, "num_key_value_heads", num_heads)
-        head_size = getattr(cfg, "head_dim", cfg.hidden_size // num_heads)
-        return num_heads, kv_heads, head_size
-
-    def intermediate_size(self, cfg, world_size):
-        return cfg.intermediate_size // world_size
-
     # -------------------- 权重预处理 --------------------
     def prepare_weights(self, model, world_size, rank):
         # 幂等：已处理则跳过（标志位 w1 is None）

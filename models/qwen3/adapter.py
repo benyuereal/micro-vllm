@@ -15,7 +15,6 @@
   复用 PagedAttention 的 _cos_pool/_sin_pool（已按 adapter.rope_theta 用 1e6 预计算）。
 - tie_word_embeddings=true：lm_head.weight is embed_tokens.weight。
 """
-import os
 import torch
 
 from models.base import ModelAdapter
@@ -24,8 +23,7 @@ from kernel.rmsnorm import (
     qk_norm_inplace,
 )
 from kernel.dense_mlp import dense_swiglu
-from kernel.gemv import gemv_v2, gemv_available
-from kernel.qwen3_decode_attn import qwen3_decode_attn
+from kernel.gemv import gemv_or_matmul
 
 try:
     from flash_attn import flash_attn_with_kvcache
@@ -37,27 +35,16 @@ class Qwen3Adapter(ModelAdapter):
     model_type = "qwen3"
 
     # -------------------- 元信息 --------------------
-    def cache_dims(self, cfg):
-        num_heads = cfg.num_attention_heads
-        kv_heads = getattr(cfg, "num_key_value_heads", num_heads)
-        head_size = getattr(cfg, "head_dim", cfg.hidden_size // num_heads)
-        return num_heads, kv_heads, head_size
-
-    def intermediate_size(self, cfg, world_size):
-        return cfg.intermediate_size // world_size
-
-    def softmax_scale(self, cfg):
-        # QK-Norm 后点积仍按 head_dim scale
-        return self.cache_dims(cfg)[2] ** -0.5
-
-    def rope_theta(self, cfg) -> float:
-        return getattr(cfg, "rope_theta", None) or 10000.0
-
     def supports_chunked_prefill(self, cfg) -> bool:
         # Qwen3 prefill_layer 用 flash_attn_with_kvcache(cache_seqlens=position_offsets)，
         # 第 N chunk 的 attention 能读到 cache 中前 N-1 chunk 的 KV；RoPE 按 per-seq offset
         # 从 cos/sin pool gather 正确位置。已验证 chunked vs 非 chunked 输出完全一致。
         return True
+
+    @staticmethod
+    def _ln_eps(ln, cfg):
+        """兼容 HF RMSNorm 的两种 eps 属性名（eps / variance_epsilon），回退 cfg.rms_norm_eps。"""
+        return getattr(ln, "eps", None) or getattr(ln, "variance_epsilon", cfg.rms_norm_eps)
 
     # -------------------- 权重预处理 --------------------
     def prepare_weights(self, model, world_size, rank):
@@ -65,11 +52,6 @@ class Qwen3Adapter(ModelAdapter):
         if getattr(first.self_attn, "_prepared", False):
             return
         cfg = model.config
-        num_heads = cfg.num_attention_heads
-        kv_heads = getattr(cfg, "num_key_value_heads", num_heads)
-        head_size = getattr(cfg, "head_dim", cfg.hidden_size // num_heads)
-        q_dim = num_heads * head_size       # 2048
-        kv_dim = kv_heads * head_size        # 1024
 
         for block in self.blocks(model):
             attn = block.self_attn
@@ -87,8 +69,8 @@ class Qwen3Adapter(ModelAdapter):
             # QK-Norm 权重（RMSNorm on head_dim，shape [head_dim]）
             attn._q_norm_w = attn.q_norm.weight.data.clone()
             attn._k_norm_w = attn.k_norm.weight.data.clone()
-            attn._q_norm_eps = getattr(attn.q_norm, "eps", None) or getattr(attn.q_norm, "variance_epsilon", cfg.rms_norm_eps)
-            attn._k_norm_eps = getattr(attn.k_norm, "eps", None) or getattr(attn.k_norm, "variance_epsilon", cfg.rms_norm_eps)
+            attn._q_norm_eps = self._ln_eps(attn.q_norm, cfg)
+            attn._k_norm_eps = self._ln_eps(attn.k_norm, cfg)
 
             # MLP: dense_swiglu 约定 gu_w 输出维 [up|gate] 顺序（前半 up、后半 gate）。
             # [N,K] 布局：cat 沿输出维 dim=0 → [2*inter, hidden]，前半 up、后半 gate。
@@ -99,11 +81,9 @@ class Qwen3Adapter(ModelAdapter):
 
             # RMSNorm 权重 + eps
             block._in_ln_w = block.input_layernorm.weight.data.clone()
-            block._in_ln_eps = getattr(block.input_layernorm, "eps", None) or \
-                getattr(block.input_layernorm, "variance_epsilon", cfg.rms_norm_eps)
+            block._in_ln_eps = self._ln_eps(block.input_layernorm, cfg)
             block._post_ln_w = block.post_attention_layernorm.weight.data.clone()
-            block._post_ln_eps = getattr(block.post_attention_layernorm, "eps", None) or \
-                getattr(block.post_attention_layernorm, "variance_epsilon", cfg.rms_norm_eps)
+            block._post_ln_eps = self._ln_eps(block.post_attention_layernorm, cfg)
 
             # 释放原始权重
             attn.q_proj = attn.k_proj = attn.v_proj = attn.o_proj = None
@@ -112,58 +92,24 @@ class Qwen3Adapter(ModelAdapter):
             attn._prepared = True
         torch.cuda.empty_cache()
 
-    # -------------------- 模块访问 --------------------
-    def embed(self, model):
-        return model.model.embed_tokens
-
-    def blocks(self, model):
-        return model.model.layers
-
-    def final_norm(self, model):
-        return model.model.norm
-
-    def lm_head(self, model):
-        # tie_word_embeddings: lm_head.weight is embed_tokens.weight
-        return model.lm_head
-
-    # -------------------- QK-Norm 辅助 --------------------
-    @staticmethod
-    def _qk_norm_decode(x, norm_w, eps, num_heads, head_size):
-        """decode: 对 [bs, num_heads*head_size] 做 per-head RMSNorm（作用在 head_dim 维）。
-        等价 transformers: q_proj(h).view(bs, H, hd) → q_norm → 还原。graph 友好（固定形状）。"""
-        bs = x.shape[0]
-        x = x.view(bs, num_heads, head_size)               # [bs, H, hd]
-        var = x.float().pow(2).mean(dim=-1, keepdim=True)  # [bs, H, 1]
-        x = (x * torch.rsqrt(var + eps) * norm_w.to(x.dtype)).to(x.dtype)
-        return x.view(bs, num_heads * head_size)
-
     # -------------------- decode 单层钩子 --------------------
+    def _project_qkv(self, attn, graph, bs):
+        """normed h（graph._h_buf[:bs]）→ QKV 投影 → QK-Norm，写 graph._qkv[:bs]。"""
+        qkv_buf = graph._qkv[:bs]
+        gemv_or_matmul(graph._h_buf[:bs], attn._qkv_w, qkv_buf, "MICRO_GEMV_QKV")
+        self._apply_qk_norm(qkv_buf, attn, graph, bs)
+        return qkv_buf
+
     def compute_qkv(self, block, h, graph, bs):
         rmsnorm_(h, block._in_ln_w, graph._h_buf[:bs], block._in_ln_eps)
-        qkv_buf = graph._qkv[:bs]
-        h_in = graph._h_buf[:bs]
-        w = block.self_attn._qkv_w  # [N,K]
-        if bs == 1 and gemv_available() and os.environ.get("MICRO_GEMV_QKV", "1") != "0":
-            gemv_v2(h_in, w, out=qkv_buf)
-        else:
-            torch.matmul(h_in, w.t(), out=qkv_buf)
-        self._apply_qk_norm(qkv_buf, block.self_attn, graph, bs)
-        return qkv_buf
+        return self._project_qkv(block.self_attn, graph, bs)
 
     def compute_next_qkv(self, block_next, mlp_out_prev, res_prev, graph, bs):
         rmsnorm_residual(
             mlp_out_prev, res_prev, block_next._in_ln_w,
             graph._h_buf[:bs], graph._residual[:bs], block_next._in_ln_eps
         )
-        qkv_buf = graph._qkv[:bs]
-        h_in = graph._h_buf[:bs]
-        w = block_next.self_attn._qkv_w  # [N,K]
-        if bs == 1 and gemv_available() and os.environ.get("MICRO_GEMV_QKV", "1") != "0":
-            gemv_v2(h_in, w, out=qkv_buf)
-        else:
-            torch.matmul(h_in, w.t(), out=qkv_buf)
-        self._apply_qk_norm(qkv_buf, block_next.self_attn, graph, bs)
-        return qkv_buf, graph._residual[:bs]
+        return self._project_qkv(block_next.self_attn, graph, bs), graph._residual[:bs]
 
     def _apply_qk_norm(self, qkv_buf, attn, graph, bs):
         """对融合 qkv buffer 的 q 段、k 段原地做 QK-Norm（per-head RMSNorm on head_dim）。
@@ -190,22 +136,6 @@ class Qwen3Adapter(ModelAdapter):
         cache_lens = cache_manager._cache_seqlens_buffer[:bs]
         out_buf = graph._attn_out[:bs]
 
-        # TileLang 轻量 decode attention（bs=1）：单 kernel Q旋转+QK+softmax+PV+存新K/V。
-        # 图下实测比 flash 慢（GQA 每 q-head 一 block 致 KV 双读 + 串行 reduce），
-        # 暂用 flash；kernel 代码保留待优化（合并 2 q-head/块 + warp reduce 后再启用）。
-        if bs == 1 and os.environ.get("MICRO_TILELANG_ATTN"):
-            attn_pre = graph._attn_pre[:bs]
-            qwen3_decode_attn(
-                qkv, k_cache, v_cache, block_table, cache_lens,
-                graph.attention._cos_pool, graph.attention._sin_pool,
-                graph.num_heads, graph.kv_num_heads, graph.head_size, out=attn_pre)
-            w = block.self_attn._o_w  # [N,K]
-            if gemv_available():
-                gemv_v2(attn_pre, w, out=out_buf)
-            else:
-                torch.matmul(attn_pre, w.t(), out=out_buf)
-            return out_buf
-
         # flash_attn GQA：q 头数(16) 可被 kv 头数(8) 整除，连续分组（head 0,1→kv0）。
         # RoPE 由 flash_attn 按 cache_seqlens 内部旋转（rotary_cos/sin half-split, interleaved=False）。
         attn = flash_attn_with_kvcache(
@@ -220,13 +150,7 @@ class Qwen3Adapter(ModelAdapter):
             num_splits=1 if bs == 1 else (0 if bs >= 32 else max(1, 32 // max(1, bs * 4)))
         ).squeeze(1)
 
-        attn_flat = attn.reshape(bs, -1)
-        w = block.self_attn._o_w  # [N,K]
-        if bs == 1 and gemv_available() and os.environ.get("MICRO_GEMV_O", "1") != "0":
-            gemv_v2(attn_flat, w, out=out_buf)
-        else:
-            torch.matmul(attn_flat, w.t(), out=out_buf)
-        return out_buf
+        return gemv_or_matmul(attn.reshape(bs, -1), block.self_attn._o_w, out_buf, "MICRO_GEMV_O")
 
     def compute_ffn(self, block, attn_out, residual, graph, bs):
         rmsnorm_residual(
@@ -290,13 +214,9 @@ class Qwen3Adapter(ModelAdapter):
         # 权重 [N,K]=[out,in] 布局：shape[0]=out(N), shape[1]=in(K=hidden)
         qkv_dim = _b.self_attn._qkv_w.shape[0]   # q_dim+2*kv_dim
         o_dim = _b.self_attn._o_w.shape[0]       # hidden（o_proj 输出维）
-        # q_dim = num_heads*head_size（o_proj 输入维 = _o_w.shape[1]=K）
-        q_dim = _b.self_attn._o_w.shape[1]
         return {
             "_h_buf": torch.empty((max_bs, hidden_dim), dtype=dtype, device=device),
             "_qkv": torch.empty(max_bs, qkv_dim, dtype=dtype, device=device),
-            # TileLang decode attn 输出（o_proj 前，= num_heads*head_size=2048）；flash 路径不用
-            "_attn_pre": torch.empty(max_bs, q_dim, dtype=dtype, device=device),
             "_attn_out": torch.empty(max_bs, o_dim, dtype=dtype, device=device),
             "_residual": torch.empty((max_bs, hidden_dim), dtype=dtype, device=device),
         }
