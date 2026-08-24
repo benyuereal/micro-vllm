@@ -202,6 +202,11 @@ class InferenceEngine:
             draft_model, draft_cfg = load_dflash2_draft(
                 draft_model_path, dtype, device, self.num_speculative_tokens,
                 max_pos=self.max_position)
+            # DFlash2 草稿权重不含 embed_tokens / lm_head：从 target 共享（同 vocab/hidden）。
+            # 对齐 vLLM load_dflash_model（draft.embed_tokens = target_embed；
+            # dflash_model.lm_head = target_lm_head）。
+            draft_model.share_target_weights(
+                target_model.model.embed_tokens, target_model.lm_head)
             draft_is_target = False
             mask_token_id = getattr(draft_cfg, "dflash_config", {}).get(
                 "mask_token_id", self.mask_token_id)
