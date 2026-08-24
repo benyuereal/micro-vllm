@@ -119,20 +119,20 @@ def _micro_loop(eng, max_steps):
                 done = (not eng.scheduler.running_sequences and not eng.scheduler.waiting_queue)
                 _t1("sched")
                 if bt == "waiting" or not b:
-                    _t0(); BatchInferenceContext(0, "waiting").broadcast(); _t1("bcast1")
+                    _t0(); eng.tp_broadcast_waiting(); _t1("bcast1")
                 else:
-                    _t0(); ctx = BatchInferenceContext(len(b), bt, b); ctx.broadcast(); _t1("bcast1")
+                    _t0(); ctx = BatchInferenceContext(len(b), bt, b); eng.tp_broadcast_batch(ctx); _t1("bcast1")
                     _t0(); eng.step(ctx); _t1("step")
                     _t0(); eng.collect(ctx); _t1("collect")
-                    _t0(); ctx.broadcast(); _t1("bcast2")
+                    _t0(); eng.tp_broadcast_tokens(ctx); _t1("bcast2")
                     _t0(); eng.update_sequences(ctx.sequences); _t1("upd")
                 _t0(); dt = torch.tensor([1 if done else 0], device=eng.device); dist.broadcast(dt, src=0); _t1("done")
             else:
-                _t0(); ctx = BatchInferenceContext.receive(eng.tokenizer); _t1("recv1")
+                _t0(); ctx = eng.tp_receive_batch(); _t1("bcast1r")
                 if ctx.batch_type != "waiting" and ctx.batch_size > 0:
                     _t0(); eng.step(ctx); _t1("step")
-                    _t0(); ctx = BatchInferenceContext.receive(eng.tokenizer); _t1("recv2")
-                    _t0(); eng.update_sequences(ctx.sequences); _t1("upd")
+                    _t0(); seqs = eng.tp_receive_tokens(ctx); _t1("recv2")
+                    _t0(); eng.update_sequences(seqs); _t1("upd")
                 _t0(); dt = torch.zeros(1, device=eng.device); dist.broadcast(dt, src=0); _t1("done")
             if int(dt.item()) == 1:
                 break

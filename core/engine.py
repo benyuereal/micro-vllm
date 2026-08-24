@@ -125,6 +125,10 @@ class InferenceEngine:
         self.sampler = Sampler()
         self._decode_ctx = DecodeContext()
         self._stream_event: Optional[StreamEvent] = None
+        # TP bcast1 紧凑协议：非 rank0 的本地 seq store（seq_id→Sequence）+ 上步
+        # batch ids（判断 batch 是否变化）。rank0 仅用 _tp_last_batch_ids。
+        self._tp_seq_store: Dict[int, "Sequence"] = {}
+        self._tp_last_batch_ids: Optional[List[int]] = None
         # decode batch 脏标志：True 时 prepare() 重建元数据。稳定 decode 每步 batch
         # 成员/顺序不变，仅当有序列完成 / prefill 新进 / append 跨 block 分配时置脏，
         # 避免每步构建 512 元素列表 + 比较的 ~1.2ms CPU 开销（见 DecodeContext.prepare）。
@@ -449,6 +453,89 @@ class InferenceEngine:
             return ctx.sequences
         recv = BatchInferenceContext.receive(self.tokenizer)
         return recv.sequences
+
+    _TP_TYPE_CODE = {"decode": 0, "prefill": 1, "waiting": 2}
+    _TP_TYPE_NAME = {0: "decode", 1: "prefill", 2: "waiting"}
+
+    def _tp_meta_buf(self):
+        """常驻 [2] int64 广播缓冲：[batch_size, type_code]。GPU 张量广播（~0.1ms，
+        无 pickle），替代 broadcast_object_list 的 meta（~0.3ms + 跨 rank 失步）。"""
+        if not hasattr(self, "_tp_meta_buf_t") or self._tp_meta_buf_t is None:
+            self._tp_meta_buf_t = torch.empty(2, dtype=torch.int64, device=self.device)
+        return self._tp_meta_buf_t
+
+    def _tp_batch_flag_buf(self):
+        """常驻 [1] int64 广播缓冲（bcast1 的 batch-unchanged 标志）。"""
+        if not hasattr(self, "_tp_flag_buf_t") or self._tp_flag_buf_t is None:
+            self._tp_flag_buf_t = torch.empty(1, dtype=torch.int64, device=self.device)
+        return self._tp_flag_buf_t
+
+    def tp_broadcast_batch(self, ctx: BatchInferenceContext):
+        """TP bcast1（紧凑）：
+        1. meta [batch_size, type_code] GPU 张量广播（~0.1ms，无 pickle）；
+        2. decode 稳态（batch 成员+顺序不变）只广播 flag=0，非 rank0 复用本地
+           seq store；batch 变化（seq 完成/新 prefill 转 decode）广播 flag=1 +
+           完整 seq 列表；prefill 直接完整广播 seq 列表。
+        替代每步 pickle 全部 32 个 Sequence（~2.0ms/步）。"""
+        if get_world_size() <= 1 or not rank0():
+            return
+        meta = self._tp_meta_buf()
+        meta[0] = ctx.batch_size
+        meta[1] = self._TP_TYPE_CODE[ctx.batch_type]
+        dist.broadcast(meta, src=0)
+        if ctx.batch_type == "decode":
+            ids = [s.seq_id for s in ctx.sequences]
+            flag = 0 if ids == self._tp_last_batch_ids else 1
+            fbuf = self._tp_batch_flag_buf()
+            fbuf[0] = flag
+            dist.broadcast(fbuf, src=0)
+            if flag == 1:
+                BatchInferenceContext.broadcast_seqs(ctx)
+            self._tp_last_batch_ids = ids
+        else:
+            BatchInferenceContext.broadcast_seqs(ctx)
+
+    def tp_broadcast_waiting(self):
+        """TP waiting：只广播 meta（type=waiting），非 rank0 据此空转。"""
+        if get_world_size() <= 1 or not rank0():
+            return
+        meta = self._tp_meta_buf()
+        meta[0] = 0
+        meta[1] = self._TP_TYPE_CODE["waiting"]
+        dist.broadcast(meta, src=0)
+
+    def tp_receive_batch(self) -> BatchInferenceContext:
+        """TP bcast1 接收，返回带 .sequences 的 ctx（供 step() 用）。
+        decode 稳态（flag=0）：复用本地 seq store（output_ids 已由 bcast2+
+        update_sequences 同步，get_next_input_ids 即上步 token）；flag=1：
+        完整 receive seq 列表并更新 store。prefill：完整 receive。"""
+        if get_world_size() <= 1 or rank0():
+            return None
+        meta = self._tp_meta_buf()
+        dist.broadcast(meta, src=0)
+        bs = int(meta[0].item())
+        batch_type = self._TP_TYPE_NAME[int(meta[1].item())]
+        ctx = BatchInferenceContext(bs, batch_type)
+        if batch_type == "waiting":
+            return ctx
+        if batch_type == "decode":
+            fbuf = self._tp_batch_flag_buf()
+            dist.broadcast(fbuf, src=0)
+            if int(fbuf[0].item()) == 0:
+                # 稳态：复用本地 store（ids 与 rank0 相同，含 padding 重复）
+                ctx.sequences = [self._tp_seq_store[sid] for sid in self._tp_last_batch_ids]
+            else:
+                seqs = BatchInferenceContext.receive_seqs(bs, self.tokenizer)
+                for s in seqs:
+                    self._tp_seq_store[s.seq_id] = s
+                self._tp_last_batch_ids = [s.seq_id for s in seqs]
+                ctx.sequences = seqs
+        else:
+            seqs = BatchInferenceContext.receive_seqs(bs, self.tokenizer)
+            for s in seqs:
+                self._tp_seq_store[s.seq_id] = s
+            ctx.sequences = seqs
+        return ctx
 
     def _decode(self, ctx: BatchInferenceContext):
         """同步 decode：launch + collect，供 step() 和 non-rank0 路径调用。"""
