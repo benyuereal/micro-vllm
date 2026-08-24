@@ -9,7 +9,7 @@
 | 脚本 | 测什么 | 用法 |
 |:-----|:-------|:-----|
 | `fair_throughput.py` | **1000 请求连续批处理** micro vs nano 公平对比（同进程、同请求、同排空语义） | `python3 fair_throughput.py <N> <max_tokens> <micro\|nano\|both>` |
-| `bench_bs_fair.py` | **单批次** bs=32/64 公平对比（同 prompt、同 max_tokens，全量 prefill+decode 计时） | `python3 bench_bs_fair.py <micro\|nano> <N> [max_tokens]` |
+| `benchmark_throuput.py` | **单批次** bs=32/64 公平对比（同 prompt、同 max_tokens，全量 prefill+decode 计时） | `python3 benchmark_throuput.py <micro\|nano> <N> [max_tokens]` |
 | `bench_batch_compare.py` | HTTP 并发 `/generate` 压测（N 条独立请求打 API 服务） | `python3 bench_batch_compare.py <url> <N>` |
 | `bench_stream.py` | HTTP 并发流式 `/generate_stream` 压测（aiohttp） | `python3 bench_stream.py [batch_size]` |
 | `bench_nano_batch.py` | nano-vllm 进程内批处理（变长 output，对齐 micro 口径） | `NUM_SEQS=256 MAX_OUT=1024 python3 bench_nano_batch.py` |
@@ -52,10 +52,10 @@ CUDA_VISIBLE_DEVICES=1 python3 fair_throughput.py 1000 80 nano
 CUDA_VISIBLE_DEVICES=1 python3 fair_throughput.py 1000 80 both
 
 # 单批次 bs=32/64
-CUDA_VISIBLE_DEVICES=1 python3 bench_bs_fair.py micro 32 500
-CUDA_VISIBLE_DEVICES=2 python3 bench_bs_fair.py nano 32 500
-CUDA_VISIBLE_DEVICES=1 python3 bench_bs_fair.py micro 64 500
-CUDA_VISIBLE_DEVICES=2 python3 bench_bs_fair.py nano 64 500
+CUDA_VISIBLE_DEVICES=1 python3 benchmark_throuput.py micro 32 500
+CUDA_VISIBLE_DEVICES=2 python3 benchmark_throuput.py nano 32 500
+CUDA_VISIBLE_DEVICES=1 python3 benchmark_throuput.py micro 64 500
+CUDA_VISIBLE_DEVICES=2 python3 benchmark_throuput.py nano 64 500
 
 # HTTP 并发压测（需先起服务: python3 api_server.py --model qwen3）
 python3 bench_batch_compare.py http://localhost:8000 256
