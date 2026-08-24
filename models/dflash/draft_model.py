@@ -303,13 +303,25 @@ class _SwiGLU(nn.Module):
 # DFlash2 草稿模型主体
 # ---------------------------------------------------------------------------
 class DFlash2DraftModel(nn.Module):
-    """完整 DFlash2 草稿模型。
+    """完整 DFlash2 草稿模型（对齐 vLLM qwen3_dflash2.py 机制）。
 
-    forward(input_ids, positions, aux_hidden_states) -> last_hidden_states [T, hidden]
-      - input_ids: [T]（1+N 个 query token：anchor + N mask）
+    机制（vLLM 参考实现）：
+    - 草稿权重【不含】embed_tokens 与 lm_head（safetensors 仅 81 key：
+      layers.* / fc / hidden_norm / norm / candidate_selector.*）。两者由
+      share_target_weights 从 target 共享（同 vocab、同 hidden）。
+    - 每步 query = 1+N token（bonus + N mask），经【共享 embed_tokens】得 query hidden，
+      过 5 层 sliding-window 非因果 decoder。
+    - context KV：target 中间层 hidden（target_layer_ids）拼接 → fc → hidden_norm →
+      各层 k/v proj + k_norm + RoPE（precompute_context_kv）。草稿 query attention
+      读 context + 本步 query（非因果）。
+    - 候选：草稿 mask 位置 hidden → 【共享 lm_head】→ top_k 候选 → selector 边打分
+      → 贪心 walk 选一条连贯路径（select_draft_tokens）。
+
+    forward(input_ids, positions, context_kv, input_embeds) -> last_hidden_states [T, hidden]
+      - input_ids: [T]（1+N query token：bonus + N mask）
       - positions: [T] 绝对位置
-      - aux_hidden_states: [T, num_aux*target_hidden]（target 中间层 hidden 拼接）
-        经 fc + hidden_norm 得到草稿输入 embedding（use_aux_hidden_state）。
+      - context_kv: 可选 list（每层 (k_ctx, v_ctx)），由 precompute_context_kv 产出
+      - input_embeds: 可选 [T, hidden]（= 共享 embed_tokens(input_ids)）；缺省自算
     """
 
     def __init__(self, cfg, dtype, device, num_speculative_tokens, max_pos=4096):
@@ -329,12 +341,12 @@ class DFlash2DraftModel(nn.Module):
 
         rope_theta = (getattr(cfg, "rope_parameters", None) or {}).get("rope_theta", 10000000)
 
-        # 注意：DFlash2 草稿权重【不含】embed_tokens 与 lm_head（safetensors 仅 81 个 key：
-        # layers.* / fc / hidden_norm / norm / candidate_selector.*）。
-        # - 输入：target 中间层 hidden states（aux）经 fc+hidden_norm，不用 embedding。
-        # - 候选 logits：草稿输出 hidden 喂给【target 的】lm_head（compute_candidates 传入）。
-        # 故这里不分配 embed_tokens / lm_head（否则是 ~5GB 随机权重 + 垃圾候选）。
+        # DFlash2 草稿权重【不含】embed_tokens 与 lm_head（safetensors 仅 81 个 key：
+        # layers.* / fc / hidden_norm / norm / candidate_selector.*）。两者从 target 共享
+        # （share_target_weights 赋值，同 vocab/hidden）：query 用共享 embed_tokens，
+        # 候选 logits 用共享 lm_head。默认 None，使用前必须先共享（否则 ~5GB 随机权重）。
         self.embed_tokens = None
+        self.lm_head = None
 
         self.layers = nn.ModuleList([
             DFlashDecoderLayer(cfg, i, dtype, device, self.block_size, rope_theta, max_pos)
@@ -368,32 +380,46 @@ class DFlash2DraftModel(nn.Module):
             raise RuntimeError("DFlash2 草稿无 embed_tokens（输入应为 aux_hidden_states）")
         return self.embed_tokens(input_ids) * self.input_embedding_scale
 
+    def share_target_weights(self, target_embed_tokens, target_lm_head):
+        """从 target 共享 embed_tokens 与 lm_head（对齐 vLLM load_dflash_model：
+        draft.embed_tokens = target_embed；dflash_model.lm_head = target_lm_head）。
+        草稿 checkpoint 不含这两组权重（同 vocab/hidden，直接复用 target 的）。"""
+        self.embed_tokens = target_embed_tokens
+        self.lm_head = target_lm_head
+
     def combine_hidden_states(self, aux_hidden_states):
+        """target 中间层 hidden 拼接 [C, num_aux*target_hidden] → fc → [C, hidden]。
+        （hidden_norm 在 precompute_context_kv 里做，对齐 vLLM。）"""
         if not self.use_aux_hidden_state:
             return aux_hidden_states
-        return self.hidden_norm(self.fc(aux_hidden_states))
+        return self.fc(aux_hidden_states)
 
     def precompute_context_kv(self, context_states, context_positions):
-        """DFlash2 核心：把 context hidden states（target 中间层 hidden 经 fc 投影后）
-        投影成各草稿层的 context K/V（k_norm + RoPE），供草稿 attention 读取。
+        """DFlash2 核心：context hidden（fc 投影后 [C, hidden]）→ hidden_norm →
+        各层 k/v proj + k_norm + RoPE，供草稿 attention 读取。
 
-        context_states: [C, hidden]（C 个 context token，如最近 sliding_window 个）
+        context_states: [C, hidden]（combine_hidden_states 输出）
         context_positions: [C] 绝对位置
         返回 list of (k [C, KV, D], v [C, KV, D])，每层一个。
         """
+        if self.use_aux_hidden_state:
+            context_states = self.hidden_norm(context_states)
         return [layer.self_attn.project_kv(context_states, context_positions)
                 for layer in self.layers]
 
-    def forward(self, input_ids, positions, aux_hidden_states=None, context_kv=None):
-        """context_kv: 可选 list（每层 (k_ctx, v_ctx)），由 precompute_context_kv 产出。
+    def forward(self, input_ids, positions, input_embeds=None, context_kv=None):
+        """DFlash2 交叉注意力 forward。
 
-        DFlash2 输入是 aux_hidden_states（target 中间层 hidden 拼接）；input_ids 仅占位
-        （草稿不用 embedding）。aux_hidden_states=None 时回退 embed_input_ids（自起草/调试）。
+        - query：input_embeds（[1+N, hidden]，= target embed_tokens([anchor]+[mask]*N)
+          * input_embedding_scale）。input_embeds=None 时回退 embed_input_ids(input_ids)。
+        - context：context_kv（每层 (k_ctx, v_ctx)），由 precompute_context_kv 从
+          target aux hidden states（combine_hidden_states 后）投影产出。
+
+        返回 last_hidden_states [1+N, hidden]。
         """
-        if aux_hidden_states is not None and self.use_aux_hidden_state:
-            hidden_states = self.combine_hidden_states(aux_hidden_states)
-        else:
-            hidden_states = self.embed_input_ids(input_ids)
+        if input_embeds is None:
+            input_embeds = self.embed_input_ids(input_ids)
+        hidden_states = input_embeds
 
         residual = None
         for i, layer in enumerate(self.layers):
@@ -402,28 +428,25 @@ class DFlash2DraftModel(nn.Module):
         hidden_states, _ = self.norm(hidden_states, residual)
         return hidden_states
 
-    def compute_candidates(self, hidden_states, target_lm_head):
-        """返回 (candidate_ids [T, top_k], unary_logits [T, top_k])。
-
-        草稿无 lm_head：用【target 的】lm_head 把草稿 hidden 映射成 vocab logits，
-        再 top_k 取候选（对齐 vLLM dflash2：候选来自 target 分布，保证可被 target 接受）。
-        """
-        logits = target_lm_head(hidden_states)
+    def compute_candidates(self, hidden_states):
+        """草稿 mask 位置 hidden → 共享 lm_head（= target lm_head）→ top_k 候选。
+        返回 (candidate_ids [T, top_k], unary_logits [T, top_k])。"""
+        if self.lm_head is None:
+            raise RuntimeError("DFlash2 草稿 lm_head 未共享（先 share_target_weights）")
+        logits = self.lm_head(hidden_states)
         top_k = self.candidate_selector.top_k if self.candidate_selector else 16
         unary_logits, candidate_ids = torch.topk(logits, top_k, dim=-1)
         return candidate_ids, unary_logits
 
-    def select_draft_tokens(self, hidden_states, anchor_token_ids, target_lm_head):
+    def select_draft_tokens(self, hidden_states, anchor_token_ids):
         """DFlash2 完整选 token：compute_candidates + selector 打分 + 贪心 walk。
 
         hidden_states: [num_reqs, N, hidden]（N 个 mask 位置的 hidden）
         anchor_token_ids: [num_reqs]
-        target_lm_head: target 模型的 lm_head（callable: hidden → vocab logits）
         返回 draft_tokens [num_reqs, N]。
         """
         num_reqs, N, _ = hidden_states.shape
-        candidate_ids, unary_logits = self.compute_candidates(
-            hidden_states.flatten(0, 1), target_lm_head)
+        candidate_ids, unary_logits = self.compute_candidates(hidden_states.flatten(0, 1))
         candidate_ids = candidate_ids.view(num_reqs, N, -1)
         unary_logits = unary_logits.view_as(candidate_ids)
         scores = self.candidate_selector(

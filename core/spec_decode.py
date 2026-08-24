@@ -102,6 +102,27 @@ class SpecDecodeController:
                                    dtype=dtype, device=device)
         self.v_cache = torch.zeros_like(self.k_cache)
 
+        # DFlash2 草稿：target 中间层 hidden states 提取（context 用）
+        # target_layer_ids 来自草稿模型 config（DFlash2 才有）；自起草为空。
+        draft_cfg = getattr(draft_model, "cfg", None)
+        dflash_cfg = getattr(draft_cfg, "dflash_config", None) or {}
+        self.target_layer_ids = list(dflash_cfg.get("target_layer_ids", []))
+        self._aux_layer_set = set(self.target_layer_ids)
+        # DFlash2 路径：草稿是独立 DFlash2DraftModel（有 precompute_context_kv）。
+        # 自起草（draft_is_target）走旧的 target 非因果 forward 路径。
+        self.use_dflash2 = (not draft_is_target) and hasattr(draft_model, "precompute_context_kv")
+        self.hidden_size = cfg.hidden_size
+        if self.use_dflash2:
+            # aux_cache[ai, pos] = target 第 target_layer_ids[ai] 层在位置 pos 的 hidden。
+            # 由 prefill/verify 的 _forward(collect_aux=True) 填充，供草稿建 context KV。
+            self.aux_cache = torch.zeros(
+                len(self.target_layer_ids), max_len, self.hidden_size,
+                dtype=dtype, device=device)
+        else:
+            self.aux_cache = None
+        # 草稿 sliding window（context 上限）；DFlash2=2048。
+        self.draft_sliding_window = int(getattr(draft_cfg, "sliding_window", 0) or 0)
+
         # 统计
         self.total_accepted = 0
         self.total_steps = 0
@@ -110,17 +131,21 @@ class SpecDecodeController:
     def reset(self):
         self.k_cache.zero_()
         self.v_cache.zero_()
+        if self.aux_cache is not None:
+            self.aux_cache.zero_()
         self.total_accepted = 0
         self.total_steps = 0
         self.total_generated = 0
 
     # ---------------- 单层 forward（兼容 prepared / HF 权重布局） ----------------
-    def _layer_forward(self, model, li, h, cos, sin, ctx_len, T, causal):
+    def _layer_forward(self, model, li, h, cos, sin, ctx_len, T, causal, write_kv=True):
         """单层：input_layernorm → attention → o_proj → residual → post_ln → mlp → residual。
 
-        causal=True（verify）：KV 写 self.k_cache[ctx_len:ctx_len+T]，attention 读 [0:ctx_len+T]。
+        causal=True（verify）：KV 写 self.k_cache[ctx_len:ctx_len+T]（write_kv=True 时），
+        attention 读 [0:ctx_len+T]。
         causal=False（draft）：attention 读 [target KV[0:ctx_len] + 本步 query KV]
         （非因果，mask 互相可见），不写持久 KV。
+        write_kv=False：不写 KV cache（用于提取 target aux hidden states，context KV 已在 cache）。
         返回新 h [T, hidden]。
         """
         layer = model.model.layers[li]
@@ -157,8 +182,9 @@ class SpecDecodeController:
 
         # attention
         if causal:
-            self.k_cache[li, ctx_len:ctx_len + T] = k
-            self.v_cache[li, ctx_len:ctx_len + T] = v
+            if write_kv:
+                self.k_cache[li, ctx_len:ctx_len + T] = k
+                self.v_cache[li, ctx_len:ctx_len + T] = v
             attn_out = self._attention(li, q, ctx_len, T, causal=True)
         else:
             attn_out = self._draft_attention(li, q, ctx_len, T, k, v)
@@ -220,20 +246,40 @@ class SpecDecodeController:
         return torch.einsum("hte,ehd->thd", attn, v)
 
     # ---------------- 模型 forward ----------------
-    def _forward(self, model, input_ids, positions, ctx_len, causal):
-        """完整 forward。返回 logits [T, vocab]。
+    def _forward(self, model, input_ids, positions, ctx_len, causal,
+                 write_kv=True, collect_aux=False):
+        """完整 forward。返回 logits [T, vocab]（collect_aux=True 时返回 (logits, aux)）。
 
-        causal=True（verify）：写 target KV cache。
+        causal=True（verify）：写 target KV cache（write_kv=True 时）。
         causal=False（draft）：不写持久 KV（mask KV 仅本步用）。
+        collect_aux=True：额外收集 target_layer_ids 各层的 hidden states（DFlash2 草稿
+        context 用），返回 (logits, aux [T, num_aux*hidden])。
         """
         T = input_ids.shape[0]
         h = model.model.embed_tokens(input_ids)
         cos = self.cos[positions].unsqueeze(1)
         sin = self.sin[positions].unsqueeze(1)
+        aux_parts = [] if collect_aux else None
         for li in range(self.num_layers):
-            h = self._layer_forward(model, li, h, cos, sin, ctx_len, T, causal)
+            h = self._layer_forward(model, li, h, cos, sin, ctx_len, T, causal,
+                                    write_kv=write_kv)
+            if collect_aux and li in self._aux_layer_set:
+                aux_parts.append(h)
         h = model.model.norm(h)
-        return model.lm_head(h)
+        logits = model.lm_head(h)
+        if collect_aux:
+            return logits, torch.cat(aux_parts, dim=-1)
+        return logits
+
+    def _extract_aux(self, input_ids, positions, ctx_len):
+        """提取 target 中间层 hidden states（DFlash2 草稿 context 用）。
+
+        返回 aux [T, num_aux*hidden]（target_layer_ids 各层 hidden 拼接）。
+        不写 KV cache（context KV 已在 self.k_cache，由 prefill/verify 写入）。
+        """
+        _, aux = self._forward(self.target, input_ids, positions, ctx_len,
+                               causal=True, write_kv=False, collect_aux=True)
+        return aux
 
     # ---------------- 主接口 ----------------
     def prefill(self, prompt_ids: List[int]):
@@ -244,19 +290,49 @@ class SpecDecodeController:
                                positions, 0, causal=True)
         return int(logits[-1].argmax())
 
+    def _draft_tokens(self, tokens: List[int], kv_len: int, anchor: int, n_draft: int) -> List[int]:
+        """起草 n_draft 个 token。返回 d_list（长度 n_draft）。
+
+        - 自起草（draft_is_target）：target 模型非因果 forward（context = target KV[0:kv_len-1]）。
+        - DFlash2（独立草稿）：交叉注意力——context KV 由 target aux hidden states 投影，
+          query = target embed_tokens([anchor]+[mask]*n_draft)，draft hidden 经 target lm_head。
+        """
+        if self.draft_is_target:
+            input_ids = torch.tensor([anchor] + [self.mask_token_id] * n_draft,
+                                     dtype=torch.long, device=self.device)
+            positions = torch.arange(kv_len - 1, kv_len - 1 + 1 + n_draft, device=self.device).long()
+            dlogits = self._forward(self.target, input_ids, positions, kv_len - 1, causal=False)
+            return [int(x) for x in dlogits[1:].argmax(dim=-1).tolist()]
+
+        # ---- DFlash2 交叉注意力草稿 ----
+        # context = tokens[0:kv_len-1]（anchor 之前）。target aux hidden states（不写 KV，
+        # context KV 已在 cache）→ combine_hidden_states（fc+hidden_norm）→ 各层 context KV。
+        ctx_len = kv_len - 1
+        context_ids = torch.tensor(tokens[:ctx_len], dtype=torch.long, device=self.device)
+        context_pos = torch.arange(ctx_len, device=self.device).long()
+        aux = self._extract_aux(context_ids, context_pos, 0)  # [ctx_len, num_aux*hidden]
+        context_states = self.draft.combine_hidden_states(aux)  # [ctx_len, hidden]
+        context_kv = self.draft.precompute_context_kv(context_states, context_pos)
+
+        # query = target embed_tokens([anchor]+[mask]*n_draft) * input_embedding_scale
+        query_ids = torch.tensor([anchor] + [self.mask_token_id] * n_draft,
+                                 dtype=torch.long, device=self.device)
+        query_embeds = self.target.model.embed_tokens(query_ids) * self.draft.input_embedding_scale
+        query_pos = torch.arange(kv_len - 1, kv_len - 1 + 1 + n_draft, device=self.device).long()
+        draft_hidden = self.draft(query_ids, query_pos, input_embeds=query_embeds,
+                                  context_kv=context_kv)  # [1+n_draft, hidden]
+        # DFlash2 无自有 lm_head，用 target 的
+        dlogits = self.target.lm_head(draft_hidden)
+        return [int(x) for x in dlogits[1:].argmax(dim=-1).tolist()]
+
     def step(self, tokens: List[int], kv_len: int, anchor: int, n_draft: int):
         """一步投机解码。返回 (new_tokens, accepted)。
 
         tokens: 当前有效 token 序列（长度 >= kv_len）。kv_len: 有效序列长度 L。
         anchor: tokens[L-1]。n_draft: 本步起草 token 数（<= N）。
         """
-        # 1. Draft（非因果，context = target KV[0:kv_len-1]）
-        draft_model = self.target if self.draft_is_target else self.draft
-        input_ids = torch.tensor([anchor] + [self.mask_token_id] * n_draft,
-                                 dtype=torch.long, device=self.device)
-        positions = torch.arange(kv_len - 1, kv_len - 1 + 1 + n_draft, device=self.device).long()
-        dlogits = self._forward(draft_model, input_ids, positions, kv_len - 1, causal=False)
-        d_list = [int(x) for x in dlogits[1:].argmax(dim=-1).tolist()]
+        # 1. Draft
+        d_list = self._draft_tokens(tokens, kv_len, anchor, n_draft)
 
         # 2. Verify（因果，写 target KV cache）
         verify_ids = [anchor] + d_list
