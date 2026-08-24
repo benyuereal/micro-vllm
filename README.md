@@ -13,7 +13,7 @@
 
 > A high-performance LLM inference engine implementing **PagedAttention + Flash Attention + Hand-written CUDA GEMV + SwiGLU Kernel Fusion** from scratch. Achieves **105%** of vLLM and **121%** of nano-vllm single-user throughput on L20, suitable for small-scale production deployment and learning.
 > 
-> 🚀 **Latest Update**: Hand-written CUDA GEMV integrated into the decode hot path, single-user throughput up another **+3.8%**!
+> 🚀 **Latest Update**: 1000-request continuous batching hits **30,316 tok/s**, leading nano-vllm by **+9.7%** (Gumbel-max Triton sampling kernel + decode fast paths)!
 
 ## ✨ Features
 
@@ -216,14 +216,14 @@ As concurrency rises, the bottleneck shifts from kernel launch overhead to memor
 
 | Framework | Throughput (tok/s) | Steps |
 |:-----|:----------------:|:-----:|
-| **micro-vllm** | **28,110** | 130 |
+| **micro-vllm** | **30,316** | 130 |
 | nano-vllm | 27,638 | 153 |
 
-- micro-vllm leads nano-vllm by **+1.7%**; per-step GPU time at bs=512 is also lower (14.33ms vs 14.36ms)
-- Recent wins: sampler `reduce-overhead` removal (saves a 155MB logits DtoD copy, 410us/step), QK-Norm+RoPE single-kernel fusion, `prepare()` dirty-flag (steady-state CPU 0.88ms→0), final-norm fusion
+- micro-vllm leads nano-vllm by **+9.7%**; per-step GPU time at bs=512 is also lower (13.5ms vs 14.36ms)
+- Recent wins: Gumbel-max single Triton sampling kernel (1225→269us/step, no 311MB fp32 materialization), `update_sequences` decode steady-state fast path (0.75ms/step CPU), sampler `reduce-overhead` removal (saves a 155MB logits DtoD copy, 410us/step), QK-Norm+RoPE single-kernel fusion, `prepare()` dirty-flag (steady-state CPU 0.88ms→0), final-norm fusion
 - Single-batch (same prompt, 500 out, full prefill+decode): bs=32 **7,060** vs 6,465 (+9.2%), bs=64 **9,864** vs 9,332 (+5.7%)
 
-Benchmark scripts live in [`benchmark/`](benchmark/README.md).
+Benchmark scripts and load-test commands live in [`benchmark/`](benchmark/README.md).
 
 ---
 

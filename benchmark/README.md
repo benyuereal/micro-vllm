@@ -23,10 +23,10 @@
 
 | 框架 | 吞吐 (tok/s) | 备注 |
 |:-----|:-----------:|:-----|
-| **micro-vllm** | **28,110** | 三轮 28122 / 28098 / 28110，130 步 |
+| **micro-vllm** | **30,316** | 两轮 30316 / 30272，130 步 |
 | nano-vllm | 27,638 | 27622 / 27653，153 步 |
 
-micro 领先 **+1.7%**。micro 单步 GPU 时间（bs=512）14.33ms 也低于 nano 14.36ms。
+micro 领先 **+9.7%**。micro 单步 GPU 时间（bs=512）13.5ms 低于 nano 14.36ms。
 
 ### 单批次吞吐（同 prompt，max_tokens=500，全量 prefill+decode 计时）
 
@@ -43,13 +43,21 @@ micro 领先 **+1.7%**。micro 单步 GPU 时间（bs=512）14.33ms 也低于 na
 | vLLM 0.21.0 | 386.4 |
 | nano-vllm | 335.8 |
 
-## 复现
+## 压测指令
 
 ```bash
-# 1000 请求对比（约 2 分钟/边）
+# 1000 请求连续批处理（micro / nano / both 同进程先后跑）
+CUDA_VISIBLE_DEVICES=1 python3 fair_throughput.py 1000 80 micro
+CUDA_VISIBLE_DEVICES=1 python3 fair_throughput.py 1000 80 nano
 CUDA_VISIBLE_DEVICES=1 python3 fair_throughput.py 1000 80 both
 
-# 单批次 bs=64
+# 单批次 bs=32/64
+CUDA_VISIBLE_DEVICES=1 python3 bench_bs_fair.py micro 32 500
+CUDA_VISIBLE_DEVICES=2 python3 bench_bs_fair.py nano 32 500
 CUDA_VISIBLE_DEVICES=1 python3 bench_bs_fair.py micro 64 500
 CUDA_VISIBLE_DEVICES=2 python3 bench_bs_fair.py nano 64 500
+
+# HTTP 并发压测（需先起服务: python3 api_server.py --model qwen3）
+python3 bench_batch_compare.py http://localhost:8000 256
+python3 bench_stream.py 32
 ```

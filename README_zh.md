@@ -13,7 +13,7 @@
 
 > 高性能 LLM 推理引擎，从零实现 **PagedAttention + Flash Attention + 手写 CUDA GEMV + SwiGLU 算子融合**，L20 上单用户吞吐达 vLLM 的 **105%**、nano-vllm 的 **121%**，适合小规模生产部署和学习。
 > 
-> 🚀 **最新进展**：手写 CUDA GEMV 集成 decode 热路径，单用户吞吐再提升 **+3.8%**！
+> 🚀 **最新进展**：1000 请求连续批处理达 **30,316 tok/s**，领先 nano-vllm **+9.7%**（Gumbel-max Triton 采样 kernel + decode 快速路径）！
 
 ## ✨ 特性
 
@@ -216,14 +216,14 @@ activated = swiglu_fused(gate_up)  # 一步完成融合计算
 
 | 框架 | 吞吐 (tok/s) | 步数 |
 |:-----|:-----------:|:----:|
-| **micro-vllm** | **28,110** | 130 |
+| **micro-vllm** | **30,316** | 130 |
 | nano-vllm | 27,638 | 153 |
 
-- micro-vllm 领先 nano-vllm **+1.7%**；bs=512 单步 GPU 时间也更低（14.33ms vs 14.36ms）
-- 近期优化：采样器去 `reduce-overhead`（省 155MB logits DtoD 拷贝，410us/步）、QK-Norm+RoPE 单 kernel 融合、`prepare()` 脏标志（稳态 CPU 0.88ms→0）、final-norm 融合
+- micro-vllm 领先 nano-vllm **+9.7%**；bs=512 单步 GPU 时间也更低（13.5ms vs 14.36ms）
+- 近期优化：Gumbel-max 单 Triton 采样 kernel（1225→269us/步，免 311MB fp32 物化）、`update_sequences` decode 稳态快速路径（省 0.75ms/步 CPU）、采样器去 `reduce-overhead`（省 155MB logits DtoD 拷贝，410us/步）、QK-Norm+RoPE 单 kernel 融合、`prepare()` 脏标志（稳态 CPU 0.88ms→0）、final-norm 融合
 - 单批次（同 prompt，500 out，全量 prefill+decode）：bs=32 **7,060** vs 6,465（+9.2%）、bs=64 **9,864** vs 9,332（+5.7%）
 
-压测脚本见 [`benchmark/`](benchmark/README.md)。
+压测脚本与压测指令见 [`benchmark/`](benchmark/README.md)。
 
 
 
