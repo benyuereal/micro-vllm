@@ -60,13 +60,14 @@ except ImportError:
 # =====================================================================
 
 # ---- g = -exp(A_log)*softplus(a+dt_bias)（fp32），beta = sigmoid(b) ----
+# A/B 是融合输入投影 buffer 的视图（row stride = STRIDE，非 N）。
 @triton.jit
-def _gdn_gbeta_kernel(A, B, A_LOG, DT_BIAS, G, BETA, N, BLOCK: tl.constexpr):
+def _gdn_gbeta_kernel(A, B, A_LOG, DT_BIAS, G, BETA, N, STRIDE, BLOCK: tl.constexpr):
     row = tl.program_id(0)
     cols = tl.arange(0, BLOCK)
     mask = cols < N
-    a = tl.load(A + row * N + cols, mask=mask, other=0.0).to(tl.float32)
-    b = tl.load(B + row * N + cols, mask=mask, other=0.0).to(tl.float32)
+    a = tl.load(A + row * STRIDE + cols, mask=mask, other=0.0).to(tl.float32)
+    b = tl.load(B + row * STRIDE + cols, mask=mask, other=0.0).to(tl.float32)
     a_log = tl.load(A_LOG + cols, mask=mask, other=0.0).to(tl.float32)
     dt = tl.load(DT_BIAS + cols, mask=mask, other=0.0).to(tl.float32)
     sp = tl.where(a + dt <= 20.0, tl.log(1.0 + tl.exp(a + dt)), a + dt)
@@ -76,9 +77,9 @@ def _gdn_gbeta_kernel(A, B, A_LOG, DT_BIAS, G, BETA, N, BLOCK: tl.constexpr):
     tl.store(BETA + row * N + cols, beta.to(BETA.dtype.element_ty), mask=mask)
 
 
-def gdn_gbeta(a, b, a_log, dt_bias, g_buf, beta_buf):
+def gdn_gbeta(a, b, a_log, dt_bias, g_buf, beta_buf, stride):
     M, N = a.shape
-    _gdn_gbeta_kernel[(M,)](a, b, a_log, dt_bias, g_buf, beta_buf, N,
+    _gdn_gbeta_kernel[(M,)](a, b, a_log, dt_bias, g_buf, beta_buf, N, stride,
                             BLOCK=triton.next_power_of_2(N))
     return g_buf, beta_buf
 
@@ -90,7 +91,7 @@ def gdn_gbeta(a, b, a_log, dt_bias, g_buf, beta_buf):
 # decode：单 token，state 滚动更新。
 @triton.jit
 def _gdn_conv_prefill_kernel(QKV, W, STATE, CU, SEQ_IDX,
-                             CONV_DIM, N_GDN, GDN_L, K: tl.constexpr, BLOCK_C: tl.constexpr):
+                             CONV_DIM, STRIDE, N_GDN, GDN_L, K: tl.constexpr, BLOCK_C: tl.constexpr):
     pid_c = tl.program_id(0)
     c = pid_c * BLOCK_C + tl.arange(0, BLOCK_C)
     cmask = c < CONV_DIM
@@ -110,10 +111,10 @@ def _gdn_conv_prefill_kernel(QKV, W, STATE, CU, SEQ_IDX,
     x2 = tl.load(st_base + 2 * CONV_DIM, mask=cmask, other=0.0).to(tl.float32)
     for i in range(0, L):
         t = start + i
-        x = tl.load(QKV + t.to(tl.int64) * CONV_DIM + c, mask=cmask, other=0.0).to(tl.float32)
+        x = tl.load(QKV + t.to(tl.int64) * STRIDE + c, mask=cmask, other=0.0).to(tl.float32)
         y = x0 * w0 + x1 * w1 + x2 * w2 + x * w3
         y = y * tl.sigmoid(y)
-        tl.store(QKV + t.to(tl.int64) * CONV_DIM + c, y.to(QKV.dtype.element_ty), mask=cmask)
+        tl.store(QKV + t.to(tl.int64) * STRIDE + c, y.to(QKV.dtype.element_ty), mask=cmask)
         # 状态存「含当前 token 的最近 3 个 pre-act 输入」= (x1, x2, x)，与 decode kernel
         # 一致（decode 存 (x1,x2,x)）。若存 (x0,x1,x2) 会漏掉最后一个 prefill token，
         # 首个 decode token 的 conv 输出错位一格。
@@ -128,7 +129,7 @@ def _gdn_conv_prefill_kernel(QKV, W, STATE, CU, SEQ_IDX,
 
 @triton.jit
 def _gdn_conv_decode_kernel(QKV, W, STATE, SEQ_IDX, IS_REAL,
-                            CONV_DIM, N_GDN, GDN_L, K: tl.constexpr, BLOCK_C: tl.constexpr):
+                            CONV_DIM, STRIDE, N_GDN, GDN_L, K: tl.constexpr, BLOCK_C: tl.constexpr):
     row = tl.program_id(0)
     # pad 行（循环复制）：不更新状态、不算输出。IS_REAL 是 buffer（graph 安全：
     # replay 时重读，非 capture 时 bake 的标量）。
@@ -146,10 +147,10 @@ def _gdn_conv_decode_kernel(QKV, W, STATE, SEQ_IDX, IS_REAL,
     w1 = tl.load(W + c * K + 1, mask=cmask, other=0.0).to(tl.float32)
     w2 = tl.load(W + c * K + 2, mask=cmask, other=0.0).to(tl.float32)
     w3 = tl.load(W + c * K + 3, mask=cmask, other=0.0).to(tl.float32)
-    x = tl.load(QKV + row.to(tl.int64) * CONV_DIM + c, mask=cmask, other=0.0).to(tl.float32)
+    x = tl.load(QKV + row.to(tl.int64) * STRIDE + c, mask=cmask, other=0.0).to(tl.float32)
     y = x0 * w0 + x1 * w1 + x2 * w2 + x * w3
     y = y * tl.sigmoid(y)
-    tl.store(QKV + row.to(tl.int64) * CONV_DIM + c, y.to(QKV.dtype.element_ty), mask=cmask)
+    tl.store(QKV + row.to(tl.int64) * STRIDE + c, y.to(QKV.dtype.element_ty), mask=cmask)
     tl.store(st_base + 0, x1, mask=cmask)
     tl.store(st_base + CONV_DIM, x2, mask=cmask)
     tl.store(st_base + 2 * CONV_DIM, x, mask=cmask)
@@ -162,7 +163,7 @@ def _gdn_conv_decode_kernel(QKV, W, STATE, SEQ_IDX, IS_REAL,
 @triton.jit
 def _gdn_recurrent_decode_kernel(QKV, G, BETA, STATE, OUT, SEQ_IDX, IS_REAL,
                                  H: tl.constexpr, DK: tl.constexpr, DV: tl.constexpr,
-                                 N_GDN, GDN_L, SCALE, BLOCK_D: tl.constexpr):
+                                 N_GDN, GDN_L, SCALE, STRIDE, BLOCK_D: tl.constexpr):
     row = tl.program_id(0)
     h = tl.program_id(1)
     if tl.load(IS_REAL + row) == 0:
@@ -174,7 +175,7 @@ def _gdn_recurrent_decode_kernel(QKV, G, BETA, STATE, OUT, SEQ_IDX, IS_REAL,
     dv = tl.arange(0, BLOCK_D)
     S_m = tl.load(S + dk[:, None] * DV + dv[None, :]).to(tl.float32)
 
-    q_base = QKV + row.to(tl.int64) * (2 * H * DK + H * DV) + h * DK
+    q_base = QKV + row.to(tl.int64) * STRIDE + h * DK
     k_base = q_base + H * DK
     v_base = k_base + H * DK
     # q/k/v 以 fp32 参与递归（对齐 HF：l2norm/scale/累加全 fp32）。
@@ -204,7 +205,7 @@ def _gdn_recurrent_decode_kernel(QKV, G, BETA, STATE, OUT, SEQ_IDX, IS_REAL,
 @triton.jit
 def _gdn_recurrent_prefill_kernel(QKV, G, BETA, STATE, OUT, CU, SEQ_IDX,
                                   H: tl.constexpr, DK: tl.constexpr, DV: tl.constexpr,
-                                  N_GDN, GDN_L, SCALE, BLOCK_D: tl.constexpr):
+                                  N_GDN, GDN_L, SCALE, STRIDE, BLOCK_D: tl.constexpr):
     s = tl.program_id(0)
     h = tl.program_id(1)
     start = tl.load(CU + s)
@@ -219,7 +220,7 @@ def _gdn_recurrent_prefill_kernel(QKV, G, BETA, STATE, OUT, CU, SEQ_IDX,
 
     for i in range(0, L):
         t = start + i
-        q_base = QKV + t.to(tl.int64) * (2 * H * DK + H * DV) + h * DK
+        q_base = QKV + t.to(tl.int64) * STRIDE + h * DK
         k_base = q_base + H * DK
         v_base = k_base + H * DK
         q = tl.load(q_base + dk).to(tl.float32)
@@ -246,12 +247,12 @@ def _gdn_recurrent_prefill_kernel(QKV, G, BETA, STATE, OUT, CU, SEQ_IDX,
 # 注意：HF Qwen3_5RMSNormGated 用 self.weight * hidden（非 1-centered）。
 @triton.jit
 def _gdn_norm_gated_kernel(O, Z, W, OUT, H: tl.constexpr, DV: tl.constexpr, eps,
-                           BLOCK_D: tl.constexpr):
+                           Z_STRIDE, BLOCK_D: tl.constexpr):
     row = tl.program_id(0)
     h = tl.program_id(1)
     dv = tl.arange(0, BLOCK_D)
     o = tl.load(O + row.to(tl.int64) * (H * DV) + h * DV + dv).to(tl.float32)
-    z = tl.load(Z + row.to(tl.int64) * (H * DV) + h * DV + dv).to(tl.float32)
+    z = tl.load(Z + row.to(tl.int64) * Z_STRIDE + h * DV + dv).to(tl.float32)
     w = tl.load(W + dv).to(tl.float32)
     rrms = tl.rsqrt(tl.sum(o * o) / DV + eps)
     y = o * rrms * w * (z * tl.sigmoid(z))
@@ -442,10 +443,16 @@ class Qwen3_5Adapter(ModelAdapter):
                 la = block.linear_attn
                 la._gdn_layer_idx = gdn_layer_idx
                 gdn_layer_idx += 1
-                la._qkv_w = self._q(la.in_proj_qkv.weight.data.contiguous())   # [6144, hidden]
-                la._z_w = self._q(la.in_proj_z.weight.data.contiguous())       # [2048, hidden]
-                la._b_w = self._q(la.in_proj_b.weight.data.contiguous())       # [16, hidden]
-                la._a_w = self._q(la.in_proj_a.weight.data.contiguous())       # [16, hidden]
+                # 4 个输入投影（qkv 6144 + z 2048 + b 16 + a 16）融合成 1 个 [8224, hidden]
+                # GEMV：b/a 仅 N=16（4 个 block，92 SM 空转）+ 3 次额外 launch 是 decode
+                # 瓶颈。融合后 1 次 GEMV（L2-flushed 实测省 ~10us/层 ×18 = 180us/step）。
+                # 下游 kernel 用 row-stride 读融合 buffer 的对应段（qkv/z/b/a 视图）。
+                la._in_w = self._q(torch.cat([
+                    la.in_proj_qkv.weight.data,   # [6144, hidden]
+                    la.in_proj_z.weight.data,     # [2048, hidden]
+                    la.in_proj_b.weight.data,     # [16, hidden]
+                    la.in_proj_a.weight.data,     # [16, hidden]
+                ], dim=0).contiguous())           # [8224, hidden]
                 la._o_w = self._q(la.out_proj.weight.data.contiguous())        # [hidden, 2048]
                 la._conv_w = la.conv1d.weight.data.squeeze(1).contiguous()  # [6144, 4]（conv 不量化）
                 la._a_log = la.A_log.data.float().contiguous()        # [16] fp32
@@ -501,20 +508,21 @@ class Qwen3_5Adapter(ModelAdapter):
         conv_dim = self._gdn_conv_dim
         scale = DK ** -0.5
 
-        qkv = torch.empty(M, conv_dim, dtype=h2d.dtype, device=dev)
-        self._lin(h2d, la._qkv_w, qkv, "MICRO_GEMV_GDN")
-        z = torch.empty(M, H * DV, dtype=h2d.dtype, device=dev)
-        self._lin(h2d, la._z_w, z, "MICRO_GEMV_GDN")
-        b = torch.empty(M, H, dtype=h2d.dtype, device=dev)
-        self._lin(h2d, la._b_w, b, "MICRO_GEMV_GDN")
-        a = torch.empty(M, H, dtype=h2d.dtype, device=dev)
-        self._lin(h2d, la._a_w, a, "MICRO_GEMV_GDN")
+        # 4 个输入投影融合成 1 个 GEMV → [M, 8224]，再切视图（row stride = 8224）。
+        # 段布局：qkv[0:6144] | z[6144:8192] | b[8192:8208] | a[8208:8224]。
+        in_dim = conv_dim + H * DV + 2 * H  # 6144 + 2048 + 16 + 16 = 8224
+        in_proj = torch.empty(M, in_dim, dtype=h2d.dtype, device=dev)
+        self._lin(h2d, la._in_w, in_proj, "MICRO_GEMV_GDN")
+        qkv = in_proj[:, :conv_dim]
+        z = in_proj[:, conv_dim:conv_dim + H * DV]
+        b = in_proj[:, conv_dim + H * DV:conv_dim + H * DV + H]
+        a = in_proj[:, conv_dim + H * DV + H:]
 
         # g（衰减率）HF 全程 fp32（-A_log.float().exp()*softplus），bf16 存会因 exp(g)
         # 在递归里逐 token 复利放大误差 → 改 fp32。beta 是 sigmoid∈[0,1]，bf16 足够。
         g = torch.empty(M, H, dtype=torch.float32, device=dev)
         beta = torch.empty(M, H, dtype=h2d.dtype, device=dev)
-        gdn_gbeta(a, b, la._a_log, la._dt_bias, g, beta)
+        gdn_gbeta(a, b, la._a_log, la._dt_bias, g, beta, stride=in_dim)
         if self._dbg_gdn is not None:
             self._dbg_gdn.append({"qkv_pre": qkv.detach().clone(), "z": z.detach().clone(),
                                   "b": b.detach().clone(), "a": a.detach().clone(),
@@ -529,22 +537,22 @@ class Qwen3_5Adapter(ModelAdapter):
             is_real = graph._gdn_is_real[:bs]
             _gdn_conv_decode_kernel[(bs, triton.cdiv(conv_dim, 512))](
                 qkv, la._conv_w, conv_state, graph._gdn_seq_idx[:bs], is_real,
-                conv_dim, n_gdn, gdn_l, K=self._gdn_K, BLOCK_C=512)
+                conv_dim, in_dim, n_gdn, gdn_l, K=self._gdn_K, BLOCK_C=512)
             o = torch.empty(M, H * DV, dtype=h2d.dtype, device=dev)
             _gdn_recurrent_decode_kernel[(bs, H)](
                 qkv, g, beta, state, o, graph._gdn_seq_idx[:bs], is_real,
                 H=H, DK=DK, DV=DV, N_GDN=n_gdn, GDN_L=gdn_l, SCALE=scale,
-                BLOCK_D=triton.next_power_of_2(max(DK, DV)))
+                STRIDE=in_dim, BLOCK_D=triton.next_power_of_2(max(DK, DV)))
         else:
             n_seqs = cu_seqlens.shape[0] - 1
             _gdn_conv_prefill_kernel[(triton.cdiv(conv_dim, 512), n_seqs)](
                 qkv, la._conv_w, conv_state, cu_seqlens, seq_idx,
-                conv_dim, n_gdn, gdn_l, K=self._gdn_K, BLOCK_C=512)
+                conv_dim, in_dim, n_gdn, gdn_l, K=self._gdn_K, BLOCK_C=512)
             o = torch.empty(M, H * DV, dtype=h2d.dtype, device=dev)
             _gdn_recurrent_prefill_kernel[(n_seqs, H)](
                 qkv, g, beta, state, o, cu_seqlens, seq_idx,
                 H=H, DK=DK, DV=DV, N_GDN=n_gdn, GDN_L=gdn_l, SCALE=scale,
-                BLOCK_D=triton.next_power_of_2(max(DK, DV)))
+                STRIDE=in_dim, BLOCK_D=triton.next_power_of_2(max(DK, DV)))
 
         if self._dbg_gdn is not None:
             self._dbg_gdn[-1]["qkv_post"] = qkv.detach().clone()
@@ -552,6 +560,7 @@ class Qwen3_5Adapter(ModelAdapter):
         og = torch.empty(M, H * DV, dtype=h2d.dtype, device=dev)
         _gdn_norm_gated_kernel[(M, H)](o, z, la._norm_w, og,
                                        H=H, DV=DV, eps=la._norm_eps,
+                                       Z_STRIDE=in_dim,
                                        BLOCK_D=triton.next_power_of_2(DV))
         out = torch.empty(M, h2d.shape[1], dtype=h2d.dtype, device=dev)
         self._lin(og, la._o_w, out, "MICRO_GEMV_GDN")
