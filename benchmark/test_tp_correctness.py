@@ -81,16 +81,16 @@ def main():
                     top2 = torch.topk(ctx.logits[0], 2, dim=-1).values
                     margins.append(float(top2[0] - top2[1]))
                 eng.collect(ctx)
-                ctx.broadcast()
+                eng.tp_broadcast_tokens(ctx)  # bcast2: decode 只发 token / prefill 发完整
                 eng.update_sequences(ctx.sequences)
             else:
                 ctx = BatchInferenceContext.receive(eng.tokenizer)
                 if ctx.batch_type == "waiting" or ctx.batch_size == 0:
                     break
                 eng.step(ctx)
-                ctx = BatchInferenceContext.receive(eng.tokenizer)
-                eng.update_sequences(ctx.sequences)
-                last_seqs = ctx.sequences
+                seqs = eng.tp_receive_tokens(ctx)  # bcast2: decode 收 token / prefill 收完整
+                eng.update_sequences(seqs)
+                last_seqs = seqs
     else:
         while True:
             b, bt = eng.get_next_batch()
