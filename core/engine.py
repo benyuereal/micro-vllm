@@ -1,3 +1,4 @@
+import os
 import torch
 import time
 import asyncio
@@ -74,6 +75,14 @@ class InferenceEngine:
         # 时需 75GB 直接 OOM）。预算 = 剩余显存 - 余量（权重/graph buffer/activation）。
         # 单 block 全层 K+V 显存 = 2(K+V) × block_size × kv_heads × head × n_layers × dtype。
         free, _ = torch.cuda.mem_get_info()
+        # TP 修复：n_blocks 必须所有 rank 一致——block 分配各 rank 独立进行（block id 即
+        # slot 编号），若 free 显存因 NCCL buffer 等略有差异导致 n_blocks 不同，block_table
+        # 会错位（rank 间 slot 指向不同物理位置）。取所有 rank 的 min 保证一致。
+        if get_world_size() > 1:
+            import torch.distributed as dist
+            free_t = torch.tensor([free], dtype=torch.int64, device=self.device)
+            dist.all_reduce(free_t, op=dist.ReduceOp.MIN)
+            free = int(free_t.item())
         per_block_bytes = (2 * 2 * self.DEFAULT_BLOCK_SIZE * self.kv_num_heads
                            * self.head_size * self.num_layers * torch.finfo(self.dtype).bits // 8)
         # 余量：权重(模型 bf16 ~1.2GB) + graph/logits buffer(max_batch×vocab) + activation。
@@ -155,7 +164,11 @@ class InferenceEngine:
         # 首个真实多 batch prefill 多耗 ~100-200ms。用短 dummy prompt 在主 batch size 跑一次。
         # 仅对支持 chunked prefill 的架构（Qwen3 GQA）——DeepSeek MLA prefill 用
         # flash_attn_func 自包含路径，dummy prefill 触发 cudaErrorAssert，跳过。
-        if self.adapter.supports_chunked_prefill(self.config):
+        # TP 修复：_warmup_prefill 跑完整 scheduler 循环，但采样仅 rank0（非 rank0 拿不到
+        # token → scheduler 状态跨 rank 分叉 → 后续 all_reduce 不同步 → NCCL 卡死）。
+        # 跳过它：首个真实 prefill 会触发 cuBLAS/flash 算法选择（多 ~100-200ms，可接受）。
+        # 注：_init_distributed() 在 __init__ 开头已 setup()，此处 get_world_size() 有效。
+        if self.adapter.supports_chunked_prefill(self.config) and get_world_size() == 1:
             self._warmup_prefill(cap_sizes)
 
         # 注册退出钩子
@@ -355,6 +368,13 @@ class InferenceEngine:
         input_ids = self._decode_ctx.prepare(batch, self.device, self.cache_manager,
                                              batch_dirty=self._ctx_batch_dirty)
         self._ctx_batch_dirty = False  # 本步已处理；后续 append/finished 会按需重新置脏
+        if input_ids is None and not rank0():
+            # TP 修复：稳态快速路径 prepare 返回 None（复用 _input_ids），但 _input_ids 的
+            # GPU→GPU 预填充只在 rank0 的 collect→commit 里做，非 rank0 没有 commit →
+            # 每步 replay 的都是第一步的 input token（输出卡死/乱码）。非 rank0 从本地
+            # seq 状态重建（output_ids 已经过 broadcast 同步，get_next_input_ids 即上步 token）。
+            input_ids = torch.tensor(
+                [s.get_next_input_ids() for s in batch], device=self.device).squeeze(1)
         ctx.logits = self.graph_runner.forward(input_ids, self.cache_manager, batch_size)
 
     @torch.inference_mode()
@@ -524,48 +544,55 @@ class InferenceEngine:
 
         # 5. 采样：仅对最后 chunk（need_sample）采样首 token；中间 chunk 不采样、不转 decode。
         #    logits 是 [total_tokens, vocab]，每条 seq 取其本 chunk 末 token（cu_q 边界）。
-        if rank0():
-            stats.sample_time = time.time()
-            sample_idx = [i for i, ns in enumerate(need_sample) if ns]
-            if sample_idx:
-                sample_batch = [batch[i] for i in sample_idx]
-                # 每条 sample seq 在 1D logits 中的末 token 位置 = cu_q[i+1] - 1
-                last_pos = [int(cu_q[i + 1]) - 1 for i in sample_idx]
-                last_logits = logits[last_pos, :]
-                temps_list = [s.temperature for s in sample_batch]
-                rep_list = [getattr(s, 'repetition_penalty', 1.0) for s in sample_batch]
-                temps = torch.tensor(temps_list, device=device)
-                topp = torch.tensor([s.top_p for s in sample_batch], device=device)
-                rep_pen = torch.tensor(rep_list, device=device)
-                any_rep = any(r > 1.0 for r in rep_list)
-                all_greedy = all(t <= 0 for t in temps_list)
-                prev = None
-                if any_rep:
-                    hist = [list(s.input_ids) for s in sample_batch]
-                    max_l = max(len(h) for h in hist)
-                    prev = torch.tensor(
-                        [h + [-1] * (max_l - len(h)) for h in hist], dtype=torch.long, device=device)
-                next_tokens = self.sampler(last_logits, temps, topp, 1000,
-                                           prev_tokens=prev, rep_penalties=rep_pen,
-                                           all_greedy=all_greedy, any_rep_pen=any_rep).tolist()
-                for j, seq in enumerate(sample_batch):
-                    seq.advance_prefill(seq._chunk_len)
-                    seq._next_token = next_tokens[j]
-                    seq._chunk_sampled = True
-                    # prefill 完成（prompt 全部写入 cache）→ 登记满块前缀供后续请求命中
-                    if seq.prefill_done >= len(seq.input_ids):
-                        self.cache_manager.register_prefix(seq.seq_id, seq.input_ids)
-            # 中间 chunk：清空 _next_token，update_sequences 据此走 advance_prefill（不转 decode）
-            for i, ns in enumerate(need_sample):
-                if not ns:
-                    batch[i]._next_token = None
-                    batch[i]._chunk_sampled = False
-            stats.sample_time = time.time() - stats.sample_time
+        #    TP 修复：采样仅 rank0（logits 各 rank 一致，argmax 结果相同），但 seq 状态推进
+        #    （advance_prefill / register_prefix / _chunk_sampled）必须所有 rank 执行——
+        #    register_prefix 驱动 prefix cache 命中，命中改变 alloc 的块分配顺序，
+        #    若仅 rank0 登记，非 rank0 的 block id 会与 rank0 错位（block_table 不一致）。
+        stats.sample_time = time.time()
+        sample_idx = [i for i, ns in enumerate(need_sample) if ns]
+        next_tokens = None
+        if rank0() and sample_idx:
+            sample_batch = [batch[i] for i in sample_idx]
+            # 每条 sample seq 在 1D logits 中的末 token 位置 = cu_q[i+1] - 1
+            last_pos = [int(cu_q[i + 1]) - 1 for i in sample_idx]
+            last_logits = logits[last_pos, :]
+            temps_list = [s.temperature for s in sample_batch]
+            rep_list = [getattr(s, 'repetition_penalty', 1.0) for s in sample_batch]
+            temps = torch.tensor(temps_list, device=device)
+            topp = torch.tensor([s.top_p for s in sample_batch], device=device)
+            rep_pen = torch.tensor(rep_list, device=device)
+            any_rep = any(r > 1.0 for r in rep_list)
+            all_greedy = all(t <= 0 for t in temps_list)
+            prev = None
+            if any_rep:
+                hist = [list(s.input_ids) for s in sample_batch]
+                max_l = max(len(h) for h in hist)
+                prev = torch.tensor(
+                    [h + [-1] * (max_l - len(h)) for h in hist], dtype=torch.long, device=device)
+            next_tokens = self.sampler(last_logits, temps, topp, 1000,
+                                       prev_tokens=prev, rep_penalties=rep_pen,
+                                       all_greedy=all_greedy, any_rep_pen=any_rep).tolist()
+        # 状态推进：所有 rank 执行（prefix cache / prefill_done 必须跨 rank 一致）
+        for j, i in enumerate(sample_idx):
+            seq = batch[i]
+            seq.advance_prefill(seq._chunk_len)
+            if rank0():
+                seq._next_token = next_tokens[j]
+            seq._chunk_sampled = True
+            # prefill 完成（prompt 全部写入 cache）→ 登记满块前缀供后续请求命中
+            if seq.prefill_done >= len(seq.input_ids):
+                self.cache_manager.register_prefix(seq.seq_id, seq.input_ids)
+        # 中间 chunk：清空 _next_token，update_sequences 据此走 advance_prefill（不转 decode）
+        for i, ns in enumerate(need_sample):
+            if not ns:
+                batch[i]._next_token = None
+                batch[i]._chunk_sampled = False
+        stats.sample_time = time.time() - stats.sample_time
 
-            stats.total_time = time.time() - stats.total_time
-            logger.info(f"Prefill: Prep {stats.prep_time*1000:.1f}ms, GPU {stats.gpu_time*1000:.1f}ms, "
-                        f"Total {stats.total_time*1000:.1f}ms | n_seqs={n_seqs} total_tokens={total_tokens} "
-                        f"chunks={chunk_lens} offsets={offsets} sample={sum(need_sample)}")
+        stats.total_time = time.time() - stats.total_time
+        logger.info(f"Prefill: Prep {stats.prep_time*1000:.1f}ms, GPU {stats.gpu_time*1000:.1f}ms, "
+                    f"Total {stats.total_time*1000:.1f}ms | n_seqs={n_seqs} total_tokens={total_tokens} "
+                    f"chunks={chunk_lens} offsets={offsets} sample={sum(need_sample)}")
 
 
     def update_sequences(self, sequences: List[Sequence]):
@@ -674,14 +701,16 @@ class InferenceEngine:
                     # 唤醒等待该 seq 的非流式 /generate handler（continuous batching）
                     self._complete_seq(seq)
 
+        # TP 修复：_ctx_batch_dirty 必须所有 rank 置位（batch 成员变化 → 各 rank 都要
+        # 重建 block_table）。finished_any 各 rank 一致（seq 状态经 broadcast 同步）。
+        if finished_any:
+            self._ctx_batch_dirty = True  # batch 成员变化 → 下一步 prepare 重建
         if rank0():
             self._stream_event = StreamEvent(output_tokens, callbacks_batch) if callbacks_batch else None
             # 若本步有 seq 结束（EOS / stop 串 / max_tokens），seq 会被移出 running，
             # 下一轮 get_next_batch 不再包含它 → collect() 的 _flush_stream 不会执行，
             # 本步暂存的最后一批 token 会丢失。这里立即冲刷，保证流式 client 收到完整输出。
-            if finished_any:
-                self._ctx_batch_dirty = True  # batch 成员变化 → 下一步 prepare 重建
-                self._flush_stream()
+            self._flush_stream()
 
     def _flush_stream(self):
         """

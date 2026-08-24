@@ -33,6 +33,7 @@ except ImportError:
     flash_attn_varlen_func = None
 
 from core.cache_manager import store_kvcache
+from core.parallel_config import all_reduce
 
 
 def rope_half_split(x, cos, sin):
@@ -248,8 +249,10 @@ class Qwen3Adapter(ModelAdapter):
         )
 
         out = torch.matmul(attn_out.view(-1, graph.num_heads * graph.head_size), attn._o_w.t())
+        out = all_reduce(out)  # TP: o_proj 按输入维切分，各 rank 持部分和，须 allreduce
         normed, residual = rmsnorm_residual_fused(out, h, block._post_ln_w, block._post_ln_eps)
         mlp_out = dense_swiglu(normed, block.mlp._gu, block.mlp._d, out.shape[0], w_is_nk=True)
+        mlp_out = all_reduce(mlp_out)  # TP: down_proj 按输入维切分，各 rank 持部分和，须 allreduce
         return mlp_out + residual
 
     # -------------------- buffer 分配 --------------------
