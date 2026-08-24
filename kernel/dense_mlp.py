@@ -21,6 +21,14 @@ import triton
 import triton.language as tl
 
 from kernel.gemv import gemv_or_matmul
+from kernel.gemv_int8 import w8_linear
+
+
+def _lin(x, w, out, env):
+    """统一线性：w 为 bf16 [N,K] 或 (w_int8, scale) 元组（W8A16）。"""
+    if isinstance(w, tuple):
+        return w8_linear(x, w[0], w[1], out, env)
+    return gemv_or_matmul(x, w, out, env)
 
 
 @triton.jit
@@ -69,16 +77,19 @@ def dense_swiglu(x, gu_w, d_w, m=None, w_is_nk=False):
     if w_is_nk:
         # [N,K] 布局：M=1 走 gemv_v2（W 直接读），否则 x @ W.t()。
         # x 可能是 3D（prefill [B,S,hidden]）→ 先展平 [M,hidden]，末尾 reshape 回原形。
+        # W8A16：gu_w/d_w 可为 (w_int8, scale) 元组，N 从 w_int8.shape[0] 取。
         lead = x.shape[:-1]
         x2 = x.reshape(-1, x.shape[-1])
         M = m if m is not None else x2.shape[0]
-        gate_up = torch.empty(M, gu_w.shape[0], dtype=x.dtype, device=x.device)
-        gemv_or_matmul(x2, gu_w, gate_up, "MICRO_GEMV_FFN")
-        inter = gu_w.shape[0] // 2
+        gu_n = gu_w[0].shape[0] if isinstance(gu_w, tuple) else gu_w.shape[0]
+        d_n = d_w[0].shape[0] if isinstance(d_w, tuple) else d_w.shape[0]
+        gate_up = torch.empty(M, gu_n, dtype=x.dtype, device=x.device)
+        _lin(x2, gu_w, gate_up, "MICRO_GEMV_FFN")
+        inter = gu_n // 2
         act = silu_mul_fused(gate_up, M, inter)
-        out = torch.empty(M, d_w.shape[0], dtype=x.dtype, device=x.device)
-        out = gemv_or_matmul(act, d_w, out, "MICRO_GEMV_FFN")
-        return out.reshape(*lead, d_w.shape[0]) if len(lead) > 1 else out
+        out = torch.empty(M, d_n, dtype=x.dtype, device=x.device)
+        out = _lin(act, d_w, out, "MICRO_GEMV_FFN")
+        return out.reshape(*lead, d_n) if len(lead) > 1 else out
     else:
         # [K,N] 旧布局：x @ W（DeepSeek/老 Qwen 不变）
         gate_up = x @ gu_w

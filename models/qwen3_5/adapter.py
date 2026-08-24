@@ -27,6 +27,7 @@
 - 多模态壳：AutoModelForCausalLM → Qwen3_5ForCausalLM（纯文本），model.config 即
   text_config，model.model 即 text model（embed_tokens/layers/norm），vision 不加载。
 """
+import os
 import torch
 import torch.nn.functional as F
 import triton
@@ -39,7 +40,13 @@ from kernel.rmsnorm import (
 )
 from kernel.dense_mlp import dense_swiglu
 from kernel.gemv import gemv_or_matmul
+from kernel.gemv_int8 import w8_linear
+from kernel.quant import quantize_per_channel
 from core.cache_manager import store_kvcache
+
+# W8A16 开关：MICRO_W8A16=1 时权重 INT8（per-channel）+ 激活 bf16。
+# decode（memory-bound）权重带宽减半；prefill（compute-bound）反量化后 matmul。
+_W8A16 = os.environ.get("MICRO_W8A16", "0") == "1"
 
 try:
     from flash_attn import flash_attn_with_kvcache, flash_attn_varlen_func
@@ -397,6 +404,29 @@ class Qwen3_5Adapter(ModelAdapter):
     def _ln_eps(ln, cfg):
         return getattr(ln, "eps", None) or getattr(ln, "variance_epsilon", cfg.rms_norm_eps)
 
+    # -------------------- W8A16 统一线性分派 --------------------
+    def _q(self, w):
+        """W8A16 开启时 bf16 [N,K] → (w_int8, scale) 元组；否则原样返回。"""
+        if _W8A16:
+            return quantize_per_channel(w)
+        return w
+
+    def _lin(self, x, w, out=None, env="MICRO_GEMV"):
+        """统一线性：w 为 bf16 [N,K] 或 (w_int8, scale) 元组（W8A16）。
+        M=1 走 int8 GEMV（权重带宽减半）；M>1 反量化后 matmul。"""
+        if isinstance(w, tuple):
+            return w8_linear(x, w[0], w[1], out, env)
+        if out is None:
+            out = torch.empty(x.shape[0], w.shape[0], dtype=x.dtype, device=x.device)
+        return gemv_or_matmul(x, w, out, env)
+
+    def _lin_prefill(self, x, w):
+        """prefill 线性（M=T>1）：w 为 bf16 [N,K] 或 (w_int8, scale) 元组。
+        反量化后 x @ w.t()（compute-bound，反量化开销可忽略）。"""
+        if isinstance(w, tuple):
+            w = (w[0].float() * w[1].unsqueeze(1)).to(x.dtype)
+        return torch.matmul(x, w.t())
+
     # -------------------- 权重预处理 --------------------
     def prepare_weights(self, model, world_size, rank):
         blocks = self.blocks(model)
@@ -412,12 +442,12 @@ class Qwen3_5Adapter(ModelAdapter):
                 la = block.linear_attn
                 la._gdn_layer_idx = gdn_layer_idx
                 gdn_layer_idx += 1
-                la._qkv_w = la.in_proj_qkv.weight.data.contiguous()   # [6144, hidden]
-                la._z_w = la.in_proj_z.weight.data.contiguous()       # [2048, hidden]
-                la._b_w = la.in_proj_b.weight.data.contiguous()       # [16, hidden]
-                la._a_w = la.in_proj_a.weight.data.contiguous()       # [16, hidden]
-                la._o_w = la.out_proj.weight.data.contiguous()        # [hidden, 2048]
-                la._conv_w = la.conv1d.weight.data.squeeze(1).contiguous()  # [6144, 4]
+                la._qkv_w = self._q(la.in_proj_qkv.weight.data.contiguous())   # [6144, hidden]
+                la._z_w = self._q(la.in_proj_z.weight.data.contiguous())       # [2048, hidden]
+                la._b_w = self._q(la.in_proj_b.weight.data.contiguous())       # [16, hidden]
+                la._a_w = self._q(la.in_proj_a.weight.data.contiguous())       # [16, hidden]
+                la._o_w = self._q(la.out_proj.weight.data.contiguous())        # [hidden, 2048]
+                la._conv_w = la.conv1d.weight.data.squeeze(1).contiguous()  # [6144, 4]（conv 不量化）
                 la._a_log = la.A_log.data.float().contiguous()        # [16] fp32
                 la._dt_bias = la.dt_bias.data.float().contiguous()    # [16] fp32
                 la._norm_w = la.norm.weight.data.float().contiguous()  # [128] fp32
@@ -436,8 +466,8 @@ class Qwen3_5Adapter(ModelAdapter):
                                  w_q[:, hd:, :].reshape(-1, w_q.shape[-1])], dim=0).contiguous()
                 w_k = attn.k_proj.weight.data.chunk(world_size, dim=0)[rank]
                 w_v = attn.v_proj.weight.data.chunk(world_size, dim=0)[rank]
-                attn._qkv_w = torch.cat([w_q, w_k, w_v], dim=0).contiguous()
-                attn._o_w = attn.o_proj.weight.data.chunk(world_size, dim=1)[rank].contiguous()
+                attn._qkv_w = self._q(torch.cat([w_q, w_k, w_v], dim=0).contiguous())
+                attn._o_w = self._q(attn.o_proj.weight.data.chunk(world_size, dim=1)[rank].contiguous())
                 attn._q_norm_w = attn.q_norm.weight.data.clone()
                 attn._k_norm_w = attn.k_norm.weight.data.clone()
                 attn._q_norm_eps = self._ln_eps(attn.q_norm, cfg)
@@ -448,8 +478,8 @@ class Qwen3_5Adapter(ModelAdapter):
             mlp = block.mlp
             w_up = mlp.up_proj.weight.data.chunk(world_size, dim=0)[rank]
             w_gate = mlp.gate_proj.weight.data.chunk(world_size, dim=0)[rank]
-            mlp._gu = torch.cat([w_up, w_gate], dim=0).contiguous()
-            mlp._d = mlp.down_proj.weight.data.chunk(world_size, dim=1)[rank].contiguous()
+            mlp._gu = self._q(torch.cat([w_up, w_gate], dim=0).contiguous())
+            mlp._d = self._q(mlp.down_proj.weight.data.chunk(world_size, dim=1)[rank].contiguous())
             mlp.gate_proj = mlp.up_proj = mlp.down_proj = None
 
             block._in_ln_w = block.input_layernorm.weight.data.clone()
@@ -472,13 +502,13 @@ class Qwen3_5Adapter(ModelAdapter):
         scale = DK ** -0.5
 
         qkv = torch.empty(M, conv_dim, dtype=h2d.dtype, device=dev)
-        gemv_or_matmul(h2d, la._qkv_w, qkv, "MICRO_GEMV_GDN")
+        self._lin(h2d, la._qkv_w, qkv, "MICRO_GEMV_GDN")
         z = torch.empty(M, H * DV, dtype=h2d.dtype, device=dev)
-        gemv_or_matmul(h2d, la._z_w, z, "MICRO_GEMV_GDN")
+        self._lin(h2d, la._z_w, z, "MICRO_GEMV_GDN")
         b = torch.empty(M, H, dtype=h2d.dtype, device=dev)
-        gemv_or_matmul(h2d, la._b_w, b, "MICRO_GEMV_GDN")
+        self._lin(h2d, la._b_w, b, "MICRO_GEMV_GDN")
         a = torch.empty(M, H, dtype=h2d.dtype, device=dev)
-        gemv_or_matmul(h2d, la._a_w, a, "MICRO_GEMV_GDN")
+        self._lin(h2d, la._a_w, a, "MICRO_GEMV_GDN")
 
         # g（衰减率）HF 全程 fp32（-A_log.float().exp()*softplus），bf16 存会因 exp(g)
         # 在递归里逐 token 复利放大误差 → 改 fp32。beta 是 sigmoid∈[0,1]，bf16 足够。
@@ -524,7 +554,7 @@ class Qwen3_5Adapter(ModelAdapter):
                                        H=H, DV=DV, eps=la._norm_eps,
                                        BLOCK_D=triton.next_power_of_2(DV))
         out = torch.empty(M, h2d.shape[1], dtype=h2d.dtype, device=dev)
-        gemv_or_matmul(og, la._o_w, out, "MICRO_GEMV_GDN")
+        self._lin(og, la._o_w, out, "MICRO_GEMV_GDN")
         if self._dbg_gdn is not None:
             self._dbg_gdn[-1]["og"] = og.detach().clone()
             self._dbg_gdn[-1]["out"] = out.detach().clone()
@@ -537,7 +567,7 @@ class Qwen3_5Adapter(ModelAdapter):
             return graph._h_buf[:bs]
         attn = block.self_attn
         qkv_buf = graph._qkv[:bs]
-        gemv_or_matmul(graph._h_buf[:bs], attn._qkv_w, qkv_buf, "MICRO_GEMV_QKV")
+        self._lin(graph._h_buf[:bs], attn._qkv_w, qkv_buf, "MICRO_GEMV_QKV")
         return qkv_buf
 
     _dbg_dec = None  # 调试：list of 每层输出 residual stream（decode）
@@ -555,7 +585,7 @@ class Qwen3_5Adapter(ModelAdapter):
             return graph._h_buf[:bs], graph._residual[:bs]
         attn = block_next.self_attn
         qkv_buf = graph._qkv[:bs]
-        gemv_or_matmul(graph._h_buf[:bs], attn._qkv_w, qkv_buf, "MICRO_GEMV_QKV")
+        self._lin(graph._h_buf[:bs], attn._qkv_w, qkv_buf, "MICRO_GEMV_QKV")
         return qkv_buf, graph._residual[:bs]
 
     def attention(self, attn_input, block, layer_idx, bs, graph, cache_manager, block_table):
@@ -598,7 +628,7 @@ class Qwen3_5Adapter(ModelAdapter):
         attn = attn * torch.sigmoid(gate.float()).to(attn.dtype)
 
         out_buf = graph._attn_out[:bs]
-        return gemv_or_matmul(attn.reshape(bs, -1), sa._o_w, out_buf, "MICRO_GEMV_O")
+        return self._lin(attn.reshape(bs, -1), sa._o_w, out_buf, "MICRO_GEMV_O")
 
     def _attention_gdn_decode(self, h_normed, block, bs, graph):
         # on_decode_batch 已填 graph._gdn_seq_idx + graph._gdn_is_real（常驻 buffer，
@@ -636,7 +666,7 @@ class Qwen3_5Adapter(ModelAdapter):
         T = h.shape[0]
 
         normed = rmsnorm1(h, block._in_ln_w, block._in_ln_eps)
-        qkv = torch.matmul(normed, sa._qkv_w.t())  # [T, 2*q_dim+2*kv_dim]（[q|gate|k|v]）
+        qkv = self._lin_prefill(normed, sa._qkv_w)  # [T, 2*q_dim+2*kv_dim]（[q|gate|k|v]）
         k_off = 2 * q_dim
         q = qkv[..., :q_dim].reshape(T, nh, hd).contiguous()
         gate = qkv[..., q_dim:2 * q_dim].reshape(T, nh, hd).contiguous()
@@ -672,7 +702,7 @@ class Qwen3_5Adapter(ModelAdapter):
             block_table=meta.block_table,
         )
         attn = attn * torch.sigmoid(gate.float()).to(attn.dtype)
-        out = torch.matmul(attn.reshape(T, -1), sa._o_w.t())
+        out = self._lin_prefill(attn.reshape(T, -1), sa._o_w)
 
         normed, residual = rmsnorm1_residual_fused(out, h, block._post_ln_w, block._post_ln_eps)
         mlp_out = dense_swiglu(normed, block.mlp._gu, block.mlp._d, T, w_is_nk=True)
