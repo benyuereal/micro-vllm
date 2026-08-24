@@ -87,7 +87,7 @@ async def rank0_inference_loop():
 def non_rank0_inference_loop():
     print(f"Rank {get_rank()}: Inference loop started")
     while running:
-        ctx = engine.tp_receive_batch()
+        ctx, _done = engine.tp_receive_batch()
         if ctx.batch_type == "waiting" or ctx.batch_size == 0:
             time.sleep(0.000)
             continue
