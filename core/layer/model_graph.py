@@ -188,6 +188,12 @@ class ModelGraphRunner:
             with torch.no_grad(), torch.cuda.graph(g):
                 self.decode(self._input_ids[:bs], bs, cache_manager, bt_buf)  # 直写 _hidden
             self._graphs[(bs, None)] = g
+            # TP 性能：custom allreduce 的 registered=True 路径在捕获时直读 input，
+            # 捕获后须交换各 rank 的 graph buffer IPC handle（replay 时 kernel 经 IPC
+            # 读 peer 的 allreduce input）。所有 rank 同序调用（对齐 vLLM capture ctx）。
+            if self.world_size > 1:
+                from core.parallel_config import register_graph_buffers
+                register_graph_buffers()
             logger.info(f"   - Batch size {bs} OK")
 
         # 恢复 buffer 原值（-1 / 0），避免污染后续真实推理的首步

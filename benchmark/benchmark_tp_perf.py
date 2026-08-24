@@ -146,6 +146,8 @@ def _micro_loop(eng, max_steps):
             eng.update_sequences(ctx.sequences)
         steps += 1
     if dbg and rank0():
+        from core import parallel_config as _pc
+        print(f"[AR_COUNTER] custom={getattr(_pc._ctx,'_ar_custom',0)} nccl={getattr(_pc._ctx,'_ar_nccl',0)}", flush=True)
         n = max(steps, 1)
         print(f"[TP_DEBUG rank0] steps={steps} per-step(ms): " +
               " ".join(f"{k}={v*1000/n:.1f}" for k, v in sorted(t_acc.items(), key=lambda x: -x[1])))
