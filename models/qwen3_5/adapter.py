@@ -162,7 +162,8 @@ def _gdn_conv_decode_kernel(QKV, W, STATE, SEQ_IDX, IS_REAL,
 # decode：每 (row, head) 一个 program；prefill：每 (seq, head) 一个 program 循环 token。
 @triton.jit
 def _gdn_recurrent_decode_kernel(QKV, G, BETA, STATE, OUT, SEQ_IDX, IS_REAL,
-                                 H: tl.constexpr, DK: tl.constexpr, DV: tl.constexpr,
+                                 H: tl.constexpr, HK: tl.constexpr,
+                                 DK: tl.constexpr, DV: tl.constexpr,
                                  N_GDN, GDN_L, SCALE, STRIDE, BLOCK_D: tl.constexpr):
     row = tl.program_id(0)
     h = tl.program_id(1)
@@ -175,9 +176,13 @@ def _gdn_recurrent_decode_kernel(QKV, G, BETA, STATE, OUT, SEQ_IDX, IS_REAL,
     dv = tl.arange(0, BLOCK_D)
     S_m = tl.load(S + dk[:, None] * DV + dv[None, :]).to(tl.float32)
 
-    q_base = QKV + row.to(tl.int64) * STRIDE + h * DK
-    k_base = q_base + H * DK
-    v_base = k_base + H * DK
+    # q/k 只有 HK 个 head（27B: HK=16, H=48），HF 用 repeat_interleave(H//HK) 扩到 H：
+    # 递归 head h 的 q/k = 原始 q/k head (h // (H//HK))。q/k 段宽 HK*DK（非 H*DK）。
+    # v 有 H 个 head（value_dim = H*DV），v head h 在 2*HK*DK + h*DV。
+    hk = h // (H // HK)
+    q_base = QKV + row.to(tl.int64) * STRIDE + hk * DK
+    k_base = QKV + row.to(tl.int64) * STRIDE + HK * DK + hk * DK
+    v_base = QKV + row.to(tl.int64) * STRIDE + 2 * HK * DK + h * DV
     # q/k/v 以 fp32 参与递归（对齐 HF：l2norm/scale/累加全 fp32）。
     q = tl.load(q_base + dk).to(tl.float32)
     k = tl.load(k_base + dk).to(tl.float32)
@@ -204,7 +209,8 @@ def _gdn_recurrent_decode_kernel(QKV, G, BETA, STATE, OUT, SEQ_IDX, IS_REAL,
 
 @triton.jit
 def _gdn_recurrent_prefill_kernel(QKV, G, BETA, STATE, OUT, CU, SEQ_IDX,
-                                  H: tl.constexpr, DK: tl.constexpr, DV: tl.constexpr,
+                                  H: tl.constexpr, HK: tl.constexpr,
+                                  DK: tl.constexpr, DV: tl.constexpr,
                                   N_GDN, GDN_L, SCALE, STRIDE, BLOCK_D: tl.constexpr):
     s = tl.program_id(0)
     h = tl.program_id(1)
@@ -217,12 +223,14 @@ def _gdn_recurrent_prefill_kernel(QKV, G, BETA, STATE, OUT, CU, SEQ_IDX,
     dk = tl.arange(0, BLOCK_D)
     dv = tl.arange(0, BLOCK_D)
     S_m = tl.load(S + dk[:, None] * DV + dv[None, :]).to(tl.float32)
+    # q/k 只有 HK 个 head，HF repeat_interleave(H//HK) 扩到 H（见 decode kernel 注释）。
+    hk = h // (H // HK)
 
     for i in range(0, L):
         t = start + i
-        q_base = QKV + t.to(tl.int64) * STRIDE + h * DK
-        k_base = q_base + H * DK
-        v_base = k_base + H * DK
+        q_base = QKV + t.to(tl.int64) * STRIDE + hk * DK
+        k_base = QKV + t.to(tl.int64) * STRIDE + HK * DK + hk * DK
+        v_base = QKV + t.to(tl.int64) * STRIDE + 2 * HK * DK + h * DV
         q = tl.load(q_base + dk).to(tl.float32)
         k = tl.load(k_base + dk).to(tl.float32)
         v = tl.load(v_base + dv).to(tl.float32)
@@ -324,6 +332,7 @@ class Qwen3_5Adapter(ModelAdapter):
         self._n_gdn = 0
         self._n_full = 0
         self._gdn_H = 16
+        self._gdn_HK = 16
         self._gdn_DK = 128
         self._gdn_DV = 128
         self._gdn_conv_dim = 6144
@@ -363,6 +372,7 @@ class Qwen3_5Adapter(ModelAdapter):
             self._n_gdn = sum(1 for t in self._layer_types if t == "linear_attention")
             self._n_full = sum(1 for t in self._layer_types if t == "full_attention")
             self._gdn_H = self._tcfg.linear_num_value_heads
+            self._gdn_HK = self._tcfg.linear_num_key_heads
             self._gdn_DK = self._tcfg.linear_key_head_dim
             self._gdn_DV = self._tcfg.linear_value_head_dim
             self._gdn_conv_dim = (2 * self._tcfg.linear_num_key_heads * self._gdn_DK
@@ -407,10 +417,77 @@ class Qwen3_5Adapter(ModelAdapter):
 
     # -------------------- W8A16 统一线性分派 --------------------
     def _q(self, w):
-        """W8A16 开启时 bf16 [N,K] → (w_int8, scale) 元组；否则原样返回。"""
+        """W8A16 开启时 bf16 [N,K] → (w_int8, scale) 元组；否则原样返回。
+        已是 (int8, scale) 元组（预量化模型，如 Qwen3.8）→ 原样返回（不重复量化）。"""
+        if isinstance(w, tuple):
+            return w
         if _W8A16:
             return quantize_per_channel(w)
         return w
+
+    def _unpack_linear(self, mod, world_size, rank, chunk_dim=0):
+        """从 Linear 模块取权重，统一成 bf16 [N,K] 或 (int8 [N,K], scale [N,K/128])。
+
+        - 普通 nn.Linear（.weight bf16）→ 返回 bf16 [N,K]（TP 按 chunk_dim 切）。
+        - pack-quantized（weight_packed int32 [N,K/4] + weight_scale bf16 [N,K/128]，
+          Qwen3.8 W8A16 预量化）→ 解包成 (int8 [N,K], scale fp32 [N,K/128])。
+          解包：每 int32 打包 4 个 int8，byte i（bits 8i..8i+7）= (int8+128)&0xFF
+          → int8 = byte - 128（非补码）；stack 沿 dim=2（byte 位置是 minor 维）。
+          已验证与 compressed_tensors 参考 dequantize 完全一致（max diff 0.0）。
+        """
+        if hasattr(mod, "weight_packed"):
+            # int32 packed [N,K/4] 与 int8 [N,K] 同字节数。若在 GPU 上解包，int32 未释放
+            # 前 int8 已分配 → 双份常驻（27B 54G 超 GPU4 45G OOM）。故先在 CPU 解包
+            # （RAM 875G 充足），只把 int8 结果搬上 GPU，int32 在 CPU 释放。
+            dev = mod.weight_packed.device
+            packed = mod.weight_packed.to("cpu")   # int32 [N, K/4] → CPU
+            scale = mod.weight_scale.to("cpu").float()  # bf16 [N, K/128] → CPU fp32
+            N, K4 = packed.shape
+            K = K4 * 4
+            p = packed.to(torch.int32)
+            b0 = (p & 0xFF).to(torch.int32)
+            b1 = ((p >> 8) & 0xFF).to(torch.int32)
+            b2 = ((p >> 16) & 0xFF).to(torch.int32)
+            b3 = ((p >> 24) & 0xFF).to(torch.int32)
+            w_int8 = torch.stack([b0 - 128, b1 - 128, b2 - 128, b3 - 128],
+                                 dim=2).reshape(N, K).to(torch.int8)
+            del packed, p, b0, b1, b2, b3  # 释放 CPU int32
+            # 释放 GPU 上的 int32 packed + scale（模块属性）
+            del mod.weight_packed
+            del mod.weight_scale
+            if hasattr(mod, "weight_shape"):
+                del mod.weight_shape
+            w_int8 = w_int8.chunk(world_size, dim=chunk_dim)[rank].to(dev)
+            scale = scale.chunk(world_size, dim=chunk_dim)[rank].to(dev)
+            return w_int8.contiguous(), scale.contiguous()
+        w = mod.weight.data
+        return w.chunk(world_size, dim=chunk_dim)[rank].contiguous()
+
+    @staticmethod
+    def _reorder_qgate(w, nh, hd):
+        """q_proj 权重行重排 [query 全部 | gate 全部]（交错 → 连续）。
+        w 为 bf16 [2*nh*hd, K] 或 (int8 [2*nh*hd, K], scale [2*nh*hd, K/128])。
+        行重排对两者都成立（scale 随行一起重排）。"""
+        if isinstance(w, tuple):
+            wq, sc = w
+            wq = wq.view(nh, 2 * hd, -1)
+            wq = torch.cat([wq[:, :hd, :].reshape(-1, wq.shape[-1]),
+                            wq[:, hd:, :].reshape(-1, wq.shape[-1])], dim=0).contiguous()
+            sc = sc.view(nh, 2 * hd, -1)
+            sc = torch.cat([sc[:, :hd, :].reshape(-1, sc.shape[-1]),
+                            sc[:, hd:, :].reshape(-1, sc.shape[-1])], dim=0).contiguous()
+            return wq, sc
+        w = w.view(nh, 2 * hd, -1)
+        return torch.cat([w[:, :hd, :].reshape(-1, w.shape[-1]),
+                          w[:, hd:, :].reshape(-1, w.shape[-1])], dim=0).contiguous()
+
+    @staticmethod
+    def _cat_w(ws):
+        """cat 一组权重（bf16 或 int8 元组，须同 dtype 类型）沿 dim=0。"""
+        if isinstance(ws[0], tuple):
+            return (torch.cat([w[0] for w in ws], dim=0).contiguous(),
+                    torch.cat([w[1] for w in ws], dim=0).contiguous())
+        return torch.cat(ws, dim=0).contiguous()
 
     def _lin(self, x, w, out=None, env="MICRO_GEMV"):
         """统一线性：w 为 bf16 [N,K] 或 (w_int8, scale) 元组（W8A16）。
@@ -423,9 +500,15 @@ class Qwen3_5Adapter(ModelAdapter):
 
     def _lin_prefill(self, x, w):
         """prefill 线性（M=T>1）：w 为 bf16 [N,K] 或 (w_int8, scale) 元组。
-        反量化后 x @ w.t()（compute-bound，反量化开销可忽略）。"""
+        反量化后 x @ w.t()（compute-bound，反量化开销可忽略）。
+        scale 两种：[N]（per-channel）→ unsqueeze(1)；[N,K/128]（group-128）→ repeat_interleave 128。"""
         if isinstance(w, tuple):
-            w = (w[0].float() * w[1].unsqueeze(1)).to(x.dtype)
+            w_int8, scale = w
+            if scale.dim() == 2:
+                sc = scale.repeat_interleave(128, dim=1)
+            else:
+                sc = scale.unsqueeze(1)
+            w = (w_int8.float() * sc).to(x.dtype)
         return torch.matmul(x, w.t())
 
     # -------------------- 权重预处理 --------------------
@@ -443,17 +526,26 @@ class Qwen3_5Adapter(ModelAdapter):
                 la = block.linear_attn
                 la._gdn_layer_idx = gdn_layer_idx
                 gdn_layer_idx += 1
-                # 4 个输入投影（qkv 6144 + z 2048 + b 16 + a 16）融合成 1 个 [8224, hidden]
-                # GEMV：b/a 仅 N=16（4 个 block，92 SM 空转）+ 3 次额外 launch 是 decode
-                # 瓶颈。融合后 1 次 GEMV（L2-flushed 实测省 ~10us/层 ×18 = 180us/step）。
-                # 下游 kernel 用 row-stride 读融合 buffer 的对应段（qkv/z/b/a 视图）。
-                la._in_w = self._q(torch.cat([
-                    la.in_proj_qkv.weight.data,   # [6144, hidden]
-                    la.in_proj_z.weight.data,     # [2048, hidden]
-                    la.in_proj_b.weight.data,     # [16, hidden]
-                    la.in_proj_a.weight.data,     # [16, hidden]
-                ], dim=0).contiguous())           # [8224, hidden]
-                la._o_w = self._q(la.out_proj.weight.data.contiguous())        # [hidden, 2048]
+                # 输入投影：qkv/z（可能 int8 预量化）+ b/a（始终 bf16，在 ignore 列表）。
+                # 0.8B（bf16）：4 个全 bf16 → 融合成 1 个 [8224, hidden] GEMV（b/a 仅 N=16
+                #   单独 GEMV 会 92 SM 空转 + 3 次额外 launch，融合省 ~180us/step）。
+                # 27B W8A16（qkv/z int8、b/a bf16）：dtype 不同不能混融 → 2 个 GEMV：
+                #   qkv+z 融成 1 个 int8 GEMV [16384, 5120]，b+a 融成 1 个 bf16 GEMV [96, 5120]。
+                # 下游 kernel 用 row-stride 读对应 buffer 的段（qkv/z 视图 / b/a 视图）。
+                qkv_w = self._unpack_linear(la.in_proj_qkv, world_size, rank)
+                z_w = self._unpack_linear(la.in_proj_z, world_size, rank)
+                b_w = self._unpack_linear(la.in_proj_b, world_size, rank)
+                a_w = self._unpack_linear(la.in_proj_a, world_size, rank)
+                la._gdn_w8 = isinstance(qkv_w, tuple)
+                if la._gdn_w8:
+                    # int8：cat int8 权重 + cat scale（group-128，scale [N, K/128]）
+                    la._in_w_qz = (torch.cat([qkv_w[0], z_w[0]], dim=0).contiguous(),
+                                   torch.cat([qkv_w[1], z_w[1]], dim=0).contiguous())
+                else:
+                    # bf16：4 个全融合成 1 个 GEMV（原 0.8B 路径）
+                    la._in_w = torch.cat([qkv_w, z_w, b_w, a_w], dim=0).contiguous()
+                la._in_w_ba = torch.cat([b_w, a_w], dim=0).contiguous()  # [2H, hidden] bf16
+                la._o_w = self._q(self._unpack_linear(la.out_proj, world_size, rank))
                 la._conv_w = la.conv1d.weight.data.squeeze(1).contiguous()  # [6144, 4]（conv 不量化）
                 la._a_log = la.A_log.data.float().contiguous()        # [16] fp32
                 la._dt_bias = la.dt_bias.data.float().contiguous()    # [16] fp32
@@ -466,15 +558,19 @@ class Qwen3_5Adapter(ModelAdapter):
                 # q_proj 输出 [num_heads, head_dim*2]，HF view(-1, head_dim*2).chunk(2,-1)：
                 # 每 head 的 2*head_dim 块 = [query(head_dim) | gate(head_dim)]（交错）。
                 # 重排权重行 → [query 全部 | gate 全部]，使 q 段连续（复用 contiguous-seg kernel）。
-                w_q = attn.q_proj.weight.data.chunk(world_size, dim=0)[rank]  # [2*nh*hd, hidden]
+                # 行重排对 bf16 和 int8 都成立（int8 的 scale 随行一起重排）。
+                w_q = self._unpack_linear(attn.q_proj, world_size, rank)  # [2*nh*hd, hidden]
                 nh, hd = tc.num_attention_heads, tc.head_dim
-                w_q = w_q.view(nh, 2 * hd, -1)
-                w_q = torch.cat([w_q[:, :hd, :].reshape(-1, w_q.shape[-1]),
-                                 w_q[:, hd:, :].reshape(-1, w_q.shape[-1])], dim=0).contiguous()
-                w_k = attn.k_proj.weight.data.chunk(world_size, dim=0)[rank]
-                w_v = attn.v_proj.weight.data.chunk(world_size, dim=0)[rank]
-                attn._qkv_w = self._q(torch.cat([w_q, w_k, w_v], dim=0).contiguous())
-                attn._o_w = self._q(attn.o_proj.weight.data.chunk(world_size, dim=1)[rank].contiguous())
+                if isinstance(w_q, tuple):
+                    w_q = self._reorder_qgate(w_q, nh, hd)
+                else:
+                    w_q = w_q.view(nh, 2 * hd, -1)
+                    w_q = torch.cat([w_q[:, :hd, :].reshape(-1, w_q.shape[-1]),
+                                     w_q[:, hd:, :].reshape(-1, w_q.shape[-1])], dim=0).contiguous()
+                w_k = self._unpack_linear(attn.k_proj, world_size, rank)
+                w_v = self._unpack_linear(attn.v_proj, world_size, rank)
+                attn._qkv_w = self._q(self._cat_w([w_q, w_k, w_v]))
+                attn._o_w = self._q(self._unpack_linear(attn.o_proj, world_size, rank, chunk_dim=1))
                 attn._q_norm_w = attn.q_norm.weight.data.clone()
                 attn._k_norm_w = attn.k_norm.weight.data.clone()
                 attn._q_norm_eps = self._ln_eps(attn.q_norm, cfg)
@@ -483,10 +579,10 @@ class Qwen3_5Adapter(ModelAdapter):
                 attn.q_norm = attn.k_norm = None
 
             mlp = block.mlp
-            w_up = mlp.up_proj.weight.data.chunk(world_size, dim=0)[rank]
-            w_gate = mlp.gate_proj.weight.data.chunk(world_size, dim=0)[rank]
-            mlp._gu = self._q(torch.cat([w_up, w_gate], dim=0).contiguous())
-            mlp._d = self._q(mlp.down_proj.weight.data.chunk(world_size, dim=1)[rank].contiguous())
+            w_up = self._unpack_linear(mlp.up_proj, world_size, rank)
+            w_gate = self._unpack_linear(mlp.gate_proj, world_size, rank)
+            mlp._gu = self._q(self._cat_w([w_up, w_gate]))
+            mlp._d = self._q(self._unpack_linear(mlp.down_proj, world_size, rank, chunk_dim=1))
             mlp.gate_proj = mlp.up_proj = mlp.down_proj = None
 
             block._in_ln_w = block.input_layernorm.weight.data.clone()
@@ -504,25 +600,43 @@ class Qwen3_5Adapter(ModelAdapter):
                      cu_seqlens=None, seq_idx=None):
         M = h2d.shape[0]
         dev = h2d.device
-        H, DK, DV = self._gdn_H, self._gdn_DK, self._gdn_DV
+        H, HK, DK, DV = self._gdn_H, self._gdn_HK, self._gdn_DK, self._gdn_DV
         conv_dim = self._gdn_conv_dim
         scale = DK ** -0.5
 
-        # 4 个输入投影融合成 1 个 GEMV → [M, 8224]，再切视图（row stride = 8224）。
-        # 段布局：qkv[0:6144] | z[6144:8192] | b[8192:8208] | a[8208:8224]。
-        in_dim = conv_dim + H * DV + 2 * H  # 6144 + 2048 + 16 + 16 = 8224
-        in_proj = torch.empty(M, in_dim, dtype=h2d.dtype, device=dev)
-        self._lin(h2d, la._in_w, in_proj, "MICRO_GEMV_GDN")
-        qkv = in_proj[:, :conv_dim]
-        z = in_proj[:, conv_dim:conv_dim + H * DV]
-        b = in_proj[:, conv_dim + H * DV:conv_dim + H * DV + H]
-        a = in_proj[:, conv_dim + H * DV + H:]
+        # 输入投影：
+        #  - bf16（0.8B）：4 个融合成 1 个 GEMV → [M, 8224]，段布局
+        #    qkv[0:6144] | z[6144:8192] | b[8192:8208] | a[8208:8224]（row stride = 8224）。
+        #  - W8A16（27B）：qkv/z int8、b/a bf16，dtype 不同不能混融 → 2 个 GEMV：
+        #    qkv+z → [M, conv_dim+H*DV]（int8），b+a → [M, 2H]（bf16）。
+        # 下游 kernel 用 row-stride 读对应 buffer 的段（qkv/z 视图 / b/a 视图）。
+        qz_dim = conv_dim + H * DV
+        if getattr(la, "_gdn_w8", False):
+            qz = torch.empty(M, qz_dim, dtype=h2d.dtype, device=dev)
+            self._lin(h2d, la._in_w_qz, qz, "MICRO_GEMV_GDN")
+            ba = torch.empty(M, 2 * H, dtype=h2d.dtype, device=dev)
+            self._lin(h2d, la._in_w_ba, ba, "MICRO_GEMV_GDN")
+            qkv = qz[:, :conv_dim]
+            z = qz[:, conv_dim:]
+            b = ba[:, :H]
+            a = ba[:, H:]
+            in_dim = qz_dim          # qkv/z 视图的 row stride
+            ba_stride = 2 * H        # b/a 视图的 row stride
+        else:
+            in_dim = qz_dim + 2 * H  # 6144 + 2048 + 16 + 16 = 8224
+            in_proj = torch.empty(M, in_dim, dtype=h2d.dtype, device=dev)
+            self._lin(h2d, la._in_w, in_proj, "MICRO_GEMV_GDN")
+            qkv = in_proj[:, :conv_dim]
+            z = in_proj[:, conv_dim:conv_dim + H * DV]
+            b = in_proj[:, conv_dim + H * DV:conv_dim + H * DV + H]
+            a = in_proj[:, conv_dim + H * DV + H:]
+            ba_stride = in_dim
 
         # g（衰减率）HF 全程 fp32（-A_log.float().exp()*softplus），bf16 存会因 exp(g)
         # 在递归里逐 token 复利放大误差 → 改 fp32。beta 是 sigmoid∈[0,1]，bf16 足够。
         g = torch.empty(M, H, dtype=torch.float32, device=dev)
         beta = torch.empty(M, H, dtype=h2d.dtype, device=dev)
-        gdn_gbeta(a, b, la._a_log, la._dt_bias, g, beta, stride=in_dim)
+        gdn_gbeta(a, b, la._a_log, la._dt_bias, g, beta, stride=ba_stride)
         if self._dbg_gdn is not None:
             self._dbg_gdn.append({"qkv_pre": qkv.detach().clone(), "z": z.detach().clone(),
                                   "b": b.detach().clone(), "a": a.detach().clone(),
@@ -541,7 +655,7 @@ class Qwen3_5Adapter(ModelAdapter):
             o = torch.empty(M, H * DV, dtype=h2d.dtype, device=dev)
             _gdn_recurrent_decode_kernel[(bs, H)](
                 qkv, g, beta, state, o, graph._gdn_seq_idx[:bs], is_real,
-                H=H, DK=DK, DV=DV, N_GDN=n_gdn, GDN_L=gdn_l, SCALE=scale,
+                H=H, HK=HK, DK=DK, DV=DV, N_GDN=n_gdn, GDN_L=gdn_l, SCALE=scale,
                 STRIDE=in_dim, BLOCK_D=triton.next_power_of_2(max(DK, DV)))
         else:
             n_seqs = cu_seqlens.shape[0] - 1
@@ -551,7 +665,7 @@ class Qwen3_5Adapter(ModelAdapter):
             o = torch.empty(M, H * DV, dtype=h2d.dtype, device=dev)
             _gdn_recurrent_prefill_kernel[(n_seqs, H)](
                 qkv, g, beta, state, o, cu_seqlens, seq_idx,
-                H=H, DK=DK, DV=DV, N_GDN=n_gdn, GDN_L=gdn_l, SCALE=scale,
+                H=H, HK=HK, DK=DK, DV=DV, N_GDN=n_gdn, GDN_L=gdn_l, SCALE=scale,
                 STRIDE=in_dim, BLOCK_D=triton.next_power_of_2(max(DK, DV)))
 
         if self._dbg_gdn is not None:
