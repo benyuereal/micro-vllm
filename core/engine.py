@@ -458,56 +458,50 @@ class InferenceEngine:
     _TP_TYPE_NAME = {0: "decode", 1: "prefill", 2: "waiting"}
 
     def _tp_meta_buf(self):
-        """常驻 [3] int64 广播缓冲：[batch_size, type_code, done]。GPU 张量广播
-        （~0.1ms，无 pickle），替代 broadcast_object_list 的 meta（~0.3ms + 跨 rank
-        失步）。done 折进 meta（done 在 bcast1 前由 scheduler 状态算出），省掉每步
-        一次独立的 done 广播往返（~0.1ms/步）。"""
+        """常驻 [4] int64 广播缓冲：[batch_size, type_code, done, flag]。单次 GPU
+        张量广播（~0.1ms，无 pickle），替代 broadcast_object_list 的 meta（~0.3ms +
+        跨 rank 失步）。done 折进 meta（done 在 bcast1 前由 scheduler 状态算出）；
+        flag 是 decode 的 batch-unchanged 标志（0=复用本地 seq store，1=完整广播
+        seq 列表）。done+flag 都折进同一次广播，省掉每步两次独立小广播往返。"""
         if not hasattr(self, "_tp_meta_buf_t") or self._tp_meta_buf_t is None:
-            self._tp_meta_buf_t = torch.empty(3, dtype=torch.int64, device=self.device)
+            self._tp_meta_buf_t = torch.empty(4, dtype=torch.int64, device=self.device)
         return self._tp_meta_buf_t
 
-    def _tp_batch_flag_buf(self):
-        """常驻 [1] int64 广播缓冲（bcast1 的 batch-unchanged 标志）。"""
-        if not hasattr(self, "_tp_flag_buf_t") or self._tp_flag_buf_t is None:
-            self._tp_flag_buf_t = torch.empty(1, dtype=torch.int64, device=self.device)
-        return self._tp_flag_buf_t
-
     def tp_broadcast_batch(self, ctx: BatchInferenceContext, done: bool = False):
-        """TP bcast1（紧凑）：
-        1. meta [batch_size, type_code, done] GPU 张量广播（~0.1ms，无 pickle）；
-        2. decode 稳态（batch 成员+顺序不变）只广播 flag=0，非 rank0 复用本地
-           seq store；batch 变化（seq 完成/新 prefill 转 decode）广播 flag=1 +
-           完整 seq 列表；prefill 直接完整广播 seq 列表。
-        替代每步 pickle 全部 32 个 Sequence（~2.0ms/步）。done 折进 meta，省掉
-        每步一次独立的 done 广播往返。"""
+        """TP bcast1（紧凑）：单次 meta [batch_size, type_code, done, flag] GPU
+        张量广播（~0.1ms，无 pickle）。
+        decode 稳态（batch 成员+顺序不变）flag=0，非 rank0 复用本地 seq store；
+        batch 变化（seq 完成/新 prefill 转 decode）flag=1 + 完整 seq 列表；
+        prefill 直接完整广播 seq 列表。
+        替代每步 pickle 全部 32 个 Sequence（~2.0ms/步）。"""
         if get_world_size() <= 1 or not rank0():
             return
         meta = self._tp_meta_buf()
         meta[0] = ctx.batch_size
         meta[1] = self._TP_TYPE_CODE[ctx.batch_type]
         meta[2] = 1 if done else 0
-        dist.broadcast(meta, src=0)
         if ctx.batch_type == "decode":
             ids = [s.seq_id for s in ctx.sequences]
             flag = 0 if ids == self._tp_last_batch_ids else 1
-            fbuf = self._tp_batch_flag_buf()
-            fbuf[0] = flag
-            dist.broadcast(fbuf, src=0)
+            meta[3] = flag
+            dist.broadcast(meta, src=0)
             if flag == 1:
                 BatchInferenceContext.broadcast_seqs(ctx)
             self._tp_last_batch_ids = ids
         else:
+            meta[3] = 1
+            dist.broadcast(meta, src=0)
             BatchInferenceContext.broadcast_seqs(ctx)
 
     def tp_broadcast_waiting(self, done: bool = False):
-        """TP waiting：只广播 meta（type=waiting, done），非 rank0 据此空转。
-        done 折进 meta，省掉每步一次独立的 done 广播往返。"""
+        """TP waiting：只广播 meta（type=waiting, done），非 rank0 据此空转。"""
         if get_world_size() <= 1 or not rank0():
             return
         meta = self._tp_meta_buf()
         meta[0] = 0
         meta[1] = self._TP_TYPE_CODE["waiting"]
         meta[2] = 1 if done else 0
+        meta[3] = 0
         dist.broadcast(meta, src=0)
 
     def tp_receive_batch(self) -> Tuple[BatchInferenceContext, bool]:
@@ -527,9 +521,7 @@ class InferenceEngine:
         if batch_type == "waiting":
             return ctx, done
         if batch_type == "decode":
-            fbuf = self._tp_batch_flag_buf()
-            dist.broadcast(fbuf, src=0)
-            if int(fbuf[0].item()) == 0:
+            if int(meta[3].item()) == 0:
                 # 稳态：复用本地 store（ids 与 rank0 相同，含 padding 重复）
                 ctx.sequences = [self._tp_seq_store[sid] for sid in self._tp_last_batch_ids]
             else:
