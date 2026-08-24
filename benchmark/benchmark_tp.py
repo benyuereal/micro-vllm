@@ -86,8 +86,8 @@ def run_micro(tp):
                 ctx = BatchInferenceContext.receive(eng.tokenizer)  # bcast1
                 if ctx.batch_type != "waiting" and ctx.batch_size > 0:
                     eng.step(ctx)
-                    eng.tp_receive_tokens(ctx)  # bcast2: 收 [bs] 采样 token
-                    eng.update_sequences(ctx.sequences)
+                    seqs = eng.tp_receive_tokens(ctx)  # bcast2: decode 收 token / prefill 收完整
+                    eng.update_sequences(seqs)
                 dt_ = torch.zeros(1, device=eng.device)
                 dist.broadcast(dt_, src=0)
             if int(dt_.item()) == 1:

@@ -409,25 +409,46 @@ class InferenceEngine:
                 dctx.prev_tokens = torch.cat(
                     [dctx.prev_tokens, new_col], dim=1)             # [bs, L+1]
 
+    def _tp_token_buf(self, bs: int) -> torch.Tensor:
+        """常驻 [max_bs] int64 广播缓冲。dist.broadcast 是异步 GPU op，若直接广播
+        sampler 返回的临时 next_tokens 张量，下一步该张量被重新赋值/释放而广播
+        仍在读 → cudaErrorIllegalAddress（use-after-free）。广播常驻缓冲（永不释放，
+        同 stream 上 copy→broadcast 有序）规避此问题。"""
+        if not hasattr(self, "_tp_token_buf_t") or self._tp_token_buf_t is None:
+            self._tp_token_buf_t = torch.empty(
+                self.scheduler.max_batch_size, dtype=torch.int64, device=self.device)
+        return self._tp_token_buf_t
+
     def tp_broadcast_tokens(self, ctx: BatchInferenceContext):
-        """TP decode 热路径：rank0 只广播本步采样 token（[bs] GPU 张量），
-        替代 bcast2 的完整 Sequence 广播（省 ~2.8ms/步 的 pickle+NCCL 往返）。
-        非 rank0 用 bcast1 建立的本地 seq + 收到的 token 本地 append。"""
+        """TP bcast2：decode 热路径只广播本步采样 token（[bs] GPU 张量），
+        替代完整 Sequence 广播（省 ~2.8ms/步 的 pickle+NCCL 往返）。
+        prefill 批次无 decode next_tokens，回退完整 ctx 广播（非 rank0 需
+        prefill_done/_next_token/state 推进）。"""
         if get_world_size() <= 1 or not rank0():
             return
-        dist.broadcast(self._decode_ctx.next_tokens, src=0)
+        if ctx.batch_type == "decode":
+            buf = self._tp_token_buf(ctx.batch_size)
+            buf[:ctx.batch_size].copy_(self._decode_ctx.next_tokens, non_blocking=True)
+            dist.broadcast(buf[:ctx.batch_size], src=0)
+        else:
+            ctx.broadcast()
 
-    def tp_receive_tokens(self, ctx: BatchInferenceContext):
-        """TP decode 热路径：非 rank0 接收采样 token，写回本地 seq._next_token。
-        本地 seq 由 bcast1 建立（output_ids 到上一步），收到 token 后 update_sequences
-        本地 append（output_ids/current_position/finished 与 rank0 一致）。"""
+    def tp_receive_tokens(self, ctx: BatchInferenceContext) -> List[Sequence]:
+        """TP bcast2 接收，返回供 update_sequences 使用的 seq 列表。
+        decode：收 [bs] 采样 token 写回本地 seq._next_token（本地 seq 由 bcast1
+        建立，update_sequences 本地 append 推进 output_ids/position/finished）；
+        prefill：回退完整 receive（非 rank0 需 prefill_done/_next_token/state 推进）。"""
         if get_world_size() <= 1 or rank0():
-            return
-        tokens = torch.zeros(ctx.batch_size, dtype=torch.int64, device=self.device)
-        dist.broadcast(tokens, src=0)
-        toks = tokens.tolist()
-        for i, seq in enumerate(ctx.sequences):
-            seq._next_token = toks[i]
+            return ctx.sequences
+        if ctx.batch_type == "decode":
+            buf = self._tp_token_buf(ctx.batch_size)
+            dist.broadcast(buf[:ctx.batch_size], src=0)
+            toks = buf[:ctx.batch_size].tolist()
+            for i, seq in enumerate(ctx.sequences):
+                seq._next_token = toks[i]
+            return ctx.sequences
+        recv = BatchInferenceContext.receive(self.tokenizer)
+        return recv.sequences
 
     def _decode(self, ctx: BatchInferenceContext):
         """同步 decode：launch + collect，供 step() 和 non-rank0 路径调用。"""
