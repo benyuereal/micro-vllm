@@ -1,5 +1,6 @@
 import os
 import torch
+import torch.distributed as dist
 import time
 import asyncio
 import logging
@@ -407,6 +408,26 @@ class InferenceEngine:
                 new_col = next_tokens_gpu.unsqueeze(1)              # [bs, 1]
                 dctx.prev_tokens = torch.cat(
                     [dctx.prev_tokens, new_col], dim=1)             # [bs, L+1]
+
+    def tp_broadcast_tokens(self, ctx: BatchInferenceContext):
+        """TP decode 热路径：rank0 只广播本步采样 token（[bs] GPU 张量），
+        替代 bcast2 的完整 Sequence 广播（省 ~2.8ms/步 的 pickle+NCCL 往返）。
+        非 rank0 用 bcast1 建立的本地 seq + 收到的 token 本地 append。"""
+        if get_world_size() <= 1 or not rank0():
+            return
+        dist.broadcast(self._decode_ctx.next_tokens, src=0)
+
+    def tp_receive_tokens(self, ctx: BatchInferenceContext):
+        """TP decode 热路径：非 rank0 接收采样 token，写回本地 seq._next_token。
+        本地 seq 由 bcast1 建立（output_ids 到上一步），收到 token 后 update_sequences
+        本地 append（output_ids/current_position/finished 与 rank0 一致）。"""
+        if get_world_size() <= 1 or rank0():
+            return
+        tokens = torch.zeros(ctx.batch_size, dtype=torch.int64, device=self.device)
+        dist.broadcast(tokens, src=0)
+        toks = tokens.tolist()
+        for i, seq in enumerate(ctx.sequences):
+            seq._next_token = toks[i]
 
     def _decode(self, ctx: BatchInferenceContext):
         """同步 decode：launch + collect，供 step() 和 non-rank0 路径调用。"""

@@ -56,8 +56,18 @@ def run_micro(tp):
     assert ws == tp, f"world_size {ws} != 期望 TP {tp}"
 
     def drive_until_done(eng, rank, ws):
-        """rank0 驱动 scheduler + broadcast，非 rank0 receive。跑完当前所有请求。"""
+        """rank0 驱动 scheduler + broadcast，非 rank0 receive。跑完当前所有请求。
+        ws==1 时不走 broadcast（dist 未初始化），直接单进程循环。"""
         while True:
+            if ws == 1:
+                b, bt = eng.get_next_batch()
+                if not b:
+                    break
+                ctx = BatchInferenceContext(len(b), bt, b)
+                eng.step(ctx)
+                eng.collect(ctx)
+                eng.update_sequences(ctx.sequences)
+                continue
             if rank0():
                 b, bt = eng.get_next_batch()
                 done = (not eng.scheduler.running_sequences and not eng.scheduler.waiting_queue)
@@ -65,18 +75,18 @@ def run_micro(tp):
                     BatchInferenceContext(0, "waiting").broadcast()
                 else:
                     ctx = BatchInferenceContext(len(b), bt, b)
-                    ctx.broadcast()
+                    ctx.broadcast()          # bcast1: 完整 seq（建立 batch）
                     eng.step(ctx)
                     eng.collect(ctx)
-                    ctx.broadcast()
+                    eng.tp_broadcast_tokens(ctx)  # bcast2: 只发 [bs] 采样 token
                     eng.update_sequences(ctx.sequences)
                 dt_ = torch.tensor([1 if done else 0], device=eng.device)
                 dist.broadcast(dt_, src=0)
             else:
-                ctx = BatchInferenceContext.receive(eng.tokenizer)
+                ctx = BatchInferenceContext.receive(eng.tokenizer)  # bcast1
                 if ctx.batch_type != "waiting" and ctx.batch_size > 0:
                     eng.step(ctx)
-                    ctx = BatchInferenceContext.receive(eng.tokenizer)
+                    eng.tp_receive_tokens(ctx)  # bcast2: 收 [bs] 采样 token
                     eng.update_sequences(ctx.sequences)
                 dt_ = torch.zeros(1, device=eng.device)
                 dist.broadcast(dt_, src=0)
