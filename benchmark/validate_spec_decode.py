@@ -232,6 +232,38 @@ class DraftRunner:
 
 
 # ---------------------------------------------------------------------------
+# Oracle 草稿（draft = target 真实 next-N token，用于验证"接受多"路径 + 展示加速上限）
+# ---------------------------------------------------------------------------
+class OracleDraftRunner:
+    """Oracle 草稿（预计算，draft 成本≈0）：返回 target 真实 next-N token。
+
+    用于验证 accept 逻辑的"接受多"路径（自起草接受率~0 只测了"立即拒绝"路径），
+    并展示 verify 侧加速上限：100% 接受时，每步 1 次 verify forward（1+N token）
+    产出 N+1 token，vs plain greedy 每步 1 token → 理论 (N+1)x 加速。
+
+    注意：oracle 的 draft 是预计算的（从参考输出切片），成本≈0，故展示的是
+    verify 侧上限，非真实端到端加速（真实加速来自 DFlash2 小草稿模型，待 W8A16）。
+    """
+
+    def __init__(self, target, device, dtype, ref_tokens, prompt_len):
+        self.target = target
+        self.device = device
+        self.dtype = dtype
+        self.ref = ref_tokens  # 完整参考 token 序列（含 prompt）
+        self.prompt_len = prompt_len
+
+    def draft(self, anchor_token, ctx_len, N):
+        """返回 target 真实 next-N token（从参考序列切片，成本≈0）。
+
+        ctx_len = kv_len-1 = 有效序列长度 L-1。anchor = tokens[L-1]。
+        next-N = ref[L : L+N]（ref 是 plain greedy 输出，与 target 预测一致）。
+        """
+        L = ctx_len + 1  # 有效序列长度
+        nxt = self.ref[L:L + N]
+        return torch.tensor(nxt, dtype=torch.long, device=self.device)
+
+
+# ---------------------------------------------------------------------------
 # Plain greedy（参考）
 # ---------------------------------------------------------------------------
 def plain_greedy(target, prompt_ids, max_new, device):
@@ -308,6 +340,8 @@ def main():
     ap.add_argument("--max-new", type=int, default=64)
     ap.add_argument("--prompt", default="The capital of France is, and the reason is that")
     ap.add_argument("--mask-token", type=int, default=0)
+    ap.add_argument("--oracle", action="store_true",
+                    help="用 oracle 草稿（draft=target 真实 next-N），验证'接受多'路径+展示加速上限")
     args = ap.parse_args()
 
     device = "cuda:0"
@@ -323,7 +357,6 @@ def main():
     print(f"Prompt ({len(prompt_ids)} tokens): {args.prompt!r}")
 
     target = TargetRunner(model, device, dtype, max_len=4096)
-    draft = DraftRunner(model, target, device, dtype, max_len=4096, mask_token_id=args.mask_token)
 
     # 1. Plain greedy（参考）
     t0 = time.time()
@@ -332,6 +365,10 @@ def main():
     ref_out = ref_tokens[len(prompt_ids):]
 
     # 2. 投机解码
+    if args.oracle:
+        draft = OracleDraftRunner(target, device, dtype, ref_tokens, len(prompt_ids))
+    else:
+        draft = DraftRunner(model, target, device, dtype, max_len=4096, mask_token_id=args.mask_token)
     t0 = time.time()
     spec_tokens, accepted_list = spec_decode(target, draft, prompt_ids, args.max_new,
                                              args.N, device, args.mask_token)
