@@ -172,7 +172,7 @@ class Qwen3Adapter(ModelAdapter):
                 q=q.unsqueeze(1), k_cache=k_cache, v_cache=v_cache,
                 cache_seqlens=graph._flash_seqlens[:bs], block_table=block_table,
                 causal=True, window_size=(-1, -1), alibi_slopes=None,
-                num_splits=1 if bs == 1 else (0 if bs >= 32 else max(1, 32 // max(1, bs * 4)))
+                num_splits=0 if bs == 1 else (0 if bs >= 32 else max(1, 32 // max(1, bs * 4)))
             ).squeeze(1)
         else:
             # flash_attn GQA：q 头数(16) 可被 kv 头数(8) 整除，连续分组（head 0,1→kv0）。
@@ -184,9 +184,10 @@ class Qwen3Adapter(ModelAdapter):
                 cache_seqlens=cache_lens, block_table=block_table,
                 causal=True, window_size=(-1, -1), rotary_interleaved=False,
                 alibi_slopes=None,
-                # num_splits：bs=1 短 KV 无需 split（split=1 省 split+combine 两轮 kernel）；
+                # num_splits：bs=1 用 0（flash 按 seqlen 自动 split-KV，长上下文把 KV 读
+                # 并行到全部 SM；旧值 1 在长上下文只 16 CTA、SM 利用率 17% 是掉速主因）；
                 # 小 batch 按 32//bs*4 给 splits 充分并行；大 batch(≥32) 让 flash 自动选(0)。
-                num_splits=1 if bs == 1 else (0 if bs >= 32 else max(1, 32 // max(1, bs * 4)))
+                num_splits=0 if bs == 1 else (0 if bs >= 32 else max(1, 32 // max(1, bs * 4)))
             ).squeeze(1)
 
         return gemv_or_matmul(attn.reshape(bs, -1), block.self_attn._o_w, out_buf, "MICRO_GEMV_O")

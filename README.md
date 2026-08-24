@@ -11,9 +11,9 @@
   </a>
 </p>
 
-> A high-performance LLM inference engine implementing **PagedAttention + Flash Attention + Hand-written CUDA GEMV + SwiGLU Kernel Fusion** from scratch. Achieves **105%** of vLLM and **121%** of nano-vllm single-user throughput on L20, suitable for small-scale production deployment and learning.
+> A high-performance LLM inference engine implementing **PagedAttention + Flash Attention + Hand-written CUDA GEMV + SwiGLU Kernel Fusion** from scratch. Achieves **106%** of vLLM and **118%** of nano-vllm single-user long-context throughput on L20, suitable for small-scale production deployment and learning.
 > 
-> 🚀 **Latest Update**: 1000-request continuous batching hits **30,316 tok/s**, leading nano-vllm by **+9.7%** (Gumbel-max Triton sampling kernel + decode fast paths)!
+> 🚀 **Latest Update**: single-user long-context (256 in / 768 out) hits **410.4 tok/s**, leading vLLM by **+6.5%** — enabled by flash-decoding (auto split-KV) for bs=1 + a paged-KV off-by-one fix. 1000-request continuous batching holds **30,316 tok/s** (+9.7% over nano-vllm).
 
 ## ✨ Features
 
@@ -179,19 +179,19 @@ Supports multi-GPU distributed inference, breaking single-GPU memory limits:
 
 ### Three-Way Comparison · Single-User Throughput (L20 / Qwen3-0.6B)
 
-Fair comparison against vLLM and nano-vllm under fully aligned conditions (short context is micro-vllm's sweet spot):
+Fair comparison against vLLM and nano-vllm under fully aligned conditions. Long context (256 in / 768 out) stresses KV-cache reads during decode — the regime where attention implementation and flash-decoding parallelism matter most:
 
-> **Hardware**: NVIDIA L20 &nbsp;|&nbsp; **Model**: Qwen3-0.6B (bf16) &nbsp;|&nbsp; **Input**: 8 tokens &nbsp;|&nbsp; **Output**: 200 tokens &nbsp;|&nbsp; **Sampling**: temperature=0.01 &nbsp;|&nbsp; **Method**: median of 7 runs, each engine on a dedicated GPU
+> **Hardware**: NVIDIA L20 &nbsp;|&nbsp; **Model**: Qwen3-0.6B (bf16) &nbsp;|&nbsp; **Input**: 256 tokens &nbsp;|&nbsp; **Output**: 768 tokens &nbsp;|&nbsp; **Sampling**: temperature=0.01 &nbsp;|&nbsp; **Method**: median of 7 runs, each engine on a dedicated GPU
 
 | Framework | Throughput (tokens/s) | Relative |
 |:-----|:----------------:|:--------:|
-| **micro-vllm** | **405.8** | **1.21×** |
-| vLLM 0.21.0 | 386.4 | 1.15× |
-| nano-vllm | 335.8 | 1.00× |
+| **micro-vllm** | **410.4** | **1.18×** |
+| vLLM 0.21.0 | 385.4 | 1.11× |
+| nano-vllm | 347.1 | 1.00× |
 
-- micro-vllm leads vLLM by **+5.0%** and nano-vllm by **+20.9%** in single-user throughput
+- micro-vllm leads vLLM by **+6.5%** and nano-vllm by **+18.2%** in single-user long-context throughput
 - All three engines show < 1 token/s standard deviation across 7 runs — stable and reproducible
-- Edge comes from hand-written CUDA GEMV + CUDA Graph amortizing kernel fixed overhead at M=1 decode
+- Edge comes from hand-written CUDA GEMV + CUDA Graph amortizing kernel fixed overhead at M=1 decode, plus flash-decoding (auto split-KV) keeping KV reads parallel across all SMs as context grows
 
 ### Three-Way Comparison · Batch Throughput (L20 / Qwen3-0.6B)
 
@@ -201,11 +201,11 @@ As concurrency rises, the bottleneck shifts from kernel launch overhead to memor
 
 | Concurrency | micro-vllm | vLLM 0.21.0 | nano-vllm |
 |:------:|:----------:|:-----------:|:---------:|
-| 1      | **405.8**  | 386.4       | 335.8     |
-| 32     | 8,090      | **8,597**   | 7,238     |
-| 64     | 10,716     | **13,256**  | 11,672    |
+| 1      | **409.1**  | 386.2       | 340.9     |
+| 32     | 7,503      | **7,749**   | 6,438     |
+| 64     | 10,469     | **11,547**  | 9,635     |
 
-- At bs=1 micro-vllm leads vLLM by **+5.0%**; as concurrency grows vLLM overtakes via compiled tensor-core GEMM
+- At bs=1 micro-vllm leads vLLM by **+6.0%**; as concurrency grows vLLM overtakes via compiled tensor-core GEMM
 - micro-vllm's positioning is clear: **low-concurrency, latency-sensitive** serving (single-user / few-user interactive scenarios), not high-concurrency aggregate throughput
 
 ### Continuous Batching · 1000 Requests (L20 / Qwen3-0.6B)
@@ -220,7 +220,7 @@ As concurrency rises, the bottleneck shifts from kernel launch overhead to memor
 | nano-vllm | 27,638 | 153 |
 
 - micro-vllm leads nano-vllm by **+9.7%**; per-step GPU time at bs=512 is also lower (13.5ms vs 14.36ms)
-- Recent wins: Gumbel-max single Triton sampling kernel (1225→269us/step, no 311MB fp32 materialization), `update_sequences` decode steady-state fast path (0.75ms/step CPU), sampler `reduce-overhead` removal (saves a 155MB logits DtoD copy, 410us/step), QK-Norm+RoPE single-kernel fusion, `prepare()` dirty-flag (steady-state CPU 0.88ms→0), final-norm fusion
+- Recent wins: flash-decoding (auto split-KV) for bs=1 decode (long-context 361→410 tok/s, +13.6% — 16 CTAs → all 92 SMs), paged-KV off-by-one fix (prefill length = exact multiple of block_size crashed the first decode step), Gumbel-max single Triton sampling kernel (1225→269us/step, no 311MB fp32 materialization), `update_sequences` decode steady-state fast path (0.75ms/step CPU), sampler `reduce-overhead` removal (saves a 155MB logits DtoD copy, 410us/step), QK-Norm+RoPE single-kernel fusion, `prepare()` dirty-flag (steady-state CPU 0.88ms→0), final-norm fusion
 - Single-batch (same prompt, 500 out, full prefill+decode): bs=32 **7,060** vs 6,465 (+9.2%), bs=64 **9,864** vs 9,332 (+5.7%)
 
 Benchmark scripts and load-test commands live in [`benchmark/`](benchmark/README.md).

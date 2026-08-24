@@ -153,9 +153,13 @@ class KVCacheManager:
             return False, None
 
         blocks = [self._free.popleft() for _ in range(n_needed)]
-        # 块位置计数器：除最后一块外都满，最后一块可能不满
+        # 块位置计数器：除最后一块外都满，最后一块可能不满。
+        # n_tokens 恰为 block_size 整数倍时最后一块也写满，_pos 须置 block_size
+        # （而非 0）——否则 append() 误判该块有空位、复用 slot 0 且不分配新块，
+        # 导致 block_table 少一列、flash 读 block_table[1]=-1 越界（illegal memory access）。
+        last_pos = n_tokens % self.block_size or self.block_size
         self._pos.update({
-            b: n_tokens % self.block_size if i == len(blocks) - 1 else self.block_size
+            b: last_pos if i == len(blocks) - 1 else self.block_size
             for i, b in enumerate(blocks)
         })
         self._blocks[seq_id] = blocks

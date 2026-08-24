@@ -11,9 +11,9 @@
   </a>
 </p>
 
-> 高性能 LLM 推理引擎，从零实现 **PagedAttention + Flash Attention + 手写 CUDA GEMV + SwiGLU 算子融合**，L20 上单用户吞吐达 vLLM 的 **105%**、nano-vllm 的 **121%**，适合小规模生产部署和学习。
+> 高性能 LLM 推理引擎，从零实现 **PagedAttention + Flash Attention + 手写 CUDA GEMV + SwiGLU 算子融合**，L20 上单用户长上下文吞吐达 vLLM 的 **106%**、nano-vllm 的 **118%**，适合小规模生产部署和学习。
 > 
-> 🚀 **最新进展**：1000 请求连续批处理达 **30,316 tok/s**，领先 nano-vllm **+9.7%**（Gumbel-max Triton 采样 kernel + decode 快速路径）！
+> 🚀 **最新进展**：单用户长上下文（256 in / 768 out）达 **410.4 tok/s**，领先 vLLM **+6.5%**——靠 bs=1 的 flash-decoding（auto split-KV）+ 一个 paged-KV off-by-one 修复。1000 请求连续批处理保持 **30,316 tok/s**（领先 nano-vllm +9.7%）。
 
 ## ✨ 特性
 
@@ -178,19 +178,19 @@ activated = swiglu_fused(gate_up)  # 一步完成融合计算
 
 ### 三方对比 · 单用户吞吐（L20 / Qwen3-0.6B）
 
-与 vLLM、nano-vllm 在完全对齐条件下公平对比（短上下文是 micro-vllm 的优势区）：
+与 vLLM、nano-vllm 在完全对齐条件下公平对比。长上下文（256 in / 768 out）压测 decode 期间的 KV cache 读取——attention 实现与 flash-decoding 并行度差异最明显的区间：
 
-> **硬件**：NVIDIA L20 &nbsp;|&nbsp; **模型**：Qwen3-0.6B (bf16) &nbsp;|&nbsp; **输入**：8 tokens &nbsp;|&nbsp; **输出**：200 tokens &nbsp;|&nbsp; **采样**：temperature=0.01 &nbsp;|&nbsp; **方法**：7 轮取中位数，各引擎独占一张 GPU
+> **硬件**：NVIDIA L20 &nbsp;|&nbsp; **模型**：Qwen3-0.6B (bf16) &nbsp;|&nbsp; **输入**：256 tokens &nbsp;|&nbsp; **输出**：768 tokens &nbsp;|&nbsp; **采样**：temperature=0.01 &nbsp;|&nbsp; **方法**：7 轮取中位数，各引擎独占一张 GPU
 
 | 框架 | 吞吐 (tokens/s) | 相对性能 |
 |:-----|:----------------:|:--------:|
-| **micro-vllm** | **405.8** | **1.21×** |
-| vLLM 0.21.0 | 386.4 | 1.15× |
-| nano-vllm | 335.8 | 1.00× |
+| **micro-vllm** | **410.4** | **1.18×** |
+| vLLM 0.21.0 | 385.4 | 1.11× |
+| nano-vllm | 347.1 | 1.00× |
 
-- micro-vllm 单用户吞吐领先 vLLM **+5.0%**、领先 nano-vllm **+20.9%**
+- micro-vllm 单用户长上下文吞吐领先 vLLM **+6.5%**、领先 nano-vllm **+18.2%**
 - 三引擎 7 轮测量标准差均 < 1 token/s，性能稳定可复现
-- 优势来源：手写 CUDA GEMV + CUDA Graph 在 M=1 decode 下摊薄 kernel 固定开销
+- 优势来源：手写 CUDA GEMV + CUDA Graph 在 M=1 decode 下摊薄 kernel 固定开销，加上 flash-decoding（auto split-KV）让 KV 读取随上下文增长仍并行到全部 SM
 
 ### 三方对比 · 批次吞吐（L20 / Qwen3-0.6B）
 
@@ -200,11 +200,11 @@ activated = swiglu_fused(gate_up)  # 一步完成融合计算
 
 | 并发数 | micro-vllm | vLLM 0.21.0 | nano-vllm |
 |:------:|:----------:|:-----------:|:---------:|
-| 1      | **405.8**  | 386.4       | 335.8     |
-| 32     | 8,090      | **8,597**   | 7,238     |
-| 64     | 10,716     | **13,256**  | 11,672    |
+| 1      | **409.1**  | 386.2       | 340.9     |
+| 32     | 7,503      | **7,749**   | 6,438     |
+| 64     | 10,469     | **11,547**  | 9,635     |
 
-- 单用户（bs=1）micro-vllm 领先 vLLM +5.0%；并发增大后 vLLM 凭借编译优化与 tensor core GEMM 反超
+- 单用户（bs=1）micro-vllm 领先 vLLM +6.0%；并发增大后 vLLM 凭借编译优化与 tensor core GEMM 反超
 - 三方均支持连续批处理，batch=64 时系统总吞吐均破万 tok/s
 - micro-vllm 定位清晰：**低并发延迟敏感场景**（手写 GEMV + 整图 Graph 摊薄 kernel 固定开销），而非高并发吞吐场景
 
@@ -220,7 +220,7 @@ activated = swiglu_fused(gate_up)  # 一步完成融合计算
 | nano-vllm | 27,638 | 153 |
 
 - micro-vllm 领先 nano-vllm **+9.7%**；bs=512 单步 GPU 时间也更低（13.5ms vs 14.36ms）
-- 近期优化：Gumbel-max 单 Triton 采样 kernel（1225→269us/步，免 311MB fp32 物化）、`update_sequences` decode 稳态快速路径（省 0.75ms/步 CPU）、采样器去 `reduce-overhead`（省 155MB logits DtoD 拷贝，410us/步）、QK-Norm+RoPE 单 kernel 融合、`prepare()` 脏标志（稳态 CPU 0.88ms→0）、final-norm 融合
+- 近期优化：bs=1 decode 的 flash-decoding（auto split-KV，长上下文 361→410 tok/s，+13.6%——16 CTA→全部 92 SM）、paged-KV off-by-one 修复（prefill 长度恰为 block_size 整数倍时首 decode 步越界崩溃）、Gumbel-max 单 Triton 采样 kernel（1225→269us/步，免 311MB fp32 物化）、`update_sequences` decode 稳态快速路径（省 0.75ms/步 CPU）、采样器去 `reduce-overhead`（省 155MB logits DtoD 拷贝，410us/步）、QK-Norm+RoPE 单 kernel 融合、`prepare()` 脏标志（稳态 CPU 0.88ms→0）、final-norm 融合
 - 单批次（同 prompt，500 out，全量 prefill+decode）：bs=32 **7,060** vs 6,465（+9.2%）、bs=64 **9,864** vs 9,332（+5.7%）
 
 压测脚本与压测指令见 [`benchmark/`](benchmark/README.md)。

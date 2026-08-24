@@ -10,8 +10,8 @@ nano:  llm.generate(prompts, sampling_params)。
 都用 Qwen3-0.6B，temp=0.6，ignore_eos 跑满 max_tokens 以测纯吞吐。
 
 用法：
-  python3 fair_throughput.py <N> <max_tokens> <micro|nano|both>
-  例: python3 fair_throughput.py 1000 80 both
+  python3 benchmark1000_throughput.py <N> <max_tokens> <micro|nano|both>
+  例: python3 benchmark1000_throughput.py 1000 80 both
 
 依赖：
   - 空闲 GPU（CUDA_VISIBLE_DEVICES 由调用方指定，如 CUDA_VISIBLE_DEVICES=1）
