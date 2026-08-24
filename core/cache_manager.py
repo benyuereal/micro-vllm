@@ -146,30 +146,114 @@ class KVCacheManager:
         # 当前步分配了新 block 的 seq（decode 快速路径：dirty 才重建 block_table）
         self._dirty_seqs: set = set()
 
-    def alloc(self, seq_id: int, n_tokens: int):
-        """预填充阶段分配块，返回 (success, slot_mapping[n_tokens])。OOM 返回 (False, None)。"""
-        n_needed = (n_tokens + self.block_size - 1) // self.block_size
+        # prefix cache：满块前缀 hash → (block_id, token_chunk)。多请求共享前缀
+        # （如 system prompt）时复用已算好的 KV block，跳过重复 prefill。
+        # 只缓存满块（尾块不满不命中）；refcount 跟踪共享，归零才真正释放。
+        self._prefix_cache: dict = {}
+        self._refcount: dict = {}
+        self._block_hash: dict = {}  # block_id → 前缀 hash（free 时 O(1) 移除表项）
+        self._seq_hit_blocks: dict = {}  # seq_id → 命中复用的 block 集合（free 时只减这些）
+        # refcount 语义：缓存自身持 1 份永久引用（register 时置 1），每个命中复用的
+        # seq 各 +1。free 只减命中引用；归零（缓存引用也没了）才真正释放。
+
+    def lookup_prefix(self, token_ids: list) -> int:
+        """查 token 序列的最长已缓存满块前缀，返回命中 token 数（block_size 整数倍）。"""
+        h = 0
+        hit = 0
+        for i in range(0, len(token_ids) - self.block_size + 1, self.block_size):
+            h = hash((h, tuple(token_ids[i:i + self.block_size])))
+            if h not in self._prefix_cache:
+                break
+            hit += self.block_size
+        return hit
+
+    def _prefix_hashes(self, token_ids: list, n_tokens: int) -> list:
+        """前 n_tokens 个 token（须为 block_size 整数倍）的链式前缀 hash 列表。"""
+        hashes = []
+        h = 0
+        for i in range(0, n_tokens, self.block_size):
+            h = hash((h, tuple(token_ids[i:i + self.block_size])))
+            hashes.append(h)
+        return hashes
+
+    def alloc(self, seq_id: int, n_tokens: int, token_ids: list = None):
+        """预填充阶段分配块，返回 (success, slot_mapping[n_tokens], prefix_hit)。
+
+        prefix_hit = 命中的已缓存前缀 token 数（block_size 整数倍）。命中块复用
+        （refcount+1，不重算），新块只覆盖 [prefix_hit, n_tokens)。
+        调用方据 prefix_hit 设 seq.prefill_done，只 prefill 新 token。
+        OOM 返回 (False, None, 0)。"""
+        prefix_hit = 0
+        prefix_blocks = []
+        if token_ids is not None:
+            prefix_hit = self.lookup_prefix(token_ids)
+            if prefix_hit:
+                prefix_blocks = [self._prefix_cache[h][0] for h in
+                                 self._prefix_hashes(token_ids, prefix_hit)]
+                for b in prefix_blocks:
+                    self._refcount[b] = self._refcount.get(b, 0) + 1
+
+        n_new = n_tokens - prefix_hit
+        n_needed = (n_new + self.block_size - 1) // self.block_size
         if len(self._free) < n_needed:
-            return False, None
+            # 显存不足：先逐出无活跃 seq 引用的已缓存前缀块（refcount==1 仅缓存自身引用）
+            for h, (b, _) in list(self._prefix_cache.items()):
+                if len(self._free) >= n_needed:
+                    break
+                if self._refcount.get(b, 0) == 1:
+                    del self._prefix_cache[h]
+                    self._block_hash.pop(b, None)
+                    self._refcount.pop(b, None)
+                    self._free.append(b)
+                    self._pos.pop(b, None)
+            if len(self._free) < n_needed:
+                # 仍不足：回滚已加的 refcount（前缀块留在缓存中，refcount=0 可被逐出）
+                for b in prefix_blocks:
+                    self._refcount[b] -= 1
+                return False, None, 0
 
         blocks = [self._free.popleft() for _ in range(n_needed)]
         # 块位置计数器：除最后一块外都满，最后一块可能不满。
-        # n_tokens 恰为 block_size 整数倍时最后一块也写满，_pos 须置 block_size
+        # n_new 恰为 block_size 整数倍时最后一块也写满，_pos 须置 block_size
         # （而非 0）——否则 append() 误判该块有空位、复用 slot 0 且不分配新块，
         # 导致 block_table 少一列、flash 读 block_table[1]=-1 越界（illegal memory access）。
-        last_pos = n_tokens % self.block_size or self.block_size
+        last_pos = n_new % self.block_size or self.block_size
         self._pos.update({
             b: last_pos if i == len(blocks) - 1 else self.block_size
             for i, b in enumerate(blocks)
         })
-        self._blocks[seq_id] = blocks
+        self._blocks[seq_id] = prefix_blocks + blocks
+        self._seq_hit_blocks[seq_id] = set(prefix_blocks)
 
-        # slot_mapping: token_idx → block_id * block_size + offset_in_block
+        # slot_mapping: 仅新 token [prefix_hit, n_tokens) → 新块 slot
         slot_mapping = torch.tensor([
-            blocks[i // self.block_size] * self.block_size + i % self.block_size
-            for i in range(n_tokens)
+            blocks[(i - prefix_hit) // self.block_size] * self.block_size
+            + (i - prefix_hit) % self.block_size
+            for i in range(prefix_hit, n_tokens)
         ], dtype=torch.int32, device=self.device)
-        return True, slot_mapping
+        return True, slot_mapping, prefix_hit
+
+    def register_prefix(self, seq_id: int, token_ids: list):
+        """prefill 完成后登记本 seq 的满块前缀（供后续请求命中）。
+
+        命中块 alloc 时已登记（在 _block_hash 中），跳过；新算的满块插入表并
+        refcount+1（本 seq 持有）。"""
+        blocks = self._blocks.get(seq_id)
+        if not blocks:
+            return
+        n_full = len(token_ids) // self.block_size
+        h = 0
+        for i in range(0, n_full * self.block_size, self.block_size):
+            h = hash((h, tuple(token_ids[i:i + self.block_size])))
+            b = blocks[i // self.block_size]
+            if b in self._block_hash:
+                continue  # 命中块：alloc 时已登记且 refcount 已含本 seq
+            self._prefix_cache[h] = (b, tuple(token_ids[i:i + self.block_size]))
+            self._block_hash[b] = h
+            # refcount = 缓存自身 1 份 + owner seq 1 份 = 2。owner 的引用记入
+            # _seq_hit_blocks，free 时统一 -1（归到缓存引用 1，块留在表供后续命中）。
+            self._refcount[b] = 2
+            self._seq_hit_blocks.setdefault(seq_id, set()).add(b)
 
     def append(self, seq_id: int):
         """解码阶段追加一个 token 的 slot（无可用块返回 -1）。"""
@@ -255,9 +339,23 @@ class KVCacheManager:
         self._cache_seqlens_buffer[:batch_size].add_(1)
 
     def free(self, seq_id: int):
-        """释放 seq 的所有块回空闲队列（避免内存泄漏，必须调用）。"""
+        """释放 seq 的所有块（避免内存泄漏，必须调用）。
+
+        命中复用的 prefix 块：只减本 seq 的引用（refcount-1），缓存自身引用仍在
+        （refcount>=1）→ 块留在 prefix 表供后续请求命中；refcount 归零（缓存引用
+        也被逐出过）才真正回 _free。自有的新块直接回 _free。"""
         if seq_id in self._blocks:
+            hit_blocks = self._seq_hit_blocks.pop(seq_id, set())
             for block_id in self._blocks[seq_id]:
+                if block_id in hit_blocks:
+                    self._refcount[block_id] = self._refcount.get(block_id, 1) - 1
+                    if self._refcount[block_id] > 0:
+                        continue  # 缓存引用（或其他 seq）仍在，保留
+                    # 归零：缓存引用已不在（被逐出），真正释放
+                    self._refcount.pop(block_id, None)
+                    h = self._block_hash.pop(block_id, None)
+                    if h is not None:
+                        self._prefix_cache.pop(h, None)
                 self._free.append(block_id)
                 self._pos.pop(block_id, None)
 

@@ -436,20 +436,32 @@ class InferenceEngine:
         device = self.device
         from models.base import PrefillMeta
 
+        # 2. KV Cache 分配 + prefix cache 命中：仅第一次 prefill（prefill_done==0）分配 block。
+        #    命中已缓存前缀时复用 block（refcount+1），prefill_done 置命中长度，只 prefill 新
+        #    token。须在 chunk_tokens 计算前——get_next_input_ids 以 prefill_done 为起点切片。
+        for seq in batch:
+            if seq.prefill_done == 0:
+                ok, _, prefix_hit = self.cache_manager.alloc(
+                    seq.seq_id, len(seq.input_ids), seq.input_ids)
+                if not ok:
+                    raise RuntimeError("OOM: prefill alloc failed")
+                if prefix_hit >= len(seq.input_ids):
+                    # 整条 prompt 已缓存：v1 不支持纯命中（需单 token forward 取首 token），回退重算
+                    prefix_hit = 0
+                seq.prefill_done = prefix_hit
+                # prefix 命中后重算 chunk 元信息：scheduler 按整条 prompt 设的 _chunk_len/
+                # _chunk_is_last 已失效。剩余新 token ≤ 单 chunk 上限时按一次性 prefill 处理
+                # （否则长 prompt 首 chunk _chunk_is_last=False 但实际已覆盖全部新 token → 死锁）。
+                if seq.prefill_done > 0 and seq.prefill_remaining <= self.scheduler.max_chunk_tokens:
+                    seq._chunk_len = seq.prefill_remaining
+                    seq._chunk_is_last = True
+
         # 每条 seq 的本 chunk token + 起始 offset（已 prefill 的 token 数）
         chunk_tokens = [seq.get_next_input_ids() for seq in batch]
         chunk_lens = [len(t) for t in chunk_tokens]
         offsets = [s.prefill_done for s in batch]
         need_sample = [s._chunk_is_last for s in batch]
         n_seqs = len(batch)
-
-        # 2. KV Cache 分配：仅第一次 prefill（prefill_done==0）按整个 prompt 长度预分配 block；
-        #    续切 chunk 复用已分配 block。
-        for seq in batch:
-            if seq.prefill_done == 0:
-                ok, _ = self.cache_manager.alloc(seq.seq_id, len(seq.input_ids))
-                if not ok:
-                    raise RuntimeError("OOM: prefill alloc failed")
 
         # 3. 组装变长元数据（cu_seqlens / position_ids / slot_mapping / block_table）。
         #    cu_seqlens/offsets 在 CPU 算好后一次 H2D；slot_mapping 经 block_table 矩阵索引
@@ -540,6 +552,9 @@ class InferenceEngine:
                     seq.advance_prefill(seq._chunk_len)
                     seq._next_token = next_tokens[j]
                     seq._chunk_sampled = True
+                    # prefill 完成（prompt 全部写入 cache）→ 登记满块前缀供后续请求命中
+                    if seq.prefill_done >= len(seq.input_ids):
+                        self.cache_manager.register_prefix(seq.seq_id, seq.input_ids)
             # 中间 chunk：清空 _next_token，update_sequences 据此走 advance_prefill（不转 decode）
             for i, ns in enumerate(need_sample):
                 if not ns:
