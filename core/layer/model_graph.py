@@ -4,7 +4,9 @@ import torch
 from typing import Dict, List
 
 from core.paged_attention import PagedAttention
-from kernel.rmsnorm import rmsnorm_, rmsnorm_residual_gemm as rmsnorm_residual
+from kernel.rmsnorm import (
+    rmsnorm_, rmsnorm1_, rmsnorm_residual_gemm as rmsnorm_residual,
+)
 from kernel.rotary import compute_slot_mapping
 from .rope import RoPE
 from core.parallel_config import get_rank, get_world_size, all_reduce
@@ -97,8 +99,13 @@ class ModelGraphRunner:
         # 架构无关的 key（_h_buf/_qkv/_attn_out/_residual）各 adapter 必返回，
         # 架构专属的（_x16/_absorb_idx/_cos_full/_sin_full，仅 DeepSeek）缺省为 None。
         bufs = self.adapter.alloc_bufs(self.model, max_b, self.hidden_dim, self.dtype, self.device)
+        # 架构无关 key 各 adapter 必返回；架构专属 key（DeepSeek _x16/_absorb_idx/...，
+        # Qwen3.5 _gdn_* 状态池/seq_idx/is_real）缺省为 None。统一挂到 self 上，
+        # 使 adapter 钩子（compute_qkv/attention/on_decode_batch）能经 graph 访问。
         for name in ("_h_buf", "_qkv", "_attn_out", "_residual",
-                     "_x16", "_absorb_idx", "_cos_full", "_sin_full"):
+                     "_x16", "_absorb_idx", "_cos_full", "_sin_full",
+                     "_gdn_state_pool", "_gdn_conv_state_pool",
+                     "_gdn_seq_idx", "_gdn_is_real", "_gdn_prefill_seq_idx"):
             setattr(self, name, bufs.get(name))
 
     # ==========================================
@@ -136,9 +143,14 @@ class ModelGraphRunner:
             else:
                 h = mlp_out + res
 
-        # final_norm 用融合 rmsnorm_ 直写 _hidden（省 HF 原生 RMSNorm 的 2 个 bf16↔fp32 D2D copy，
+        # final_norm 用融合 rmsnorm 直写 _hidden（省 HF 原生 RMSNorm 的 2 个 bf16↔fp32 D2D copy，
         # 且省 _hidden[:bs]=h 的 1MB copy）。图捕获时 _hidden[:bs] 即此 kernel 输出，无需额外赋值。
-        rmsnorm_(h, self._final_norm_w, self._hidden[:bs], self._final_norm_eps)
+        # Qwen3.5 的 final_norm 是 1-centered（x*rrms*(1+w)），须用 rmsnorm1_；
+        # Qwen3/DeepSeek 是标准（x*rrms*w），用 rmsnorm_。
+        if self.adapter.final_norm_one_centered():
+            rmsnorm1_(h, self._final_norm_w, self._hidden[:bs], self._final_norm_eps)
+        else:
+            rmsnorm_(h, self._final_norm_w, self._hidden[:bs], self._final_norm_eps)
         return self._hidden[:bs]  # lm_head 移出 graph（见 forward），避免 155MB logits D2D copy
 
     def capture(self, cache_manager, batch_sizes: List[int] = [1, 2, 4, 8, 16, 32]):

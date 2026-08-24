@@ -198,12 +198,14 @@ class InferenceEngine:
         dummy_prompt = "warmup "  # ~2 token
         sid_base = 10_000_000  # 避免与真实 seq_id 冲突
         for bs in warm_sizes:
+            dummy_seqs = []
             for i in range(bs):
                 seq = Sequence(sid_base + i, dummy_prompt, self.tokenizer, max_tokens=2)
                 seq.temperature = 0.01; seq.top_p = 1.0
                 if self.eos_token_id is not None:
                     seq.eos_token_id = self.eos_token_id
                 self.scheduler.add_request(seq)
+                dummy_seqs.append(seq)
             # 跑 prefill + 1 decode（触发该 batch_size 的 prefill GEMM/flash + decode graph replay）
             for _ in range(20):
                 b, bt = self.get_next_batch()
@@ -213,12 +215,13 @@ class InferenceEngine:
                 self.step(ctx); self.collect(ctx); self.update_sequences(ctx.sequences)
                 if not self.scheduler.running_sequences and not self.scheduler.waiting_queue:
                     break
-            # 清理 dummy seq 的 KV（释放 block）
-            for i in range(bs):
+            # 清理 dummy seq 的 KV（释放 block）+ GDN 状态池 slot（幂等：已释放则 no-op）
+            for seq in dummy_seqs:
                 try:
-                    self.cache_manager.free(sid_base + i)
+                    self.cache_manager.free(seq.seq_id)
                 except Exception:
                     pass
+                self.adapter.on_seq_finished(seq)
             self.scheduler.running_sequences.clear()
             self.scheduler.finished_sequences.clear()
 
@@ -233,6 +236,25 @@ class InferenceEngine:
         self.model, self.tokenizer = load_model(model_path, device=self.device_str)
         self.model.eval()
         self.config = self.model.config
+        self._normalize_text_config()
+
+    def _normalize_text_config(self):
+        """多模态壳（Qwen3.5 ForConditionalGeneration）：顶层 config 是 Qwen3_5Config，
+        不含 hidden_size/vocab_size 等文本维度（都在 text_config）。engine/runner 直接读
+        self.config.hidden_size / model.config.vocab_size，故把 text_config 的标量属性
+        拷到顶层 config（幂等：已有则跳过）。adapter._tc 仍优先用真实 text_config。"""
+        tc = getattr(self.config, "text_config", None)
+        if tc is None or hasattr(self.config, "hidden_size"):
+            return
+        for attr in ("hidden_size", "vocab_size", "num_hidden_layers",
+                     "num_attention_heads", "num_key_value_heads", "head_dim",
+                     "intermediate_size", "rms_norm_eps", "layer_types",
+                     "rope_parameters", "max_position_embeddings",
+                     "linear_num_value_heads", "linear_num_key_heads",
+                     "linear_key_head_dim", "linear_value_head_dim",
+                     "linear_conv_kernel_dim"):
+            if hasattr(tc, attr) and not hasattr(self.config, attr):
+                setattr(self.config, attr, getattr(tc, attr))
 
     def _init_config(self):
         # 通过适配器提取架构相关维度（GQA vs MLA 等差异在此屏蔽）
@@ -355,6 +377,10 @@ class InferenceEngine:
         input_ids = self._decode_ctx.prepare(batch, self.device, self.cache_manager,
                                              batch_dirty=self._ctx_batch_dirty)
         self._ctx_batch_dirty = False  # 本步已处理；后续 append/finished 会按需重新置脏
+        # GDN 有状态层：填 _gdn_seq_idx/_gdn_is_real（常驻 buffer，graph 安全）。
+        # 必须在 forward（graph replay）之前，kernel 读这些 buffer 跳过 pad 行。
+        if self.adapter.gdn_stateful():
+            self.adapter.on_decode_batch(batch, self.graph_runner)
         ctx.logits = self.graph_runner.forward(input_ids, self.cache_manager, batch_size)
 
     @torch.inference_mode()
@@ -506,6 +532,9 @@ class InferenceEngine:
         stats.prep_time = time.time() - stats.prep_time
 
         # 4. 推理（变长：input_ids 1D，logits 末 token 用于采样）
+        # GDN 有状态层：填 _gdn_prefill_seq_idx + 首 chunk 清零状态（新序列从空状态开始）。
+        if self.adapter.gdn_stateful():
+            self.adapter.on_prefill_batch(batch, self.prefill_runner)
         stats.gpu_time = time.time()
         logits = self.prefill_runner.forward(input_ids, self.cache_manager, meta)
         stats.gpu_time = time.time() - stats.gpu_time
@@ -586,6 +615,7 @@ class InferenceEngine:
                         if seq.state == "finished" and seq.seq_id not in freed:
                             freed.add(seq.seq_id)
                             self.cache_manager.free(seq.seq_id)
+                            self.adapter.on_seq_finished(seq)  # 释放 GDN 状态池 slot
                             self.scheduler.mark_finished(seq)
                             self._complete_seq(seq)
                     self._ctx_batch_dirty = True
@@ -654,6 +684,7 @@ class InferenceEngine:
             if finished_this_step:
                 finished_any = True
                 self.cache_manager.free(seq_id)
+                self.adapter.on_seq_finished(seq)  # 释放 GDN 状态池 slot
                 if rank0():
                     self.scheduler.mark_finished(seq)
                     # 唤醒等待该 seq 的非流式 /generate handler（continuous batching）
