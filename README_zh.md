@@ -336,7 +336,7 @@ curl -X POST "http://localhost:8000/generate_stream" \
 ### 启动 vLLM 服务
 
 ```bash
-python vllm_server.py
+vllm serve /models/Qwen3-0.6B --port 8001 --max-model-len 4096
 ```
 
 

@@ -124,7 +124,7 @@ class QwenAdapter(ModelAdapter):
         return mlp_out, graph._residual[:bs]
 
     # -------------------- prefill 单层钩子 --------------------
-    def prefill_layer(self, block, h, layer_idx, B, S, graph, cache_manager, block_table):
+    def prefill(self, block, h, layer_idx, B, S, graph, cache_manager, block_table):
         from kernel.rmsnorm import rmsnorm, rmsnorm_residual_fused
 
         w_qkv, b_qkv = block.attn._qkv_w, block.attn._qkv_b

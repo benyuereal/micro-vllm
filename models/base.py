@@ -13,7 +13,7 @@ ModelAdapter - 多架构适配器抽象基类
     2. 权重预处理：把原始 block 权重重排为 runner 复用的内部张量
     3. 模块访问：统一 embedding / layers / final_norm / lm_head 命名
     4. 单层前向钩子：compute_qkv / attention / compute_ffn (decode)
-                   prefill_layer (prefill)
+                   prefill (prefill)
 
 🔑 **关键约定**:
     - cache 维度由 `cache_dims()` 决定，直接喂给 KVCacheManager。
@@ -51,6 +51,11 @@ class PrefillMeta:
 class ModelAdapter(ABC):
     model_type: str = ""
 
+    # decode attention 路径开关：True=prerope+store+pure-flash（Qwen3 用，省 50us/层）；
+    # False=flash internal-rotary+k=/v=（DeepSeek MLA 等）。基类默认 False，
+    # 调用方直接读 self.adapter.use_prerope_decode，无需 getattr 兜底。
+    use_prerope_decode = False
+
     # ------------------------------------------------------------------
     # 元信息
     # ------------------------------------------------------------------
@@ -84,7 +89,7 @@ class ModelAdapter(ABC):
         return head_dim ** -0.5
 
     def supports_chunked_prefill(self, cfg) -> bool:
-        """该架构的 prefill_layer 是否支持 chunked 续写（第 N chunk 的 attention 能读到
+        """该架构的 prefill 是否支持 chunked 续写（第 N chunk 的 attention 能读到
         cache 中前 N-1 chunk 的 KV）。GQA + flash_attn_with_kvcache 支持；MLA prefill
         用 flash_attn_func（自包含，不读 cache 前缀）暂不支持。默认 False（保守）。"""
         return False
@@ -163,8 +168,8 @@ class ModelAdapter(ABC):
     # prefill 单层钩子（变长：h 为 1D [total_tokens, hidden]，各 seq 长度由 meta.cu_seqlens 掩码）
     # ------------------------------------------------------------------
     @abstractmethod
-    def prefill_layer(self, block, h: torch.Tensor, layer_idx: int,
-                      graph, cache_manager, meta: "PrefillMeta") -> torch.Tensor:
+    def prefill(self, block, h: torch.Tensor, layer_idx: int,
+                graph, cache_manager, meta: "PrefillMeta") -> torch.Tensor:
         """变长 prefill 单层前向（含 attention 写入 paged cache + FFN），返回新 hidden [total_tokens, hidden]。"""
         ...
 

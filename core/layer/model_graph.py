@@ -116,7 +116,7 @@ class ModelGraphRunner:
         # 同时算 flash_seqlens = cache_seqlens + 1（含当前 token，flash 读取长度）：
         # micro 的 cache_seqlens 在 commit() 里 +1（forward 后），故 forward 内是旧值，
         # 需 +1 让 flash 读到刚 store 的当前 token（对齐 nano：context_lens 是新长度）。
-        if getattr(self.adapter, "use_prerope_decode", False):
+        if self.adapter.use_prerope_decode:
             compute_slot_mapping(block_table, cache_manager._cache_seqlens_buffer[:bs],
                                  cache_manager.block_size, self._slot_mapping[:bs])
             torch.add(cache_manager._cache_seqlens_buffer[:bs], 1, out=self._flash_seqlens[:bs])

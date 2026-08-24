@@ -380,7 +380,7 @@ class DeepSeekAdapter(ModelAdapter):
         return mlp_out, graph._residual[:bs]
 
     # ==================== prefill 单层钩子（变长：h=[total_tokens, hidden]）====================
-    def prefill_layer(self, block, h, layer_idx, graph, cache_manager, meta):
+    def prefill(self, block, h, layer_idx, graph, cache_manager, meta):
         # input_layernorm
         x = rmsnorm(h, block._in_ln_w, block._in_ln_eps)
         attn = block.self_attn

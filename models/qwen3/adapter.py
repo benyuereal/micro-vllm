@@ -35,6 +35,13 @@ except ImportError:
 from core.cache_manager import store_kvcache
 
 
+def rope_half_split(x, cos, sin):
+    """half-split RoPE（Llama 风格 rotate_half）：x [..., d]，cos/sin [..., 1, d//2]。
+    q/k 共用（prefill 路径按 per-token position gather 后逐 token 旋转）。"""
+    x1, x2 = x.chunk(2, dim=-1)
+    return torch.cat([x1 * cos - x2 * sin, x2 * cos + x1 * sin], dim=-1)
+
+
 class Qwen3Adapter(ModelAdapter):
     model_type = "qwen3"
 
@@ -44,7 +51,7 @@ class Qwen3Adapter(ModelAdapter):
 
     # -------------------- 元信息 --------------------
     def supports_chunked_prefill(self, cfg) -> bool:
-        # Qwen3 prefill_layer 用 flash_attn_varlen_func(block_table=...)，第 N chunk 的
+        # Qwen3 prefill 用 flash_attn_varlen_func(block_table=...)，第 N chunk 的
         # attention 经 block_table 读 cache 中前 N-1 chunk 的 KV；RoPE 按 per-token position
         # 从 cos/sin pool gather 正确位置。已验证 chunked vs 非 chunked 输出完全一致。
         return True
@@ -112,7 +119,7 @@ class Qwen3Adapter(ModelAdapter):
         internal-rotary 路径在此处单独做（_apply_qk_norm）。"""
         qkv_buf = graph._qkv[:bs]
         gemv_or_matmul(graph._h_buf[:bs], attn._qkv_w, qkv_buf, "MICRO_GEMV_QKV")
-        if not getattr(self, "use_prerope_decode", False):
+        if not self.use_prerope_decode:
             self._apply_qk_norm(qkv_buf, attn, graph, bs)
         return qkv_buf
 
@@ -155,7 +162,7 @@ class Qwen3Adapter(ModelAdapter):
         # prerope+store 路径（对齐 nano-vllm，省 50us/层）：flash 前显式旋转 q/k、
         # store k/v，flash 跑纯 attention（无 rotary_cos/sin、无 k=/v=）。
         # internal-rotary 路径保留为 fallback（旧逻辑）。
-        if getattr(self, "use_prerope_decode", False):
+        if self.use_prerope_decode:
             # QK-Norm + RoPE 融合（prerope 路径）：对 q 段、k 段原地 norm+rotate，
             # 替代分离的 _apply_qk_norm + apply_rope_decode（省中间读+写）。
             sa = block.self_attn
@@ -202,7 +209,7 @@ class Qwen3Adapter(ModelAdapter):
         return mlp_out, graph._residual[:bs]
 
     # -------------------- prefill 单层钩子（变长：h=[total_tokens, hidden]）--------------------
-    def prefill_layer(self, block, h, layer_idx, graph, cache_manager, meta):
+    def prefill(self, block, h, layer_idx, graph, cache_manager, meta):
         attn = block.self_attn
         normed = rmsnorm(h, block._in_ln_w, block._in_ln_eps)
 
@@ -223,10 +230,8 @@ class Qwen3Adapter(ModelAdapter):
         pos = meta.position_ids.long()                         # [total]
         cos = cos_pool[pos].unsqueeze(1)                       # [total, 1, dim//2]
         sin = sin_pool[pos].unsqueeze(1)
-        q1, q2 = q.chunk(2, dim=-1)
-        k1, k2 = k.chunk(2, dim=-1)
-        q = torch.cat([q1 * cos - q2 * sin, q2 * cos + q1 * sin], dim=-1)
-        k = torch.cat([k1 * cos - k2 * sin, k2 * cos + k1 * sin], dim=-1)
+        q = rope_half_split(q, cos, sin)
+        k = rope_half_split(k, cos, sin)
 
         # 写入 paged cache：本步算出的 k/v 按 slot_mapping scatter，供 varlen attention 经
         # block_table 读回完整 KV（含 chunked 续写时的 cache 前缀）。
