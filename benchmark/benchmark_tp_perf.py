@@ -27,6 +27,9 @@ MODE = sys.argv[1]          # micro | vllm
 TP = int(sys.argv[2])       # 1 | 2
 KIND = sys.argv[3] if len(sys.argv) > 3 else "single"   # single | multi
 BS = int(sys.argv[4]) if len(sys.argv) > 4 else 32
+# vLLM 显存利用率：默认 0.92。GPU 被其他进程占用时调低（0.6B 模型 KV 需求小，
+# 调低不影响 decode 吞吐，只减 KV block 数）。
+VLLM_MEM_UTIL = float(os.environ.get("VLLM_MEM_UTIL", "0.92"))
 
 # 单用户口径（对齐 benchmark_single_user.py）
 S_IN, S_OUT, S_ROUNDS, S_TEMP = 256, 768, 7, 0.01
@@ -94,31 +97,43 @@ def _micro_loop(eng, max_steps):
 
     rank = get_rank()
     ws = int(os.environ.get("WORLD_SIZE", "1"))
+    dbg = os.environ.get("TP_DEBUG")
+    t_acc = {}
     steps = 0
+    # 计时：每段【之后】sync（而非之前），把该段的 GPU 异步执行算进该段。
+    # 旧版 sync-before 会把 step 的 forward 执行藏进下一段的 sync，导致 step 显示 0.6ms
+    # 而实际 13ms——forward 成本被错误归零。
+    def _t0():
+        if dbg:
+            _tt[0] = time.time()
+        return _tt
+    def _t1(key):
+        if dbg:
+            torch.cuda.synchronize()
+            t_acc[key] = t_acc.get(key, 0) + (time.time() - _tt[0])
+    _tt = [0.0]
     while steps < max_steps:
         if ws > 1:
             if rank0():
-                b, bt = eng.get_next_batch()
+                _t0(); b, bt = eng.get_next_batch()
                 done = (not eng.scheduler.running_sequences and not eng.scheduler.waiting_queue)
+                _t1("sched")
                 if bt == "waiting" or not b:
-                    BatchInferenceContext(0, "waiting").broadcast()
+                    _t0(); BatchInferenceContext(0, "waiting").broadcast(); _t1("bcast1")
                 else:
-                    ctx = BatchInferenceContext(len(b), bt, b)
-                    ctx.broadcast()
-                    eng.step(ctx)
-                    eng.collect(ctx)
-                    ctx.broadcast()
-                    eng.update_sequences(ctx.sequences)
-                dt = torch.tensor([1 if done else 0], device=eng.device)
-                dist.broadcast(dt, src=0)
+                    _t0(); ctx = BatchInferenceContext(len(b), bt, b); ctx.broadcast(); _t1("bcast1")
+                    _t0(); eng.step(ctx); _t1("step")
+                    _t0(); eng.collect(ctx); _t1("collect")
+                    _t0(); ctx.broadcast(); _t1("bcast2")
+                    _t0(); eng.update_sequences(ctx.sequences); _t1("upd")
+                _t0(); dt = torch.tensor([1 if done else 0], device=eng.device); dist.broadcast(dt, src=0); _t1("done")
             else:
-                ctx = BatchInferenceContext.receive(eng.tokenizer)
+                _t0(); ctx = BatchInferenceContext.receive(eng.tokenizer); _t1("recv1")
                 if ctx.batch_type != "waiting" and ctx.batch_size > 0:
-                    eng.step(ctx)
-                    ctx = BatchInferenceContext.receive(eng.tokenizer)
-                    eng.update_sequences(ctx.sequences)
-                dt = torch.zeros(1, device=eng.device)
-                dist.broadcast(dt, src=0)
+                    _t0(); eng.step(ctx); _t1("step")
+                    _t0(); ctx = BatchInferenceContext.receive(eng.tokenizer); _t1("recv2")
+                    _t0(); eng.update_sequences(ctx.sequences); _t1("upd")
+                _t0(); dt = torch.zeros(1, device=eng.device); dist.broadcast(dt, src=0); _t1("done")
             if int(dt.item()) == 1:
                 break
         else:
@@ -130,6 +145,10 @@ def _micro_loop(eng, max_steps):
             eng.collect(ctx)
             eng.update_sequences(ctx.sequences)
         steps += 1
+    if dbg and rank0():
+        n = max(steps, 1)
+        print(f"[TP_DEBUG rank0] steps={steps} per-step(ms): " +
+              " ".join(f"{k}={v*1000/n:.1f}" for k, v in sorted(t_acc.items(), key=lambda x: -x[1])))
 
 
 def run_micro_multi():
@@ -167,7 +186,8 @@ def run_micro_multi():
 # ----------------------------- vllm -----------------------------
 def run_vllm_single():
     from vllm import LLM, SamplingParams
-    llm = LLM(MODEL, enforce_eager=False, tensor_parallel_size=TP, max_model_len=4096)
+    llm = LLM(MODEL, enforce_eager=False, tensor_parallel_size=TP, max_model_len=4096,
+              gpu_memory_utilization=VLLM_MEM_UTIL)
     prompt = make_prompt(S_IN)
     llm.generate([prompt], SamplingParams(temperature=S_TEMP, max_tokens=8))
     walls = []
@@ -183,7 +203,8 @@ def run_vllm_single():
 
 def run_vllm_multi():
     from vllm import LLM, SamplingParams
-    llm = LLM(MODEL, enforce_eager=False, tensor_parallel_size=TP, max_model_len=4096)
+    llm = LLM(MODEL, enforce_eager=False, tensor_parallel_size=TP, max_model_len=4096,
+              gpu_memory_utilization=VLLM_MEM_UTIL)
     prompt = make_prompt(M_IN)
     llm.generate([prompt], SamplingParams(temperature=M_TEMP, max_tokens=8))
     prompts = [prompt] * BS

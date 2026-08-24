@@ -281,6 +281,15 @@ class InferenceEngine:
         try:
             if torch.distributed.is_initialized():
                 logger.info(f"Rank {self.rank}: Shutting down distributed process group...")
+                # TP 修复：destroy_process_group 前必须先释放 CUDA Graph——graph 捕获了
+                # NCCL allreduce kernel，communicator 销毁时若 graph 仍持有 NCCL kernel
+                # 引用会 hang（表现为进程 100% CPU 卡死、GPU 不释放，污染后续 run）。
+                # 先清 graph 再 destroy，两 rank 各自独立释放，无跨 rank 依赖。
+                try:
+                    self.graph_runner._graphs.clear()
+                    torch.cuda.synchronize()
+                except Exception:
+                    pass
                 torch.distributed.destroy_process_group()
         except Exception as e:
             logger.warning(f"Error during shutdown: {e}")

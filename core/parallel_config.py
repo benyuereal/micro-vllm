@@ -23,6 +23,11 @@ def setup():
     
     # 新增：仅当多卡且未初始化时，才初始化分布式
     if world_size > 1 and not dist.is_initialized():
+        # TP 修复：init_process_group 前必须先 set_device(rank)——NCCL communicator
+        # 绑定到当前默认设备，若 rank1 在 cuda:0 上初始化，其 allreduce 会走错卡
+        # （P2P 开启时直接 hang，P2P 关闭时退化为 host 中转慢 30%+）。
+        if torch.cuda.is_available():
+            torch.cuda.set_device(rank)
         # 自动选择后端（CUDA用nccl，CPU用gloo）
         backend = "nccl" if torch.cuda.is_available() else "gloo"
         dist.init_process_group(
@@ -68,6 +73,10 @@ def rank0():
 
 def all_reduce(input_):
     if get_world_size() == 1:
+        return input_
+    # 诊断开关：MICRO_TP_NO_ALLREDUCE=1 跳过 allreduce（仅用于量化通信开销，
+    # 输出不正确，勿用于正确性验证）。
+    if os.environ.get("MICRO_TP_NO_ALLREDUCE") == "1":
         return input_
     # 新增：指定默认group为WORLD，避免parallel_group为None时报错
     dist.all_reduce(input_, group=get_group() or dist.group.WORLD)
