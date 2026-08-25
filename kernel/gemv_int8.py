@@ -79,6 +79,15 @@ def w8_linear(x, w_int8, scale, out=None, env="MICRO_GEMV"):
             _mod.gemv_int8_group(x, w_int8, scale, out)
         else:
             _mod.gemv_int8(x, w_int8, scale, out)
+    elif is_group and M <= 128:
+        # 小 M prefill（32 < M ≤ 128，如投机解码 prompt prefill M≈61）：group-128 int8
+        # 走双后端 int8 GEMM（TileLang 默认 / Triton 备选），权重 HBM 只读一次。
+        # 原路径反量化整份 int8 权重到 bf16（w_int8.float()*sc 物化 4x fp32 临时 +
+        # bf16 拷贝，mlp_gu M=61 反量化占 7.29ms/7.9ms），int8 GEMM 快 22x（0.35ms）。
+        # 只影响 prefill（M>32）；decode（M≤32）仍走 int8 GEMV，不受影响。
+        # M>128 时 int8 GEMM 的 BLOCK_M 超 shared mem 上限（M=256 编译失败），回退反量化。
+        from kernel.gemm_int8_triton import verify_int8_gemm
+        return verify_int8_gemm(x, w_int8, scale, out)
     else:
         # 反量化：per-channel scale [N]→[N,1]；group scale [N,K/128]→repeat_interleave 128
         if is_group:

@@ -589,12 +589,18 @@ class Qwen3_5Adapter(ModelAdapter):
 
         投机解码 verify（M 小，verify_gemm 开）：group-128 int8 走双后端 int8 GEMM
         （TileLang 默认 / Triton 备选，MICRO_VERIFY_GEMM 切换；权重 HBM 只读一次，
-        shared 内 dequant→bf16 + GEMM），避免反量化 54GB bf16 权重/层。"""
+        shared 内 dequant→bf16 + GEMM），避免反量化 54GB bf16 权重/层。
+
+        小 M prefill（M≤128，如投机解码 prompt prefill M≈61）：同样走 int8 GEMM。
+        原路径反量化整份 int8 权重到 bf16（w_int8.float()*sc 物化 4x fp32 临时 +
+        bf16 拷贝，mlp_gu M=61 反量化占 7.29ms/7.9ms），int8 GEMM 权重 HBM 只读
+        一次（0.35ms，快 22x）。M>128 时 int8 GEMM 的 BLOCK_M 超 shared mem 上限
+        （M=256 编译失败），回退反量化 matmul（正常大 batch prefill 不受影响）。"""
         if isinstance(w, tuple):
             w_int8, scale = w
             if scale.dim() == 2:
-                from kernel.gemm_int8_triton import verify_gemm_enabled, verify_int8_gemm
-                if verify_gemm_enabled():
+                from kernel.gemm_int8_triton import verify_int8_gemm
+                if x.shape[0] <= 128:
                     return verify_int8_gemm(x, w_int8, scale)
                 sc = scale.repeat_interleave(128, dim=1)
             else:
