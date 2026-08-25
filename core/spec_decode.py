@@ -86,7 +86,6 @@ class SpecDecodeController:
         self._verify_ids = torch.empty(M, dtype=torch.int64, device=self.device)
         self._anchor_t = torch.empty(1, dtype=torch.int64, device=self.device)
         self._arange = torch.arange(max_len, dtype=torch.int64, device=self.device)
-        self._pos_buf = torch.empty(max_len, dtype=torch.int64, device=self.device)
         self._cu_q = torch.empty(2, dtype=torch.int32, device=self.device)
         self._cu_k = torch.empty(2, dtype=torch.int32, device=self.device)
         self._prompt_buf = torch.empty(max_len, dtype=torch.int64, device=self.device)
@@ -222,10 +221,14 @@ class SpecDecodeController:
         else:
             context_kv = None
 
-        # query = [anchor] + [mask]*N，位置 [kv_len-1, kv_len+N)（静态 buffer 索引写）
+        # query = [anchor] + [mask]*N，位置 [kv_len-1, kv_len+N)。
+        # 位置就是连续 arange，直接取常驻 _arange 的零拷贝切片（_pos_buf 是 empty
+        # 未初始化，读它拿到垃圾 index → rope gather OOB，故弃用 _pos_buf）。
         self._query_ids[0] = anchor
-        query_embeds = self.embed(self._query_ids) * self.input_embedding_scale
-        query_pos = self._pos_buf[kv_len - 1: kv_len - 1 + 1 + self.N]
+        query_embeds = self.embed(self._query_ids)
+        if self.input_embedding_scale != 1.0:
+            query_embeds = query_embeds * self.input_embedding_scale
+        query_pos = self._arange[kv_len - 1: kv_len - 1 + 1 + self.N]
         out = self.draft.forward(self._query_ids, query_pos,
                                  input_embeds=query_embeds, context_kv=context_kv)
         # out: [1+N, hidden]，取 [1:]（N 个 mask 位置）
@@ -302,10 +305,10 @@ class SpecDecodeController:
         ok, slot_mapping, _ = self.cache_manager.alloc(seq_id, self.max_len, None)
         if not ok:
             raise RuntimeError("spec decode: KV cache alloc failed")
-        # 静态 block_table（专用 buffer，避免与 engine 共享 buffer 冲突）
+        # 静态 block_table（复用 init 预分配的常驻 _bt buffer，避免每次 generate 新建）
         blocks = self.cache_manager._blocks[seq_id]
-        bt = torch.full((1, self.cache_manager.max_seq_blocks), -1,
-                        dtype=torch.int32, device=device)
+        bt = self._bt
+        bt.fill_(-1)
         bt[0, :len(blocks)] = torch.tensor(blocks, dtype=torch.int32, device=device)
 
         # ---- 分配 GDN slot + 清零状态（新序列从空状态开始）----
@@ -315,11 +318,15 @@ class SpecDecodeController:
 
         try:
             # ---- prefill prompt（收集 aux[0:P]）----
-            positions = torch.arange(P, device=device, dtype=torch.int64)
-            cu_q = torch.tensor([0, P], device=device, dtype=torch.int32)
-            cu_k = torch.tensor([0, P], device=device, dtype=torch.int32)
+            # 位置/cu_seqlens 走常驻 buffer（零运行期分配）：positions=arange 前缀切片，
+            # cu_q/cu_k 前缀写 [0, P]。
+            positions = self._arange[:P]
+            self._cu_q[0] = 0
+            self._cu_q[1] = P
+            self._cu_k[0] = 0
+            self._cu_k[1] = P
             logits = self._target_forward(
-                prompt_ids, positions, slot_mapping[:P], cu_q, cu_k, bt,
+                prompt_ids, positions, slot_mapping[:P], self._cu_q, self._cu_k, bt,
                 P, P, gdn_slot, collect_aux_from=0, gdn_checkpoint=False)
             anchor = int(logits[-1].argmax())
             generated = [anchor]
@@ -336,35 +343,41 @@ class SpecDecodeController:
                 # 1. draft 提议
                 draft_tokens = self._draft_propose(anchor, kv_len)  # [N]
                 # 2. verify（1+N token，开 GDN 检查点，收集 aux[kv_len-1:...]）
-                verify_ids = torch.cat([torch.tensor([anchor], device=device),
-                                        draft_tokens])
+                # 输入全部走常驻 buffer（零运行期分配）：verify_ids 前缀写、vpos=arange
+                # 切片、vslot=slot_mapping 切片、cu_q/cu_k 前缀写。
                 M = 1 + self.N
-                vpos = torch.arange(kv_len - 1, kv_len - 1 + M,
-                                    device=device, dtype=torch.int64)
+                self._verify_ids[0] = anchor
+                self._verify_ids[1:] = draft_tokens
+                vpos = self._arange[kv_len - 1: kv_len - 1 + M]
                 vslot = slot_mapping[kv_len - 1: kv_len - 1 + M]
-                vcu_q = torch.tensor([0, M], device=device, dtype=torch.int32)
-                vcu_k = torch.tensor([0, kv_len - 1 + M], device=device, dtype=torch.int32)
+                self._cu_q[0] = 0
+                self._cu_q[1] = M
+                self._cu_k[0] = 0
+                self._cu_k[1] = kv_len - 1 + M
                 vlogits = self._target_forward(
-                    verify_ids, vpos, vslot, vcu_q, vcu_k, bt,
+                    self._verify_ids, vpos, vslot, self._cu_q, self._cu_k, bt,
                     M, kv_len - 1 + M, gdn_slot,
                     collect_aux_from=kv_len - 1, gdn_checkpoint=True)
                 self.total_steps += 1
 
-                # 3. 贪心接受
+                # 3. 贪心接受。draft/target 各 .cpu() 一次（共 2 次同步），Python 侧
+                # 纯 int 比较——替代原来逐元素 int() 的 ~N+2 次 CPU-GPU 同步。
                 target_preds = vlogits.argmax(dim=-1)  # [M]
+                d_cpu = draft_tokens.cpu().tolist()
+                t_cpu = target_preds.cpu().tolist()
                 accepted = 0
                 for i in range(self.N):
-                    if int(draft_tokens[i]) == int(target_preds[i]):
+                    if d_cpu[i] == t_cpu[i]:
                         accepted += 1
                     else:
                         break
-                bonus = int(target_preds[accepted])
+                bonus = t_cpu[accepted]
 
                 # 4. GDN 状态回滚到 checkpoint[accepted]
                 self._gdn_rollback(gdn_slot, accepted)
 
                 # 5. 提交 accepted 个 draft + 1 个 bonus
-                new_tokens = [int(t) for t in draft_tokens[:accepted].tolist()] + [bonus]
+                new_tokens = d_cpu[:accepted] + [bonus]
                 generated.extend(new_tokens)
                 self.total_accepted += accepted
                 self.total_generated += len(new_tokens)

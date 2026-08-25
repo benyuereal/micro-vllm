@@ -327,6 +327,61 @@ def qk_norm_rope_partial_inplace(qkv_buf, bs, seg_offset, num_heads, head_size,
         eps, BLOCK_H=BLOCK_H, BLOCK_R=BLOCK_R)
 
 
+# ---- prefill 纯 partial RoPE（无 norm）：in-place half-split 前 rot 维 ----
+# 替代 _prefill_full 里 PyTorch 的 cos/sin gather + 4 slice + 4 mul + 2 add + 2 cat
+# （每 (q,k) 张量 ~12 个小 kernel × 2 × 16 full 层 = ~384 次 launch/verify）。
+# 一个 program = (token, head)，只读写前 rot 维（rot 之后维度不动）。
+@triton.jit
+def _rope_partial_inplace_kernel(X, COS, SIN, POS,
+                                 stride_t, stride_h,
+                                 head_size: tl.constexpr, rot: tl.constexpr,
+                                 BLOCK_R: tl.constexpr):
+    t = tl.program_id(0)
+    h = tl.program_id(1)
+    pos = tl.load(POS + t)
+    base = t.to(tl.int64) * stride_t + h * stride_h
+    r_offs = tl.arange(0, BLOCK_R)
+    r_mask = r_offs < rot // 2
+    c = tl.load(COS + pos * (rot // 2) + r_offs, mask=r_mask, other=0.0).to(tl.float32)
+    s = tl.load(SIN + pos * (rot // 2) + r_offs, mask=r_mask, other=0.0).to(tl.float32)
+    x1 = tl.load(X + base + r_offs, mask=r_mask, other=0.0).to(tl.float32)
+    x2 = tl.load(X + base + rot // 2 + r_offs, mask=r_mask, other=0.0).to(tl.float32)
+    o1 = (x1 * c - x2 * s).to(X.dtype.element_ty)
+    o2 = (x2 * c + x1 * s).to(X.dtype.element_ty)
+    tl.store(X + base + r_offs, o1, mask=r_mask)
+    tl.store(X + base + rot // 2 + r_offs, o2, mask=r_mask)
+
+
+def rope_partial_inplace(x, cos_pool, sin_pool, positions):
+    """x [T, H, head_dim] in-place partial RoPE（前 rot 维 half-split，rot 后不动）。
+    positions [T] int64。cos/sin 表 [max_pos, rot//2]（PagedAttention 池）。"""
+    T, H, hd = x.shape
+    rot = cos_pool.shape[1] * 2
+    BLOCK_R = triton.next_power_of_2(rot // 2)
+    _rope_partial_inplace_kernel[(T, H)](
+        x, cos_pool, sin_pool, positions,
+        x.stride(0), x.stride(1),
+        head_size=hd, rot=rot, BLOCK_R=BLOCK_R)
+
+
+# ---- attn_output_gate：out = attn * sigmoid(gate)（fp32 sigmoid，bf16 输出）----
+# 替代 PyTorch 的 sigmoid + cast + mul 三个 elementwise kernel（× 16 full 层）。
+@triton.jit
+def _attn_gate_kernel(ATTN, GATE, BLOCK: tl.constexpr):
+    pid = tl.program_id(0)
+    offs = pid * BLOCK + tl.arange(0, BLOCK)
+    a = tl.load(ATTN + offs).to(tl.float32)
+    g = tl.load(GATE + offs).to(tl.float32)
+    tl.store(ATTN + offs, (a * tl.sigmoid(g)).to(ATTN.dtype.element_ty))
+
+
+def attn_gate_inplace(attn, gate):
+    """attn [T, nh, hd]（in-place *= sigmoid(gate)），gate 同形状。"""
+    n = attn.numel()
+    BLOCK = 1024
+    _attn_gate_kernel[(triton.cdiv(n, BLOCK),)](attn, gate, BLOCK=BLOCK)
+
+
 # =====================================================================
 # Adapter
 # =====================================================================
@@ -838,21 +893,13 @@ class Qwen3_5Adapter(ModelAdapter):
         q = rmsnorm1(q, sa._q_norm_w, sa._q_norm_eps)
         k = rmsnorm1(k, sa._k_norm_w, sa._k_norm_eps)
 
-        rot = self._rot
+        # partial RoPE：Triton in-place（前 rot 维 half-split，rot 后不动），替代 PyTorch
+        # 的 cos/sin gather + 4 slice + 4 mul + 2 add + 2 cat（每张量 ~12 小 kernel）。
         cos_pool = graph.attention._cos_pool
         sin_pool = graph.attention._sin_pool
         pos = meta.position_ids.long()
-        cos = cos_pool[pos].unsqueeze(1)
-        sin = sin_pool[pos].unsqueeze(1)
-
-        def _rope_partial(x):
-            xr, xp = x[..., :rot], x[..., rot:]
-            x1, x2 = xr[..., :rot // 2], xr[..., rot // 2:]
-            xr = torch.cat([x1 * cos - x2 * sin, x2 * cos + x1 * sin], dim=-1)
-            return torch.cat([xr, xp], dim=-1)
-
-        q = _rope_partial(q)
-        k = _rope_partial(k)
+        rope_partial_inplace(q, cos_pool, sin_pool, pos)
+        rope_partial_inplace(k, cos_pool, sin_pool, pos)
 
         k_cache, v_cache = cache_manager.get(layer_idx)
         store_kvcache(k, v, k_cache, v_cache, meta.slot_mapping)
@@ -863,7 +910,8 @@ class Qwen3_5Adapter(ModelAdapter):
             softmax_scale=hd ** -0.5, causal=True,
             block_table=meta.block_table,
         )
-        attn = attn * torch.sigmoid(gate.float()).to(attn.dtype)
+        # attn_output_gate：Triton in-place（attn *= sigmoid(gate)），替代 sigmoid+cast+mul。
+        attn_gate_inplace(attn, gate)
         out = self._lin_prefill(attn.reshape(T, -1), sa._o_w)
 
         normed, residual = rmsnorm1_residual_fused(out, h, block._post_ln_w, block._post_ln_eps)

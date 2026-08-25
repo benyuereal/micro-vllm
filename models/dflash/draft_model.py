@@ -26,6 +26,64 @@ from typing import List, Optional
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import triton
+import triton.language as tl
+
+# 复用仓库现成 Triton kernel（pointwise/递归类小算子允许 Triton，GEMM 走 cuBLAS/int8）：
+# - rmsnorm / rmsnorm_residual_fused：非 1-centered RMSNorm（Qwen3 风格 out=x*rrms*w），
+#   替代 PyTorch 的 float/pow/mean/rsqrt/mul/cast 碎片 op（每层 4 个 norm × 5 层）。
+# - apply_rope_decode：in-place half-split RoPE（[T, heads, dim] + cos/sin 表 + positions），
+#   替代 PyTorch 的 chunk/cat/mul 碎片 op。
+from kernel.rmsnorm import rmsnorm as _triton_rmsnorm
+from kernel.rmsnorm import rmsnorm_residual_fused as _triton_rmsnorm_res
+from kernel.rotary import apply_rope_decode
+
+
+# ---- DFlash2 grouped conv 融合 kernel（taps=2 特化）----
+# 原 PyTorch 版每次调用 ~8 个小 kernel（unflatten/view/add/mul/pad/where/flatten ×2 tap），
+# 每 draft forward 20 次（5 层 × 2 conv × prepare/finish）= ~160 次 launch。融合成单
+# kernel：out[t,g,j] = (base[0,g,j]+delta[t,0,g])*x[t,g,j]
+#              + (base[1,g,j]+delta[t,1,g]) * (x[t-1,g,j] if t>=1 else 0)。
+# 数值与原式逐项一致（同顺序 fp32 累加、同 bf16 存储）。
+@triton.jit
+def _grouped_conv_fused_kernel(HS, DELTA, BASE, OUT,
+                               G, GS, T, D_T_STRIDE, BLOCK_G: tl.constexpr, BLOCK_J: tl.constexpr):
+    t = tl.program_id(0)
+    g = tl.program_id(1) * BLOCK_G + tl.arange(0, BLOCK_G)
+    j = tl.arange(0, BLOCK_J)
+    gmask = g < G
+    # x[t, g, j]：HS 行宽 = G*GS
+    x = tl.load(HS + t.to(tl.int64) * (G * GS) + g[:, None] * GS + j[None, :],
+                mask=gmask[:, None], other=0.0).to(tl.float32)
+    # x[t-1, g, j]（t==0 时 0，对齐 F.pad 的 leading 0）
+    prev = tl.load(HS + (t - 1).to(tl.int64) * (G * GS) + g[:, None] * GS + j[None, :],
+                   mask=gmask[:, None] & (t >= 1), other=0.0).to(tl.float32)
+    # delta [T, 2, G]（T-stride = D_T_STRIDE，非 2*G：delta 是 [T,2,taps,G] 的切片）：
+    # tap0 = delta[t,0,g]，tap1 = delta[t,1,g]
+    d0 = tl.load(DELTA + t.to(tl.int64) * D_T_STRIDE + 0 * G + g, mask=gmask, other=0.0).to(tl.float32)
+    d1 = tl.load(DELTA + t.to(tl.int64) * D_T_STRIDE + 1 * G + g, mask=gmask, other=0.0).to(tl.float32)
+    # base [2, G, GS]
+    b0 = tl.load(BASE + g[:, None] * GS + j[None, :], mask=gmask[:, None], other=0.0).to(tl.float32)
+    b1 = tl.load(BASE + (G * GS) + g[:, None] * GS + j[None, :], mask=gmask[:, None], other=0.0).to(tl.float32)
+    c0 = b0 + d0[:, None]
+    c1 = b1 + d1[:, None]
+    out = c0 * x + c1 * prev
+    tl.store(OUT + t.to(tl.int64) * (G * GS) + g[:, None] * GS + j[None, :],
+             out.to(OUT.dtype.element_ty), mask=gmask[:, None])
+
+
+def _grouped_conv_fused(hidden_states, delta, base, num_groups, group_size):
+    """taps=2 融合版 _grouped_conv（单 Triton kernel）。
+    hidden_states [T, G*GS]，delta [T, 2, G]（T-stride 可能非 2*G，取 delta.stride(0)），
+    base [2, G*GS] → out [T, G*GS]。"""
+    T = hidden_states.shape[0]
+    out = torch.empty_like(hidden_states)
+    BLOCK_G = 32
+    BLOCK_J = max(16, group_size)
+    _grouped_conv_fused_kernel[(T, triton.cdiv(num_groups, BLOCK_G))](
+        hidden_states, delta, base, out,
+        num_groups, group_size, T, delta.stride(0), BLOCK_G=BLOCK_G, BLOCK_J=BLOCK_J)
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -58,35 +116,40 @@ class RMSNorm(nn.Module):
         self.eps = eps
 
     def _norm(self, x):
-        out = x * torch.rsqrt(x.float().pow(2).mean(-1, keepdim=True) + self.eps)
-        return out.to(x.dtype)
+        # 走 Triton rmsnorm（非 1-centered，out=x*rrms*w），替代 PyTorch 碎片 op。
+        return _triton_rmsnorm(x, self.weight, self.eps)
 
     def forward(self, x, residual=None):
         if residual is None:
-            return self._norm(x) * self.weight
-        # fused：new_residual = x + residual；normed = norm(new_residual) * weight
-        new_residual = x + residual
-        return self._norm(new_residual) * self.weight, new_residual
+            return self._norm(x)
+        # fused：new_residual = x + residual；normed = norm(new_residual) * weight。
+        # Triton rmsnorm_residual_fused 一次 kernel 算 (normed, x+residual)。
+        return _triton_rmsnorm_res(x, residual, self.weight, self.eps)
 
 
 # ---------------------------------------------------------------------------
 # DFlashGroupedConv（DFlash2 特有：可学习分组卷积，系数由 hidden 投影得到）
 # ---------------------------------------------------------------------------
-def _grouped_conv(hidden_states, delta, base, block_size, num_groups, group_size, taps):
+def _grouped_conv(hidden_states, delta, base, block_size, num_groups, group_size, taps,
+                  position=None):
     """对齐 vLLM _grouped_conv。
 
     hidden_states: [T, hidden]
     delta: [T, taps, num_groups]（本侧系数增量）
     base: [taps, hidden]（基础卷积核）
+    position: 可选预计算的 [T] 位置（= arange(T) mod block_size）。草稿路径 T 恒为
+      block_size（1+N，2 的幂），故 position 是常量，由 DFlashGroupedConv 预计算传入，
+      避免每次调用现建 torch.arange 临时张量。
     """
     blocks = hidden_states.unflatten(-1, (num_groups, group_size))  # [T, G, gs]
     coefficients = base.view(1, taps, num_groups, group_size) + delta.unsqueeze(-1)  # [T,taps,G,gs]
     output = coefficients[:, 0] * blocks  # [T, G, gs]
-    position = torch.arange(hidden_states.shape[0], device=hidden_states.device)
-    if block_size & (block_size - 1) == 0:
-        position = position & (block_size - 1)
-    else:
-        position = position % block_size
+    if position is None:
+        position = torch.arange(hidden_states.shape[0], device=hidden_states.device)
+        if block_size & (block_size - 1) == 0:
+            position = position & (block_size - 1)
+        else:
+            position = position % block_size
     for tap in range(1, taps):
         shifted = F.pad(blocks[:-tap], (0, 0, 0, 0, tap, 0))
         output = output + coefficients[:, tap] * shifted * (position >= tap).view(-1, 1, 1)
@@ -107,11 +170,30 @@ class DFlashGroupedConv(nn.Module):
         )
         self.kernel_projection = nn.Linear(hidden_size, 2 * taps * self.num_groups, bias=False)
         self.kernel_projection.weight.data = self.kernel_projection.weight.data.to(params_dtype)
+        # 预计算 position（= arange(block_size) mod block_size）。草稿路径 T 恒为
+        # block_size（1+N，2 的幂），故 position 是常量；register_buffer 随 .to(device)
+        # 迁移，避免每次 _convolve 现建 torch.arange 临时张量（每 draft forward 20 次）。
+        pos = torch.arange(block_size)
+        if block_size & (block_size - 1) == 0:
+            pos = pos & (block_size - 1)
+        else:
+            pos = pos % block_size
+        self.register_buffer("_conv_pos", pos, persistent=False)
 
     def _convolve(self, hidden_states, delta, side):
+        T = hidden_states.shape[0]
+        # taps==2 且 T==block_size（DFlash2 草稿路径，position=arange 不 wrap）→ 单
+        # Triton kernel 融合（省 ~8 小 kernel/次 × 20 次/forward）。否则回退 PyTorch 版
+        # （taps>2 或 T!=block_size 时 position>=tap 的 wrap 语义需原式）。
+        if self.taps == 2 and T == self.block_size:
+            return _grouped_conv_fused(
+                hidden_states, delta, self.base_kernel[side],
+                self.num_groups, self.group_size)
+        position = self._conv_pos if T == self.block_size else None
         return _grouped_conv(
             hidden_states, delta, self.base_kernel[side],
             self.block_size, self.num_groups, self.group_size, self.taps,
+            position=position,
         )
 
     def prepare(self, hidden_states):
@@ -202,10 +284,10 @@ class DFlashAttention(nn.Module):
         q = q.view(-1, self.num_heads, self.head_dim)
         k = k.view(-1, self.num_kv_heads, self.head_dim)
 
-        cos = self._cos[positions].unsqueeze(1)  # [T, 1, hd//2]
-        sin = self._sin[positions].unsqueeze(1)
-        q = _rope_half_split(q, cos, sin)
-        k = _rope_half_split(k, cos, sin)
+        # 融合 Triton RoPE（in-place half-split，cos/sin 表 + per-token positions），
+        # 替代 PyTorch 的 cos/sin gather + chunk/cat/mul 碎片 op。
+        apply_rope_decode(q, self._cos, self._sin, positions)
+        apply_rope_decode(k, self._cos, self._sin, positions)
 
         # 拼接 context KV（DFlash2：草稿 attention 读 context + 1+N query，非因果）
         if context_kv is not None:
@@ -231,9 +313,8 @@ class DFlashAttention(nn.Module):
         k = self.k_proj(hidden_states).view(-1, self.num_kv_heads, self.head_dim)
         v = self.v_proj(hidden_states).view(-1, self.num_kv_heads, self.head_dim)
         k = self.k_norm(k)
-        cos = self._cos[positions].unsqueeze(1)
-        sin = self._sin[positions].unsqueeze(1)
-        k = _rope_half_split(k, cos, sin)
+        # 融合 Triton RoPE（in-place half-split），替代 PyTorch 碎片 op。
+        apply_rope_decode(k, self._cos, self._sin, positions)
         return k, v
 
 

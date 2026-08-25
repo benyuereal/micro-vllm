@@ -1,6 +1,6 @@
 # TODO
 
-## [ ] spec_decode.py 临时张量改初始化常驻 GPU 缓冲区
+## [x] spec_decode.py 临时张量改初始化常驻 GPU 缓冲区
 - `core/spec_decode.py` 里所有 `torch.tensor(...)` / `torch.arange(...)` 等**每步创建临时张量**的地方，
   全部移到 `__init__`（或 controller 构建时）一次性创建**常驻 GPU 设备缓冲区**（按 max 尺寸预分配）。
 - 每步 forward 只往缓冲区**前缀写入**（`buf[:end] = ...`），kernel/下游用 `buf[:end]` 切片取数据，
