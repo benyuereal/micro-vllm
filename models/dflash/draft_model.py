@@ -213,16 +213,16 @@ class DFlashAttention(nn.Module):
             k = torch.cat([k_ctx, k], dim=0)
             v = torch.cat([v_ctx, v], dim=0)
 
-        # 非因果 sliding-window attention（草稿 query 只有 1+N 个 token，直接算）
-        # GQA：把 kv 头 repeat 到 q 头数
-        n_rep = self.num_heads // self.num_kv_heads
-        k = k.repeat_interleave(n_rep, dim=1)
-        v = v.view(-1, self.num_kv_heads, self.head_dim).repeat_interleave(n_rep, dim=1)
-        attn = F.scaled_dot_product_attention(
-            q.transpose(0, 1), k.transpose(0, 1), v.transpose(0, 1),
-            is_causal=False, scale=self.scaling,
-        )
-        attn = attn.transpose(0, 1).reshape(-1, self.q_size)
+        # 非因果 sliding-window attention（草稿 query 只有 1+N 个 token，直接算）。
+        # flash_attn_func 原生支持 GQA（num_heads=32 != num_kv_heads=8），无需
+        # repeat_interleave（省 4x KV 显存膨胀 + 一次 repeat copy）。
+        # 形状：q [T,H,D]→[1,T,H,D]，k/v [S,KV,D]→[1,S,KV,D]（S=C+T，context 在前）。
+        from flash_attn import flash_attn_func
+        attn = flash_attn_func(
+            q.unsqueeze(0), k.unsqueeze(0), v.unsqueeze(0),
+            softmax_scale=self.scaling, causal=False,
+        )  # [1, T, H, D]
+        attn = attn.squeeze(0).reshape(-1, self.q_size)
         return self.o_proj(attn)
 
     def project_kv(self, hidden_states, positions):
