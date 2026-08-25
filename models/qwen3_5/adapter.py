@@ -91,7 +91,8 @@ def gdn_gbeta(a, b, a_log, dt_bias, g_buf, beta_buf, stride):
 # decode：单 token，state 滚动更新。
 @triton.jit
 def _gdn_conv_prefill_kernel(QKV, W, STATE, CU, SEQ_IDX,
-                             CONV_DIM, STRIDE, N_GDN, GDN_L, K: tl.constexpr, BLOCK_C: tl.constexpr):
+                             CONV_DIM, STRIDE, N_GDN, GDN_L, K: tl.constexpr, BLOCK_C: tl.constexpr,
+                             CHECKPOINT, CP_N_GDN, CP_ENABLED: tl.constexpr):
     pid_c = tl.program_id(0)
     c = pid_c * BLOCK_C + tl.arange(0, BLOCK_C)
     cmask = c < CONV_DIM
@@ -122,6 +123,12 @@ def _gdn_conv_prefill_kernel(QKV, W, STATE, CU, SEQ_IDX,
             tl.store(st_base + 0, x1, mask=cmask)
             tl.store(st_base + CONV_DIM, x2, mask=cmask)
             tl.store(st_base + 2 * CONV_DIM, x, mask=cmask)
+        # 投机解码：每 token 存 conv 状态检查点（[t, gdn_l, 3, conv_dim]），供接受后回滚。
+        if CP_ENABLED:
+            cp_base = CHECKPOINT + (t.to(tl.int64) * CP_N_GDN + GDN_L) * 3 * CONV_DIM + c
+            tl.store(cp_base + 0, x1.to(CHECKPOINT.dtype.element_ty), mask=cmask)
+            tl.store(cp_base + CONV_DIM, x2.to(CHECKPOINT.dtype.element_ty), mask=cmask)
+            tl.store(cp_base + 2 * CONV_DIM, x.to(CHECKPOINT.dtype.element_ty), mask=cmask)
         x0 = x1
         x1 = x2
         x2 = x
@@ -211,7 +218,8 @@ def _gdn_recurrent_decode_kernel(QKV, G, BETA, STATE, OUT, SEQ_IDX, IS_REAL,
 def _gdn_recurrent_prefill_kernel(QKV, G, BETA, STATE, OUT, CU, SEQ_IDX,
                                   H: tl.constexpr, HK: tl.constexpr,
                                   DK: tl.constexpr, DV: tl.constexpr,
-                                  N_GDN, GDN_L, SCALE, STRIDE, BLOCK_D: tl.constexpr):
+                                  N_GDN, GDN_L, SCALE, STRIDE, BLOCK_D: tl.constexpr,
+                                  CHECKPOINT, CP_N_GDN, CP_ENABLED: tl.constexpr):
     s = tl.program_id(0)
     h = tl.program_id(1)
     start = tl.load(CU + s)
@@ -247,6 +255,10 @@ def _gdn_recurrent_prefill_kernel(QKV, G, BETA, STATE, OUT, CU, SEQ_IDX,
         o = tl.sum(S_m * q[:, None], axis=0)
         o_base = OUT + t.to(tl.int64) * (H * DV) + h * DV
         tl.store(o_base + dv, o.to(OUT.dtype.element_ty))
+        # 投机解码：每 token 存递归状态检查点（[t, gdn_l, H, DK, DV]），供接受后回滚。
+        if CP_ENABLED:
+            cp_base = CHECKPOINT + (t.to(tl.int64) * CP_N_GDN + GDN_L) * H * DK * DV + h * DK * DV
+            tl.store(cp_base + dk[:, None] * DV + dv[None, :], S_m.to(CHECKPOINT.dtype.element_ty))
 
     tl.store(S + dk[:, None] * DV + dv[None, :], S_m.to(STATE.dtype.element_ty))
 
@@ -501,10 +513,17 @@ class Qwen3_5Adapter(ModelAdapter):
     def _lin_prefill(self, x, w):
         """prefill 线性（M=T>1）：w 为 bf16 [N,K] 或 (w_int8, scale) 元组。
         反量化后 x @ w.t()（compute-bound，反量化开销可忽略）。
-        scale 两种：[N]（per-channel）→ unsqueeze(1)；[N,K/128]（group-128）→ repeat_interleave 128。"""
+        scale 两种：[N]（per-channel）→ unsqueeze(1)；[N,K/128]（group-128）→ repeat_interleave 128。
+
+        投机解码 verify（M 小，force_gemm 开）：group-128 int8 走分块 int8 GEMV
+        （权重 HBM 只读一次，fp32 累加 bit-exact 原 GEMV），避免反量化 54GB bf16
+        权重/层。经 w8_linear 分派（_force_gemm 且 M<=8 → tiled）。"""
         if isinstance(w, tuple):
             w_int8, scale = w
             if scale.dim() == 2:
+                from kernel.gemv_int8 import _force_gemm, w8_linear
+                if _force_gemm:
+                    return w8_linear(x, w_int8, scale)
                 sc = scale.repeat_interleave(128, dim=1)
             else:
                 sc = scale.unsqueeze(1)
@@ -659,14 +678,34 @@ class Qwen3_5Adapter(ModelAdapter):
                 STRIDE=in_dim, BLOCK_D=triton.next_power_of_2(max(DK, DV)))
         else:
             n_seqs = cu_seqlens.shape[0] - 1
-            _gdn_conv_prefill_kernel[(triton.cdiv(conv_dim, 512), n_seqs)](
-                qkv, la._conv_w, conv_state, cu_seqlens, seq_idx,
-                conv_dim, in_dim, n_gdn, gdn_l, K=self._gdn_K, BLOCK_C=512)
-            o = torch.empty(M, H * DV, dtype=h2d.dtype, device=dev)
-            _gdn_recurrent_prefill_kernel[(n_seqs, H)](
-                qkv, g, beta, state, o, cu_seqlens, seq_idx,
-                H=H, HK=HK, DK=DK, DV=DV, N_GDN=n_gdn, GDN_L=gdn_l, SCALE=scale,
-                STRIDE=in_dim, BLOCK_D=triton.next_power_of_2(max(DK, DV)))
+            # 投机解码检查点：graph._gdn_cp_enabled 时把每 token 的 conv/recurrent 状态
+            # 存进 graph._gdn_cp_conv / _gdn_cp_state（[M, n_gdn, ...]，M=total tokens）。
+            # 正常 prefill 不启用（CP_ENABLED=False，kernel 内分支被编译掉，零开销）。
+            cp_enabled = bool(getattr(graph, "_gdn_cp_enabled", False))
+            cp_state = getattr(graph, "_gdn_cp_state", None)
+            cp_conv = getattr(graph, "_gdn_cp_conv", None)
+            if cp_enabled:
+                _gdn_conv_prefill_kernel[(triton.cdiv(conv_dim, 512), n_seqs)](
+                    qkv, la._conv_w, conv_state, cu_seqlens, seq_idx,
+                    conv_dim, in_dim, n_gdn, gdn_l, K=self._gdn_K, BLOCK_C=512,
+                    CHECKPOINT=cp_conv, CP_N_GDN=n_gdn, CP_ENABLED=True)
+                o = torch.empty(M, H * DV, dtype=h2d.dtype, device=dev)
+                _gdn_recurrent_prefill_kernel[(n_seqs, H)](
+                    qkv, g, beta, state, o, cu_seqlens, seq_idx,
+                    H=H, HK=HK, DK=DK, DV=DV, N_GDN=n_gdn, GDN_L=gdn_l, SCALE=scale,
+                    STRIDE=in_dim, BLOCK_D=triton.next_power_of_2(max(DK, DV)),
+                    CHECKPOINT=cp_state, CP_N_GDN=n_gdn, CP_ENABLED=True)
+            else:
+                _gdn_conv_prefill_kernel[(triton.cdiv(conv_dim, 512), n_seqs)](
+                    qkv, la._conv_w, conv_state, cu_seqlens, seq_idx,
+                    conv_dim, in_dim, n_gdn, gdn_l, K=self._gdn_K, BLOCK_C=512,
+                    CHECKPOINT=conv_state, CP_N_GDN=n_gdn, CP_ENABLED=False)
+                o = torch.empty(M, H * DV, dtype=h2d.dtype, device=dev)
+                _gdn_recurrent_prefill_kernel[(n_seqs, H)](
+                    qkv, g, beta, state, o, cu_seqlens, seq_idx,
+                    H=H, HK=HK, DK=DK, DV=DV, N_GDN=n_gdn, GDN_L=gdn_l, SCALE=scale,
+                    STRIDE=in_dim, BLOCK_D=triton.next_power_of_2(max(DK, DV)),
+                    CHECKPOINT=state, CP_N_GDN=n_gdn, CP_ENABLED=False)
 
         if self._dbg_gdn is not None:
             self._dbg_gdn[-1]["qkv_post"] = qkv.detach().clone()

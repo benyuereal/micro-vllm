@@ -1,381 +1,384 @@
-"""DFlash2 投机解码控制器（engine 集成）。
+"""DFlash2 投机解码控制器（Qwen3.8-27B W8A16 适配版）。
 
-机制（对齐 vLLM dflash2，已在 benchmark/validate_spec_decode.py 独立验证）：
-- 每步草稿模型用 1+N 个 query token（anchor + N 个 mask token）并行起草 N 个 token，
-  target 模型一次 forward（1+N token，因果）验证，greedy 下确定性接受
-  （draft token 与 target argmax 一致则接受，遇首个不一致停止，bonus=target 预测）。
-- 正确性：接受的 token 全是 target 自己的预测，故投机解码输出与无投机 greedy 逐 token 一致。
+与 0.6B 版的核心差异（三大挑战的解法）：
 
-本控制器自包含（dense KV cache + 自管 forward），复用 engine 的模型权重与 tokenizer，
-与 engine 的 paged cache 解耦。用于：
-  1. 机制正确性端到端验证（Qwen3-0.6B 自起草 / oracle）。
-  2. 单用户 decode 吞吐对比（有/无投机解码）。
-W8A16 目标模型就绪后，可迁移到 paged cache + CUDA graph 路径以获取真实加速。
+1. GDN stateful 层（48 个 GDN 线性注意力层，递归+conv 有状态）：
+   不能手写 forward（访问 self_attn 会崩），必须走 engine 的 adapter forward 路径
+   （复用 self.model，权重已 prepare_weights）。控制器自己跑 forward 循环
+   （embed → 逐层 adapter.prefill → final_norm → lm_head），与 ModelPrefillRunner 一致。
 
-权重布局兼容：
-- prepared（engine 的 Qwen3Adapter.prepare_weights 后）：attn._qkv_w/_o_w/_q_norm_w/...，
-  mlp._gu/_d，block._in_ln_w/_post_ln_w。
-- HF 原始（transformers 加载，未 prepare）：attn.q_proj/k_proj/...，mlp.gate_proj/...。
-  两种布局用同一 forward（_layer_forward 内按 hasattr 分派）。
+2. aux hidden state 收集：GDN 是顺序有状态的，不能 re-forward context（会二次推进
+   递归状态）。故 aux 在主 forward 内收集——prefill/verify 每层 forward 后，若该层在
+   target_layer_ids 里，就把 hidden state 写进滚动 aux_cache[ai, pos]。draft 的 context
+   KV 由 aux_cache 投影（combine_hidden_states → precompute_context_kv）。
 
-索引约定（与验证脚本一致）：
-- kv_len = 有效序列长度 L。anchor = tokens[L-1]。
-- Draft/Verify 的 context = KV[0:L-1]（anchor 之前），写入 [anchor, d_0..d_{N-1}] 的
-  KV 到 [L-1, L+N)。接受 accepted 个 draft + bonus 后，kv_len += accepted+1。
-- 未接受的 draft KV 是 stale，由下一步 anchor query 覆盖，context 长度排除 stale 区。
+3. 显存复用 engine 模型：不 load 27GB 新副本，直接用 engine 的 self.model / adapter /
+   prefill_runner / cache_manager。
+
+GDN 状态回滚（投机解码正确性关键）：
+   verify forward（1+N token）会把 GDN 递归/conv 状态推进过全部 1+N 个 token，但只有
+   accepted 个有效。解法：verify 时开 GDN 逐 token 状态检查点（adapter 的 prefill kernel
+   支持，CP_ENABLED constexpr，正常 prefill 零开销），接受后回滚到 checkpoint[accepted]。
+
+KV cache（paged）：
+   一次性 alloc(max_len) 个 slot，block_table 静态。verify 写 [kv_len-1, kv_len-1+1+N)，
+   只 accepted 个有效，stale 区由下一步 verify 覆盖（自愈合）。flash 只读 cu_seqlens_k
+   以内的有效区，不读 stale。
+
+贪心投机解码等价性：draft 提议 N 个 token，target 一次 causal forward 验证，贪心接受
+（draft==target argmax 则接受，首个不匹配处 bonus=target 预测）。单序列下与不开投机
+解码的贪心输出逐 token 一致。
 """
 from typing import List, Optional
 
 import torch
-import torch.nn.functional as F
+
+from models.base import PrefillMeta
+from kernel.gemv_int8 import set_force_gemm
 
 
-# ---------------------------------------------------------------------------
-# RoPE（half-split / rotate_half，与 Qwen3 一致）
-# ---------------------------------------------------------------------------
-def _build_rope_cache(head_dim, max_pos, theta, device, dtype):
-    inv_freq = 1.0 / (theta ** (torch.arange(0, head_dim, 2, device=device, dtype=torch.float32) / head_dim))
-    t = torch.arange(max_pos, device=device, dtype=torch.float32)
-    freqs = torch.einsum("i,j->ij", t, inv_freq)
-    emb = torch.cat((freqs, freqs), dim=-1)
-    cos = emb.cos()[:, :head_dim // 2].to(dtype)
-    sin = emb.sin()[:, :head_dim // 2].to(dtype)
-    return cos, sin
-
-
-def _rope_half_split(x, cos, sin):
-    x1, x2 = x.chunk(2, dim=-1)
-    return torch.cat([x1 * cos - x2 * sin, x2 * cos + x1 * sin], dim=-1)
-
-
-def _rmsnorm_head(x, weight, eps):
-    """per-head RMSNorm：x [T, H, D]，weight [D]。fp32 计算，返回 x.dtype。"""
-    dtype = x.dtype
-    xf = x.float()
-    var = xf.pow(2).mean(-1, keepdim=True)
-    xf = xf * torch.rsqrt(var + eps)
-    return (xf * weight.float()).to(dtype)
-
-
-def _rmsnorm_full(x, weight, eps):
-    """full RMSNorm：x [T, H]，weight [H]。"""
-    dtype = x.dtype
-    xf = x.float()
-    var = xf.pow(2).mean(-1, keepdim=True)
-    xf = xf * torch.rsqrt(var + eps)
-    return (xf * weight.float()).to(dtype)
-
-
-# ---------------------------------------------------------------------------
-# 投机解码控制器
-# ---------------------------------------------------------------------------
 class SpecDecodeController:
-    """DFlash2 投机解码控制器（单序列，dense KV cache）。
+    """DFlash2 投机解码控制器（Qwen3.8 GDN 混合模型，复用 engine 模型）。"""
 
-    复用 engine 的模型权重（target_model）做 verify，草稿模型（DFlash2 或自起草）
-    独立 forward。draft 与 target 可同模型（自起草）或不同（DFlash2 小草稿 + 大目标）。
-    """
+    def __init__(self, engine, draft_model, num_speculative_tokens: int,
+                 mask_token_id: int, max_len: int = 1024):
+        self.engine = engine
+        self.model = engine.model                 # 复用 engine 的 W8A16 模型
+        self.adapter = engine.adapter
+        self.prefill_runner = engine.prefill_runner
+        self.cache_manager = engine.cache_manager
+        self.device = engine.device
+        self.dtype = engine.dtype
 
-    def __init__(self, target_model, draft_model, device, dtype,
-                 num_speculative_tokens: int = 7, mask_token_id: int = 0,
-                 max_len: int = 4096, draft_is_target: bool = False):
-        self.target = target_model
-        self.draft = draft_model
-        self.device = device
-        self.dtype = dtype
         self.N = num_speculative_tokens
         self.mask_token_id = mask_token_id
         self.max_len = max_len
-        self.draft_is_target = draft_is_target
 
-        cfg = target_model.config
-        self.num_layers = cfg.num_hidden_layers
-        self.num_heads = cfg.num_attention_heads
-        self.num_kv_heads = cfg.num_key_value_heads
-        self.head_dim = getattr(cfg, "head_dim", cfg.hidden_size // cfg.num_attention_heads)
-        self.vocab_size = cfg.vocab_size
-        theta = getattr(cfg, "rope_theta", None) or (getattr(cfg, "rope_parameters", None) or {}).get("rope_theta", 1000000.0)
-        self.cos, self.sin = _build_rope_cache(self.head_dim, max_len, theta, device, dtype)
+        # target 模块（经 adapter 访问，权重已 prepare_weights）
+        self.embed = self.adapter.embed(self.model)
+        self.blocks = self.adapter.blocks(self.model)
+        self.final_norm = self.adapter.final_norm(self.model)
+        self.lm_head = self.adapter.lm_head(self.model)
+        self.num_layers = len(self.blocks)
 
-        # target 的 dense KV cache
-        self.k_cache = torch.zeros(self.num_layers, max_len, self.num_kv_heads, self.head_dim,
-                                   dtype=dtype, device=device)
-        self.v_cache = torch.zeros_like(self.k_cache)
+        # target hidden size（aux_cache 维度）
+        tc = getattr(self.model.config, "text_config", self.model.config)
+        self.hidden = tc.hidden_size
 
-        # DFlash2 草稿：target 中间层 hidden states 提取（context 用）
-        # target_layer_ids 来自草稿模型 config（DFlash2 才有）；自起草为空。
-        draft_cfg = getattr(draft_model, "cfg", None)
-        dflash_cfg = getattr(draft_cfg, "dflash_config", None) or {}
-        self.target_layer_ids = list(dflash_cfg.get("target_layer_ids", []))
-        self._aux_layer_set = set(self.target_layer_ids)
-        # DFlash2 路径：草稿是独立 DFlash2DraftModel（有 precompute_context_kv）。
-        # 自起草（draft_is_target）走旧的 target 非因果 forward 路径。
-        self.use_dflash2 = (not draft_is_target) and hasattr(draft_model, "precompute_context_kv")
-        self.hidden_size = cfg.hidden_size
-        if self.use_dflash2:
-            # aux_cache[ai, pos] = target 第 target_layer_ids[ai] 层在位置 pos 的 hidden。
-            # 由 prefill/verify 的 _forward(collect_aux=True) 填充，供草稿建 context KV。
-            self.aux_cache = torch.zeros(
-                len(self.target_layer_ids), max_len, self.hidden_size,
-                dtype=dtype, device=device)
-        else:
-            self.aux_cache = None
-        # 草稿 sliding window（context 上限）；DFlash2=2048。
-        self.draft_sliding_window = int(getattr(draft_cfg, "sliding_window", 0) or 0)
+        # aux 层（target_layer_ids）
+        self.aux_layers = list(draft_model.target_layer_ids)
+        self.num_aux = len(self.aux_layers)
+        self.aux_index = {li: i for i, li in enumerate(self.aux_layers)}
+
+        # draft
+        self.draft = draft_model
+        self.input_embedding_scale = draft_model.input_embedding_scale
+
+        # 滚动 aux cache：[num_aux, max_len, hidden] bf16
+        self.aux_cache = torch.zeros(
+            self.num_aux, max_len, self.hidden, dtype=self.dtype, device=self.device)
+
+        # 静态 buffer（init 预分配，热路径零运行期分配：只 copy_/索引写）。
+        # 每步 verify/draft 的 ids/positions/cu_seqlens/block_table 都从这些 buffer 取。
+        M = 1 + self.N
+        self._query_ids = torch.full((M,), self.mask_token_id,
+                                     dtype=torch.int64, device=self.device)
+        self._verify_ids = torch.empty(M, dtype=torch.int64, device=self.device)
+        self._anchor_t = torch.empty(1, dtype=torch.int64, device=self.device)
+        self._arange = torch.arange(max_len, dtype=torch.int64, device=self.device)
+        self._pos_buf = torch.empty(max_len, dtype=torch.int64, device=self.device)
+        self._cu_q = torch.empty(2, dtype=torch.int32, device=self.device)
+        self._cu_k = torch.empty(2, dtype=torch.int32, device=self.device)
+        self._prompt_buf = torch.empty(max_len, dtype=torch.int64, device=self.device)
+        self._bt = torch.full((1, self.cache_manager.max_seq_blocks), -1,
+                              dtype=torch.int32, device=self.device)
+
+        # GDN 状态检查点 buffer（verify 时逐 token 存，接受后回滚）
+        self._gdn_cp_state = None
+        self._gdn_cp_conv = None
+        self._alloc_gdn_checkpoint()
 
         # 统计
         self.total_accepted = 0
         self.total_steps = 0
         self.total_generated = 0
 
-    def reset(self):
-        self.k_cache.zero_()
-        self.v_cache.zero_()
-        if self.aux_cache is not None:
-            self.aux_cache.zero_()
+    # ------------------------------------------------------------------
+    # GDN 检查点 buffer
+    # ------------------------------------------------------------------
+    def _alloc_gdn_checkpoint(self):
+        """按 verify 最大 token 数 (1+N) 分配 GDN 状态检查点 buffer。
+        recurrent: [M, n_gdn, H, DK, DV] fp32；conv: [M, n_gdn, K-1, conv_dim] bf16。"""
+        n_gdn = self.adapter._n_gdn
+        if n_gdn == 0:
+            return  # 纯全注意力模型，无需 GDN 检查点
+        M = 1 + self.N
+        H, DK, DV = self.adapter._gdn_H, self.adapter._gdn_DK, self.adapter._gdn_DV
+        conv_dim = self.adapter._gdn_conv_dim
+        K = self.adapter._gdn_K
+        self._gdn_cp_state = torch.zeros(
+            M, n_gdn, H, DK, DV, dtype=torch.float32, device=self.device)
+        self._gdn_cp_conv = torch.zeros(
+            M, n_gdn, K - 1, conv_dim, dtype=self.dtype, device=self.device)
+
+    # ------------------------------------------------------------------
+    # GDN slot 管理（直接操作 adapter 的类级共享状态池）
+    # ------------------------------------------------------------------
+    def _gdn_pool(self):
+        return self.adapter._shared[self.adapter._dev_key(self.device)]
+
+    def _gdn_alloc(self):
+        pool = self._gdn_pool()
+        if not pool["free"]:
+            raise RuntimeError("GDN 状态池耗尽")
+        return pool["free"].pop()
+
+    def _gdn_free(self, slot):
+        self._gdn_pool()["free"].append(slot)
+
+    # ------------------------------------------------------------------
+    # target forward（走 adapter 路径，收集 aux，可选 GDN 检查点）
+    # ------------------------------------------------------------------
+    def _target_forward(self, input_ids, positions, slot_mapping,
+                        cu_q, cu_k, block_table, max_sq, max_sk,
+                        gdn_slot, collect_aux_from, gdn_checkpoint):
+        """跑一次 target prefill forward，返回 logits [M, vocab]。
+
+        collect_aux_from: 从哪个绝对位置开始收集 aux（None=不收集），收集 M 个。
+        gdn_checkpoint: 是否开 GDN 逐 token 检查点（verify 用）。
+        """
+        M = input_ids.shape[0]
+        h = self.embed(input_ids)
+
+        # verify（M=1+N≈8）强制 TileLang int8 分块 GEMM：int8 GEMV 对 M>1 把权重读
+        # M 次（27GB×8=216GB），GEMM 权重 HBM 只读一次（shared 内 dequant），快 12-31x。
+        # prefill（M 大）本就走反量化 matmul，不受影响。
+        set_force_gemm(bool(gdn_checkpoint))
+
+        # GDN 检查点开关（graph=prefill_runner 的 buffer）。prefill_runner 与 engine
+        # 正常 prefill 路径【共享】，故必须在 finally 里复位 _gdn_cp_enabled=False，
+        # 否则后续非 spec prefill（M 大）会往 8-token 检查点 buffer 写 M 个 → 越界。
+        self.prefill_runner._gdn_cp_enabled = bool(gdn_checkpoint)
+        if gdn_checkpoint:
+            self.prefill_runner._gdn_cp_state = self._gdn_cp_state
+            self.prefill_runner._gdn_cp_conv = self._gdn_cp_conv
+        self.prefill_runner._gdn_prefill_seq_idx[0] = gdn_slot
+
+        try:
+            meta = PrefillMeta(
+                cu_seqlens_q=cu_q, cu_seqlens_k=cu_k,
+                position_ids=positions, slot_mapping=slot_mapping,
+                block_table=block_table, n_seqs=1,
+                max_seqlen_q=max_sq, max_seqlen_k=max_sk)
+
+            for layer_idx in range(self.num_layers):
+                block = self.blocks[layer_idx]
+                h = self.adapter.prefill(block, h, layer_idx, self.prefill_runner,
+                                         self.cache_manager, meta)
+                if collect_aux_from is not None and layer_idx in self.aux_index:
+                    ai = self.aux_index[layer_idx]
+                    start = collect_aux_from
+                    end = start + M
+                    if end <= self.max_len:
+                        self.aux_cache[ai, start:end].copy_(h)
+
+            h = self.final_norm(h)
+            out = self.lm_head(h)
+        finally:
+            # 复位共享状态：force_gemm + GDN 检查点开关（engine 正常 prefill/decode 依赖）
+            set_force_gemm(False)
+            self.prefill_runner._gdn_cp_enabled = False
+        return out
+
+    # ------------------------------------------------------------------
+    # GDN 状态回滚
+    # ------------------------------------------------------------------
+    def _gdn_rollback(self, gdn_slot, accepted):
+        """把 GDN 递归/conv 状态回滚到 checkpoint[accepted]。
+        checkpoint[t] = 处理完 verify_ids[t]（0-indexed）后的状态。
+        保留 anchor + accepted 个 draft = 前 1+accepted 个 token 的状态 = checkpoint[accepted]。"""
+        if self._gdn_cp_state is None:
+            return
+        pool = self._gdn_pool()
+        pool["state"][gdn_slot].copy_(self._gdn_cp_state[accepted])
+        pool["conv"][gdn_slot].copy_(self._gdn_cp_conv[accepted])
+
+    # ------------------------------------------------------------------
+    # draft 提议
+    # ------------------------------------------------------------------
+    def _draft_propose(self, anchor, kv_len):
+        """draft 模型提议 N 个 token。
+
+        anchor: 最后已提交 token（位置 kv_len-1）。context = tokens[0:kv_len-1]。
+        返回 [N] int64 提议 token。
+        """
+        ctx_len = kv_len - 1
+        if ctx_len > 0:
+            # aux: [num_aux, ctx_len, hidden] → [ctx_len, num_aux*hidden]
+            aux = self.aux_cache[:, :ctx_len].permute(1, 0, 2).reshape(ctx_len, -1)
+            combined = self.draft.combine_hidden_states(aux)  # [ctx_len, hidden]
+            ctx_pos = self._arange[:ctx_len]
+            context_kv = self.draft.precompute_context_kv(combined, ctx_pos)
+        else:
+            context_kv = None
+
+        # query = [anchor] + [mask]*N，位置 [kv_len-1, kv_len+N)（静态 buffer 索引写）
+        self._query_ids[0] = anchor
+        query_embeds = self.embed(self._query_ids) * self.input_embedding_scale
+        query_pos = self._pos_buf[kv_len - 1: kv_len - 1 + 1 + self.N]
+        out = self.draft.forward(self._query_ids, query_pos,
+                                 input_embeds=query_embeds, context_kv=context_kv)
+        # out: [1+N, hidden]，取 [1:]（N 个 mask 位置）
+        if self.draft.candidate_selector is not None:
+            # DFlash2 完整选 token：selector 边打分 + 贪心 walk
+            self._anchor_t[0] = anchor
+            draft = self.draft.select_draft_tokens(
+                out[1:].unsqueeze(0), self._anchor_t)
+            return draft[0]  # [N]
+        # 回退：直接 argmax
+        logits = self.lm_head(out[1:])
+        return logits.argmax(dim=-1)  # [N]
+
+    # ------------------------------------------------------------------
+    # 预热：编译 TileLang int8 GEMM kernel（verify M=1+N 的各层 shape）
+    # ------------------------------------------------------------------
+    @torch.inference_mode()
+    def warmup(self):
+        """跑一次 dummy verify forward（M=1+N，gdn_checkpoint=True），触发所有层
+        的 TileLang int8 GEMM 编译（每 (M,N,K,dtype) 一次，~3s/shape）。放 init 时
+        做，避免首个真实 verify 卡在编译（否则 e2e 吞吐被一次性编译拉低）。"""
+        device = self.device
+        M = 1 + self.N
+        gdn_slot = self._gdn_alloc()
+        self.prefill_runner._gdn_state_pool[gdn_slot] = 0
+        self.prefill_runner._gdn_conv_state_pool[gdn_slot] = 0
+        # 临时 KV slot（dummy，只为让 _target_forward 跑通编译）
+        seq_id = 999_999
+        ok, slot_mapping, _ = self.cache_manager.alloc(seq_id, M, None)
+        if ok:
+            blocks = self.cache_manager._blocks[seq_id]
+            bt = torch.full((1, self.cache_manager.max_seq_blocks), -1,
+                            dtype=torch.int32, device=device)
+            bt[0, :len(blocks)] = torch.tensor(blocks, dtype=torch.int32, device=device)
+            input_ids = torch.zeros(M, dtype=torch.int64, device=device)
+            positions = torch.arange(M, device=device, dtype=torch.int64)
+            cu_q = torch.tensor([0, M], device=device, dtype=torch.int32)
+            cu_k = torch.tensor([0, M], device=device, dtype=torch.int32)
+            try:
+                self._target_forward(input_ids, positions, slot_mapping, cu_q, cu_k,
+                                     bt, M, M, gdn_slot,
+                                     collect_aux_from=0, gdn_checkpoint=True)
+            finally:
+                self.cache_manager.free(seq_id)
+        self._gdn_free(gdn_slot)
+        torch.cuda.synchronize()
+
+    # ------------------------------------------------------------------
+    # 主入口
+    # ------------------------------------------------------------------
+    @torch.inference_mode()
+    def generate(self, prompt_ids: List[int], max_tokens: int,
+                 eos_token_id: Optional[int] = None) -> List[int]:
+        """投机解码生成。返回新生成的 token 列表。"""
+        device = self.device
+        P = len(prompt_ids)
+        # 先把真实 prompt token 载入静态 buffer（_prompt_buf 是 empty 未初始化，
+        # 必须先 copy 真实值再取切片，否则 embed_tokens 读到垃圾 index → gather OOB）。
+        self._prompt_buf[:P].copy_(torch.tensor(prompt_ids, dtype=torch.int64, device=device))
+        prompt_ids = self._prompt_buf[:P]
+        if P >= self.max_len:
+            raise RuntimeError(f"prompt 过长 ({P} >= {self.max_len})")
+        # 留 N 个 slot 给 verify 的 draft token（verify 写 [kv_len-1, kv_len-1+1+N)）
+        max_tokens = max(1, min(max_tokens, self.max_len - P - self.N))
+
+        # 重置统计
         self.total_accepted = 0
         self.total_steps = 0
         self.total_generated = 0
+        self.aux_cache.zero_()
 
-    # ---------------- 单层 forward（兼容 prepared / HF 权重布局） ----------------
-    def _layer_forward(self, model, li, h, cos, sin, ctx_len, T, causal, write_kv=True):
-        """单层：input_layernorm → attention → o_proj → residual → post_ln → mlp → residual。
+        # ---- 分配 KV cache（一次性 max_len 个 slot）----
+        seq_id = 1_000_000
+        ok, slot_mapping, _ = self.cache_manager.alloc(seq_id, self.max_len, None)
+        if not ok:
+            raise RuntimeError("spec decode: KV cache alloc failed")
+        # 静态 block_table（专用 buffer，避免与 engine 共享 buffer 冲突）
+        blocks = self.cache_manager._blocks[seq_id]
+        bt = torch.full((1, self.cache_manager.max_seq_blocks), -1,
+                        dtype=torch.int32, device=device)
+        bt[0, :len(blocks)] = torch.tensor(blocks, dtype=torch.int32, device=device)
 
-        causal=True（verify）：KV 写 self.k_cache[ctx_len:ctx_len+T]（write_kv=True 时），
-        attention 读 [0:ctx_len+T]。
-        causal=False（draft）：attention 读 [target KV[0:ctx_len] + 本步 query KV]
-        （非因果，mask 互相可见），不写持久 KV。
-        write_kv=False：不写 KV cache（用于提取 target aux hidden states，context KV 已在 cache）。
-        返回新 h [T, hidden]。
-        """
-        layer = model.model.layers[li]
-        attn = layer.self_attn
-        mlp = layer.mlp
-        prepared = hasattr(attn, "_qkv_w")
+        # ---- 分配 GDN slot + 清零状态（新序列从空状态开始）----
+        gdn_slot = self._gdn_alloc()
+        self.prefill_runner._gdn_state_pool[gdn_slot] = 0
+        self.prefill_runner._gdn_conv_state_pool[gdn_slot] = 0
 
-        # input_layernorm
-        if prepared:
-            h_normed = _rmsnorm_full(h, layer._in_ln_w, layer._in_ln_eps)
-        else:
-            h_normed = layer.input_layernorm(h)
+        try:
+            # ---- prefill prompt（收集 aux[0:P]）----
+            positions = torch.arange(P, device=device, dtype=torch.int64)
+            cu_q = torch.tensor([0, P], device=device, dtype=torch.int32)
+            cu_k = torch.tensor([0, P], device=device, dtype=torch.int32)
+            logits = self._target_forward(
+                prompt_ids, positions, slot_mapping[:P], cu_q, cu_k, bt,
+                P, P, gdn_slot, collect_aux_from=0, gdn_checkpoint=False)
+            anchor = int(logits[-1].argmax())
+            generated = [anchor]
+            kv_len = P + 1
+            self.total_generated = 1
 
-        # QKV 投影
-        if prepared:
-            qkv = h_normed @ attn._qkv_w.t()  # [T, qkv_dim]
-            q_dim = self.num_heads * self.head_dim
-            kv_dim = self.num_kv_heads * self.head_dim
-            q = qkv[:, :q_dim].view(T, self.num_heads, self.head_dim)
-            k = qkv[:, q_dim:q_dim + kv_dim].view(T, self.num_kv_heads, self.head_dim)
-            v = qkv[:, q_dim + kv_dim:].view(T, self.num_kv_heads, self.head_dim)
-            q = _rmsnorm_head(q, attn._q_norm_w, attn._q_norm_eps)
-            k = _rmsnorm_head(k, attn._k_norm_w, attn._k_norm_eps)
-        else:
-            q = attn.q_proj(h_normed).view(T, self.num_heads, self.head_dim)
-            k = attn.k_proj(h_normed).view(T, self.num_kv_heads, self.head_dim)
-            v = attn.v_proj(h_normed).view(T, self.num_kv_heads, self.head_dim)
-            q = attn.q_norm(q)
-            k = attn.k_norm(k)
+            # ---- 投机解码主循环 ----
+            while len(generated) < max_tokens:
+                if eos_token_id is not None and anchor == eos_token_id:
+                    break
+                if kv_len + self.N > self.max_len:
+                    break
 
-        # RoPE
-        q = _rope_half_split(q, cos, sin)
-        k = _rope_half_split(k, cos, sin)
+                # 1. draft 提议
+                draft_tokens = self._draft_propose(anchor, kv_len)  # [N]
+                # 2. verify（1+N token，开 GDN 检查点，收集 aux[kv_len-1:...]）
+                verify_ids = torch.cat([torch.tensor([anchor], device=device),
+                                        draft_tokens])
+                M = 1 + self.N
+                vpos = torch.arange(kv_len - 1, kv_len - 1 + M,
+                                    device=device, dtype=torch.int64)
+                vslot = slot_mapping[kv_len - 1: kv_len - 1 + M]
+                vcu_q = torch.tensor([0, M], device=device, dtype=torch.int32)
+                vcu_k = torch.tensor([0, kv_len - 1 + M], device=device, dtype=torch.int32)
+                vlogits = self._target_forward(
+                    verify_ids, vpos, vslot, vcu_q, vcu_k, bt,
+                    M, kv_len - 1 + M, gdn_slot,
+                    collect_aux_from=kv_len - 1, gdn_checkpoint=True)
+                self.total_steps += 1
 
-        # attention
-        if causal:
-            if write_kv:
-                self.k_cache[li, ctx_len:ctx_len + T] = k
-                self.v_cache[li, ctx_len:ctx_len + T] = v
-            attn_out = self._attention(li, q, ctx_len, T, causal=True)
-        else:
-            attn_out = self._draft_attention(li, q, ctx_len, T, k, v)
+                # 3. 贪心接受
+                target_preds = vlogits.argmax(dim=-1)  # [M]
+                accepted = 0
+                for i in range(self.N):
+                    if int(draft_tokens[i]) == int(target_preds[i]):
+                        accepted += 1
+                    else:
+                        break
+                bonus = int(target_preds[accepted])
 
-        # o_proj
-        if prepared:
-            attn_out = attn_out.reshape(T, -1) @ attn._o_w.t()
-        else:
-            attn_out = attn.o_proj(attn_out.reshape(T, -1))
+                # 4. GDN 状态回滚到 checkpoint[accepted]
+                self._gdn_rollback(gdn_slot, accepted)
 
-        h = attn_out + h
-        residual = h
+                # 5. 提交 accepted 个 draft + 1 个 bonus
+                new_tokens = [int(t) for t in draft_tokens[:accepted].tolist()] + [bonus]
+                generated.extend(new_tokens)
+                self.total_accepted += accepted
+                self.total_generated += len(new_tokens)
+                kv_len += len(new_tokens)
+                anchor = bonus
 
-        # post_attention_layernorm
-        if prepared:
-            h_normed = _rmsnorm_full(h, layer._post_ln_w, layer._post_ln_eps)
-        else:
-            h_normed = layer.post_attention_layernorm(h)
+                if eos_token_id is not None and anchor == eos_token_id:
+                    break
 
-        # mlp (SwiGLU)
-        if prepared:
-            gu = h_normed @ mlp._gu.t()  # [T, 2*inter]，前半 up、后半 gate
-            inter = gu.shape[1] // 2
-            up = gu[:, :inter]
-            gate = gu[:, inter:]
-            h = (F.silu(gate) * up) @ mlp._d.t()
-        else:
-            h = mlp.down_proj(F.silu(mlp.gate_proj(h_normed)) * mlp.up_proj(h_normed))
-
-        return h + residual
-
-    def _attention(self, li, q, ctx_len, T, causal):
-        end = ctx_len + T
-        k = self.k_cache[li, :end]
-        v = self.v_cache[li, :end]
-        n_rep = self.num_heads // self.num_kv_heads
-        k = k.repeat_interleave(n_rep, dim=1)
-        v = v.repeat_interleave(n_rep, dim=1)
-        scores = torch.einsum("thd,ehd->hte", q, k) * (self.head_dim ** -0.5)
-        if causal:
-            q_pos = ctx_len + torch.arange(T, device=q.device)
-            kv_pos = torch.arange(end, device=q.device)
-            mask = kv_pos[None, :] <= q_pos[:, None]
-            scores = scores.masked_fill(~mask[None], float("-inf"))
-        attn = scores.softmax(-1)
-        return torch.einsum("hte,ehd->thd", attn, v)
-
-    def _draft_attention(self, li, q, ctx_len, T, k_q, v_q):
-        """非因果：query 看全部 context（target KV[0:ctx_len]）+ 全部 1+N query。"""
-        k_ctx = self.k_cache[li, :ctx_len]
-        v_ctx = self.v_cache[li, :ctx_len]
-        k = torch.cat([k_ctx, k_q], dim=0)
-        v = torch.cat([v_ctx, v_q], dim=0)
-        n_rep = self.num_heads // self.num_kv_heads
-        k = k.repeat_interleave(n_rep, dim=1)
-        v = v.repeat_interleave(n_rep, dim=1)
-        scores = torch.einsum("thd,ehd->hte", q, k) * (self.head_dim ** -0.5)
-        attn = scores.softmax(-1)
-        return torch.einsum("hte,ehd->thd", attn, v)
-
-    # ---------------- 模型 forward ----------------
-    def _forward(self, model, input_ids, positions, ctx_len, causal,
-                 write_kv=True, collect_aux=False):
-        """完整 forward。返回 logits [T, vocab]（collect_aux=True 时返回 (logits, aux)）。
-
-        causal=True（verify）：写 target KV cache（write_kv=True 时）。
-        causal=False（draft）：不写持久 KV（mask KV 仅本步用）。
-        collect_aux=True：额外收集 target_layer_ids 各层的 hidden states（DFlash2 草稿
-        context 用），返回 (logits, aux [T, num_aux*hidden])。
-        """
-        T = input_ids.shape[0]
-        h = model.model.embed_tokens(input_ids)
-        cos = self.cos[positions].unsqueeze(1)
-        sin = self.sin[positions].unsqueeze(1)
-        aux_parts = [] if collect_aux else None
-        for li in range(self.num_layers):
-            h = self._layer_forward(model, li, h, cos, sin, ctx_len, T, causal,
-                                    write_kv=write_kv)
-            if collect_aux and li in self._aux_layer_set:
-                aux_parts.append(h)
-        h = model.model.norm(h)
-        logits = model.lm_head(h)
-        if collect_aux:
-            return logits, torch.cat(aux_parts, dim=-1)
-        return logits
-
-    def _extract_aux(self, input_ids, positions, ctx_len):
-        """提取 target 中间层 hidden states（DFlash2 草稿 context 用）。
-
-        返回 aux [T, num_aux*hidden]（target_layer_ids 各层 hidden 拼接）。
-        不写 KV cache（context KV 已在 self.k_cache，由 prefill/verify 写入）。
-        """
-        _, aux = self._forward(self.target, input_ids, positions, ctx_len,
-                               causal=True, write_kv=False, collect_aux=True)
-        return aux
-
-    # ---------------- 主接口 ----------------
-    def prefill(self, prompt_ids: List[int]):
-        """prefill prompt，返回首 token（target 预测）。"""
-        self.reset()
-        positions = torch.arange(len(prompt_ids), device=self.device).long()
-        logits = self._forward(self.target, torch.tensor(prompt_ids, device=self.device),
-                               positions, 0, causal=True)
-        return int(logits[-1].argmax())
-
-    def _draft_tokens(self, tokens: List[int], kv_len: int, anchor: int, n_draft: int) -> List[int]:
-        """起草 n_draft 个 token。返回 d_list（长度 n_draft）。
-
-        - 自起草（draft_is_target）：target 模型非因果 forward（context = target KV[0:kv_len-1]）。
-        - DFlash2（独立草稿）：交叉注意力——context KV 由 target aux hidden states 投影，
-          query = target embed_tokens([anchor]+[mask]*n_draft)，draft hidden 经 target lm_head。
-        """
-        if self.draft_is_target:
-            input_ids = torch.tensor([anchor] + [self.mask_token_id] * n_draft,
-                                     dtype=torch.long, device=self.device)
-            positions = torch.arange(kv_len - 1, kv_len - 1 + 1 + n_draft, device=self.device).long()
-            dlogits = self._forward(self.target, input_ids, positions, kv_len - 1, causal=False)
-            return [int(x) for x in dlogits[1:].argmax(dim=-1).tolist()]
-
-        # ---- DFlash2 交叉注意力草稿 ----
-        # context = tokens[0:kv_len-1]（anchor 之前）。target aux hidden states（不写 KV，
-        # context KV 已在 cache）→ combine_hidden_states（fc+hidden_norm）→ 各层 context KV。
-        ctx_len = kv_len - 1
-        context_ids = torch.tensor(tokens[:ctx_len], dtype=torch.long, device=self.device)
-        context_pos = torch.arange(ctx_len, device=self.device).long()
-        aux = self._extract_aux(context_ids, context_pos, 0)  # [ctx_len, num_aux*hidden]
-        context_states = self.draft.combine_hidden_states(aux)  # [ctx_len, hidden]
-        context_kv = self.draft.precompute_context_kv(context_states, context_pos)
-
-        # query = target embed_tokens([anchor]+[mask]*n_draft) * input_embedding_scale
-        query_ids = torch.tensor([anchor] + [self.mask_token_id] * n_draft,
-                                 dtype=torch.long, device=self.device)
-        query_embeds = self.target.model.embed_tokens(query_ids) * self.draft.input_embedding_scale
-        query_pos = torch.arange(kv_len - 1, kv_len - 1 + 1 + n_draft, device=self.device).long()
-        draft_hidden = self.draft(query_ids, query_pos, input_embeds=query_embeds,
-                                  context_kv=context_kv)  # [1+n_draft, hidden]
-        # DFlash2 无自有 lm_head，用 target 的
-        dlogits = self.target.lm_head(draft_hidden)
-        return [int(x) for x in dlogits[1:].argmax(dim=-1).tolist()]
-
-    def step(self, tokens: List[int], kv_len: int, anchor: int, n_draft: int):
-        """一步投机解码。返回 (new_tokens, accepted)。
-
-        tokens: 当前有效 token 序列（长度 >= kv_len）。kv_len: 有效序列长度 L。
-        anchor: tokens[L-1]。n_draft: 本步起草 token 数（<= N）。
-        """
-        # 1. Draft
-        d_list = self._draft_tokens(tokens, kv_len, anchor, n_draft)
-
-        # 2. Verify（因果，写 target KV cache）
-        verify_ids = [anchor] + d_list
-        verify_t = torch.tensor(verify_ids, device=self.device)
-        verify_pos = torch.arange(kv_len - 1, kv_len - 1 + len(verify_ids), device=self.device).long()
-        vlogits = self._forward(self.target, verify_t, verify_pos, kv_len - 1, causal=True)
-        target_preds = [int(vlogits[i].argmax()) for i in range(len(verify_ids))]
-
-        # 3. Accept（greedy 确定性）
-        accepted = 0
-        for i in range(n_draft):
-            if d_list[i] == target_preds[i]:
-                accepted += 1
-            else:
-                break
-        bonus = target_preds[accepted]
-        new_tokens = d_list[:accepted] + [bonus]
-
-        self.total_accepted += accepted
-        self.total_steps += 1
-        self.total_generated += len(new_tokens)
-        return new_tokens, accepted
+            return generated[:max_tokens]
+        finally:
+            self.cache_manager.free(seq_id)
+            self._gdn_free(gdn_slot)
 
     @property
     def avg_acceptance(self) -> float:
         return self.total_accepted / self.total_steps if self.total_steps else 0.0
-
-    def generate(self, prompt_ids: List[int], max_new_tokens: int,
-                 eos_token_id: Optional[int] = None) -> List[int]:
-        """完整生成。返回新生成的 token 列表。"""
-        tokens = list(prompt_ids)
-        kv_len = len(prompt_ids)
-        anchor = self.prefill(prompt_ids)
-        tokens.append(anchor)
-        kv_len += 1
-        generated = 1
-        while generated < max_new_tokens:
-            if eos_token_id is not None and anchor == eos_token_id:
-                break
-            n_draft = min(self.N, max_new_tokens - generated)
-            new_tokens, _ = self.step(tokens, kv_len, anchor, n_draft)
-            tokens.extend(new_tokens)
-            kv_len += len(new_tokens)
-            generated += len(new_tokens)
-            anchor = new_tokens[-1]
-        return tokens[len(prompt_ids):]
