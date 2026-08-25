@@ -26,43 +26,136 @@ from typing import List, Optional
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import triton
+import triton.language as tl
 
-from kernel.dflash_ops import (
-    build_rope_cache, rope_half_split, grouped_conv, score_edges,
-)
+# 复用仓库现成 Triton kernel（pointwise/递归类小算子允许 Triton，GEMM 走 cuBLAS/int8）：
+# - rmsnorm / rmsnorm_residual_fused：非 1-centered RMSNorm（Qwen3 风格 out=x*rrms*w），
+#   替代 PyTorch 的 float/pow/mean/rsqrt/mul/cast 碎片 op（每层 4 个 norm × 5 层）。
+# - apply_rope_decode：in-place half-split RoPE（[T, heads, dim] + cos/sin 表 + positions），
+#   替代 PyTorch 的 chunk/cat/mul 碎片 op。
 from kernel.rmsnorm import rmsnorm as _triton_rmsnorm
-from kernel.draft_gemm import draft_gemm
+from kernel.rmsnorm import rmsnorm_residual_fused as _triton_rmsnorm_res
+from kernel.rotary import apply_rope_decode
 
-# GEMM M 上界（TileLang T.gemm 要求 M%16==0，pad 到 BLOCK_M 的倍数）：
-# - query 路径：1+N=8 个 token（anchor + N mask），上界 16。
-# - context 路径：变长 C（target 中间层 hidden 投影），上界 4096（sliding_window=2048）。
-_QUERY_MAX_M = 16
-_CTX_MAX_M = 4096
+
+# ---- DFlash2 grouped conv 融合 kernel（taps=2 特化）----
+# 原 PyTorch 版每次调用 ~8 个小 kernel（unflatten/view/add/mul/pad/where/flatten ×2 tap），
+# 每 draft forward 20 次（5 层 × 2 conv × prepare/finish）= ~160 次 launch。融合成单
+# kernel：out[t,g,j] = (base[0,g,j]+delta[t,0,g])*x[t,g,j]
+#              + (base[1,g,j]+delta[t,1,g]) * (x[t-1,g,j] if t>=1 else 0)。
+# 数值与原式逐项一致（同顺序 fp32 累加、同 bf16 存储）。
+@triton.jit
+def _grouped_conv_fused_kernel(HS, DELTA, BASE, OUT,
+                               G, GS, T, D_T_STRIDE, BLOCK_G: tl.constexpr, BLOCK_J: tl.constexpr):
+    t = tl.program_id(0)
+    g = tl.program_id(1) * BLOCK_G + tl.arange(0, BLOCK_G)
+    j = tl.arange(0, BLOCK_J)
+    gmask = g < G
+    # x[t, g, j]：HS 行宽 = G*GS
+    x = tl.load(HS + t.to(tl.int64) * (G * GS) + g[:, None] * GS + j[None, :],
+                mask=gmask[:, None], other=0.0).to(tl.float32)
+    # x[t-1, g, j]（t==0 时 0，对齐 F.pad 的 leading 0）
+    prev = tl.load(HS + (t - 1).to(tl.int64) * (G * GS) + g[:, None] * GS + j[None, :],
+                   mask=gmask[:, None] & (t >= 1), other=0.0).to(tl.float32)
+    # delta [T, 2, G]（T-stride = D_T_STRIDE，非 2*G：delta 是 [T,2,taps,G] 的切片）：
+    # tap0 = delta[t,0,g]，tap1 = delta[t,1,g]
+    d0 = tl.load(DELTA + t.to(tl.int64) * D_T_STRIDE + 0 * G + g, mask=gmask, other=0.0).to(tl.float32)
+    d1 = tl.load(DELTA + t.to(tl.int64) * D_T_STRIDE + 1 * G + g, mask=gmask, other=0.0).to(tl.float32)
+    # base [2, G, GS]
+    b0 = tl.load(BASE + g[:, None] * GS + j[None, :], mask=gmask[:, None], other=0.0).to(tl.float32)
+    b1 = tl.load(BASE + (G * GS) + g[:, None] * GS + j[None, :], mask=gmask[:, None], other=0.0).to(tl.float32)
+    c0 = b0 + d0[:, None]
+    c1 = b1 + d1[:, None]
+    out = c0 * x + c1 * prev
+    tl.store(OUT + t.to(tl.int64) * (G * GS) + g[:, None] * GS + j[None, :],
+             out.to(OUT.dtype.element_ty), mask=gmask[:, None])
+
+
+def _grouped_conv_fused(hidden_states, delta, base, num_groups, group_size):
+    """taps=2 融合版 _grouped_conv（单 Triton kernel）。
+    hidden_states [T, G*GS]，delta [T, 2, G]（T-stride 可能非 2*G，取 delta.stride(0)），
+    base [2, G*GS] → out [T, G*GS]。"""
+    T = hidden_states.shape[0]
+    out = torch.empty_like(hidden_states)
+    BLOCK_G = 32
+    BLOCK_J = max(16, group_size)
+    _grouped_conv_fused_kernel[(T, triton.cdiv(num_groups, BLOCK_G))](
+        hidden_states, delta, base, out,
+        num_groups, group_size, T, delta.stride(0), BLOCK_G=BLOCK_G, BLOCK_J=BLOCK_J)
+    return out
+
+
+# ---------------------------------------------------------------------------
+# RoPE（half-split / Llama 风格 rotate_half，与 Qwen3 一致）
+# ---------------------------------------------------------------------------
+def _rope_half_split(x, cos, sin):
+    """x [..., d]，cos/sin [..., d//2]。返回旋转后的 x。"""
+    x1, x2 = x.chunk(2, dim=-1)
+    return torch.cat([x1 * cos - x2 * sin, x2 * cos + x1 * sin], dim=-1)
+
+
+def _build_rope_cache(head_dim, max_pos, theta, device, dtype):
+    """预计算 cos/sin 表 [max_pos, head_dim//2]。"""
+    inv_freq = 1.0 / (theta ** (torch.arange(0, head_dim, 2, device=device).float() / head_dim))
+    pos = torch.arange(max_pos, device=device).float()
+    freqs = torch.outer(pos, inv_freq)
+    emb = torch.cat([freqs, freqs], dim=-1)  # [max_pos, head_dim]
+    cos = emb.cos()[:, : head_dim // 2].to(dtype)  # [max_pos, head_dim//2]
+    sin = emb.sin()[:, : head_dim // 2].to(dtype)
+    return cos, sin
 
 
 # ---------------------------------------------------------------------------
 # RMSNorm（支持 fused residual 形式：forward(x, residual) -> (normed, new_residual)）
 # ---------------------------------------------------------------------------
 class RMSNorm(nn.Module):
-    """复用 kernel/rmsnorm.py 的 Triton rmsnorm（fp32 累加，与原 torch 实现数值一致）。"""
-
     def __init__(self, hidden_size, eps=1e-6, dtype=torch.bfloat16):
         super().__init__()
         self.weight = nn.Parameter(torch.ones(hidden_size, dtype=dtype))
         self.eps = eps
 
+    def _norm(self, x):
+        # 走 Triton rmsnorm（非 1-centered，out=x*rrms*w），替代 PyTorch 碎片 op。
+        return _triton_rmsnorm(x, self.weight, self.eps)
+
     def forward(self, x, residual=None):
         if residual is None:
-            return _triton_rmsnorm(x, self.weight, self.eps)
-        # fused：new_residual = x + residual；normed = norm(new_residual) * weight
-        new_residual = x + residual
-        return _triton_rmsnorm(new_residual, self.weight, self.eps), new_residual
+            return self._norm(x)
+        # fused：new_residual = x + residual；normed = norm(new_residual) * weight。
+        # Triton rmsnorm_residual_fused 一次 kernel 算 (normed, x+residual)。
+        return _triton_rmsnorm_res(x, residual, self.weight, self.eps)
 
 
 # ---------------------------------------------------------------------------
 # DFlashGroupedConv（DFlash2 特有：可学习分组卷积，系数由 hidden 投影得到）
-# 核心卷积复用 kernel/dflash_ops.grouped_conv。
 # ---------------------------------------------------------------------------
+def _grouped_conv(hidden_states, delta, base, block_size, num_groups, group_size, taps,
+                  position=None):
+    """对齐 vLLM _grouped_conv。
+
+    hidden_states: [T, hidden]
+    delta: [T, taps, num_groups]（本侧系数增量）
+    base: [taps, hidden]（基础卷积核）
+    position: 可选预计算的 [T] 位置（= arange(T) mod block_size）。草稿路径 T 恒为
+      block_size（1+N，2 的幂），故 position 是常量，由 DFlashGroupedConv 预计算传入，
+      避免每次调用现建 torch.arange 临时张量。
+    """
+    blocks = hidden_states.unflatten(-1, (num_groups, group_size))  # [T, G, gs]
+    coefficients = base.view(1, taps, num_groups, group_size) + delta.unsqueeze(-1)  # [T,taps,G,gs]
+    output = coefficients[:, 0] * blocks  # [T, G, gs]
+    if position is None:
+        position = torch.arange(hidden_states.shape[0], device=hidden_states.device)
+        if block_size & (block_size - 1) == 0:
+            position = position & (block_size - 1)
+        else:
+            position = position % block_size
+    for tap in range(1, taps):
+        shifted = F.pad(blocks[:-tap], (0, 0, 0, 0, tap, 0))
+        output = output + coefficients[:, tap] * shifted * (position >= tap).view(-1, 1, 1)
+    return output.flatten(-2)
+
+
 class DFlashGroupedConv(nn.Module):
     def __init__(self, hidden_size, taps, group_size, block_size, params_dtype):
         super().__init__()
@@ -77,18 +170,36 @@ class DFlashGroupedConv(nn.Module):
         )
         self.kernel_projection = nn.Linear(hidden_size, 2 * taps * self.num_groups, bias=False)
         self.kernel_projection.weight.data = self.kernel_projection.weight.data.to(params_dtype)
+        # 预计算 position（= arange(block_size) mod block_size）。草稿路径 T 恒为
+        # block_size（1+N，2 的幂），故 position 是常量；register_buffer 随 .to(device)
+        # 迁移，避免每次 _convolve 现建 torch.arange 临时张量（每 draft forward 20 次）。
+        pos = torch.arange(block_size)
+        if block_size & (block_size - 1) == 0:
+            pos = pos & (block_size - 1)
+        else:
+            pos = pos % block_size
+        self.register_buffer("_conv_pos", pos, persistent=False)
 
     def _convolve(self, hidden_states, delta, side):
-        return grouped_conv(
+        T = hidden_states.shape[0]
+        # taps==2 且 T==block_size（DFlash2 草稿路径，position=arange 不 wrap）→ 单
+        # Triton kernel 融合（省 ~8 小 kernel/次 × 20 次/forward）。否则回退 PyTorch 版
+        # （taps>2 或 T!=block_size 时 position>=tap 的 wrap 语义需原式）。
+        if self.taps == 2 and T == self.block_size:
+            return _grouped_conv_fused(
+                hidden_states, delta, self.base_kernel[side],
+                self.num_groups, self.group_size)
+        position = self._conv_pos if T == self.block_size else None
+        return _grouped_conv(
             hidden_states, delta, self.base_kernel[side],
             self.block_size, self.num_groups, self.group_size, self.taps,
+            position=position,
         )
 
     def prepare(self, hidden_states):
-        # kernel_projection [T, hidden] @ [2*taps*G, hidden].T → TileLang GEMM
-        coefficients = draft_gemm(
-            hidden_states, self.kernel_projection.weight, _QUERY_MAX_M
-        ).reshape(hidden_states.shape[0], 2, self.taps, self.num_groups)
+        coefficients = self.kernel_projection(hidden_states).reshape(
+            hidden_states.shape[0], 2, self.taps, self.num_groups
+        )
         return self._convolve(hidden_states, coefficients[:, 0], 0), coefficients[:, 1]
 
     def finish(self, hidden_states, coefficients):
@@ -112,18 +223,24 @@ class CandidateSelector(nn.Module):
         self.hidden_projection.weight.data = self.hidden_projection.weight.data.to(params_dtype)
 
     def forward(self, candidate_ids, unary_logits, hidden_states, anchor_token_ids):
-        # hidden_projection [T, hidden] @ [rank, hidden].T → TileLang GEMM。
-        # hidden_states 可能是 3D [num_reqs, N, hidden]（select_draft_tokens 传入），
-        # 展平成 2D 过 GEMM 再还原（原 nn.Linear 对 3D 按最后一维做特征，等价）。
-        orig_shape = hidden_states.shape
-        hidden = draft_gemm(
-            hidden_states.reshape(-1, orig_shape[-1]),
-            self.hidden_projection.weight, _QUERY_MAX_M,
-        ).reshape(*orig_shape[:-1], -1)
-        return score_edges(
+        hidden = self.hidden_projection(hidden_states)
+        return _score_edges(
             self.predecessor_codebook, self.successor_codebook,
             candidate_ids, unary_logits, hidden, anchor_token_ids, self.top_k,
         )
+
+
+def _score_edges(predecessor_table, successor_table, candidate_ids,
+                 unary_logits, hidden, anchor_token_ids, top_k):
+    successors = successor_table[candidate_ids]
+    predecessor_ids = torch.cat(
+        (anchor_token_ids[:, None, None].expand(-1, 1, top_k), candidate_ids[:, :-1]),
+        dim=1,
+    )
+    predecessors = predecessor_table[predecessor_ids]
+    return unary_logits[:, :, None] + torch.einsum(
+        "blpr,blcr->blpc", predecessors * hidden[:, :, None], successors
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -152,29 +269,25 @@ class DFlashAttention(nn.Module):
         self.k_norm = RMSNorm(head_dim, eps=rms_norm_eps, dtype=dtype)
 
         self.rope_theta = rope_theta
-        self._cos, self._sin = build_rope_cache(head_dim, max_pos, rope_theta, device, dtype)
+        self._cos, self._sin = _build_rope_cache(head_dim, max_pos, rope_theta, device, dtype)
 
     def forward(self, positions, hidden_states, context_kv=None):
         """positions: [T] 绝对位置。hidden_states: [T, hidden]（1+N query token）。
         context_kv: 可选 (k_ctx [C, KV, D], v_ctx [C, KV, D])——target 中间层 hidden
         预计算的 context KV（DFlash2 核心：草稿 attention 读 context + query）。
         返回 [T, hidden]。"""
-        # QKV 投影 → TileLang GEMM（x @ w.T，w 是 [N,K]）
-        q = draft_gemm(hidden_states, self.q_proj.weight, _QUERY_MAX_M).view(
-            -1, self.num_heads, self.head_dim)
-        k = draft_gemm(hidden_states, self.k_proj.weight, _QUERY_MAX_M).view(
-            -1, self.num_kv_heads, self.head_dim)
-        v = draft_gemm(hidden_states, self.v_proj.weight, _QUERY_MAX_M).view(
-            -1, self.num_kv_heads, self.head_dim)
+        q = self.q_proj(hidden_states).view(-1, self.num_heads, self.head_dim)
+        k = self.k_proj(hidden_states).view(-1, self.num_kv_heads, self.head_dim)
+        v = self.v_proj(hidden_states).view(-1, self.num_kv_heads, self.head_dim)
         q = self.q_norm(q).view(-1, self.q_size)
         k = self.k_norm(k).view(-1, self.kv_size)
         q = q.view(-1, self.num_heads, self.head_dim)
         k = k.view(-1, self.num_kv_heads, self.head_dim)
 
-        cos = self._cos[positions].unsqueeze(1)  # [T, 1, hd//2]
-        sin = self._sin[positions].unsqueeze(1)
-        q = rope_half_split(q, cos, sin)
-        k = rope_half_split(k, cos, sin)
+        # 融合 Triton RoPE（in-place half-split，cos/sin 表 + per-token positions），
+        # 替代 PyTorch 的 cos/sin gather + chunk/cat/mul 碎片 op。
+        apply_rope_decode(q, self._cos, self._sin, positions)
+        apply_rope_decode(k, self._cos, self._sin, positions)
 
         # 拼接 context KV（DFlash2：草稿 attention 读 context + 1+N query，非因果）
         if context_kv is not None:
@@ -182,30 +295,26 @@ class DFlashAttention(nn.Module):
             k = torch.cat([k_ctx, k], dim=0)
             v = torch.cat([v_ctx, v], dim=0)
 
-        # 非因果 sliding-window attention（草稿 query 只有 1+N 个 token，直接算）。
-        # flash_attn_func 原生支持 GQA（num_heads=32 != num_kv_heads=8），无需
-        # repeat_interleave（省 4x KV 显存膨胀 + 一次 repeat copy）。
-        # 形状：q [T,H,D]→[1,T,H,D]，k/v [S,KV,D]→[1,S,KV,D]（S=C+T，context 在前）。
-        from flash_attn import flash_attn_func
-        attn = flash_attn_func(
-            q.unsqueeze(0), k.unsqueeze(0), v.unsqueeze(0),
-            softmax_scale=self.scaling, causal=False,
-        )  # [1, T, H, D]
-        attn = attn.squeeze(0).reshape(-1, self.q_size)
-        return draft_gemm(attn, self.o_proj.weight, _QUERY_MAX_M)
+        # 非因果 sliding-window attention（草稿 query 只有 1+N 个 token，直接算）
+        # GQA：把 kv 头 repeat 到 q 头数
+        n_rep = self.num_heads // self.num_kv_heads
+        k = k.repeat_interleave(n_rep, dim=1)
+        v = v.view(-1, self.num_kv_heads, self.head_dim).repeat_interleave(n_rep, dim=1)
+        attn = F.scaled_dot_product_attention(
+            q.transpose(0, 1), k.transpose(0, 1), v.transpose(0, 1),
+            is_causal=False, scale=self.scaling,
+        )
+        attn = attn.transpose(0, 1).reshape(-1, self.q_size)
+        return self.o_proj(attn)
 
     def project_kv(self, hidden_states, positions):
         """hidden_states [C, hidden]（context token）→ (k [C, KV, D], v [C, KV, D])。
-        用于 precompute_context_kv：target 中间层 hidden 投影成草稿 context KV。
-        C 变长（可达几千），走 TileLang runtime-grid GEMM（max_m=_CTX_MAX_M）。"""
-        k = draft_gemm(hidden_states, self.k_proj.weight, _CTX_MAX_M).view(
-            -1, self.num_kv_heads, self.head_dim)
-        v = draft_gemm(hidden_states, self.v_proj.weight, _CTX_MAX_M).view(
-            -1, self.num_kv_heads, self.head_dim)
+        用于 precompute_context_kv：target 中间层 hidden 投影成草稿 context KV。"""
+        k = self.k_proj(hidden_states).view(-1, self.num_kv_heads, self.head_dim)
+        v = self.v_proj(hidden_states).view(-1, self.num_kv_heads, self.head_dim)
         k = self.k_norm(k)
-        cos = self._cos[positions].unsqueeze(1)
-        sin = self._sin[positions].unsqueeze(1)
-        k = rope_half_split(k, cos, sin)
+        # 融合 Triton RoPE（in-place half-split），替代 PyTorch 碎片 op。
+        apply_rope_decode(k, self._cos, self._sin, positions)
         return k, v
 
 
@@ -268,11 +377,7 @@ class _SwiGLU(nn.Module):
             m.weight.data = m.weight.data.to(dtype)
 
     def forward(self, x):
-        # gate/up/down → TileLang GEMM；silu 保持 torch F.silu（与原实现精度一致，
-        # 原实现也是 bf16 silu）。
-        gate = draft_gemm(x, self.gate_proj.weight, _QUERY_MAX_M)
-        up = draft_gemm(x, self.up_proj.weight, _QUERY_MAX_M)
-        return draft_gemm(F.silu(gate) * up, self.down_proj.weight, _QUERY_MAX_M)
+        return self.down_proj(F.silu(self.gate_proj(x)) * self.up_proj(x))
 
 
 # ---------------------------------------------------------------------------
@@ -368,9 +473,7 @@ class DFlash2DraftModel(nn.Module):
         （hidden_norm 在 precompute_context_kv 里做，对齐 vLLM。）"""
         if not self.use_aux_hidden_state:
             return aux_hidden_states
-        # fc [C, num_aux*target_hidden] @ [hidden, num_aux*target_hidden].T → TileLang
-        # runtime-grid GEMM（C 变长，max_m=_CTX_MAX_M）。
-        return draft_gemm(aux_hidden_states, self.fc.weight, _CTX_MAX_M)
+        return self.fc(aux_hidden_states)
 
     def precompute_context_kv(self, context_states, context_positions):
         """DFlash2 核心：context hidden（fc 投影后 [C, hidden]）→ hidden_norm →

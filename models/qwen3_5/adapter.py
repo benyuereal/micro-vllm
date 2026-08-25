@@ -91,7 +91,9 @@ def gdn_gbeta(a, b, a_log, dt_bias, g_buf, beta_buf, stride):
 # decode：单 token，state 滚动更新。
 @triton.jit
 def _gdn_conv_prefill_kernel(QKV, W, STATE, CU, SEQ_IDX,
-                             CONV_DIM, STRIDE, N_GDN, GDN_L, K: tl.constexpr, BLOCK_C: tl.constexpr):
+                             CONV_DIM, STRIDE, N_GDN, GDN_L, K: tl.constexpr, BLOCK_C: tl.constexpr,
+                             CHECKPOINT, CP_N_GDN, CP_ENABLED: tl.constexpr,
+                             INIT_STATE, INIT_FROM_CP: tl.constexpr):
     pid_c = tl.program_id(0)
     c = pid_c * BLOCK_C + tl.arange(0, BLOCK_C)
     cmask = c < CONV_DIM
@@ -106,9 +108,16 @@ def _gdn_conv_prefill_kernel(QKV, W, STATE, CU, SEQ_IDX,
     sid = tl.load(SEQ_IDX + s)
     # 状态池 [pool, n_gdn, 3, conv_dim]：offset = (slot*n_gdn + 本层 gdn 索引) * 3*conv_dim
     st_base = STATE + (sid.to(tl.int64) * N_GDN + GDN_L) * 3 * CONV_DIM + c
-    x0 = tl.load(st_base + 0, mask=cmask, other=0.0).to(tl.float32)
-    x1 = tl.load(st_base + CONV_DIM, mask=cmask, other=0.0).to(tl.float32)
-    x2 = tl.load(st_base + 2 * CONV_DIM, mask=cmask, other=0.0).to(tl.float32)
+    # 初始 conv 状态：spec 去 rollback 后，非首步 verify 从 checkpoint[accepted_prev]
+    # （INIT_STATE 指向 [n_gdn, 3, conv_dim]，token 索引已 bake 进 base 指针）读。
+    # conv 是 bf16、recurrent 是 fp32，dtype/布局不同 → 两个 kernel 各自处理。
+    if INIT_FROM_CP:
+        st_init = INIT_STATE + GDN_L * 3 * CONV_DIM + c
+    else:
+        st_init = st_base
+    x0 = tl.load(st_init + 0, mask=cmask, other=0.0).to(tl.float32)
+    x1 = tl.load(st_init + CONV_DIM, mask=cmask, other=0.0).to(tl.float32)
+    x2 = tl.load(st_init + 2 * CONV_DIM, mask=cmask, other=0.0).to(tl.float32)
     for i in range(0, L):
         t = start + i
         x = tl.load(QKV + t.to(tl.int64) * STRIDE + c, mask=cmask, other=0.0).to(tl.float32)
@@ -122,6 +131,12 @@ def _gdn_conv_prefill_kernel(QKV, W, STATE, CU, SEQ_IDX,
             tl.store(st_base + 0, x1, mask=cmask)
             tl.store(st_base + CONV_DIM, x2, mask=cmask)
             tl.store(st_base + 2 * CONV_DIM, x, mask=cmask)
+        # 投机解码：每 token 存 conv 状态检查点（[t, gdn_l, 3, conv_dim]），供接受后回滚。
+        if CP_ENABLED:
+            cp_base = CHECKPOINT + (t.to(tl.int64) * CP_N_GDN + GDN_L) * 3 * CONV_DIM + c
+            tl.store(cp_base + 0, x1.to(CHECKPOINT.dtype.element_ty), mask=cmask)
+            tl.store(cp_base + CONV_DIM, x2.to(CHECKPOINT.dtype.element_ty), mask=cmask)
+            tl.store(cp_base + 2 * CONV_DIM, x.to(CHECKPOINT.dtype.element_ty), mask=cmask)
         x0 = x1
         x1 = x2
         x2 = x
@@ -211,7 +226,9 @@ def _gdn_recurrent_decode_kernel(QKV, G, BETA, STATE, OUT, SEQ_IDX, IS_REAL,
 def _gdn_recurrent_prefill_kernel(QKV, G, BETA, STATE, OUT, CU, SEQ_IDX,
                                   H: tl.constexpr, HK: tl.constexpr,
                                   DK: tl.constexpr, DV: tl.constexpr,
-                                  N_GDN, GDN_L, SCALE, STRIDE, BLOCK_D: tl.constexpr):
+                                  N_GDN, GDN_L, SCALE, STRIDE, BLOCK_D: tl.constexpr,
+                                  CHECKPOINT, CP_N_GDN, CP_ENABLED: tl.constexpr,
+                                  INIT_STATE, INIT_FROM_CP: tl.constexpr):
     s = tl.program_id(0)
     h = tl.program_id(1)
     start = tl.load(CU + s)
@@ -222,7 +239,15 @@ def _gdn_recurrent_prefill_kernel(QKV, G, BETA, STATE, OUT, CU, SEQ_IDX,
     S = STATE + (sid.to(tl.int64) * N_GDN + GDN_L) * H * DK * DV + h * DK * DV
     dk = tl.arange(0, BLOCK_D)
     dv = tl.arange(0, BLOCK_D)
-    S_m = tl.load(S + dk[:, None] * DV + dv[None, :]).to(tl.float32)
+    # 初始状态：spec 去 rollback 后，非首步 verify 直接从 checkpoint[accepted_prev]
+    # （INIT_STATE 指向 [n_gdn, H, DK, DV]，token 索引已 bake 进 base 指针）读，
+    # 省掉接受后 copy_ 回 pool 的 DtoD。首步 verify / 正常 prefill 仍从 pool 读。
+    # 初始 load 在循环前，checkpoint store 在循环内 → 无读写竞争。
+    if INIT_FROM_CP:
+        S_init = INIT_STATE + GDN_L * H * DK * DV + h * DK * DV
+    else:
+        S_init = S
+    S_m = tl.load(S_init + dk[:, None] * DV + dv[None, :]).to(tl.float32)
     # q/k 只有 HK 个 head，HF repeat_interleave(H//HK) 扩到 H（见 decode kernel 注释）。
     hk = h // (H // HK)
 
@@ -247,6 +272,10 @@ def _gdn_recurrent_prefill_kernel(QKV, G, BETA, STATE, OUT, CU, SEQ_IDX,
         o = tl.sum(S_m * q[:, None], axis=0)
         o_base = OUT + t.to(tl.int64) * (H * DV) + h * DV
         tl.store(o_base + dv, o.to(OUT.dtype.element_ty))
+        # 投机解码：每 token 存递归状态检查点（[t, gdn_l, H, DK, DV]），供接受后回滚。
+        if CP_ENABLED:
+            cp_base = CHECKPOINT + (t.to(tl.int64) * CP_N_GDN + GDN_L) * H * DK * DV + h * DK * DV
+            tl.store(cp_base + dk[:, None] * DV + dv[None, :], S_m.to(CHECKPOINT.dtype.element_ty))
 
     tl.store(S + dk[:, None] * DV + dv[None, :], S_m.to(STATE.dtype.element_ty))
 
@@ -313,6 +342,61 @@ def qk_norm_rope_partial_inplace(qkv_buf, bs, seg_offset, num_heads, head_size,
         qkv_buf, norm_weight, cos_pool, sin_pool, positions,
         qkv_buf.stride(0), seg_offset, head_size, num_heads, rot,
         eps, BLOCK_H=BLOCK_H, BLOCK_R=BLOCK_R)
+
+
+# ---- prefill 纯 partial RoPE（无 norm）：in-place half-split 前 rot 维 ----
+# 替代 _prefill_full 里 PyTorch 的 cos/sin gather + 4 slice + 4 mul + 2 add + 2 cat
+# （每 (q,k) 张量 ~12 个小 kernel × 2 × 16 full 层 = ~384 次 launch/verify）。
+# 一个 program = (token, head)，只读写前 rot 维（rot 之后维度不动）。
+@triton.jit
+def _rope_partial_inplace_kernel(X, COS, SIN, POS,
+                                 stride_t, stride_h,
+                                 head_size: tl.constexpr, rot: tl.constexpr,
+                                 BLOCK_R: tl.constexpr):
+    t = tl.program_id(0)
+    h = tl.program_id(1)
+    pos = tl.load(POS + t)
+    base = t.to(tl.int64) * stride_t + h * stride_h
+    r_offs = tl.arange(0, BLOCK_R)
+    r_mask = r_offs < rot // 2
+    c = tl.load(COS + pos * (rot // 2) + r_offs, mask=r_mask, other=0.0).to(tl.float32)
+    s = tl.load(SIN + pos * (rot // 2) + r_offs, mask=r_mask, other=0.0).to(tl.float32)
+    x1 = tl.load(X + base + r_offs, mask=r_mask, other=0.0).to(tl.float32)
+    x2 = tl.load(X + base + rot // 2 + r_offs, mask=r_mask, other=0.0).to(tl.float32)
+    o1 = (x1 * c - x2 * s).to(X.dtype.element_ty)
+    o2 = (x2 * c + x1 * s).to(X.dtype.element_ty)
+    tl.store(X + base + r_offs, o1, mask=r_mask)
+    tl.store(X + base + rot // 2 + r_offs, o2, mask=r_mask)
+
+
+def rope_partial_inplace(x, cos_pool, sin_pool, positions):
+    """x [T, H, head_dim] in-place partial RoPE（前 rot 维 half-split，rot 后不动）。
+    positions [T] int64。cos/sin 表 [max_pos, rot//2]（PagedAttention 池）。"""
+    T, H, hd = x.shape
+    rot = cos_pool.shape[1] * 2
+    BLOCK_R = triton.next_power_of_2(rot // 2)
+    _rope_partial_inplace_kernel[(T, H)](
+        x, cos_pool, sin_pool, positions,
+        x.stride(0), x.stride(1),
+        head_size=hd, rot=rot, BLOCK_R=BLOCK_R)
+
+
+# ---- attn_output_gate：out = attn * sigmoid(gate)（fp32 sigmoid，bf16 输出）----
+# 替代 PyTorch 的 sigmoid + cast + mul 三个 elementwise kernel（× 16 full 层）。
+@triton.jit
+def _attn_gate_kernel(ATTN, GATE, BLOCK: tl.constexpr):
+    pid = tl.program_id(0)
+    offs = pid * BLOCK + tl.arange(0, BLOCK)
+    a = tl.load(ATTN + offs).to(tl.float32)
+    g = tl.load(GATE + offs).to(tl.float32)
+    tl.store(ATTN + offs, (a * tl.sigmoid(g)).to(ATTN.dtype.element_ty))
+
+
+def attn_gate_inplace(attn, gate):
+    """attn [T, nh, hd]（in-place *= sigmoid(gate)），gate 同形状。"""
+    n = attn.numel()
+    BLOCK = 1024
+    _attn_gate_kernel[(triton.cdiv(n, BLOCK),)](attn, gate, BLOCK=BLOCK)
 
 
 # =====================================================================
@@ -501,10 +585,23 @@ class Qwen3_5Adapter(ModelAdapter):
     def _lin_prefill(self, x, w):
         """prefill 线性（M=T>1）：w 为 bf16 [N,K] 或 (w_int8, scale) 元组。
         反量化后 x @ w.t()（compute-bound，反量化开销可忽略）。
-        scale 两种：[N]（per-channel）→ unsqueeze(1)；[N,K/128]（group-128）→ repeat_interleave 128。"""
+        scale 两种：[N]（per-channel）→ unsqueeze(1)；[N,K/128]（group-128）→ repeat_interleave 128。
+
+        投机解码 verify（M 小，verify_gemm 开）：group-128 int8 走双后端 int8 GEMM
+        （TileLang 默认 / Triton 备选，MICRO_VERIFY_GEMM 切换；权重 HBM 只读一次，
+        shared 内 dequant→bf16 + GEMM），避免反量化 54GB bf16 权重/层。
+
+        小 M prefill（M≤128，如投机解码 prompt prefill M≈61）：同样走 int8 GEMM。
+        原路径反量化整份 int8 权重到 bf16（w_int8.float()*sc 物化 4x fp32 临时 +
+        bf16 拷贝，mlp_gu M=61 反量化占 7.29ms/7.9ms），int8 GEMM 权重 HBM 只读
+        一次（0.35ms，快 22x）。M>128 时 int8 GEMM 的 BLOCK_M 超 shared mem 上限
+        （M=256 编译失败），回退反量化 matmul（正常大 batch prefill 不受影响）。"""
         if isinstance(w, tuple):
             w_int8, scale = w
             if scale.dim() == 2:
+                from kernel.gemm_int8_triton import verify_int8_gemm
+                if x.shape[0] <= 128:
+                    return verify_int8_gemm(x, w_int8, scale)
                 sc = scale.repeat_interleave(128, dim=1)
             else:
                 sc = scale.unsqueeze(1)
@@ -659,14 +756,49 @@ class Qwen3_5Adapter(ModelAdapter):
                 STRIDE=in_dim, BLOCK_D=triton.next_power_of_2(max(DK, DV)))
         else:
             n_seqs = cu_seqlens.shape[0] - 1
-            _gdn_conv_prefill_kernel[(triton.cdiv(conv_dim, 512), n_seqs)](
-                qkv, la._conv_w, conv_state, cu_seqlens, seq_idx,
-                conv_dim, in_dim, n_gdn, gdn_l, K=self._gdn_K, BLOCK_C=512)
-            o = torch.empty(M, H * DV, dtype=h2d.dtype, device=dev)
-            _gdn_recurrent_prefill_kernel[(n_seqs, H)](
-                qkv, g, beta, state, o, cu_seqlens, seq_idx,
-                H=H, HK=HK, DK=DK, DV=DV, N_GDN=n_gdn, GDN_L=gdn_l, SCALE=scale,
-                STRIDE=in_dim, BLOCK_D=triton.next_power_of_2(max(DK, DV)))
+            # 投机解码检查点：graph._gdn_cp_enabled 时把每 token 的 conv/recurrent 状态
+            # 存进 graph._gdn_cp_conv / _gdn_cp_state（[M, n_gdn, ...]，M=total tokens）。
+            # 正常 prefill 不启用（CP_ENABLED=False，kernel 内分支被编译掉，零开销）。
+            cp_enabled = bool(getattr(graph, "_gdn_cp_enabled", False))
+            cp_state = getattr(graph, "_gdn_cp_state", None)
+            cp_conv = getattr(graph, "_gdn_cp_conv", None)
+            # spec 去 rollback：非首步 verify 的初始状态直接读 checkpoint[accepted_prev]
+            # （graph._gdn_init_state_s/_c 是 [n_gdn, ...] 视图，token 索引已 bake 进 base 指针）。
+            # recurrent 是 fp32 [n_gdn,H,DK,DV]、conv 是 bf16 [n_gdn,3,conv_dim]，两个独立视图。
+            # 首步 verify / 正常 prefill：INIT_FROM_CP=False，从 pool 读（INIT_STATE 传 pool 占位）。
+            init_from_cp = bool(getattr(graph, "_gdn_init_from_cp", False))
+            if init_from_cp:
+                init_state_s = graph._gdn_init_state_s   # [n_gdn, H, DK, DV] fp32
+                init_state_c = graph._gdn_init_state_c   # [n_gdn, 3, conv_dim] bf16
+            else:
+                init_state_s = state                      # 占位（kernel 内 INIT_FROM_CP=False 不读）
+                init_state_c = conv_state
+            if cp_enabled:
+                _gdn_conv_prefill_kernel[(triton.cdiv(conv_dim, 512), n_seqs)](
+                    qkv, la._conv_w, conv_state, cu_seqlens, seq_idx,
+                    conv_dim, in_dim, n_gdn, gdn_l, K=self._gdn_K, BLOCK_C=512,
+                    CHECKPOINT=cp_conv, CP_N_GDN=n_gdn, CP_ENABLED=True,
+                    INIT_STATE=init_state_c, INIT_FROM_CP=init_from_cp)
+                o = torch.empty(M, H * DV, dtype=h2d.dtype, device=dev)
+                _gdn_recurrent_prefill_kernel[(n_seqs, H)](
+                    qkv, g, beta, state, o, cu_seqlens, seq_idx,
+                    H=H, HK=HK, DK=DK, DV=DV, N_GDN=n_gdn, GDN_L=gdn_l, SCALE=scale,
+                    STRIDE=in_dim, BLOCK_D=triton.next_power_of_2(max(DK, DV)),
+                    CHECKPOINT=cp_state, CP_N_GDN=n_gdn, CP_ENABLED=True,
+                    INIT_STATE=init_state_s, INIT_FROM_CP=init_from_cp)
+            else:
+                _gdn_conv_prefill_kernel[(triton.cdiv(conv_dim, 512), n_seqs)](
+                    qkv, la._conv_w, conv_state, cu_seqlens, seq_idx,
+                    conv_dim, in_dim, n_gdn, gdn_l, K=self._gdn_K, BLOCK_C=512,
+                    CHECKPOINT=conv_state, CP_N_GDN=n_gdn, CP_ENABLED=False,
+                    INIT_STATE=init_state_c, INIT_FROM_CP=init_from_cp)
+                o = torch.empty(M, H * DV, dtype=h2d.dtype, device=dev)
+                _gdn_recurrent_prefill_kernel[(n_seqs, H)](
+                    qkv, g, beta, state, o, cu_seqlens, seq_idx,
+                    H=H, HK=HK, DK=DK, DV=DV, N_GDN=n_gdn, GDN_L=gdn_l, SCALE=scale,
+                    STRIDE=in_dim, BLOCK_D=triton.next_power_of_2(max(DK, DV)),
+                    CHECKPOINT=state, CP_N_GDN=n_gdn, CP_ENABLED=False,
+                    INIT_STATE=init_state_s, INIT_FROM_CP=init_from_cp)
 
         if self._dbg_gdn is not None:
             self._dbg_gdn[-1]["qkv_post"] = qkv.detach().clone()
@@ -799,21 +931,13 @@ class Qwen3_5Adapter(ModelAdapter):
         q = rmsnorm1(q, sa._q_norm_w, sa._q_norm_eps)
         k = rmsnorm1(k, sa._k_norm_w, sa._k_norm_eps)
 
-        rot = self._rot
+        # partial RoPE：Triton in-place（前 rot 维 half-split，rot 后不动），替代 PyTorch
+        # 的 cos/sin gather + 4 slice + 4 mul + 2 add + 2 cat（每张量 ~12 小 kernel）。
         cos_pool = graph.attention._cos_pool
         sin_pool = graph.attention._sin_pool
         pos = meta.position_ids.long()
-        cos = cos_pool[pos].unsqueeze(1)
-        sin = sin_pool[pos].unsqueeze(1)
-
-        def _rope_partial(x):
-            xr, xp = x[..., :rot], x[..., rot:]
-            x1, x2 = xr[..., :rot // 2], xr[..., rot // 2:]
-            xr = torch.cat([x1 * cos - x2 * sin, x2 * cos + x1 * sin], dim=-1)
-            return torch.cat([xr, xp], dim=-1)
-
-        q = _rope_partial(q)
-        k = _rope_partial(k)
+        rope_partial_inplace(q, cos_pool, sin_pool, pos)
+        rope_partial_inplace(k, cos_pool, sin_pool, pos)
 
         k_cache, v_cache = cache_manager.get(layer_idx)
         store_kvcache(k, v, k_cache, v_cache, meta.slot_mapping)
@@ -824,7 +948,8 @@ class Qwen3_5Adapter(ModelAdapter):
             softmax_scale=hd ** -0.5, causal=True,
             block_table=meta.block_table,
         )
-        attn = attn * torch.sigmoid(gate.float()).to(attn.dtype)
+        # attn_output_gate：Triton in-place（attn *= sigmoid(gate)），替代 sigmoid+cast+mul。
+        attn_gate_inplace(attn, gate)
         out = self._lin_prefill(attn.reshape(T, -1), sa._o_w)
 
         normed, residual = rmsnorm1_residual_fused(out, h, block._post_ln_w, block._post_ln_eps)

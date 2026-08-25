@@ -97,10 +97,15 @@ class InferenceEngine:
                            * self.head_size * self.num_layers * torch.finfo(self.dtype).bits // 8)
         # 余量：权重(模型 bf16 ~1.2GB) + graph/logits buffer(max_batch×vocab) + activation。
         # max_batch=512 时 _logits buffer ≈ 155MB，graph workspace 等，保守留 6GB。
-        kv_budget = max(free - 6 * (1 << 30), per_block_bytes * 16)
+        # 投机解码（DFlash2）额外预留：draft 模型(~3.6GB) + GDN 状态检查点(~1.1GB) +
+        # aux_cache(~0.1GB) + 余量。KV 预算在 draft 加载前算，须先扣掉这部分，否则
+        # draft 加载时 OOM（KV 吃满显存）。
+        spec_reserve = 6 * (1 << 30) if self.spec_decode_enabled else 0
+        kv_budget = max(free - 6 * (1 << 30) - spec_reserve, per_block_bytes * 16)
         n_blocks = max(int(kv_budget // per_block_bytes),
                        max_batch_size * 2)  # 至少够 max_batch 条短请求各 2 block
-        logger.info(f"KV 预算: free={free/1e9:.1f}GB 留6GB → n_blocks={n_blocks} "
+        logger.info(f"KV 预算: free={free/1e9:.1f}GB 留6GB"
+                    f"{' + 投机解码6GB' if spec_reserve else ''} → n_blocks={n_blocks} "
                     f"({n_blocks*self.DEFAULT_BLOCK_SIZE} tokens, 可跑 {n_blocks//max_seq_blocks} 条满{self.max_position}上下文)")
         self.cache_manager = KVCacheManager(
             n_blocks=n_blocks, block_size=self.DEFAULT_BLOCK_SIZE,
@@ -193,48 +198,36 @@ class InferenceEngine:
         atexit.register(self.shutdown)
 
     def _build_spec_controller(self, draft_model_path: Optional[str]):
-        """构建 SpecDecodeController。
+        """构建 SpecDecodeController（Qwen3.8 GDN 混合模型适配版）。
 
-        注意：engine 的 self.model 权重已被 adapter.prepare_weights 重排
-        （q_proj/k_proj/... 置 None，存 _qkv_w 等），无法直接用于控制器的
-        手动 forward。故控制器加载一份【新鲜的】目标模型副本（同权重，未 prepare）。
-        自起草时草稿=该副本；DFlash2 时草稿=独立小草稿模型。
+        显存复用 engine 模型：不 load 27GB 新副本，控制器直接用 self.model /
+        adapter / prefill_runner / cache_manager（权重已 prepare_weights，走 adapter
+        forward 路径处理 GDN stateful 层）。
 
-        draft_model_path=None → 自起草（草稿=目标模型副本）。
-        draft_model_path=路径 → 加载 DFlash2 小草稿模型（load_dflash2_draft）。
+        draft_model_path=路径 → 加载 DFlash2 小草稿模型（load_dflash2_draft），
+        其 embed_tokens / lm_head 从 engine 的 target 共享（同 vocab/hidden）。
         """
         from core.spec_decode import SpecDecodeController
-        from core.model_loader import load_model
         device = self.device
         dtype = self.dtype
-        # 加载新鲜目标模型副本（控制器专用，dense KV cache 手动 forward）
-        target_model, _ = load_model(self._model_path, device=device)
-        target_model.eval()
         if draft_model_path is None:
-            # 自起草：草稿=目标模型副本
-            draft_model = target_model
-            draft_is_target = True
-            mask_token_id = self.mask_token_id
-        else:
-            from models.dflash import load_dflash2_draft
-            draft_model, draft_cfg = load_dflash2_draft(
-                draft_model_path, dtype, device, self.num_speculative_tokens,
-                max_pos=self.max_position)
-            # DFlash2 草稿权重不含 embed_tokens / lm_head：从 target 共享（同 vocab/hidden）。
-            # 对齐 vLLM load_dflash_model（draft.embed_tokens = target_embed；
-            # dflash_model.lm_head = target_lm_head）。
-            draft_model.share_target_weights(
-                target_model.model.embed_tokens, target_model.lm_head)
-            draft_is_target = False
-            mask_token_id = getattr(draft_cfg, "dflash_config", {}).get(
-                "mask_token_id", self.mask_token_id)
+            raise RuntimeError("Qwen3.8 投机解码需 draft_model_path（DFlash2 小草稿）")
+        from models.dflash import load_dflash2_draft
+        draft_model, draft_cfg = load_dflash2_draft(
+            draft_model_path, dtype, device, self.num_speculative_tokens,
+            max_pos=self.max_position)
+        # DFlash2 草稿权重不含 embed_tokens / lm_head：从 engine 的 target 共享
+        # （同 vocab/hidden）。对齐 vLLM load_dflash_model。
+        draft_model.share_target_weights(
+            self.adapter.embed(self.model), self.adapter.lm_head(self.model))
+        mask_token_id = getattr(draft_cfg, "dflash_config", {}).get(
+            "mask_token_id", self.mask_token_id)
         self._spec_controller = SpecDecodeController(
-            target_model, draft_model, device, dtype,
+            self, draft_model,
             num_speculative_tokens=self.num_speculative_tokens,
-            mask_token_id=mask_token_id, max_len=self.max_position,
-            draft_is_target=draft_is_target)
+            mask_token_id=mask_token_id, max_len=self.max_position)
         logger.info(f"投机解码控制器已构建: N={self.num_speculative_tokens} "
-                    f"mask_token={mask_token_id} draft={'self' if draft_is_target else draft_model_path}")
+                    f"mask_token={mask_token_id} draft={draft_model_path}")
 
     def _warmup_sampler(self, batch_sizes):
         """对所有捕获的 batch_size 预热 sampler 编译路径，消除首次调用的 ~1-2s 捕获开销。
