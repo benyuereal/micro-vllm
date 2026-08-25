@@ -11,6 +11,21 @@ CPU 有充足时间 launch 下一段 → 缺口小。dflash 分支（TileLang GE
 verify GEMM 快得多，GPU 早完成，CPU 开销才显形为大缺口（~130ms）。本脚本在
 specopt 上量「segment 和 vs e2e step」的差，作为参照系。
 
+【结论（两分支实测，N_ITER=5）】
+  specopt（旧 CUDA GEMV，verify 500ms）：segment 和 510.970ms，e2e step 511.152ms，
+    缺口 0.182ms。GPU 忙 500ms，CPU 有充足时间 launch → 缺口极小。
+  dflash（TileLang GEMM，verify 52.5ms）：segment 和 65.689ms，e2e step 65.969ms，
+    缺口 0.280ms。decode 单步仅 66ms，【无 130ms 缺口】。
+  cProfile（两分支）：CPU Python 可忽略（accept 的 .cpu() 是 GPU-wait 非 CPU 计算；
+    triton/tilelang launch 每 step 仅 ~10-20ms 且被 GPU 时间掩盖）。
+
+  「130ms 缺口」真相：dflash e2e 38.3 tok/s = 64 tok / 1.67s = prefill(~1.08s,
+  61 tok) + 9 decode step(9×66ms=0.594s)。1.08s prefill / 9 step ≈ 120ms/step =
+  所谓「130ms 缺口」实为【一次性 prompt prefill 摊到 decode step】，非每步
+  CPU/Python/launch 开销（实测仅 0.28ms）。e2e tok/s 指标把 prefill 算进分子分母，
+  拉低了表观吞吐；纯 decode 稳态是 66ms/step ≈ 150 tok/s（acceptance 6.556）。
+  要提 e2e tok/s 应优化 prefill（或加长输出摊薄 prefill），而非抠 decode 每步开销。
+
 用法：CUDA_VISIBLE_DEVICES=3 MICRO_W8A16=1 N_ITER=5 python3 demo/profile_step_gap.py
 """
 import os, sys, time, cProfile, pstats, io
