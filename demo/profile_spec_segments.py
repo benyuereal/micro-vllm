@@ -4,8 +4,9 @@
   draft: aux_gather / combine(fc) / precompute_ctx_kv / query_embed /
          forward_5L / select_tokens(lm_head+selector)
   verify: _target_forward 整体（GEMM 主导，另列非 GEMM 参考）
-  accept: argmax + 贪心比较 + bonus（含 CPU-GPU 同步）
-  rollback: GDN 状态回滚
+  accept: argmax + 贪心比较 + bonus（2 次 CPU-GPU 同步）
+  rollback: 去 rollback 后为 0（GDN 初始状态直接读 checkpoint[accepted_prev]，
+            省掉原 0.406ms/step 的 DtoD copy_ 回 pool）
 
 用法：CUDA_VISIBLE_DEVICES=3 MICRO_W8A16=1 python3 demo/profile_spec_segments.py
 """
@@ -22,14 +23,17 @@ N_ITER = int(os.environ.get("N_ITER", "5"))
 
 
 def _accept(draft_tokens, vlogits, N):
+    # 与 generate() 一致：draft/target 各 .cpu() 一次（共 2 次同步），Python int 比较。
     target_preds = vlogits.argmax(dim=-1)
+    d_cpu = draft_tokens.cpu().tolist()
+    t_cpu = target_preds.cpu().tolist()
     accepted = 0
     for i in range(N):
-        if int(draft_tokens[i]) == int(target_preds[i]):
+        if d_cpu[i] == t_cpu[i]:
             accepted += 1
         else:
             break
-    bonus = int(target_preds[accepted])
+    bonus = t_cpu[accepted]
     return accepted, bonus
 
 
@@ -63,7 +67,9 @@ def main():
     anchor = int(logits[-1].argmax())
     kv_len = P + 1
 
-    # warm（编译 + 稳定）
+    # warm（编译 + 稳定）。accepted_prev 跟踪上一步接受数（去 rollback：下一步 verify
+    # 的 GDN 初始状态直接读 checkpoint[accepted_prev]，与 generate() 一致）。
+    accepted_prev = None
     for _ in range(2):
         dt = ctrl._draft_propose(anchor, kv_len)
         vid = torch.cat([torch.tensor([anchor], device=device), dt])
@@ -71,9 +77,16 @@ def main():
         vslot = slot_mapping[kv_len - 1: kv_len - 1 + M]
         vcu_q = torch.tensor([0, M], device=device, dtype=torch.int32)
         vcu_k = torch.tensor([0, kv_len - 1 + M], device=device, dtype=torch.int32)
-        vl = ctrl._target_forward(vid, vpos, vslot, vcu_q, vcu_k, bt, M, kv_len - 1 + M,
-                                  gdn_slot, collect_aux_from=kv_len - 1, gdn_checkpoint=True)
-        ctrl._gdn_rollback(gdn_slot, 0)
+        if accepted_prev is not None:
+            vl = ctrl._target_forward(vid, vpos, vslot, vcu_q, vcu_k, bt, M, kv_len - 1 + M,
+                                      gdn_slot, collect_aux_from=kv_len - 1, gdn_checkpoint=True,
+                                      init_from_cp=True,
+                                      init_state_s=ctrl._gdn_cp_state[accepted_prev],
+                                      init_state_c=ctrl._gdn_cp_conv[accepted_prev])
+        else:
+            vl = ctrl._target_forward(vid, vpos, vslot, vcu_q, vcu_k, bt, M, kv_len - 1 + M,
+                                      gdn_slot, collect_aux_from=kv_len - 1, gdn_checkpoint=True)
+        accepted_prev = 0
         anchor = int(vl[0].argmax()); kv_len += 1
 
     # ---- 分段计时（每段单独 sync，串行累加）----
@@ -105,21 +118,37 @@ def main():
         seg2.setdefault("draft.select_tokens", []).append(ms)
         draft_tokens = draft[0]
 
-        ms, vlogits = timeit(lambda: ctrl._target_forward(
-            torch.cat([torch.tensor([anchor], device=device), draft_tokens]),
-            torch.arange(kv_len - 1, kv_len - 1 + M, device=device, dtype=torch.int64),
-            slot_mapping[kv_len - 1: kv_len - 1 + M],
-            torch.tensor([0, M], device=device, dtype=torch.int32),
-            torch.tensor([0, kv_len - 1 + M], device=device, dtype=torch.int32),
-            bt, M, kv_len - 1 + M, gdn_slot,
-            collect_aux_from=kv_len - 1, gdn_checkpoint=True))
+        # 去 rollback：verify 的 GDN 初始状态直接读 checkpoint[accepted_prev]（非首步）。
+        if accepted_prev is not None:
+            ms, vlogits = timeit(lambda: ctrl._target_forward(
+                torch.cat([torch.tensor([anchor], device=device), draft_tokens]),
+                torch.arange(kv_len - 1, kv_len - 1 + M, device=device, dtype=torch.int64),
+                slot_mapping[kv_len - 1: kv_len - 1 + M],
+                torch.tensor([0, M], device=device, dtype=torch.int32),
+                torch.tensor([0, kv_len - 1 + M], device=device, dtype=torch.int32),
+                bt, M, kv_len - 1 + M, gdn_slot,
+                collect_aux_from=kv_len - 1, gdn_checkpoint=True,
+                init_from_cp=True,
+                init_state_s=ctrl._gdn_cp_state[accepted_prev],
+                init_state_c=ctrl._gdn_cp_conv[accepted_prev]))
+        else:
+            ms, vlogits = timeit(lambda: ctrl._target_forward(
+                torch.cat([torch.tensor([anchor], device=device), draft_tokens]),
+                torch.arange(kv_len - 1, kv_len - 1 + M, device=device, dtype=torch.int64),
+                slot_mapping[kv_len - 1: kv_len - 1 + M],
+                torch.tensor([0, M], device=device, dtype=torch.int32),
+                torch.tensor([0, kv_len - 1 + M], device=device, dtype=torch.int32),
+                bt, M, kv_len - 1 + M, gdn_slot,
+                collect_aux_from=kv_len - 1, gdn_checkpoint=True))
         seg2.setdefault("verify.target_forward", []).append(ms)
 
         ms, res = timeit(lambda: _accept(draft_tokens, vlogits, N))
         seg2.setdefault("accept", []).append(ms)
         accepted, bonus = res
-        ms, _ = timeit(lambda: ctrl._gdn_rollback(gdn_slot, accepted))
-        seg2.setdefault("rollback", []).append(ms)
+        # 去 rollback：不再 copy_ 回 pool（原 0.406ms/step 的 DtoD 已消除）。
+        # 只记录 accepted 供下一步 verify 读 checkpoint[accepted]（纯 Python，无 GPU 拷贝）。
+        accepted_prev = accepted
+        seg2.setdefault("rollback", []).append(0.0)
 
         anchor = bonus
         kv_len += accepted + 1

@@ -96,6 +96,10 @@ class SpecDecodeController:
         self._gdn_cp_state = None
         self._gdn_cp_conv = None
         self._alloc_gdn_checkpoint()
+        # 去 rollback：上一步 verify 接受的 token 数。下一步 verify 的 GDN 初始状态
+        # 直接读 checkpoint[accepted_prev]（省掉接受后 copy_ 回 pool 的 DtoD）。
+        # None = 首步 verify（prefill 后，无检查点，初始状态从 pool 读）。
+        self._gdn_accepted_prev = None
 
         # 统计
         self.total_accepted = 0
@@ -140,11 +144,15 @@ class SpecDecodeController:
     # ------------------------------------------------------------------
     def _target_forward(self, input_ids, positions, slot_mapping,
                         cu_q, cu_k, block_table, max_sq, max_sk,
-                        gdn_slot, collect_aux_from, gdn_checkpoint):
+                        gdn_slot, collect_aux_from, gdn_checkpoint,
+                        init_from_cp=False, init_state_s=None, init_state_c=None):
         """跑一次 target prefill forward，返回 logits [M, vocab]。
 
         collect_aux_from: 从哪个绝对位置开始收集 aux（None=不收集），收集 M 个。
         gdn_checkpoint: 是否开 GDN 逐 token 检查点（verify 用）。
+        init_from_cp/init_state_s/init_state_c: 去 rollback——非首步 verify 的 GDN
+            初始状态直接读 checkpoint[accepted_prev]（init_state_s/c 是 [n_gdn,...]
+            视图，token 索引已 bake 进 base 指针），省掉接受后 copy_ 回 pool 的 DtoD。
         """
         M = input_ids.shape[0]
         h = self.embed(input_ids)
@@ -161,6 +169,11 @@ class SpecDecodeController:
         if gdn_checkpoint:
             self.prefill_runner._gdn_cp_state = self._gdn_cp_state
             self.prefill_runner._gdn_cp_conv = self._gdn_cp_conv
+        # 去 rollback：初始状态来源（首步 verify / 正常 prefill 走 pool，INIT_FROM_CP=False）
+        self.prefill_runner._gdn_init_from_cp = bool(init_from_cp)
+        if init_from_cp:
+            self.prefill_runner._gdn_init_state_s = init_state_s
+            self.prefill_runner._gdn_init_state_c = init_state_c
         self.prefill_runner._gdn_prefill_seq_idx[0] = gdn_slot
 
         try:
@@ -184,9 +197,10 @@ class SpecDecodeController:
             h = self.final_norm(h)
             out = self.lm_head(h)
         finally:
-            # 复位共享状态：force_gemm + GDN 检查点开关（engine 正常 prefill/decode 依赖）
+            # 复位共享状态：force_gemm + GDN 检查点/初始状态开关（engine 正常 prefill/decode 依赖）
             set_force_gemm(False)
             self.prefill_runner._gdn_cp_enabled = False
+            self.prefill_runner._gdn_init_from_cp = False
         return out
 
     # ------------------------------------------------------------------
@@ -332,6 +346,8 @@ class SpecDecodeController:
             generated = [anchor]
             kv_len = P + 1
             self.total_generated = 1
+            # 首步 verify 无检查点（prefill 后 GDN 状态在 pool），初始状态从 pool 读。
+            self._gdn_accepted_prev = None
 
             # ---- 投机解码主循环 ----
             while len(generated) < max_tokens:
@@ -354,10 +370,22 @@ class SpecDecodeController:
                 self._cu_q[1] = M
                 self._cu_k[0] = 0
                 self._cu_k[1] = kv_len - 1 + M
+                # 去 rollback：非首步 verify 的 GDN 初始状态直接读 checkpoint[accepted_prev]
+                # （[n_gdn,...] 视图，token 索引 bake 进 base 指针），省掉接受后 copy_ 回 pool。
+                if self._gdn_accepted_prev is not None:
+                    init_from_cp = True
+                    init_state_s = self._gdn_cp_state[self._gdn_accepted_prev]
+                    init_state_c = self._gdn_cp_conv[self._gdn_accepted_prev]
+                else:
+                    init_from_cp = False
+                    init_state_s = None
+                    init_state_c = None
                 vlogits = self._target_forward(
                     self._verify_ids, vpos, vslot, self._cu_q, self._cu_k, bt,
                     M, kv_len - 1 + M, gdn_slot,
-                    collect_aux_from=kv_len - 1, gdn_checkpoint=True)
+                    collect_aux_from=kv_len - 1, gdn_checkpoint=True,
+                    init_from_cp=init_from_cp,
+                    init_state_s=init_state_s, init_state_c=init_state_c)
                 self.total_steps += 1
 
                 # 3. 贪心接受。draft/target 各 .cpu() 一次（共 2 次同步），Python 侧
@@ -373,8 +401,9 @@ class SpecDecodeController:
                         break
                 bonus = t_cpu[accepted]
 
-                # 4. GDN 状态回滚到 checkpoint[accepted]
-                self._gdn_rollback(gdn_slot, accepted)
+                # 4. 去 rollback：不再 copy_ 回 pool。记录 accepted，下一步 verify 的
+                #    GDN 初始状态直接读 checkpoint[accepted]（见上方 init_from_cp）。
+                self._gdn_accepted_prev = accepted
 
                 # 5. 提交 accepted 个 draft + 1 个 bonus
                 new_tokens = d_cpu[:accepted] + [bonus]

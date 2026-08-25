@@ -92,7 +92,8 @@ def gdn_gbeta(a, b, a_log, dt_bias, g_buf, beta_buf, stride):
 @triton.jit
 def _gdn_conv_prefill_kernel(QKV, W, STATE, CU, SEQ_IDX,
                              CONV_DIM, STRIDE, N_GDN, GDN_L, K: tl.constexpr, BLOCK_C: tl.constexpr,
-                             CHECKPOINT, CP_N_GDN, CP_ENABLED: tl.constexpr):
+                             CHECKPOINT, CP_N_GDN, CP_ENABLED: tl.constexpr,
+                             INIT_STATE, INIT_FROM_CP: tl.constexpr):
     pid_c = tl.program_id(0)
     c = pid_c * BLOCK_C + tl.arange(0, BLOCK_C)
     cmask = c < CONV_DIM
@@ -107,9 +108,16 @@ def _gdn_conv_prefill_kernel(QKV, W, STATE, CU, SEQ_IDX,
     sid = tl.load(SEQ_IDX + s)
     # 状态池 [pool, n_gdn, 3, conv_dim]：offset = (slot*n_gdn + 本层 gdn 索引) * 3*conv_dim
     st_base = STATE + (sid.to(tl.int64) * N_GDN + GDN_L) * 3 * CONV_DIM + c
-    x0 = tl.load(st_base + 0, mask=cmask, other=0.0).to(tl.float32)
-    x1 = tl.load(st_base + CONV_DIM, mask=cmask, other=0.0).to(tl.float32)
-    x2 = tl.load(st_base + 2 * CONV_DIM, mask=cmask, other=0.0).to(tl.float32)
+    # 初始 conv 状态：spec 去 rollback 后，非首步 verify 从 checkpoint[accepted_prev]
+    # （INIT_STATE 指向 [n_gdn, 3, conv_dim]，token 索引已 bake 进 base 指针）读。
+    # conv 是 bf16、recurrent 是 fp32，dtype/布局不同 → 两个 kernel 各自处理。
+    if INIT_FROM_CP:
+        st_init = INIT_STATE + GDN_L * 3 * CONV_DIM + c
+    else:
+        st_init = st_base
+    x0 = tl.load(st_init + 0, mask=cmask, other=0.0).to(tl.float32)
+    x1 = tl.load(st_init + CONV_DIM, mask=cmask, other=0.0).to(tl.float32)
+    x2 = tl.load(st_init + 2 * CONV_DIM, mask=cmask, other=0.0).to(tl.float32)
     for i in range(0, L):
         t = start + i
         x = tl.load(QKV + t.to(tl.int64) * STRIDE + c, mask=cmask, other=0.0).to(tl.float32)
@@ -219,7 +227,8 @@ def _gdn_recurrent_prefill_kernel(QKV, G, BETA, STATE, OUT, CU, SEQ_IDX,
                                   H: tl.constexpr, HK: tl.constexpr,
                                   DK: tl.constexpr, DV: tl.constexpr,
                                   N_GDN, GDN_L, SCALE, STRIDE, BLOCK_D: tl.constexpr,
-                                  CHECKPOINT, CP_N_GDN, CP_ENABLED: tl.constexpr):
+                                  CHECKPOINT, CP_N_GDN, CP_ENABLED: tl.constexpr,
+                                  INIT_STATE, INIT_FROM_CP: tl.constexpr):
     s = tl.program_id(0)
     h = tl.program_id(1)
     start = tl.load(CU + s)
@@ -230,7 +239,15 @@ def _gdn_recurrent_prefill_kernel(QKV, G, BETA, STATE, OUT, CU, SEQ_IDX,
     S = STATE + (sid.to(tl.int64) * N_GDN + GDN_L) * H * DK * DV + h * DK * DV
     dk = tl.arange(0, BLOCK_D)
     dv = tl.arange(0, BLOCK_D)
-    S_m = tl.load(S + dk[:, None] * DV + dv[None, :]).to(tl.float32)
+    # 初始状态：spec 去 rollback 后，非首步 verify 直接从 checkpoint[accepted_prev]
+    # （INIT_STATE 指向 [n_gdn, H, DK, DV]，token 索引已 bake 进 base 指针）读，
+    # 省掉接受后 copy_ 回 pool 的 DtoD。首步 verify / 正常 prefill 仍从 pool 读。
+    # 初始 load 在循环前，checkpoint store 在循环内 → 无读写竞争。
+    if INIT_FROM_CP:
+        S_init = INIT_STATE + GDN_L * H * DK * DV + h * DK * DV
+    else:
+        S_init = S
+    S_m = tl.load(S_init + dk[:, None] * DV + dv[None, :]).to(tl.float32)
     # q/k 只有 HK 个 head，HF repeat_interleave(H//HK) 扩到 H（见 decode kernel 注释）。
     hk = h // (H // HK)
 
@@ -739,28 +756,43 @@ class Qwen3_5Adapter(ModelAdapter):
             cp_enabled = bool(getattr(graph, "_gdn_cp_enabled", False))
             cp_state = getattr(graph, "_gdn_cp_state", None)
             cp_conv = getattr(graph, "_gdn_cp_conv", None)
+            # spec 去 rollback：非首步 verify 的初始状态直接读 checkpoint[accepted_prev]
+            # （graph._gdn_init_state_s/_c 是 [n_gdn, ...] 视图，token 索引已 bake 进 base 指针）。
+            # recurrent 是 fp32 [n_gdn,H,DK,DV]、conv 是 bf16 [n_gdn,3,conv_dim]，两个独立视图。
+            # 首步 verify / 正常 prefill：INIT_FROM_CP=False，从 pool 读（INIT_STATE 传 pool 占位）。
+            init_from_cp = bool(getattr(graph, "_gdn_init_from_cp", False))
+            if init_from_cp:
+                init_state_s = graph._gdn_init_state_s   # [n_gdn, H, DK, DV] fp32
+                init_state_c = graph._gdn_init_state_c   # [n_gdn, 3, conv_dim] bf16
+            else:
+                init_state_s = state                      # 占位（kernel 内 INIT_FROM_CP=False 不读）
+                init_state_c = conv_state
             if cp_enabled:
                 _gdn_conv_prefill_kernel[(triton.cdiv(conv_dim, 512), n_seqs)](
                     qkv, la._conv_w, conv_state, cu_seqlens, seq_idx,
                     conv_dim, in_dim, n_gdn, gdn_l, K=self._gdn_K, BLOCK_C=512,
-                    CHECKPOINT=cp_conv, CP_N_GDN=n_gdn, CP_ENABLED=True)
+                    CHECKPOINT=cp_conv, CP_N_GDN=n_gdn, CP_ENABLED=True,
+                    INIT_STATE=init_state_c, INIT_FROM_CP=init_from_cp)
                 o = torch.empty(M, H * DV, dtype=h2d.dtype, device=dev)
                 _gdn_recurrent_prefill_kernel[(n_seqs, H)](
                     qkv, g, beta, state, o, cu_seqlens, seq_idx,
                     H=H, HK=HK, DK=DK, DV=DV, N_GDN=n_gdn, GDN_L=gdn_l, SCALE=scale,
                     STRIDE=in_dim, BLOCK_D=triton.next_power_of_2(max(DK, DV)),
-                    CHECKPOINT=cp_state, CP_N_GDN=n_gdn, CP_ENABLED=True)
+                    CHECKPOINT=cp_state, CP_N_GDN=n_gdn, CP_ENABLED=True,
+                    INIT_STATE=init_state_s, INIT_FROM_CP=init_from_cp)
             else:
                 _gdn_conv_prefill_kernel[(triton.cdiv(conv_dim, 512), n_seqs)](
                     qkv, la._conv_w, conv_state, cu_seqlens, seq_idx,
                     conv_dim, in_dim, n_gdn, gdn_l, K=self._gdn_K, BLOCK_C=512,
-                    CHECKPOINT=conv_state, CP_N_GDN=n_gdn, CP_ENABLED=False)
+                    CHECKPOINT=conv_state, CP_N_GDN=n_gdn, CP_ENABLED=False,
+                    INIT_STATE=init_state_c, INIT_FROM_CP=init_from_cp)
                 o = torch.empty(M, H * DV, dtype=h2d.dtype, device=dev)
                 _gdn_recurrent_prefill_kernel[(n_seqs, H)](
                     qkv, g, beta, state, o, cu_seqlens, seq_idx,
                     H=H, HK=HK, DK=DK, DV=DV, N_GDN=n_gdn, GDN_L=gdn_l, SCALE=scale,
                     STRIDE=in_dim, BLOCK_D=triton.next_power_of_2(max(DK, DV)),
-                    CHECKPOINT=state, CP_N_GDN=n_gdn, CP_ENABLED=False)
+                    CHECKPOINT=state, CP_N_GDN=n_gdn, CP_ENABLED=False,
+                    INIT_STATE=init_state_s, INIT_FROM_CP=init_from_cp)
 
         if self._dbg_gdn is not None:
             self._dbg_gdn[-1]["qkv_post"] = qkv.detach().clone()
