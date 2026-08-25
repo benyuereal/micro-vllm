@@ -97,6 +97,8 @@ def main():
     ap.add_argument("--N", type=int, default=3)
     ap.add_argument("--max-new", type=int, default=32)
     ap.add_argument("--prompt", default="The capital of France is, and the reason is that")
+    ap.add_argument("--bench", action="store_true",
+                    help="额外测 e2e 吞吐（spec decode vs plain greedy tok/s + 接受率）")
     args = ap.parse_args()
 
     from core.model_loader import load_model
@@ -137,6 +139,31 @@ def main():
     print("=" * 60)
     print(f"参考输出: {tokenizer.decode(ref)!r}")
     print(f"投机输出: {tokenizer.decode(spec)!r}")
+
+    if args.bench:
+        import time
+        # e2e 吞吐：warmup 后计时 spec decode 与 plain greedy（合成草稿接受率≈0，
+        # spec 每步 = 1 次 draft forward + 1 次 verify forward，故 tok/s 低于 greedy）。
+        bench_new = max(args.max_new, 64)
+        ctrl.generate(prompt_ids, 8)  # warmup
+        torch.cuda.synchronize()
+        t0 = time.perf_counter()
+        spec_b = ctrl.generate(prompt_ids, bench_new)
+        torch.cuda.synchronize()
+        t_spec = time.perf_counter() - t0
+        ctrl.reset()
+        t0 = time.perf_counter()
+        ref_b = plain_greedy_controller(ctrl, prompt_ids, bench_new)
+        torch.cuda.synchronize()
+        t_greedy = time.perf_counter() - t0
+        print("\n" + "=" * 60)
+        print(f"e2e 吞吐（N={args.N}, max_new={bench_new}）:")
+        print(f"  spec decode : {len(spec_b)} tok / {t_spec:.3f}s = {len(spec_b) / t_spec:.1f} tok/s  "
+              f"接受率={ctrl.avg_acceptance:.3f}/N")
+        print(f"  plain greedy: {len(ref_b)} tok / {t_greedy:.3f}s = {len(ref_b) / t_greedy:.1f} tok/s")
+        print(f"  token match : {ref_b == spec_b}")
+        print("=" * 60)
+
     assert match, "DFlash2 草稿路径 wiring 错误：spec 输出与 plain greedy 不一致！"
     print("\n✅ DFlash2 草稿路径 wiring 验证通过：交叉注意力草稿 + target lm_head，"
           "spec 输出与 plain greedy 逐 token 一致")
