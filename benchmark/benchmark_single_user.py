@@ -104,15 +104,22 @@ def run_nano():
     return walls
 
 
-if MODE == "micro":
-    walls = run_micro()
-elif MODE == "vllm":
-    walls = run_vllm()
-elif MODE == "nano":
-    walls = run_nano()
-else:
-    raise SystemExit(f"unknown mode: {MODE} (micro|vllm|nano)")
+def main():
+    if MODE == "micro":
+        walls = run_micro()
+    elif MODE == "vllm":
+        walls = run_vllm()
+    elif MODE == "nano":
+        walls = run_nano()
+    else:
+        raise SystemExit(f"unknown mode: {MODE} (micro|vllm|nano)")
 
-med_wall = statistics.median(walls)
-print(f"{MODE} bs=1 ({IN_TOK}in/{OUT_TOK}out): {OUT_TOK/med_wall:.1f} tok/s | "
-      f"wall {med_wall*1000:.0f} ms | rounds={[f'{w*1000:.0f}' for w in walls]}")
+    med_wall = statistics.median(walls)
+    print(f"{MODE} bs=1 ({IN_TOK}in/{OUT_TOK}out): {OUT_TOK/med_wall:.1f} tok/s | "
+          f"wall {med_wall*1000:.0f} ms | rounds={[f'{w*1000:.0f}' for w in walls]}")
+
+
+if __name__ == "__main__":
+    # vLLM 用 multiprocessing spawn 起 engine core 子进程，会重新 import 本模块；
+    # 无 __main__ guard 时子进程会重跑 run_vllm() 导致递归 spawn 崩溃。
+    main()

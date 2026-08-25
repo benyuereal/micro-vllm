@@ -91,6 +91,14 @@ class DecodeContext:
         self.next_tokens = next_tokens_gpu
 
         next_tokens = next_tokens_gpu.tolist()
+        # decode batch 含循环复制的 pad 重复 seq（同一 Sequence 对象出现多次）。
+        # 仅对每个 seq_id 的首次出现写 _next_token：pad 行在 GDN 架构下被 kernel
+        # 跳过（IS_REAL=0），其输出是未初始化垃圾，若按行写会覆盖真实 token。
+        # 非 GDN 架构 pad 行输出与真实行相同，去重无副作用。
+        seen = set()
         for i, seq in enumerate(batch):
+            if seq.seq_id in seen:
+                continue
+            seen.add(seq.seq_id)
             seq._next_token = next_tokens[i]
         return next_tokens

@@ -134,6 +134,11 @@ class ModelAdapter(ABC):
         """返回最终 RMSNorm 层。"""
         return model.model.norm
 
+    def final_norm_one_centered(self) -> bool:
+        """final_norm 是否 1-centered（out = x*rrms*(1+w)）。Qwen3.5 是，Qwen3/DeepSeek 否。
+        model_graph 的 decode 末层据此选 rmsnorm_ / rmsnorm1_。"""
+        return False
+
     def lm_head(self, model):
         """返回 lm_head（callable: hidden → logits）。"""
         return model.lm_head
@@ -183,3 +188,27 @@ class ModelAdapter(ABC):
 
     def get_buf(self, bufs, name, bs):
         return bufs[name][:bs]
+
+    # ------------------------------------------------------------------
+    # 有状态层（GDN 线性注意力等）的 batch 元信息钩子
+    # ------------------------------------------------------------------
+    def gdn_stateful(self) -> bool:
+        """该架构是否有 per-seq 递归状态（GDN）。True 时 engine 在每步 forward 前
+        调 on_decode_batch / on_prefill_batch 把 batch 的 seq_id 传给 adapter，
+        用于索引 per-seq 状态池（decode pad 行去重、prefill 首 chunk 清零状态）。"""
+        return False
+
+    def on_decode_batch(self, batch, graph):
+        """decode 步 forward 前调用：batch 为 pad 后的序列列表（循环复制填充）。
+        adapter 据此填 graph 上的状态池索引（真实行 vs pad 行）。默认 no-op。"""
+        pass
+
+    def on_prefill_batch(self, batch, graph):
+        """prefill 步 forward 前调用：batch 为本 prefill batch 的序列列表。
+        adapter 据此填状态池索引 + 首 chunk 清零状态。默认 no-op。"""
+        pass
+
+    def on_seq_finished(self, seq):
+        """seq 完成（EOS/stop/max_tokens）时调用：释放其 per-seq 状态池 slot
+        （GDN 等）。默认 no-op。"""
+        pass
