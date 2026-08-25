@@ -7,7 +7,8 @@
 12-31x（实测 mlp_gu 3.6ms→0.3ms），maxdiff=0.0（与反量化 matmul 完全一致）。
 
 仅用于投机解码 verify（M 小）。正常 decode（M=1）走 GEMV、prefill（M 大）走反量化
-matmul，均不受影响（由 gemv_int8.set_force_gemm 开关控制）。
+matmul，均不受影响（由 kernel.gemm_int8_triton.set_verify_gemm 开关控制，
+MICRO_VERIFY_GEMM=tilelang|triton 选后端，本模块是 tilelang 后端）。
 """
 import torch
 import tilelang

@@ -587,15 +587,15 @@ class Qwen3_5Adapter(ModelAdapter):
         反量化后 x @ w.t()（compute-bound，反量化开销可忽略）。
         scale 两种：[N]（per-channel）→ unsqueeze(1)；[N,K/128]（group-128）→ repeat_interleave 128。
 
-        投机解码 verify（M 小，force_gemm 开）：group-128 int8 走分块 int8 GEMV
-        （权重 HBM 只读一次，fp32 累加 bit-exact 原 GEMV），避免反量化 54GB bf16
-        权重/层。经 w8_linear 分派（_force_gemm 且 M<=8 → tiled）。"""
+        投机解码 verify（M 小，verify_gemm 开）：group-128 int8 走双后端 int8 GEMM
+        （TileLang 默认 / Triton 备选，MICRO_VERIFY_GEMM 切换；权重 HBM 只读一次，
+        shared 内 dequant→bf16 + GEMM），避免反量化 54GB bf16 权重/层。"""
         if isinstance(w, tuple):
             w_int8, scale = w
             if scale.dim() == 2:
-                from kernel.gemv_int8 import _force_gemm, w8_linear
-                if _force_gemm:
-                    return w8_linear(x, w_int8, scale)
+                from kernel.gemm_int8_triton import verify_gemm_enabled, verify_int8_gemm
+                if verify_gemm_enabled():
+                    return verify_int8_gemm(x, w_int8, scale)
                 sc = scale.repeat_interleave(128, dim=1)
             else:
                 sc = scale.unsqueeze(1)
