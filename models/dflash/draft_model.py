@@ -27,72 +27,35 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-
-# ---------------------------------------------------------------------------
-# RoPE（half-split / Llama 风格 rotate_half，与 Qwen3 一致）
-# ---------------------------------------------------------------------------
-def _rope_half_split(x, cos, sin):
-    """x [..., d]，cos/sin [..., d//2]。返回旋转后的 x。"""
-    x1, x2 = x.chunk(2, dim=-1)
-    return torch.cat([x1 * cos - x2 * sin, x2 * cos + x1 * sin], dim=-1)
-
-
-def _build_rope_cache(head_dim, max_pos, theta, device, dtype):
-    """预计算 cos/sin 表 [max_pos, head_dim//2]。"""
-    inv_freq = 1.0 / (theta ** (torch.arange(0, head_dim, 2, device=device).float() / head_dim))
-    pos = torch.arange(max_pos, device=device).float()
-    freqs = torch.outer(pos, inv_freq)
-    emb = torch.cat([freqs, freqs], dim=-1)  # [max_pos, head_dim]
-    cos = emb.cos()[:, : head_dim // 2].to(dtype)  # [max_pos, head_dim//2]
-    sin = emb.sin()[:, : head_dim // 2].to(dtype)
-    return cos, sin
+from kernel.dflash_ops import (
+    build_rope_cache, rope_half_split, grouped_conv, score_edges,
+)
+from kernel.rmsnorm import rmsnorm as _triton_rmsnorm
 
 
 # ---------------------------------------------------------------------------
 # RMSNorm（支持 fused residual 形式：forward(x, residual) -> (normed, new_residual)）
 # ---------------------------------------------------------------------------
 class RMSNorm(nn.Module):
+    """复用 kernel/rmsnorm.py 的 Triton rmsnorm（fp32 累加，与原 torch 实现数值一致）。"""
+
     def __init__(self, hidden_size, eps=1e-6, dtype=torch.bfloat16):
         super().__init__()
         self.weight = nn.Parameter(torch.ones(hidden_size, dtype=dtype))
         self.eps = eps
 
-    def _norm(self, x):
-        out = x * torch.rsqrt(x.float().pow(2).mean(-1, keepdim=True) + self.eps)
-        return out.to(x.dtype)
-
     def forward(self, x, residual=None):
         if residual is None:
-            return self._norm(x) * self.weight
+            return _triton_rmsnorm(x, self.weight, self.eps)
         # fused：new_residual = x + residual；normed = norm(new_residual) * weight
         new_residual = x + residual
-        return self._norm(new_residual) * self.weight, new_residual
+        return _triton_rmsnorm(new_residual, self.weight, self.eps), new_residual
 
 
 # ---------------------------------------------------------------------------
 # DFlashGroupedConv（DFlash2 特有：可学习分组卷积，系数由 hidden 投影得到）
+# 核心卷积复用 kernel/dflash_ops.grouped_conv。
 # ---------------------------------------------------------------------------
-def _grouped_conv(hidden_states, delta, base, block_size, num_groups, group_size, taps):
-    """对齐 vLLM _grouped_conv。
-
-    hidden_states: [T, hidden]
-    delta: [T, taps, num_groups]（本侧系数增量）
-    base: [taps, hidden]（基础卷积核）
-    """
-    blocks = hidden_states.unflatten(-1, (num_groups, group_size))  # [T, G, gs]
-    coefficients = base.view(1, taps, num_groups, group_size) + delta.unsqueeze(-1)  # [T,taps,G,gs]
-    output = coefficients[:, 0] * blocks  # [T, G, gs]
-    position = torch.arange(hidden_states.shape[0], device=hidden_states.device)
-    if block_size & (block_size - 1) == 0:
-        position = position & (block_size - 1)
-    else:
-        position = position % block_size
-    for tap in range(1, taps):
-        shifted = F.pad(blocks[:-tap], (0, 0, 0, 0, tap, 0))
-        output = output + coefficients[:, tap] * shifted * (position >= tap).view(-1, 1, 1)
-    return output.flatten(-2)
-
-
 class DFlashGroupedConv(nn.Module):
     def __init__(self, hidden_size, taps, group_size, block_size, params_dtype):
         super().__init__()
@@ -109,7 +72,7 @@ class DFlashGroupedConv(nn.Module):
         self.kernel_projection.weight.data = self.kernel_projection.weight.data.to(params_dtype)
 
     def _convolve(self, hidden_states, delta, side):
-        return _grouped_conv(
+        return grouped_conv(
             hidden_states, delta, self.base_kernel[side],
             self.block_size, self.num_groups, self.group_size, self.taps,
         )
@@ -142,23 +105,10 @@ class CandidateSelector(nn.Module):
 
     def forward(self, candidate_ids, unary_logits, hidden_states, anchor_token_ids):
         hidden = self.hidden_projection(hidden_states)
-        return _score_edges(
+        return score_edges(
             self.predecessor_codebook, self.successor_codebook,
             candidate_ids, unary_logits, hidden, anchor_token_ids, self.top_k,
         )
-
-
-def _score_edges(predecessor_table, successor_table, candidate_ids,
-                 unary_logits, hidden, anchor_token_ids, top_k):
-    successors = successor_table[candidate_ids]
-    predecessor_ids = torch.cat(
-        (anchor_token_ids[:, None, None].expand(-1, 1, top_k), candidate_ids[:, :-1]),
-        dim=1,
-    )
-    predecessors = predecessor_table[predecessor_ids]
-    return unary_logits[:, :, None] + torch.einsum(
-        "blpr,blcr->blpc", predecessors * hidden[:, :, None], successors
-    )
 
 
 # ---------------------------------------------------------------------------
@@ -187,7 +137,7 @@ class DFlashAttention(nn.Module):
         self.k_norm = RMSNorm(head_dim, eps=rms_norm_eps, dtype=dtype)
 
         self.rope_theta = rope_theta
-        self._cos, self._sin = _build_rope_cache(head_dim, max_pos, rope_theta, device, dtype)
+        self._cos, self._sin = build_rope_cache(head_dim, max_pos, rope_theta, device, dtype)
 
     def forward(self, positions, hidden_states, context_kv=None):
         """positions: [T] 绝对位置。hidden_states: [T, hidden]（1+N query token）。
@@ -204,8 +154,8 @@ class DFlashAttention(nn.Module):
 
         cos = self._cos[positions].unsqueeze(1)  # [T, 1, hd//2]
         sin = self._sin[positions].unsqueeze(1)
-        q = _rope_half_split(q, cos, sin)
-        k = _rope_half_split(k, cos, sin)
+        q = rope_half_split(q, cos, sin)
+        k = rope_half_split(k, cos, sin)
 
         # 拼接 context KV（DFlash2：草稿 attention 读 context + 1+N query，非因果）
         if context_kv is not None:
@@ -233,7 +183,7 @@ class DFlashAttention(nn.Module):
         k = self.k_norm(k)
         cos = self._cos[positions].unsqueeze(1)
         sin = self._sin[positions].unsqueeze(1)
-        k = _rope_half_split(k, cos, sin)
+        k = rope_half_split(k, cos, sin)
         return k, v
 
 

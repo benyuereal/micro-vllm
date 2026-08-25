@@ -12,11 +12,12 @@
   2. 单用户 decode 吞吐对比（有/无投机解码）。
 W8A16 目标模型就绪后，可迁移到 paged cache + CUDA graph 路径以获取真实加速。
 
-权重布局兼容：
-- prepared（engine 的 Qwen3Adapter.prepare_weights 后）：attn._qkv_w/_o_w/_q_norm_w/...，
-  mlp._gu/_d，block._in_ln_w/_post_ln_w。
-- HF 原始（transformers 加载，未 prepare）：attn.q_proj/k_proj/...，mlp.gate_proj/...。
-  两种布局用同一 forward（_layer_forward 内按 hasattr 分派）。
+权重布局：HF 原始（transformers 加载，未 prepare）——attn.q_proj/k_proj/...，
+mlp.gate_proj/...。engine 的 _build_spec_controller 加载的正是新鲜未 prepare 副本
+（prepare_weights 会重排权重，无法用于本控制器的逐层 forward）。
+
+公共算子（RoPE / RMSNorm）复用 kernel/dflash_ops.py 与 kernel/rmsnorm.py，
+attention 用 flash_attn（原生 GQA，无 repeat_interleave）。
 
 索引约定（与验证脚本一致）：
 - kv_len = 有效序列长度 L。anchor = tokens[L-1]。
@@ -28,42 +29,10 @@ from typing import List, Optional
 
 import torch
 import torch.nn.functional as F
+from flash_attn import flash_attn_func, flash_attn_varlen_func
 
-
-# ---------------------------------------------------------------------------
-# RoPE（half-split / rotate_half，与 Qwen3 一致）
-# ---------------------------------------------------------------------------
-def _build_rope_cache(head_dim, max_pos, theta, device, dtype):
-    inv_freq = 1.0 / (theta ** (torch.arange(0, head_dim, 2, device=device, dtype=torch.float32) / head_dim))
-    t = torch.arange(max_pos, device=device, dtype=torch.float32)
-    freqs = torch.einsum("i,j->ij", t, inv_freq)
-    emb = torch.cat((freqs, freqs), dim=-1)
-    cos = emb.cos()[:, :head_dim // 2].to(dtype)
-    sin = emb.sin()[:, :head_dim // 2].to(dtype)
-    return cos, sin
-
-
-def _rope_half_split(x, cos, sin):
-    x1, x2 = x.chunk(2, dim=-1)
-    return torch.cat([x1 * cos - x2 * sin, x2 * cos + x1 * sin], dim=-1)
-
-
-def _rmsnorm_head(x, weight, eps):
-    """per-head RMSNorm：x [T, H, D]，weight [D]。fp32 计算，返回 x.dtype。"""
-    dtype = x.dtype
-    xf = x.float()
-    var = xf.pow(2).mean(-1, keepdim=True)
-    xf = xf * torch.rsqrt(var + eps)
-    return (xf * weight.float()).to(dtype)
-
-
-def _rmsnorm_full(x, weight, eps):
-    """full RMSNorm：x [T, H]，weight [H]。"""
-    dtype = x.dtype
-    xf = x.float()
-    var = xf.pow(2).mean(-1, keepdim=True)
-    xf = xf * torch.rsqrt(var + eps)
-    return (xf * weight.float()).to(dtype)
+from kernel.dflash_ops import build_rope_cache, rope_half_split
+from kernel.rmsnorm import rmsnorm
 
 
 # ---------------------------------------------------------------------------
@@ -95,7 +64,7 @@ class SpecDecodeController:
         self.head_dim = getattr(cfg, "head_dim", cfg.hidden_size // cfg.num_attention_heads)
         self.vocab_size = cfg.vocab_size
         theta = getattr(cfg, "rope_theta", None) or (getattr(cfg, "rope_parameters", None) or {}).get("rope_theta", 1000000.0)
-        self.cos, self.sin = _build_rope_cache(self.head_dim, max_len, theta, device, dtype)
+        self.cos, self.sin = build_rope_cache(self.head_dim, max_len, theta, device, dtype)
 
         # target 的 dense KV cache
         self.k_cache = torch.zeros(self.num_layers, max_len, self.num_kv_heads, self.head_dim,
@@ -137,7 +106,7 @@ class SpecDecodeController:
         self.total_steps = 0
         self.total_generated = 0
 
-    # ---------------- 单层 forward（兼容 prepared / HF 权重布局） ----------------
+    # ---------------- 单层 forward（HF 权重布局） ----------------
     def _layer_forward(self, model, li, h, cos, sin, ctx_len, T, causal, write_kv=True):
         """单层：input_layernorm → attention → o_proj → residual → post_ln → mlp → residual。
 
@@ -151,99 +120,55 @@ class SpecDecodeController:
         layer = model.model.layers[li]
         attn = layer.self_attn
         mlp = layer.mlp
-        prepared = hasattr(attn, "_qkv_w")
+        nh, nkv, hd = self.num_heads, self.num_kv_heads, self.head_dim
 
         # input_layernorm
-        if prepared:
-            h_normed = _rmsnorm_full(h, layer._in_ln_w, layer._in_ln_eps)
-        else:
-            h_normed = layer.input_layernorm(h)
+        h_normed = layer.input_layernorm(h)
 
-        # QKV 投影
-        if prepared:
-            qkv = h_normed @ attn._qkv_w.t()  # [T, qkv_dim]
-            q_dim = self.num_heads * self.head_dim
-            kv_dim = self.num_kv_heads * self.head_dim
-            q = qkv[:, :q_dim].view(T, self.num_heads, self.head_dim)
-            k = qkv[:, q_dim:q_dim + kv_dim].view(T, self.num_kv_heads, self.head_dim)
-            v = qkv[:, q_dim + kv_dim:].view(T, self.num_kv_heads, self.head_dim)
-            q = _rmsnorm_head(q, attn._q_norm_w, attn._q_norm_eps)
-            k = _rmsnorm_head(k, attn._k_norm_w, attn._k_norm_eps)
-        else:
-            q = attn.q_proj(h_normed).view(T, self.num_heads, self.head_dim)
-            k = attn.k_proj(h_normed).view(T, self.num_kv_heads, self.head_dim)
-            v = attn.v_proj(h_normed).view(T, self.num_kv_heads, self.head_dim)
-            q = attn.q_norm(q)
-            k = attn.k_norm(k)
+        # QKV 投影 + per-head QK-Norm + RoPE
+        q = attn.q_norm(attn.q_proj(h_normed).view(T, nh, hd))
+        k = attn.k_norm(attn.k_proj(h_normed).view(T, nkv, hd))
+        v = attn.v_proj(h_normed).view(T, nkv, hd)
+        q = rope_half_split(q, cos, sin)
+        k = rope_half_split(k, cos, sin)
 
-        # RoPE
-        q = _rope_half_split(q, cos, sin)
-        k = _rope_half_split(k, cos, sin)
-
-        # attention
+        # attention（flash_attn 原生 GQA，无 repeat_interleave）
         if causal:
             if write_kv:
                 self.k_cache[li, ctx_len:ctx_len + T] = k
                 self.v_cache[li, ctx_len:ctx_len + T] = v
-            attn_out = self._attention(li, q, ctx_len, T, causal=True)
+            attn_out = self._verify_attention(li, q, ctx_len, T)
         else:
             attn_out = self._draft_attention(li, q, ctx_len, T, k, v)
 
-        # o_proj
-        if prepared:
-            attn_out = attn_out.reshape(T, -1) @ attn._o_w.t()
-        else:
-            attn_out = attn.o_proj(attn_out.reshape(T, -1))
+        # o_proj + residual
+        h = attn.o_proj(attn_out.reshape(T, -1)) + h
 
-        h = attn_out + h
-        residual = h
+        # post_attention_layernorm + mlp (SwiGLU) + residual
+        h_normed = layer.post_attention_layernorm(h)
+        return mlp.down_proj(F.silu(mlp.gate_proj(h_normed)) * mlp.up_proj(h_normed)) + h
 
-        # post_attention_layernorm
-        if prepared:
-            h_normed = _rmsnorm_full(h, layer._post_ln_w, layer._post_ln_eps)
-        else:
-            h_normed = layer.post_attention_layernorm(h)
-
-        # mlp (SwiGLU)
-        if prepared:
-            gu = h_normed @ mlp._gu.t()  # [T, 2*inter]，前半 up、后半 gate
-            inter = gu.shape[1] // 2
-            up = gu[:, :inter]
-            gate = gu[:, inter:]
-            h = (F.silu(gate) * up) @ mlp._d.t()
-        else:
-            h = mlp.down_proj(F.silu(mlp.gate_proj(h_normed)) * mlp.up_proj(h_normed))
-
-        return h + residual
-
-    def _attention(self, li, q, ctx_len, T, causal):
+    def _verify_attention(self, li, q, ctx_len, T):
+        """因果 verify：query [ctx_len, ctx_len+T) 读 KV [0:ctx_len+T]（含本步写入）。
+        varlen 单序列 causal（q 从 ctx_len 起，kv 从 0 起，等价于原 mask 逻辑）。"""
         end = ctx_len + T
-        k = self.k_cache[li, :end]
-        v = self.v_cache[li, :end]
-        n_rep = self.num_heads // self.num_kv_heads
-        k = k.repeat_interleave(n_rep, dim=1)
-        v = v.repeat_interleave(n_rep, dim=1)
-        scores = torch.einsum("thd,ehd->hte", q, k) * (self.head_dim ** -0.5)
-        if causal:
-            q_pos = ctx_len + torch.arange(T, device=q.device)
-            kv_pos = torch.arange(end, device=q.device)
-            mask = kv_pos[None, :] <= q_pos[:, None]
-            scores = scores.masked_fill(~mask[None], float("-inf"))
-        attn = scores.softmax(-1)
-        return torch.einsum("hte,ehd->thd", attn, v)
+        k = self.k_cache[li, :end].unsqueeze(0)  # [1, end, nkv, hd]
+        v = self.v_cache[li, :end].unsqueeze(0)
+        cu_q = torch.tensor([0, T], dtype=torch.int32, device=q.device)
+        cu_k = torch.tensor([0, end], dtype=torch.int32, device=q.device)
+        out = flash_attn_varlen_func(
+            q, k.squeeze(0), v.squeeze(0), cu_q, cu_k, T, end,
+            softmax_scale=self.head_dim ** -0.5, causal=True)
+        return out  # [T, nh, hd]
 
     def _draft_attention(self, li, q, ctx_len, T, k_q, v_q):
         """非因果：query 看全部 context（target KV[0:ctx_len]）+ 全部 1+N query。"""
-        k_ctx = self.k_cache[li, :ctx_len]
-        v_ctx = self.v_cache[li, :ctx_len]
-        k = torch.cat([k_ctx, k_q], dim=0)
-        v = torch.cat([v_ctx, v_q], dim=0)
-        n_rep = self.num_heads // self.num_kv_heads
-        k = k.repeat_interleave(n_rep, dim=1)
-        v = v.repeat_interleave(n_rep, dim=1)
-        scores = torch.einsum("thd,ehd->hte", q, k) * (self.head_dim ** -0.5)
-        attn = scores.softmax(-1)
-        return torch.einsum("hte,ehd->thd", attn, v)
+        k = torch.cat([self.k_cache[li, :ctx_len], k_q], dim=0).unsqueeze(0)  # [1, S, nkv, hd]
+        v = torch.cat([self.v_cache[li, :ctx_len], v_q], dim=0).unsqueeze(0)
+        out = flash_attn_func(
+            q.unsqueeze(0), k, v,
+            softmax_scale=self.head_dim ** -0.5, causal=False)
+        return out.squeeze(0)  # [T, nh, hd]
 
     # ---------------- 模型 forward ----------------
     def _forward(self, model, input_ids, positions, ctx_len, causal,

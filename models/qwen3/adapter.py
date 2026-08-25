@@ -34,13 +34,7 @@ except ImportError:
 
 from core.cache_manager import store_kvcache
 from core.parallel_config import all_reduce
-
-
-def rope_half_split(x, cos, sin):
-    """half-split RoPE（Llama 风格 rotate_half）：x [..., d]，cos/sin [..., 1, d//2]。
-    q/k 共用（prefill 路径按 per-token position gather 后逐 token 旋转）。"""
-    x1, x2 = x.chunk(2, dim=-1)
-    return torch.cat([x1 * cos - x2 * sin, x2 * cos + x1 * sin], dim=-1)
+from kernel.dflash_ops import rope_half_split  # 公共 half-split RoPE（prefill 路径按 per-token position gather 后逐 token 旋转）
 
 
 class Qwen3Adapter(ModelAdapter):
