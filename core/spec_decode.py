@@ -34,7 +34,7 @@ from typing import List, Optional
 import torch
 
 from models.base import PrefillMeta
-from kernel.gemv_int8 import set_force_gemm
+from kernel.gemm_int8_triton import set_verify_gemm
 
 
 class SpecDecodeController:
@@ -150,10 +150,11 @@ class SpecDecodeController:
         M = input_ids.shape[0]
         h = self.embed(input_ids)
 
-        # verify（M=1+N≈8）强制 TileLang int8 分块 GEMM：int8 GEMV 对 M>1 把权重读
-        # M 次（27GB×8=216GB），GEMM 权重 HBM 只读一次（shared 内 dequant），快 12-31x。
+        # verify（M=1+N≈8）走双后端 int8 GEMM（TileLang 默认 / Triton 备选，
+        # MICRO_VERIFY_GEMM 切换）：权重 HBM 只读一次（shared 内 dequant→bf16 +
+        # GEMM），比原 CUDA tiled GEMV 快 ~12x（mlp_gu 3.59ms→0.29ms）。
         # prefill（M 大）本就走反量化 matmul，不受影响。
-        set_force_gemm(bool(gdn_checkpoint))
+        set_verify_gemm(bool(gdn_checkpoint))
 
         # GDN 检查点开关（graph=prefill_runner 的 buffer）。prefill_runner 与 engine
         # 正常 prefill 路径【共享】，故必须在 finally 里复位 _gdn_cp_enabled=False，
@@ -185,8 +186,8 @@ class SpecDecodeController:
             h = self.final_norm(h)
             out = self.lm_head(h)
         finally:
-            # 复位共享状态：force_gemm + GDN 检查点开关（engine 正常 prefill/decode 依赖）
-            set_force_gemm(False)
+            # 复位共享状态：verify GEMM 开关 + GDN 检查点开关（engine 正常 prefill/decode 依赖）
+            set_verify_gemm(False)
             self.prefill_runner._gdn_cp_enabled = False
         return out
 
@@ -240,13 +241,14 @@ class SpecDecodeController:
         return logits.argmax(dim=-1)  # [N]
 
     # ------------------------------------------------------------------
-    # 预热：编译 TileLang int8 GEMM kernel（verify M=1+N 的各层 shape）
+    # 预热：编译 verify int8 GEMM kernel（verify M=1+N 的各层 shape）
     # ------------------------------------------------------------------
     @torch.inference_mode()
     def warmup(self):
         """跑一次 dummy verify forward（M=1+N，gdn_checkpoint=True），触发所有层
-        的 TileLang int8 GEMM 编译（每 (M,N,K,dtype) 一次，~3s/shape）。放 init 时
-        做，避免首个真实 verify 卡在编译（否则 e2e 吞吐被一次性编译拉低）。"""
+        的 verify int8 GEMM 编译（TileLang 每 (M,N,K,dtype) 一次 ~3s/shape；
+        Triton 首调 JIT）。放 init 时做，避免首个真实 verify 卡在编译
+        （否则 e2e 吞吐被一次性编译拉低）。"""
         device = self.device
         M = 1 + self.N
         gdn_slot = self._gdn_alloc()
