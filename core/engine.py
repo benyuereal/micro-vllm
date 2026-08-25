@@ -52,10 +52,19 @@ class InferenceEngine:
     DEFAULT_BLOCK_SIZE = 256
 
     def __init__(self, model_path: str, max_batch_size: int = 512, max_prefill_tokens: int = 8192,
-                 max_context_length: int = 1024):
+                 max_context_length: int = 1024,
+                 spec_decode: bool = False, draft_model_path: str = None,
+                 num_speculative_tokens: int = 7, mask_token_id: int = 0):
         self._init_distributed()
         self._init_model(model_path)
         self._init_config()
+        # 投机解码（DFlash2）配置。spec_decode=True 时构建 SpecDecodeController：
+        #   draft_model_path=None → 自起草（草稿=目标模型，机制验证用）
+        #   draft_model_path=路径 → 加载 DFlash2 小草稿模型（W8A16 目标就绪后端到端）
+        self.spec_decode_enabled = spec_decode
+        self.num_speculative_tokens = num_speculative_tokens
+        self.mask_token_id = mask_token_id
+        self._spec_controller = None
 
         # 核心组件初始化
         self.device, self.dtype = self._auto_configure()
@@ -158,8 +167,56 @@ class InferenceEngine:
         if self.adapter.supports_chunked_prefill(self.config):
             self._warmup_prefill(cap_sizes)
 
+        # 投机解码控制器（DFlash2）。在 CUDA graph 捕获后构建（需 device/dtype 就绪）。
+        if self.spec_decode_enabled:
+            self._build_spec_controller(draft_model_path)
+
         # 注册退出钩子
         atexit.register(self.shutdown)
+
+    def _build_spec_controller(self, draft_model_path: Optional[str]):
+        """构建 SpecDecodeController。
+
+        注意：engine 的 self.model 权重已被 adapter.prepare_weights 重排
+        （q_proj/k_proj/... 置 None，存 _qkv_w 等），无法直接用于控制器的
+        手动 forward。故控制器加载一份【新鲜的】目标模型副本（同权重，未 prepare）。
+        自起草时草稿=该副本；DFlash2 时草稿=独立小草稿模型。
+
+        draft_model_path=None → 自起草（草稿=目标模型副本）。
+        draft_model_path=路径 → 加载 DFlash2 小草稿模型（load_dflash2_draft）。
+        """
+        from core.spec_decode import SpecDecodeController
+        from core.model_loader import load_model
+        device = self.device
+        dtype = self.dtype
+        # 加载新鲜目标模型副本（控制器专用，dense KV cache 手动 forward）
+        target_model, _ = load_model(self._model_path, device=device)
+        target_model.eval()
+        if draft_model_path is None:
+            # 自起草：草稿=目标模型副本
+            draft_model = target_model
+            draft_is_target = True
+            mask_token_id = self.mask_token_id
+        else:
+            from models.dflash import load_dflash2_draft
+            draft_model, draft_cfg = load_dflash2_draft(
+                draft_model_path, dtype, device, self.num_speculative_tokens,
+                max_pos=self.max_position)
+            # DFlash2 草稿权重不含 embed_tokens / lm_head：从 target 共享（同 vocab/hidden）。
+            # 对齐 vLLM load_dflash_model（draft.embed_tokens = target_embed；
+            # dflash_model.lm_head = target_lm_head）。
+            draft_model.share_target_weights(
+                target_model.model.embed_tokens, target_model.lm_head)
+            draft_is_target = False
+            mask_token_id = getattr(draft_cfg, "dflash_config", {}).get(
+                "mask_token_id", self.mask_token_id)
+        self._spec_controller = SpecDecodeController(
+            target_model, draft_model, device, dtype,
+            num_speculative_tokens=self.num_speculative_tokens,
+            mask_token_id=mask_token_id, max_len=self.max_position,
+            draft_is_target=draft_is_target)
+        logger.info(f"投机解码控制器已构建: N={self.num_speculative_tokens} "
+                    f"mask_token={mask_token_id} draft={'self' if draft_is_target else draft_model_path}")
 
     def _warmup_sampler(self, batch_sizes):
         """对所有捕获的 batch_size 预热 sampler 编译路径，消除首次调用的 ~1-2s 捕获开销。
@@ -233,6 +290,7 @@ class InferenceEngine:
 
     def _init_model(self, model_path: str):
         logger.info(f"Loading model {model_path} on rank {self.rank}")
+        self._model_path = model_path
         self.model, self.tokenizer = load_model(model_path, device=self.device_str)
         self.model.eval()
         self.config = self.model.config
@@ -449,6 +507,35 @@ class InferenceEngine:
         
         self.scheduler.running_sequences.clear()
         return results
+
+    def generate_spec_decode(self, prompt: str, max_tokens: int = 100) -> Dict[str, object]:
+        """投机解码生成（单序列，DFlash2 draft-verify-accept，greedy 确定性接受）。
+
+        返回 {text, tokens, avg_acceptance, num_steps, time_s, tok_s}。
+        输出与无投机 greedy 逐 token 一致（正确性保证）。
+        """
+        if self._spec_controller is None:
+            raise RuntimeError("投机解码未启用（构造时 spec_decode=True）")
+        prompt_ids = self.tokenizer.encode(prompt, add_special_tokens=True)
+        cap = self.max_position
+        if len(prompt_ids) > cap:
+            prompt_ids = prompt_ids[:cap]
+        max_tokens = max(1, min(max_tokens, cap - len(prompt_ids)))
+
+        t0 = time.time()
+        out_ids = self._spec_controller.generate(
+            prompt_ids, max_tokens, eos_token_id=self.eos_token_id)
+        elapsed = time.time() - t0
+
+        text = self.tokenizer.decode(out_ids, skip_special_tokens=True)
+        return {
+            "text": text,
+            "tokens": out_ids,
+            "avg_acceptance": self._spec_controller.avg_acceptance,
+            "num_steps": self._spec_controller.total_steps,
+            "time_s": elapsed,
+            "tok_s": len(out_ids) / elapsed if elapsed > 0 else 0.0,
+        }
 
     # -------------------------------------------------------------------------
     # 内部逻辑 (Internal Logic)
