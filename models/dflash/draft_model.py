@@ -31,6 +31,13 @@ from kernel.dflash_ops import (
     build_rope_cache, rope_half_split, grouped_conv, score_edges,
 )
 from kernel.rmsnorm import rmsnorm as _triton_rmsnorm
+from kernel.draft_gemm import draft_gemm
+
+# GEMM M 上界（TileLang T.gemm 要求 M%16==0，pad 到 BLOCK_M 的倍数）：
+# - query 路径：1+N=8 个 token（anchor + N mask），上界 16。
+# - context 路径：变长 C（target 中间层 hidden 投影），上界 4096（sliding_window=2048）。
+_QUERY_MAX_M = 16
+_CTX_MAX_M = 4096
 
 
 # ---------------------------------------------------------------------------
@@ -78,9 +85,10 @@ class DFlashGroupedConv(nn.Module):
         )
 
     def prepare(self, hidden_states):
-        coefficients = self.kernel_projection(hidden_states).reshape(
-            hidden_states.shape[0], 2, self.taps, self.num_groups
-        )
+        # kernel_projection [T, hidden] @ [2*taps*G, hidden].T → TileLang GEMM
+        coefficients = draft_gemm(
+            hidden_states, self.kernel_projection.weight, _QUERY_MAX_M
+        ).reshape(hidden_states.shape[0], 2, self.taps, self.num_groups)
         return self._convolve(hidden_states, coefficients[:, 0], 0), coefficients[:, 1]
 
     def finish(self, hidden_states, coefficients):
@@ -104,7 +112,14 @@ class CandidateSelector(nn.Module):
         self.hidden_projection.weight.data = self.hidden_projection.weight.data.to(params_dtype)
 
     def forward(self, candidate_ids, unary_logits, hidden_states, anchor_token_ids):
-        hidden = self.hidden_projection(hidden_states)
+        # hidden_projection [T, hidden] @ [rank, hidden].T → TileLang GEMM。
+        # hidden_states 可能是 3D [num_reqs, N, hidden]（select_draft_tokens 传入），
+        # 展平成 2D 过 GEMM 再还原（原 nn.Linear 对 3D 按最后一维做特征，等价）。
+        orig_shape = hidden_states.shape
+        hidden = draft_gemm(
+            hidden_states.reshape(-1, orig_shape[-1]),
+            self.hidden_projection.weight, _QUERY_MAX_M,
+        ).reshape(*orig_shape[:-1], -1)
         return score_edges(
             self.predecessor_codebook, self.successor_codebook,
             candidate_ids, unary_logits, hidden, anchor_token_ids, self.top_k,
@@ -144,9 +159,13 @@ class DFlashAttention(nn.Module):
         context_kv: 可选 (k_ctx [C, KV, D], v_ctx [C, KV, D])——target 中间层 hidden
         预计算的 context KV（DFlash2 核心：草稿 attention 读 context + query）。
         返回 [T, hidden]。"""
-        q = self.q_proj(hidden_states).view(-1, self.num_heads, self.head_dim)
-        k = self.k_proj(hidden_states).view(-1, self.num_kv_heads, self.head_dim)
-        v = self.v_proj(hidden_states).view(-1, self.num_kv_heads, self.head_dim)
+        # QKV 投影 → TileLang GEMM（x @ w.T，w 是 [N,K]）
+        q = draft_gemm(hidden_states, self.q_proj.weight, _QUERY_MAX_M).view(
+            -1, self.num_heads, self.head_dim)
+        k = draft_gemm(hidden_states, self.k_proj.weight, _QUERY_MAX_M).view(
+            -1, self.num_kv_heads, self.head_dim)
+        v = draft_gemm(hidden_states, self.v_proj.weight, _QUERY_MAX_M).view(
+            -1, self.num_kv_heads, self.head_dim)
         q = self.q_norm(q).view(-1, self.q_size)
         k = self.k_norm(k).view(-1, self.kv_size)
         q = q.view(-1, self.num_heads, self.head_dim)
@@ -173,13 +192,16 @@ class DFlashAttention(nn.Module):
             softmax_scale=self.scaling, causal=False,
         )  # [1, T, H, D]
         attn = attn.squeeze(0).reshape(-1, self.q_size)
-        return self.o_proj(attn)
+        return draft_gemm(attn, self.o_proj.weight, _QUERY_MAX_M)
 
     def project_kv(self, hidden_states, positions):
         """hidden_states [C, hidden]（context token）→ (k [C, KV, D], v [C, KV, D])。
-        用于 precompute_context_kv：target 中间层 hidden 投影成草稿 context KV。"""
-        k = self.k_proj(hidden_states).view(-1, self.num_kv_heads, self.head_dim)
-        v = self.v_proj(hidden_states).view(-1, self.num_kv_heads, self.head_dim)
+        用于 precompute_context_kv：target 中间层 hidden 投影成草稿 context KV。
+        C 变长（可达几千），走 TileLang runtime-grid GEMM（max_m=_CTX_MAX_M）。"""
+        k = draft_gemm(hidden_states, self.k_proj.weight, _CTX_MAX_M).view(
+            -1, self.num_kv_heads, self.head_dim)
+        v = draft_gemm(hidden_states, self.v_proj.weight, _CTX_MAX_M).view(
+            -1, self.num_kv_heads, self.head_dim)
         k = self.k_norm(k)
         cos = self._cos[positions].unsqueeze(1)
         sin = self._sin[positions].unsqueeze(1)
@@ -246,7 +268,11 @@ class _SwiGLU(nn.Module):
             m.weight.data = m.weight.data.to(dtype)
 
     def forward(self, x):
-        return self.down_proj(F.silu(self.gate_proj(x)) * self.up_proj(x))
+        # gate/up/down → TileLang GEMM；silu 保持 torch F.silu（与原实现精度一致，
+        # 原实现也是 bf16 silu）。
+        gate = draft_gemm(x, self.gate_proj.weight, _QUERY_MAX_M)
+        up = draft_gemm(x, self.up_proj.weight, _QUERY_MAX_M)
+        return draft_gemm(F.silu(gate) * up, self.down_proj.weight, _QUERY_MAX_M)
 
 
 # ---------------------------------------------------------------------------
@@ -342,7 +368,9 @@ class DFlash2DraftModel(nn.Module):
         （hidden_norm 在 precompute_context_kv 里做，对齐 vLLM。）"""
         if not self.use_aux_hidden_state:
             return aux_hidden_states
-        return self.fc(aux_hidden_states)
+        # fc [C, num_aux*target_hidden] @ [hidden, num_aux*target_hidden].T → TileLang
+        # runtime-grid GEMM（C 变长，max_m=_CTX_MAX_M）。
+        return draft_gemm(aux_hidden_states, self.fc.weight, _CTX_MAX_M)
 
     def precompute_context_kv(self, context_states, context_positions):
         """DFlash2 核心：context hidden（fc 投影后 [C, hidden]）→ hidden_norm →
