@@ -48,6 +48,26 @@ class BatchInferenceContext:
         dist.broadcast_object_list(seq_dict_list, src=0)
 
     # ------------------------------
+    # 紧凑 bcast1 用：只广播 seq 字典列表（meta 已由 engine 用 GPU 张量广播）
+    # ------------------------------
+    @classmethod
+    def broadcast_seqs(cls, ctx):
+        """rank0：广播 ctx.sequences 的字典列表（不含 meta）。"""
+        if get_world_size() <= 1 or not rank0():
+            return
+        seq_dict_list = [seq.to_dict() for seq in ctx.sequences]
+        dist.broadcast_object_list(seq_dict_list, src=0)
+
+    @classmethod
+    def receive_seqs(cls, batch_size, _tokenizer):
+        """非 rank0：接收 seq 字典列表，返回 Sequence 列表。"""
+        if rank0():
+            raise RuntimeError("receive_seqs can only be called on non-main rank")
+        seq_dict_list = [None] * batch_size
+        dist.broadcast_object_list(seq_dict_list, src=0)
+        return [Sequence.from_dict(d, _tokenizer) for d in seq_dict_list]
+
+    # ------------------------------
     # 非主Rank接收：和broadcast一一对应，成对调用
     # ------------------------------
     @classmethod
