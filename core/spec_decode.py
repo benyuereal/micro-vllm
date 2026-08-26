@@ -107,6 +107,20 @@ class SpecDecodeController:
         self._bt = torch.full((1, self.cache_manager.max_seq_blocks), -1,
                               dtype=torch.int32, device=self.device)
 
+        # ---- verify CUDA graph 固定 buffer（M=1+N 固定 shape，replay 前 eager 填）----
+        # vpos/vslot 是独立常驻 buffer（非 _arange/slot_mapping 的变偏移视图——视图 base
+        # 指针每步变，graph replay 会读错地址）。replay 前 copy_ 进这两个固定 buffer。
+        self._vpos = torch.empty(M, dtype=torch.int64, device=self.device)
+        self._vslot = torch.empty(M, dtype=torch.int32, device=self.device)
+        # aux 收集：graph 内写固定 _aux_tmp[ai]（目的地固定，graph 安全），replay 后
+        # eager 拷到 aux_cache[ai, kv_len-1:...]（目的地偏移每步变，不能进 graph）。
+        self._aux_tmp = torch.zeros(self.num_aux, M, self.hidden,
+                                    dtype=self.dtype, device=self.device)
+        # final_norm 输出（lm_head 之前）。graph 捕获到此为止，lm_head 在 replay 后
+        # eager 跑（对齐非 spec decode：避免 [M,vocab] 大输出进 graph buffer）。
+        self._vhidden = torch.empty(M, self.hidden, dtype=self.dtype, device=self.device)
+        self._verify_graph = None
+
         # GDN 状态检查点 buffer（verify 时逐 token 存，接受后回滚）
         self._gdn_cp_state = None
         self._gdn_cp_conv = None
@@ -160,7 +174,8 @@ class SpecDecodeController:
     def _forward(self, input_ids, positions, slot_mapping,
                  cu_q, cu_k, block_table, max_sq, max_sk,
                  gdn_slot, collect_aux_from, gdn_checkpoint,
-                 init_from_cp=False, init_state_s=None, init_state_c=None):
+                 init_from_cp=False, init_state_s=None, init_state_c=None,
+                 graph_mode=False):
         """跑一次 target 模型 forward（prefill/verify 共享本体），返回 logits [M, vocab]。
 
         调用方走两个阶段薄封装（见下方 _prefill/_verify），它们各自定死参数语义；
@@ -171,6 +186,13 @@ class SpecDecodeController:
         init_from_cp/init_state_s/init_state_c: 去 rollback——非首步 verify 的 GDN
             初始状态直接读 checkpoint[accepted_prev]（init_state_s/c 是 [n_gdn,...]
             视图，token 索引已 bake 进 base 指针），省掉接受后 copy_ 回 pool 的 DtoD。
+        graph_mode: verify CUDA graph 捕获/重放路径。True 时：
+            - aux 写固定 _aux_tmp[ai]（目的地固定，graph 安全），不写 aux_cache
+              （目的地偏移每步变，replay 后由 _verify_graph 拷过去）。
+            - 只跑到 final_norm 写 _vhidden，不跑 lm_head（replay 后 eager 跑，
+              对齐非 spec decode 避免 [M,vocab] 大输出进 graph buffer）。
+            - 不做任何 host 侧 buffer 写（gdn_slot/init_idx 等由调用方在 capture
+              前 eager 写好，capture 体内只读）。
         """
         M = input_ids.shape[0]
         h = self.embed(input_ids)
@@ -184,6 +206,8 @@ class SpecDecodeController:
         # GDN 检查点开关（graph=prefill_runner 的 buffer）。prefill_runner 与 engine
         # 正常 prefill 路径【共享】，故必须在 finally 里复位 _gdn_cp_enabled=False，
         # 否则后续非 spec prefill（M 大）会往 8-token 检查点 buffer 写 M 个 → 越界。
+        # graph_mode 下这些开关在 capture 前已 eager 设好且 capture 体内不再改，
+        # finally 复位仍保留（capture 后 eager 路径依赖复位）。
         self.prefill_runner._gdn_cp_enabled = bool(gdn_checkpoint)
         if gdn_checkpoint:
             self.prefill_runner._gdn_cp_state = self._gdn_cp_state
@@ -193,7 +217,10 @@ class SpecDecodeController:
         if init_from_cp:
             self.prefill_runner._gdn_init_state_s = init_state_s
             self.prefill_runner._gdn_init_state_c = init_state_c
-        self.prefill_runner._gdn_prefill_seq_idx[0] = gdn_slot
+        if not graph_mode:
+            # host 侧写 buffer[0]：graph 捕获时会被 bake 成 capture 时的值，replay 不重读。
+            # graph_mode 下 gdn_slot 由 _verify_graph 在 capture 前 eager 写好。
+            self.prefill_runner._gdn_prefill_seq_idx[0] = gdn_slot
 
         try:
             meta = PrefillMeta(
@@ -208,12 +235,20 @@ class SpecDecodeController:
                                          self.cache_manager, meta)
                 if collect_aux_from is not None and layer_idx in self.aux_index:
                     ai = self.aux_index[layer_idx]
-                    start = collect_aux_from
-                    end = start + M
-                    if end <= self.max_len:
-                        self.aux_cache[ai, start:end].copy_(h)
+                    if graph_mode:
+                        # 固定目的地（graph 安全）；replay 后拷到 aux_cache 正确偏移。
+                        self._aux_tmp[ai].copy_(h)
+                    else:
+                        start = collect_aux_from
+                        end = start + M
+                        if end <= self.max_len:
+                            self.aux_cache[ai, start:end].copy_(h)
 
             h = self.final_norm(h)
+            if graph_mode:
+                # 只到 final_norm（写固定 _vhidden），lm_head 在 replay 后 eager 跑。
+                self._vhidden.copy_(h)
+                return self._vhidden
             out = self.lm_head(h)
         finally:
             # 复位共享状态：verify GEMM 开关 + GDN 检查点/初始状态开关（engine 正常 prefill/decode 依赖）
@@ -244,10 +279,16 @@ class SpecDecodeController:
         非首步 GDN 初始状态直接读 checkpoint[accepted_prev]（去 rollback）。
         返回 vlogits [M, vocab]。
 
-        输入全部走常驻 buffer（零运行期分配）：verify_ids 前缀写、vpos=arange 切片、
-        vslot=slot_mapping 切片、cu_q/cu_k 前缀写。
+        稳态（非首步，有检查点）且 verify graph 已捕获 → 走 CUDA graph replay
+        （_verify_graph_replay）；首步（init_from_cp=False，GDN 初始状态在 pool）
+        或 graph 未捕获 → eager。
         """
         M = 1 + self.N
+        # 稳态 verify 走 CUDA graph（固定 M=1+N shape，GDN 初始状态从 checkpoint 读）
+        if self._verify_graph is not None and self._gdn_accepted_prev is not None:
+            return self._verify_graph_replay(anchor, draft_tokens, kv_len,
+                                             slot_mapping, gdn_slot)
+        # ---- eager 路径（首步 / graph 未捕获）----
         self._verify_ids[0] = anchor
         self._verify_ids[1:] = draft_tokens
         vpos = self._arange[kv_len - 1: kv_len - 1 + M]
@@ -256,17 +297,130 @@ class SpecDecodeController:
         self._cu_q[1] = M
         self._cu_k[0] = 0
         self._cu_k[1] = kv_len - 1 + M
-        # 去 rollback：非首步 GDN 初始状态直接读 checkpoint[accepted_prev]
-        # （[n_gdn,...] 视图，token 索引 bake 进 base 指针），省掉接受后 copy_ 回 pool。
+        # 去 rollback：非首步 GDN 初始状态直接读 checkpoint[accepted_prev]。
+        # CUDA graph 安全：INIT_STATE 传【完整 checkpoint buffer base】，token 索引
+        # 写 device buffer _gdn_init_idx[0]（kernel 内 tl.load 读，非 bake 进指针）。
         accepted_prev = self._gdn_accepted_prev
+        if accepted_prev is not None:
+            self.prefill_runner._gdn_init_idx[0] = accepted_prev
         return self._forward(self._verify_ids, vpos, vslot, self._cu_q, self._cu_k,
                              self._bt, M, kv_len - 1 + M, gdn_slot,
                              collect_aux_from=kv_len - 1, gdn_checkpoint=True,
                              init_from_cp=accepted_prev is not None,
-                             init_state_s=(self._gdn_cp_state[accepted_prev]
+                             init_state_s=(self._gdn_cp_state
                                            if accepted_prev is not None else None),
-                             init_state_c=(self._gdn_cp_conv[accepted_prev]
+                             init_state_c=(self._gdn_cp_conv
                                            if accepted_prev is not None else None))
+
+    # ------------------------------------------------------------------
+    # verify CUDA graph：捕获 + 稳态 replay
+    # ------------------------------------------------------------------
+    def capture_verify_graph(self):
+        """捕获 verify（M=1+N 固定 shape，稳态 init_from_cp=True）的 CUDA graph。
+
+        固定 buffer（replay 前 eager 填，graph 读 device 内存）：
+          - verify_ids / vpos / vslot / cu_k：动态输入（每步变），固定地址 + copy_。
+          - gdn_slot（_gdn_prefill_seq_idx[0]）/ init token（_gdn_init_idx[0]）：
+            device buffer，graph 内 tl.load 读（非 capture 时 bake 的标量）。
+        固定地址原地读写（graph 安全）：
+          - GDN 递归/conv 状态池（class 级单例）+ 检查点 buffer（_gdn_cp_state/conv）。
+          - paged KV cache（store_kvcache 写 + flash 读，block_table=self._bt 固定）。
+        graph 内写固定目的地、replay 后 eager 补：
+          - aux 写 _aux_tmp[ai]（固定），replay 后拷到 aux_cache[ai, kv_len-1:...]。
+          - final_norm 写 _vhidden（固定），replay 后 eager 跑 lm_head。
+        失败（某 kernel 不可捕获）→ 留 _verify_graph=None，回退 eager。
+        """
+        if self._verify_graph is not None:
+            return
+        device = self.device
+        M = 1 + self.N
+        gdn_slot = self._gdn_alloc()
+        self.prefill_runner._gdn_state_pool[gdn_slot] = 0
+        self.prefill_runner._gdn_conv_state_pool[gdn_slot] = 0
+        seq_id = 999_998
+        ok, slot_mapping, _ = self.cache_manager.alloc(seq_id, self.max_len, None)
+        if not ok:
+            self._gdn_free(gdn_slot)
+            raise RuntimeError("verify graph capture: KV cache alloc failed")
+        blocks = self.cache_manager._blocks[seq_id]
+        self._bt.fill_(-1)
+        self._bt[0, :len(blocks)] = torch.tensor(blocks, dtype=torch.int32, device=device)
+        try:
+            # 填固定 buffer（dummy 值，capture 只记录结构/指针）
+            self._verify_ids.fill_(0)
+            kv_len = M + 1  # dummy：让 vpos/vslot/cu_k 落在合法范围
+            self._vpos.copy_(self._arange[kv_len - 1: kv_len - 1 + M])
+            self._vslot.copy_(slot_mapping[kv_len - 1: kv_len - 1 + M])
+            self._cu_q[0] = 0
+            self._cu_q[1] = M
+            self._cu_k[0] = 0
+            self._cu_k[1] = kv_len - 1 + M
+            # GDN 稳态：gdn_slot + init token index（device buffer，graph 内读）
+            self.prefill_runner._gdn_prefill_seq_idx[0] = gdn_slot
+            self.prefill_runner._gdn_init_idx[0] = 0
+            # warmup（eager，触发所有层 verify kernel 编译 + 稳定 allocator）
+            for _ in range(3):
+                self._forward(self._verify_ids, self._vpos, self._vslot,
+                              self._cu_q, self._cu_k, self._bt,
+                              M, self.max_len, gdn_slot,
+                              collect_aux_from=kv_len - 1, gdn_checkpoint=True,
+                              init_from_cp=True,
+                              init_state_s=self._gdn_cp_state,
+                              init_state_c=self._gdn_cp_conv,
+                              graph_mode=True)
+            torch.cuda.synchronize()
+            # capture（max_seqlen_k 传固定上界 self.max_len：flash varlen 的 grid 由
+            # seqlen_q=M 定、K-loop 由 cu_seqlen_k device buffer 定，max_seqlen_k 不进
+            # grid/loop，故固定上界安全且 graph 可重放）
+            g = torch.cuda.CUDAGraph()
+            with torch.no_grad(), torch.cuda.graph(g):
+                self._forward(self._verify_ids, self._vpos, self._vslot,
+                              self._cu_q, self._cu_k, self._bt,
+                              M, self.max_len, gdn_slot,
+                              collect_aux_from=kv_len - 1, gdn_checkpoint=True,
+                              init_from_cp=True,
+                              init_state_s=self._gdn_cp_state,
+                              init_state_c=self._gdn_cp_conv,
+                              graph_mode=True)
+            self._verify_graph = g
+        except Exception as e:
+            import logging
+            logging.getLogger(__name__).warning(
+                f"verify CUDA graph 捕获失败，回退 eager: {e}")
+            self._verify_graph = None
+        finally:
+            self.cache_manager.free(seq_id)
+            self._gdn_free(gdn_slot)
+            # 复位共享 GDN 标志（capture 后 engine 正常 prefill/decode 依赖）
+            self.prefill_runner._gdn_cp_enabled = False
+            self.prefill_runner._gdn_init_from_cp = False
+
+    def _verify_graph_replay(self, anchor, draft_tokens, kv_len, slot_mapping,
+                             gdn_slot):
+        """稳态 verify 走 CUDA graph replay。返回 vlogits [M, vocab]。
+
+        replay 前 eager 填固定 buffer（graph 读 device 内存）；replay 后 eager 补
+        aux 拷贝（_aux_tmp→aux_cache 正确偏移）+ lm_head（_vhidden→vlogits）。
+        """
+        M = 1 + self.N
+        self._verify_ids[0] = anchor
+        self._verify_ids[1:] = draft_tokens
+        self._vpos.copy_(self._arange[kv_len - 1: kv_len - 1 + M])
+        self._vslot.copy_(slot_mapping[kv_len - 1: kv_len - 1 + M])
+        self._cu_q[0] = 0
+        self._cu_q[1] = M
+        self._cu_k[0] = 0
+        self._cu_k[1] = kv_len - 1 + M
+        # GDN：gdn_slot + init token index（device buffer，graph 内 tl.load 读）
+        self.prefill_runner._gdn_prefill_seq_idx[0] = gdn_slot
+        self.prefill_runner._gdn_init_idx[0] = self._gdn_accepted_prev
+        # replay（GDN 状态池/检查点/paged KV 原地读写，aux→_aux_tmp，final_norm→_vhidden）
+        self._verify_graph.replay()
+        # aux：固定 _aux_tmp[ai] → aux_cache[ai, kv_len-1:...]（目的地偏移每步变，eager 拷）
+        for ai in range(self.num_aux):
+            self.aux_cache[ai, kv_len - 1: kv_len - 1 + M].copy_(self._aux_tmp[ai])
+        # lm_head（replay 后 eager 跑，_vhidden 是 final_norm 输出）
+        return self.lm_head(self._vhidden)
 
     # ------------------------------------------------------------------
     # GDN 状态回滚

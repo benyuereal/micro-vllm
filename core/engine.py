@@ -230,8 +230,13 @@ class InferenceEngine:
         # JIT 编译（~3s/shape × 64 层）+ kernel 初始化。放构建时做，否则首个真实请求
         # 被一次性编译拉低（实测首请求 23.7s vs 稳态 5.0s，差 ~18.5s 全在编译）。
         self._spec_controller.warmup()
+        # verify 阶段（M=1+N 固定 shape）进 CUDA graph：warmup 后捕获一次，
+        # 稳态 verify（非首步，GDN 初始状态从 checkpoint 读）走 replay。
+        # 捕获失败自动回退 eager（_verify_graph=None）。
+        self._spec_controller.capture_verify_graph()
         logger.info(f"投机解码控制器已构建: N={self.num_speculative_tokens} "
-                    f"mask_token={mask_token_id} draft={draft_model_path}")
+                    f"mask_token={mask_token_id} draft={draft_model_path} "
+                    f"verify_graph={'on' if self._spec_controller._verify_graph is not None else 'off(eager)'}")
 
     def _warmup_sampler(self, batch_sizes):
         """对所有捕获的 batch_size 预热 sampler 编译路径，消除首次调用的 ~1-2s 捕获开销。
