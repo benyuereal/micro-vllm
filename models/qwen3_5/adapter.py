@@ -42,11 +42,21 @@ from kernel.dense_mlp import dense_swiglu
 from kernel.gemv import gemv_or_matmul
 from kernel.gemv_int8 import w8_linear
 from kernel.quant import quantize_per_channel
+from kernel import marlin as _marlin
 from core.cache_manager import store_kvcache
 
 # W8A16 开关：MICRO_W8A16=1 时权重 INT8（per-channel）+ 激活 bf16。
 # decode（memory-bound）权重带宽减半；prefill（compute-bound）反量化后 matmul。
 _W8A16 = os.environ.get("MICRO_W8A16", "0") == "1"
+
+# verify int8 GEMM 后端：MICRO_VERIFY_GEMM=marlin|tilelang，默认 marlin。
+# marlin 模式：权重存 Marlin 格式（repacked int8，同字节数），verify/decode/prefill
+#   的 int8 线性全走 marlin_forward（CUTLASS C++，int8 tensor-core mma）。
+# tilelang 模式：保持 (int8 [N,K], scale) 元组 + TileLang/Triton GEMM（原行为）。
+# 显存约束：Marlin repacked 与 int8 [N,K] 同字节（24.33GB），不能两者共存（~67G OOM），
+#   故 marlin 模式用 Marlin 格式【替换】int8（非额外保留）。
+_MICRO_VERIFY_GEMM = os.environ.get("MICRO_VERIFY_GEMM", "marlin").lower()
+_MARLIN = _MICRO_VERIFY_GEMM == "marlin"
 
 try:
     from flash_attn import flash_attn_with_kvcache, flash_attn_varlen_func
@@ -515,6 +525,33 @@ class Qwen3_5Adapter(ModelAdapter):
             return quantize_per_channel(w)
         return w
 
+    @staticmethod
+    def _is_marlin(w):
+        """w 是否为 Marlin 格式 dict（marlin 模式的 W8A16 权重）。"""
+        return isinstance(w, dict) and "wq" in w
+
+    def _to_marlin(self, w_int8, scale):
+        """(int8 [N,K], scale fp32 [N,K/128]) → Marlin 格式 dict。
+
+        int8 → packed int32 [N,K/4]（byte-128 编码）→ build_marlin（gptq_marlin_repack
+        + permute/pad scales）。Marlin repacked 与 int8 同字节数，转换后 int8 可释放
+        （不增显存）。scale fp32→bf16（build_marlin 期望 bf16，与 checkpoint 一致）。"""
+        assert _marlin.marlin_available(), "MICRO_VERIFY_GEMM=marlin 但 Marlin kernel 不可用"
+        N, K = w_int8.shape
+        packed = _marlin.int8_to_packed(w_int8)      # int32 [N,K/4]
+        scale_bf16 = scale.to(torch.bfloat16)         # [N,K/128]
+        m = _marlin.build_marlin(packed, scale_bf16, N, K, w_int8.device)
+        del packed, scale_bf16
+        return m
+
+    def _store_w(self, w):
+        """存权重：marlin 模式且 w 是 group-128 (int8, scale[N,K/128]) 元组 → 转 Marlin
+        dict（替换 int8，同字节数不增显存）；否则原样返回（bf16 / tilelang int8 元组 /
+        per-channel 自量化 scale[N]——Marlin 只支持 group-128，per-channel 保持原路径）。"""
+        if _MARLIN and isinstance(w, tuple) and w[1].dim() == 2:
+            return self._to_marlin(w[0], w[1])
+        return w
+
     def _unpack_linear(self, mod, world_size, rank, chunk_dim=0):
         """从 Linear 模块取权重，统一成 bf16 [N,K] 或 (int8 [N,K], scale [N,K/128])。
 
@@ -580,8 +617,13 @@ class Qwen3_5Adapter(ModelAdapter):
         return torch.cat(ws, dim=0).contiguous()
 
     def _lin(self, x, w, out=None, env="MICRO_GEMV"):
-        """统一线性：w 为 bf16 [N,K] 或 (w_int8, scale) 元组（W8A16）。
-        M=1 走 int8 GEMV（权重带宽减半）；M>1 反量化后 matmul。"""
+        """统一线性：w 为 bf16 [N,K] / (w_int8, scale) 元组（W8A16 tilelang）/
+        Marlin dict（W8A16 marlin 模式）。
+        - Marlin dict → marlin_forward（CUTLASS C++ int8 GEMM，全 M 通用）。
+        - (int8, scale) → w8_linear（M=1 int8 GEMV / M>1 反量化 matmul）。
+        - bf16 → gemv_or_matmul。"""
+        if self._is_marlin(w):
+            return _marlin.marlin_forward(w, x, out)
         if isinstance(w, tuple):
             return w8_linear(x, w[0], w[1], out, env)
         if out is None:
@@ -601,7 +643,12 @@ class Qwen3_5Adapter(ModelAdapter):
         原路径反量化整份 int8 权重到 bf16（w_int8.float()*sc 物化 4x fp32 临时 +
         bf16 拷贝，mlp_gu M=61 反量化占 7.29ms/7.9ms），int8 GEMM 权重 HBM 只读
         一次（0.35ms，快 22x）。M>128 时 int8 GEMM 的 BLOCK_M 超 shared mem 上限
-        （M=256 编译失败），回退反量化 matmul（正常大 batch prefill 不受影响）。"""
+        （M=256 编译失败），回退反量化 matmul（正常大 batch prefill 不受影响）。
+
+        Marlin dict（marlin 模式）：全 M 走 marlin_forward（CUTLASS C++ int8 GEMM，
+        权重 HBM 只读一次，M 大时 tensor-core 跨 M 复用权重，比反量化 matmul 快）。"""
+        if self._is_marlin(w):
+            return _marlin.marlin_forward(w, x)
         if isinstance(w, tuple):
             w_int8, scale = w
             if scale.dim() == 2:
@@ -641,14 +688,16 @@ class Qwen3_5Adapter(ModelAdapter):
                 a_w = self._unpack_linear(la.in_proj_a, world_size, rank)
                 la._gdn_w8 = isinstance(qkv_w, tuple)
                 if la._gdn_w8:
-                    # int8：cat int8 权重 + cat scale（group-128，scale [N, K/128]）
-                    la._in_w_qz = (torch.cat([qkv_w[0], z_w[0]], dim=0).contiguous(),
-                                   torch.cat([qkv_w[1], z_w[1]], dim=0).contiguous())
+                    # int8：cat int8 权重 + cat scale（group-128，scale [N, K/128]）。
+                    # marlin 模式：_store_w 把 (int8, scale) 转 Marlin dict（替换 int8）。
+                    la._in_w_qz = self._store_w(
+                        (torch.cat([qkv_w[0], z_w[0]], dim=0).contiguous(),
+                         torch.cat([qkv_w[1], z_w[1]], dim=0).contiguous()))
                 else:
                     # bf16：4 个全融合成 1 个 GEMV（原 0.8B 路径）
                     la._in_w = torch.cat([qkv_w, z_w, b_w, a_w], dim=0).contiguous()
                 la._in_w_ba = torch.cat([b_w, a_w], dim=0).contiguous()  # [2H, hidden] bf16
-                la._o_w = self._q(self._unpack_linear(la.out_proj, world_size, rank))
+                la._o_w = self._store_w(self._q(self._unpack_linear(la.out_proj, world_size, rank)))
                 la._conv_w = la.conv1d.weight.data.squeeze(1).contiguous()  # [6144, 4]（conv 不量化）
                 la._a_log = la.A_log.data.float().contiguous()        # [16] fp32
                 la._dt_bias = la.dt_bias.data.float().contiguous()    # [16] fp32
@@ -672,8 +721,8 @@ class Qwen3_5Adapter(ModelAdapter):
                                      w_q[:, hd:, :].reshape(-1, w_q.shape[-1])], dim=0).contiguous()
                 w_k = self._unpack_linear(attn.k_proj, world_size, rank)
                 w_v = self._unpack_linear(attn.v_proj, world_size, rank)
-                attn._qkv_w = self._q(self._cat_w([w_q, w_k, w_v]))
-                attn._o_w = self._q(self._unpack_linear(attn.o_proj, world_size, rank, chunk_dim=1))
+                attn._qkv_w = self._store_w(self._q(self._cat_w([w_q, w_k, w_v])))
+                attn._o_w = self._store_w(self._q(self._unpack_linear(attn.o_proj, world_size, rank, chunk_dim=1)))
                 attn._q_norm_w = attn.q_norm.weight.data.clone()
                 attn._k_norm_w = attn.k_norm.weight.data.clone()
                 attn._q_norm_eps = self._ln_eps(attn.q_norm, cfg)
@@ -684,8 +733,8 @@ class Qwen3_5Adapter(ModelAdapter):
             mlp = block.mlp
             w_up = self._unpack_linear(mlp.up_proj, world_size, rank)
             w_gate = self._unpack_linear(mlp.gate_proj, world_size, rank)
-            mlp._gu = self._q(self._cat_w([w_up, w_gate]))
-            mlp._d = self._q(self._unpack_linear(mlp.down_proj, world_size, rank, chunk_dim=1))
+            mlp._gu = self._store_w(self._q(self._cat_w([w_up, w_gate])))
+            mlp._d = self._store_w(self._q(self._unpack_linear(mlp.down_proj, world_size, rank, chunk_dim=1)))
             mlp.gate_proj = mlp.up_proj = mlp.down_proj = None
 
             block._in_ln_w = block.input_layernorm.weight.data.clone()
