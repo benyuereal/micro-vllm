@@ -226,6 +226,10 @@ class InferenceEngine:
             self, draft_model,
             num_speculative_tokens=self.num_speculative_tokens,
             mask_token_id=mask_token_id, max_len=self.max_position)
+        # 预热：跑一次 dummy verify forward，触发所有层 verify int8 GEMM 的 TileLang
+        # JIT 编译（~3s/shape × 64 层）+ kernel 初始化。放构建时做，否则首个真实请求
+        # 被一次性编译拉低（实测首请求 23.7s vs 稳态 5.0s，差 ~18.5s 全在编译）。
+        self._spec_controller.warmup()
         logger.info(f"投机解码控制器已构建: N={self.num_speculative_tokens} "
                     f"mask_token={mask_token_id} draft={draft_model_path}")
 
