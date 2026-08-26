@@ -1,31 +1,26 @@
-
 # micro-vllm
 
 <p align="center">
   <img width="300" src="assets/logo.png" alt="logo">
 </p>
 
-<p align="center">
-  <a href="https://trendshift.io/repositories/xxxx" target="_blank">
-    <img src="https://trendshift.io/api/badge/repositories/xxxx" alt="micro-vllm" style="width: 250px; height: 55px;" width="250" height="55"/>
-  </a>
-</p>
-
-> A high-performance LLM inference engine implementing **PagedAttention + Flash Attention + Hand-written CUDA GEMV + SwiGLU Kernel Fusion** from scratch. Achieves **106%** of vLLM and **118%** of nano-vllm single-user long-context throughput on L20, suitable for small-scale production deployment and learning.
-> 
-> 🚀 **Latest Update**: single-user long-context (256 in / 768 out) hits **410.4 tok/s**, leading vLLM by **+6.5%** — enabled by flash-decoding (auto split-KV) for bs=1 + a paged-KV off-by-one fix. 1000-request continuous batching holds **30,316 tok/s** (+9.7% over nano-vllm).
+> A high-performance LLM inference engine built **from scratch** — PagedAttention, Flash Attention, CUDA Graph, continuous batching, hand-written CUDA/Triton/TileLang kernels, **W8A16 quantization**, **speculative decoding (DFlash2)**, and a **GDN (Gated DeltaNet) hybrid-attention** model stack. No vLLM/SGLang runtime dependency: the whole engine is ~8k lines of Python you can read end to end.
+>
+> 🚀 **Headline**: single-GPU **Qwen3.8-27B (W8A16) + DFlash2 speculative decoding** hits **101.5 tok/s = 1.77× vLLM** (57.4 tok/s) on an L20. Non-spec single-user long-context (Qwen3-0.6B) reaches **410 tok/s**, +6.5% over vLLM.
 
 ## ✨ Features
 
-* 🚀 **Continuous Batching** - Dynamic batch filling, GPU utilization **~99%** at batch=32
-* 💾 **PagedAttention** - KV cache paging management, fragmentation ↓80%
-* ⚡ **Flash Attention** - Automatic RoPE, zero-copy cache update
-* 🧠 **SwiGLU Kernel Fusion** - Fused Gate/Up projection with activation to reduce memory bandwidth usage
-* 🔥 **CUDA Graph** - Whole-graph capture optimization, GPU kernel scheduling overhead ↓
-* 📦 **torch.compile** - Sampler compilation optimization
-* 🌊 **Streaming Output** - Real-time streaming generation support
-* 🌐 **Tensor Parallelism** - Multi-GPU distributed inference, break single-GPU memory limits
-* 📖 **Clean Codebase** - ~1500 lines of Python code, easy to learn and extend
+* 🚀 **Continuous Batching** — dynamic batch filling, ~99% GPU utilization at batch=32
+* 💾 **PagedAttention** — KV-cache paging, ~5% fragmentation, no pre-allocation waste
+* ⚡ **Flash Attention v2** — auto RoPE, zero-copy paged KV, flash-decoding (auto split-KV) for bs=1
+* 🔥 **CUDA Graph** — whole-graph capture for decode; pre-captured across batch sizes
+* 🎲 **Speculative Decoding (DFlash2)** — N=7 draft / M=8 verify, greedy accept, GDN state checkpoint-rollback; **1.77× vLLM** on Qwen3.8-27B
+* 🧮 **W8A16 Quantization** — Marlin-format int8 group-128 weights, TileLang verify GEMM + hand-written int8 GEMV
+* 🌊 **GDN Hybrid Attention** — Gated DeltaNet linear-attention layers (no KV cache, recursive state) mixed with full attention
+* 🧠 **MLA + MoE** — Multi-head Latent Attention and Mixture-of-Experts (DeepSeek-V2-Lite)
+* 🌐 **Tensor Parallelism** — column/row parallel, multi-GPU
+* 📡 **OpenAI-Compatible API** — real token-level streaming SSE, `ignore_eos`, configurable context length
+* 📖 **Clean Codebase** — ~8k lines of Python, easy to learn and extend
 
 ---
 
@@ -34,10 +29,13 @@
 - [Features](#-features)
 - [Architecture](#-architecture)
 - [Core Technologies](#-core-technologies)
+- [Supported Models](#-supported-models)
+- [Speculative Decoding](#-speculative-decoding)
 - [Performance Benchmark](#-performance-benchmark)
 - [Quick Start](#-quick-start)
 - [API Reference](#-api-reference)
-- [Comparison](#-comparison)
+- [Project Structure](#-project-structure)
+- [Dependencies](#-dependencies)
 
 ---
 
@@ -47,23 +45,22 @@
 ┌─────────────────────────────────────────────────────────────────┐
 │                        InferenceEngine                          │
 ├─────────────────────────────────────────────────────────────────┤
-│  ┌──────────────┐    ┌──────────────┐    ┌──────────────┐   │
-│  │   Scheduler  │───▶│  KVCacheMgr  │───▶│ModelGraphRunner│   │
-│  │(Continuous  │    │   (Paging)   │    │(TP+CUDA Graph)│   │
-│  │  Batching)  │    │              │    │              │   │
-│  └──────────────┘    └──────────────┘    └──────────────┘   │
-│         │                   │                   │              │
-│         ▼                   ▼                   ▼              │
-│  ┌─────────────────────────────────────────────────────────┐  │
-│  │                    Flash Attention v2                    │  │
-│  │              flash_attn_with_kvcache                     │  │
-│  └─────────────────────────────────────────────────────────┘  │
-│         │                   │                   │              │
-│         ▼                   ▼                   ▼              │
-│  ┌─────────────────────────────────────────────────────────┐  │
-│  │                 SwiGLU Fused Kernel                      │  │
-│  │              (Gate + Up + Activation)                    │  │
-│  └─────────────────────────────────────────────────────────┘  │
+│  ┌──────────────┐    ┌──────────────┐    ┌───────────────────┐  │
+│  │   Scheduler  │───▶│  KVCacheMgr  │───▶│  ModelGraphRunner │  │
+│  │(Continuous   │    │   (Paging)   │    │ (TP + CUDA Graph) │  │
+│  │  Batching)   │    │              │    │                   │  │
+│  └──────────────┘    └──────────────┘    └───────────────────┘  │
+│         │                   │                   │               │
+│         ▼                   ▼                   ▼               │
+│  ┌─────────────────────────────────────────────────────────┐    │
+│  │  ModelAdapter (per-arch)  →  Flash Attention / GDN / MLA │    │
+│  │  + W8A16 int8 GEMM/GEMV  +  SwiGLU / RMSNorm / RoPE      │    │
+│  └─────────────────────────────────────────────────────────┘    │
+│         │                                                       │
+│         ▼                                                       │
+│  ┌─────────────────────────────────────────────────────────┐    │
+│  │  SpecDecodeController (DFlash2 draft-verify-accept)      │    │
+│  └─────────────────────────────────────────────────────────┘    │
 └─────────────────────────────────────────────────────────────────┘
 ```
 
@@ -71,11 +68,13 @@
 
 | Component | Responsibility |
 |-----------|----------------|
-| `InferenceEngine` | Inference engine entry, auto model loading |
-| `Scheduler` | Continuous batching, SJF alignment strategy |
-| `KVCacheManager` | PagedAttention KV cache paging |
-| `ModelGraphRunner` | CUDA Graph capture and execution |
-| `Sampler` | torch.compile compiled token sampler |
+| `InferenceEngine` | Engine entry: model load, scheduling, KV-cache, execution |
+| `Scheduler` | Continuous batching, dynamic fill |
+| `KVCacheManager` | PagedAttention KV-cache paging |
+| `ModelGraphRunner` | CUDA Graph capture and replay (decode) |
+| `ModelAdapter` | Per-architecture forward (Qwen / Qwen3 / Qwen3.5 / DeepSeek) |
+| `SpecDecodeController` | DFlash2 draft → target verify → greedy accept |
+| `Sampler` | torch.compile token sampler |
 
 ---
 
@@ -83,13 +82,9 @@
 
 ### 1. PagedAttention
 
-Implemented based on [vLLM PagedAttention](https://arxiv.org/abs/2309.06180):
-
-- **Mechanism**: KV cache paging (Block=256 tokens), dynamic allocation
-- **Benefits**: 5% fragmentation, 92% reuse rate, no pre-allocation waste
+KV-cache paging (Block=256 tokens), dynamic allocation, ~5% fragmentation, no pre-allocation waste.
 
 ```python
-# Core API
 cache_manager.alloc(seq_id, num_tokens)  # Allocate cache blocks
 cache_manager.append(seq_id)             # Append new token
 cache_manager.free(seq_id)               # Free cache
@@ -97,107 +92,96 @@ cache_manager.free(seq_id)               # Free cache
 
 ### 2. Flash Attention v2
 
-Using `flash_attn_with_kvcache` for efficient attention:
+`flash_attn_with_kvcache` for efficient attention: auto RoPE, zero-copy paged KV update, and **flash-decoding** (auto split-KV) that keeps KV reads parallel across all SMs at bs=1 as context grows.
 
-- **Auto RoPE**: Pass `rotary_cos/sin` directly
-- **Zero-copy**: Update directly to existing KV cache
-- **Paged KV**: Support `block_table` paging access
+### 3. W8A16 Quantization
+
+Marlin-format int8 weights (group-128, byte-128 encoding) with two decode paths:
+
+* **Verify GEMM** (`kernel/gemm_int8_triton.py`) — TileLang int8 GEMM for the fixed M=8 speculative-verify shape
+* **int8 GEMV** (`kernel/gemv_int8.cu`) — hand-written CUDA for M=1 decode
+
+`lm_head` stays bf16; int8 dequant is a temporary compute, never persisted.
+
+### 4. GDN (Gated DeltaNet) Hybrid Attention
+
+Qwen3.5 / Qwen3.8 mix **linear-attention GDN layers** (no KV cache — only a per-seq recursive fp32 state + short conv state) with periodic **full-attention** layers (`full_attention_interval=4`). GDN decode updates only real rows of the state pool; the delta-rule recurrence runs in fp32.
+
+### 5. MLA + MoE (DeepSeek)
+
+Multi-head Latent Attention (compressed KV latent) and Mixture-of-Experts routing for DeepSeek-V2-Lite, with TileLang paged-MLA and routed-expert GEMM kernels.
+
+### 6. CUDA Graph
+
+Decode forward is captured as a single CUDA Graph and replayed per step, pre-captured across batch sizes to eliminate inter-kernel launch overhead.
+
+### 7. Tensor Parallelism
+
+Column-parallel (QKV / Gate-Up) + row-parallel (O / Down) with `all_reduce` on activations, breaking single-GPU memory limits.
+
+---
+
+## 🧩 Supported Models
+
+| Model | Architecture | Notes |
+|-------|-------------|-------|
+| Qwen2-7B-Chat | dense, GQA | reference baseline |
+| Qwen3-0.6B | dense, GQA + QK-Norm | primary benchmark model |
+| Qwen3 | dense, GQA + QK-Norm, independent head_dim | HF-named weights |
+| Qwen3.5 | **GDN hybrid** (linear + full attn) | 1-centered RMSNorm, partial RoPE |
+| Qwen3.8-27B | **GDN hybrid + W8A16** | spec-decoding headline model |
+| DeepSeek-V2-Lite | **MLA + MoE** | latent attention + routed experts |
+
+Model adapters live in `models/` (`qwen/`, `qwen3/`, `qwen3_5/`, `deepseek/`); the DFlash2 draft model in `models/dflash/`.
+
+---
+
+## 🎲 Speculative Decoding
+
+DFlash2 draft-verify-accept, greedy:
+
+* **Draft** — a 5-layer sliding-window (2048) non-causal model proposes N=7 tokens in one forward, fed by the target's intermediate hidden states (aux layers) projected through an FC + norm.
+* **Verify** — the target runs one causal forward over M=1+N=8 tokens (fixed shape).
+* **Accept** — greedy match: accept while draft==target-argmax, bonus = target's prediction at the first mismatch. Single-sequence output is token-identical to non-spec greedy.
+
+**GDN state rollback** is the correctness crux: verify advances the GDN recursive/conv state over all 1+N tokens, but only `accepted` are valid. Verify enables per-token GDN state checkpoints (zero overhead in normal prefill) and rolls back to `checkpoint[accepted]`.
 
 ```python
-flash_attn_with_kvcache(
-    q=q.unsqueeze(1),
-    k_cache=k_cache,
-    v_cache=v_cache,
-    rotary_cos=cos_cache,
-    rotary_sin=sin_cache,
-    block_table=block_table,
-    causal=True
+engine = InferenceEngine(
+    model_path="/path/to/Qwen3.8-27B-W8A16",
+    spec_decode=True,
+    draft_model_path="/path/to/dflash2-draft",
+    num_speculative_tokens=7,
 )
+res = engine.generate_spec_decode("prompt", max_tokens=3000)
 ```
-
-### 3. SwiGLU Kernel Fusion (NEW ⭐)
-
-Custom kernel to fuse the MLP layer bottleneck:
-
-- **Mechanism**: Fuses Gate Projection, Up Projection matrix multiplication, and SwiGLU activation into a single kernel
-- **Benefits**: Reduces intermediate HBM reads/writes, significantly lowers memory bandwidth pressure, especially improving throughput in large batch scenarios
-- **Implementation**: Located in `kernel/swiglu.py`
-
-```python
-from kernel.swiglu import swiglu_fused
-activated = swiglu_fused(gate_up)  # Fused computation in one step
-```
-
-### 4. CUDA Graph Optimization
-
-Encapsulate all Transformer layers into a single CUDA Graph:
-
-- **Mechanism**: Capture N-layer forward as one Graph, single replay
-- **Benefits**: Eliminate inter-layer scheduling overhead, pre-capture multiple batch sizes
-- **Supported**: batch_size ∈ [1, 2, 4, 8, 16, 32]
-
-### 5. torch.compile Sampling Optimization
-
-Compile the entire sampling process using PyTorch compile:
-
-- **Fused Kernel**: Top-K + Top-P filtering in one kernel
-- **Dynamic Batch**: Support different batch sizes
-- **Mode**: `reduce-overhead` to reduce Python overhead
-
-### 6. Continuous Batching Scheduler
-
-Continuous batching strategy in decode phase:
-
-| Strategy | Implementation | Goal |
-|----------|---------------|------|
-| **Dynamic Fill** | New requests insert prefill anytime | Maximize GPU utilization |
-| **Same Length Batch** | Sequences with same length form batch | Eliminate padding waste |
-| **SJF Alignment** | Short sequences complete first | Form "length clusters" |
-
-> **Typical Alignment Process**:
-> ```
-> t=0: [50, 52, 55, 60, 100] → Select length 50
-> t=1: [51, 52, 55, 60, 100] → Select length 51
-> t=2: [52, 52, 55, 60, 100] → Select length 52 (two sequences aligned)
-> ...
-> t=8: [60, 60, 60, 60, 100] → Four sequences perfectly aligned!
-> ```
-
-### 7. Tensor Parallelism (NEW ⭐)
-
-Supports multi-GPU distributed inference, breaking single-GPU memory limits:
-
-- **Strategy**: Column Parallel + Row Parallel
-  - MLP: Gate/Up projection Column Parallel, Down projection Row Parallel
-  - Attention: QKV projection Column Parallel, Output projection Row Parallel
-- **Communication**: Uses `all_reduce` to synchronize activations
-- **Advantage**: Supports super large model deployment while maintaining efficient inference
 
 ---
 
 ## 📊 Performance Benchmark
 
-### Three-Way Comparison · Single-User Throughput (L20 / Qwen3-0.6B)
+### Speculative Decoding · Single-GPU (L20 / Qwen3.8-27B W8A16 + DFlash2)
 
-Fair comparison against vLLM and nano-vllm under fully aligned conditions. Long context (256 in / 768 out) stresses KV-cache reads during decode — the regime where attention implementation and flash-decoding parallelism matter most:
+| Framework | Throughput (tok/s) | Relative |
+|:-----|:----------------:|:--------:|
+| **micro-vllm** | **101.5** | **1.77×** |
+| vLLM (TP1, DFlash2) | 57.4 | 1.00× |
 
-> **Hardware**: NVIDIA L20 &nbsp;|&nbsp; **Model**: Qwen3-0.6B (bf16) &nbsp;|&nbsp; **Input**: 256 tokens &nbsp;|&nbsp; **Output**: 768 tokens &nbsp;|&nbsp; **Sampling**: temperature=0.01 &nbsp;|&nbsp; **Method**: median of 7 runs, each engine on a dedicated GPU
+Edge comes from the W8A16 int8 verify GEMM/GEMV + CUDA Graph amortizing launch overhead at the fixed M=8 verify shape.
 
-| Framework | Throughput (tokens/s) | Relative |
+### Single-User Long-Context (L20 / Qwen3-0.6B bf16)
+
+256 in / 768 out, temperature=0.01, median of 7 runs, each engine on a dedicated GPU:
+
+| Framework | Throughput (tok/s) | Relative |
 |:-----|:----------------:|:--------:|
 | **micro-vllm** | **410.4** | **1.18×** |
 | vLLM 0.21.0 | 385.4 | 1.11× |
 | nano-vllm | 347.1 | 1.00× |
 
-- micro-vllm leads vLLM by **+6.5%** and nano-vllm by **+18.2%** in single-user long-context throughput
-- All three engines show < 1 token/s standard deviation across 7 runs — stable and reproducible
-- Edge comes from hand-written CUDA GEMV + CUDA Graph amortizing kernel fixed overhead at M=1 decode, plus flash-decoding (auto split-KV) keeping KV reads parallel across all SMs as context grows
+### Batch Throughput (L20 / Qwen3-0.6B bf16)
 
-### Three-Way Comparison · Batch Throughput (L20 / Qwen3-0.6B)
-
-As concurrency rises, the bottleneck shifts from kernel launch overhead to memory bandwidth and tensor-core GEMM, where vLLM's inductor compilation pays off:
-
-> **Hardware**: NVIDIA L20 &nbsp;|&nbsp; **Model**: Qwen3-0.6B (bf16) &nbsp;|&nbsp; **Input**: 128 tokens &nbsp;|&nbsp; **Output**: 256 tokens &nbsp;|&nbsp; **Sampling**: temperature=0.01
+128 in / 256 out, temperature=0.01:
 
 | Concurrency | micro-vllm | vLLM 0.21.0 | nano-vllm |
 |:------:|:----------:|:-----------:|:---------:|
@@ -205,50 +189,29 @@ As concurrency rises, the bottleneck shifts from kernel launch overhead to memor
 | 32     | 7,503      | **7,749**   | 6,438     |
 | 64     | 10,469     | **11,547**  | 9,635     |
 
-- At bs=1 micro-vllm leads vLLM by **+6.0%**; as concurrency grows vLLM overtakes via compiled tensor-core GEMM
-- micro-vllm's positioning is clear: **low-concurrency, latency-sensitive** serving (single-user / few-user interactive scenarios), not high-concurrency aggregate throughput
+At bs=1 micro-vllm leads vLLM by +6.0%; as concurrency grows vLLM overtakes via compiled tensor-core GEMM. micro-vllm's positioning: **low-concurrency, latency-sensitive** serving.
 
-### Continuous Batching · 1000 Requests (L20 / Qwen3-0.6B)
+### Continuous Batching · 1000 Requests (L20 / Qwen3-0.6B bf16)
 
-1000 mixed requests (max_tokens 40-80 random, temp=0.6, ignore_eos), all enqueued then drained — the realistic high-concurrency serving scenario:
-
-> **Hardware**: NVIDIA L20 &nbsp;|&nbsp; **Model**: Qwen3-0.6B (bf16) &nbsp;|&nbsp; **Method**: 3-run stable values
+1000 mixed requests (max_tokens 40–80, temp=0.6, ignore_eos), all enqueued then drained:
 
 | Framework | Throughput (tok/s) | Steps |
 |:-----|:----------------:|:-----:|
 | **micro-vllm** | **30,316** | 130 |
 | nano-vllm | 27,638 | 153 |
 
-- micro-vllm leads nano-vllm by **+9.7%**; per-step GPU time at bs=512 is also lower (13.5ms vs 14.36ms)
-- Recent wins: flash-decoding (auto split-KV) for bs=1 decode (long-context 361→410 tok/s, +13.6% — 16 CTAs → all 92 SMs), paged-KV off-by-one fix (prefill length = exact multiple of block_size crashed the first decode step), Gumbel-max single Triton sampling kernel (1225→269us/step, no 311MB fp32 materialization), `update_sequences` decode steady-state fast path (0.75ms/step CPU), sampler `reduce-overhead` removal (saves a 155MB logits DtoD copy, 410us/step), QK-Norm+RoPE single-kernel fusion, `prepare()` dirty-flag (steady-state CPU 0.88ms→0), final-norm fusion
-- Single-batch (same prompt, 500 out, full prefill+decode): bs=32 **7,060** vs 6,465 (+9.2%), bs=64 **9,864** vs 9,332 (+5.7%)
-
 Benchmark scripts and load-test commands live in [`benchmark/`](benchmark/README.md).
 
 ---
-
-
-
-
 
 ## 🚀 Quick Start
 
 ### Installation
 
 ```bash
-# Clone the project (recommend switching to online branch for latest optimizations)
 git clone https://github.com/benyuereal/micro-vllm.git
 cd micro-vllm
-# Install dependencies
 pip install -r requirements.txt
-```
-
-### Model Download
-
-```bash
-huggingface-cli download --resume-download Qwen/Qwen2-7B-Chat \
-  --local-dir ~/huggingface/Qwen2-7B-Chat/ \
-  --local-dir-use-symlinks False
 ```
 
 ### Basic Usage
@@ -256,17 +219,13 @@ huggingface-cli download --resume-download Qwen/Qwen2-7B-Chat \
 ```python
 from core.engine import InferenceEngine
 
-# Initialize engine
 engine = InferenceEngine(
-    model_path="/path/to/Qwen2-7B-Chat",
-    max_batch_size=32
+    model_path="/path/to/Qwen3-0.6B",
+    max_batch_size=32,
 )
 
 # Batch generation
-results = engine.generate(
-    ["Hello", "AI is"],
-    max_tokens=100
-)
+results = engine.generate(["Hello", "AI is"], max_tokens=100)
 for prompt, text in results.items():
     print(f"{prompt}: {text}")
 
@@ -278,10 +237,20 @@ for token, text in engine.stream_generate("The future of AI is", max_tokens=50):
 ### Start API Server
 
 ```bash
-python api_server.py
+# Non-spec (continuous batching)
+python api_server.py --model /path/to/Qwen3-0.6B
+
+# Speculative decoding (DFlash2, greedy)
+python api_server.py \
+    --model /path/to/Qwen3.8-27B-W8A16 \
+    --spec-decode \
+    --draft-model /path/to/dflash2-draft \
+    --num-spec-tokens 7 \
+    --max-context-length 4096
 ```
 
-After startup, available at:
+Server args: `--model` / `--model-name`, `--spec-decode`, `--draft-model`, `--num-spec-tokens`, `--max-batch-size` (default 512), `--max-context-length` (default 1024), `--served-model-name`. After startup:
+
 - API Docs: http://localhost:8000/docs
 - Health Check: http://localhost:8000/health
 
@@ -289,59 +258,22 @@ After startup, available at:
 
 ## 🌐 API Reference
 
-### Non-streaming Generation
+OpenAI-compatible endpoints: `POST /v1/completions`, `POST /v1/chat/completions` (both support `stream: true` with real token-level SSE), `GET /v1/models`. Legacy: `POST /generate`, `POST /batch_generate`, `POST /generate_stream`.
 
 ```bash
-curl -X POST "http://localhost:8000/generate" \
+curl http://localhost:8000/v1/completions \
   -H "Content-Type: application/json" \
   -d '{
-    "prompt": "Write a Java file upload code",
-    "max_tokens": 500,
-    "temperature": 0.7
-  }'
-```
-
-### Streaming Generation
-
-```bash
-curl -X POST "http://localhost:8000/generate_stream" \
-  -H "Content-Type: application/json" \
-  -d '{
-    "prompt": "Write a SpringBoot file upload code",
-    "max_tokens": 500,
-    "temperature": 0.7,
+    "model": "Qwen3.8-27B",
+    "prompt": "Hello, write a Java file upload code",
+    "max_tokens": 1000,
+    "temperature": 0,
+    "ignore_eos": true,
     "stream": true
   }'
 ```
 
----
-
-## ⚖️ Comparison Test
-
-### Start vLLM Server
-
-```bash
-python -m vllm.entrypoints.openapi.api_server \
-    --model /path/to/Qwen3-0.6B \
-    --host 0.0.0.0 \
-    --port 8000 \
-    --trust-remote-code \
-    --served-model-name Qwen3-0.6B
-```
-
-### Test Request
-
-```bash
-curl http://localhost:8000/v1/completions \
-    -H "Content-Type: application/json" \
-    -d '{
-        "model": "Qwen3-0.6B",
-        "prompt": "Hello, write a Java file upload code",
-        "max_tokens": 1000,
-        "temperature": 0.7,
-        "stream": true
-    }'
-```
+> The spec-decode path is **greedy-only** (`temperature=0`); sampling requests return HTTP 400 on a spec-enabled instance.
 
 ---
 
@@ -353,18 +285,29 @@ micro-vllm/
 │   ├── engine.py           # Inference engine entry
 │   ├── scheduler.py        # Continuous batching scheduler
 │   ├── cache_manager.py    # PagedAttention KV cache manager
-│   ├── paged_attention.py  # Paged attention implementation
-│   ├── sequence.py         # Sequence state management
+│   ├── paged_attention.py  # Paged attention
+│   ├── sequence.py         # Sequence state
+│   ├── spec_decode.py      # DFlash2 draft-verify-accept controller
+│   ├── model_loader.py     # Weight loading (incl. W8A16 unpack)
 │   └── layer/
 │       ├── model_graph.py  # CUDA Graph wrapper
+│       ├── model_prefill.py# Prefill runner
+│       ├── rope.py         # RoPE
 │       └── sampler.py      # torch.compile sampler
 ├── models/
-│   └── qwen_adapter.py     # Qwen model adapter
+│   ├── qwen/  qwen3/  qwen3_5/  deepseek/   # per-arch adapters
+│   └── dflash/                        # DFlash2 draft model
 ├── kernel/
-│   ├── rmsnorm.py          # RMSNorm custom implementation
-│   └── swiglu.py       # ⭐ SwiGLU fused activation (Latest optimization)
-├── api_server.py           # FastAPI server
-└── requirements.txt         # Project dependencies
+│   ├── gemv.cu / gemv.py               # hand-written CUDA GEMV
+│   ├── gemv_int8.cu / gemv_int8.py     # int8 GEMV (W8A16)
+│   ├── gemm_int8_triton.py             # TileLang verify int8 GEMM
+│   ├── mla.py / moe.py / pre_mla.py    # DeepSeek MLA + MoE
+│   ├── rmsnorm.py / rotary.py / sampling.py
+│   └── dense_mlp.py / quant.py
+├── api_server.py           # FastAPI / OpenAI-compatible server
+├── demo/                   # correctness + profiling scripts
+├── benchmark/              # throughput / load-test scripts
+└── requirements.txt
 ```
 
 ---
@@ -375,13 +318,13 @@ micro-vllm/
 - transformers >= 4.56.0
 - flash-attn >= 2.0.0
 - fastapi >= 0.100.0
+- tilelang (verify int8 GEMM; Triton fallback)
 
 ---
 
 ## 💡 Note
 
-This framework is suitable for small-to-medium scale LLM service production deployment, achieving 105% of vLLM's single-user throughput with clean code that is easy to understand and extend.
----
+This framework targets small-to-medium scale LLM serving with clean, readable code: single-user latency (spec decode, W8A16) and low-concurrency interactive workloads. For high-concurrency aggregate throughput, vLLM's compiled tensor-core GEMM currently leads.
 
 ## 📄 License
 
