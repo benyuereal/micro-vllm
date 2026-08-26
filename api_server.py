@@ -5,6 +5,10 @@ import json
 import os
 import time
 import uuid
+# CUDA 显存分配器：expandable_segments 消除碎片（长输入 prefill 的 W8A16 反量化
+# 临时张量 320-680MB 需要大块连续显存；固定段分配器下 reserved-unallocated 碎片
+# 导致 3072 输入 OOM 0/4 失败）。须在 import torch 前设置。
+os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 from queue import Queue
 from typing import List, Optional, Union
 
