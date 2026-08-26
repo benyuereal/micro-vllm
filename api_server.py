@@ -439,12 +439,16 @@ if __name__ == "__main__":
     ap.add_argument("--spec-decode", action="store_true", default=os.environ.get("SPEC_DECODE", "") == "1")
     ap.add_argument("--draft-model", default=os.environ.get("DRAFT_MODEL", ""))
     ap.add_argument("--num-spec-tokens", type=int, default=7)
+    ap.add_argument("--max-batch-size", type=int,
+                    default=int(os.environ.get("MAX_BATCH_SIZE", "512")),
+                    help="KV manager 按 max_batch*2 强制下限 block 数，大模型 spec 模式调小防 OOM")
     ap.add_argument("--served-model-name", default=os.environ.get("SERVED_MODEL_NAME", ""))
     args, _ = ap.parse_known_args()
     if args.served_model_name:
         SERVED_MODEL_NAME = args.served_model_name
     print(f"Rank {get_rank()}: Loading model from {model_path}...")
-    engine = InferenceEngine(model_path, spec_decode=args.spec_decode,
+    engine = InferenceEngine(model_path, max_batch_size=args.max_batch_size,
+                             spec_decode=args.spec_decode,
                              draft_model_path=args.draft_model or None,
                              num_speculative_tokens=args.num_spec_tokens)
     print(f"Rank {get_rank()}: Model loaded on {engine.device}")
