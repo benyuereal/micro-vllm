@@ -94,23 +94,26 @@ def verify_gemm_enabled() -> bool:
 def _select_backend():
     """选 verify int8 GEMM 后端（缓存）。
 
-    MICRO_VERIFY_GEMM=tilelang|triton，默认 triton；ROCm（torch.version.hip 非空）
+    MICRO_VERIFY_GEMM=tilelang|triton，默认 tilelang（约束：tile op 用 TileLang，
+    Triton 仅 ROCm fallback / pointwise 小算子）；ROCm（torch.version.hip 非空）
     或 tilelang import 失败时 fallback triton（Triton 双平台可编译）。
 
-    默认 triton 的依据（M=8 verify, FLUSH=1 HBM 冷读, 受控对比 median-of-5）：
-    Triton 在寄存器内 dequant→bf16 再 tl.dot（无 bf16 shared round-trip，与 vLLM
-    Marlin W8A16 同思路——Marlin 也是寄存器 dequant 后走 bf16 mma，**非** int8
-    tensor-core mma），比 TileLang 的 shared 内 dequant→bf16 快：
-      gate N=17408:  triton 196.1 vs tilelang 201.2us
-      q_proj N=12288: triton 140.3 vs tilelang 157.7us
-      in_proj N=10240: triton 117.8 vs tilelang 125.4us
-    两者均 ~1.11-1.13x 慢于 Marlin（174.1/126.0/106.5us），差距来自 Marlin 的
-    深 cp.async pipeline + 128B 向量化 int8 权重读 + int8 驻留 shared（非 bf16），
-    非 mma 数值类型——详见 bench_tlo_worktree.py 实测。"""
+    默认 tilelang 的依据（M=8 verify, FLUSH=1 HBM 冷读, 受控对比 median-of-5）：
+    优化后 TileLang（_int8_gemm_kernel_fast：int8 cp.async 直进 shared + dequant 到
+    bf16 shared + BK=256，gate_proj 203→189us 逼近 Marlin 174.8）在最大层反超
+    Triton：
+      gate N=17408:  tilelang 188.6 vs triton 196.1us
+      q_proj N=12288: tilelang 155.2 vs triton 143.1us
+      in_proj N=10240: tilelang 118.8 vs triton 117.8us
+    两者均 ~1.08-1.23x 慢于 Marlin（174.1/126.0/106.5us），差距来自 Marlin 把
+    dequant 增量融进 mma 循环（逐 fragment 交错，与 HBM 读完全 overlap），TileLang
+    T.gemm 先 dequant 整 tile 再 mma 无法交错——结构性，非实现问题。
+    注：verify 真实默认后端是 Marlin（adapter._MICRO_VERIFY_GEMM 默认 marlin），
+    本分派仅在 MICRO_VERIFY_GEMM=tilelang|triton 显式指定时生效。"""
     global _backend
     if _backend is not None:
         return _backend
-    want = os.environ.get("MICRO_VERIFY_GEMM", "triton").lower()
+    want = os.environ.get("MICRO_VERIFY_GEMM", "tilelang").lower()
     if torch.version.hip is not None:
         want = "triton"
     if want == "tilelang":
