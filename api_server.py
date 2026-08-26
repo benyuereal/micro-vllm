@@ -558,6 +558,9 @@ if __name__ == "__main__":
     ap.add_argument("--max-batch-size", type=int,
                     default=int(os.environ.get("MAX_BATCH_SIZE", "512")),
                     help="KV manager 按 max_batch*2 强制下限 block 数，大模型 spec 模式调小防 OOM")
+    ap.add_argument("--max-context-length", type=int,
+                    default=int(os.environ.get("MAX_CONTEXT_LENGTH", "1024")),
+                    help="序列长度上限（prompt+output），默认 1024；长输出基准调大")
     ap.add_argument("--served-model-name", default=os.environ.get("SERVED_MODEL_NAME", ""))
     args, _ = ap.parse_known_args()
     if args.served_model_name:
@@ -566,7 +569,8 @@ if __name__ == "__main__":
     engine = InferenceEngine(model_path, max_batch_size=args.max_batch_size,
                              spec_decode=args.spec_decode,
                              draft_model_path=args.draft_model or None,
-                             num_speculative_tokens=args.num_spec_tokens)
+                             num_speculative_tokens=args.num_spec_tokens,
+                             max_context_length=args.max_context_length)
     print(f"Rank {get_rank()}: Model loaded on {engine.device}")
 
     if rank0():
