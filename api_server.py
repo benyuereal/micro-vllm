@@ -150,13 +150,7 @@ async def rank0_inference_loop():
 
         if batch_type == "waiting" or not batch:
             engine.tp_broadcast_waiting()
-            # spec 模式：请求走 _run_spec 的 executor 线程（不经 scheduler），主循环
-            # 长期空转。tight poll 白烧 CPU 且与 executor 线程抢 GIL，加 5ms 睡眠降空转
-            # （非 spec 请求走 add_request，5ms 延迟对在线服务可忽略）。
-            if engine.spec_decode_enabled:
-                await asyncio.sleep(0.005)
-            else:
-                await asyncio.sleep(0.0)
+            await asyncio.sleep(0.0)
             continue
 
         ctx = BatchInferenceContext(len(batch), batch_type, batch)
