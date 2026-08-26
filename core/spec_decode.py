@@ -298,12 +298,16 @@ class SpecDecodeController:
     @torch.inference_mode()
     def generate(self, prompt_ids: List[int], max_tokens: int,
                  eos_token_id: Optional[int] = None,
-                 on_tokens=None) -> List[int]:
+                 on_tokens=None, ignore_eos: bool = False) -> List[int]:
         """投机解码生成。返回新生成的 token 列表。
 
         on_tokens: 可选回调，每提交一批 token（首 token / 每步 accepted+bonus）时
             调用 on_tokens(List[int])。用于真流式（SSE 逐 token 推送）。None=不回调。
+        ignore_eos: True 时遇到 EOS 不停（跑满 max_tokens），对齐 OpenAI/vllm bench 语义。
         """
+        # ignore_eos 时直接置 None，下方两处 EOS 检查自动短路
+        if ignore_eos:
+            eos_token_id = None
         device = self.device
         P = len(prompt_ids)
         # 先把真实 prompt token 载入静态 buffer（_prompt_buf 是 empty 未初始化，

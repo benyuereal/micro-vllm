@@ -97,6 +97,7 @@ class CompletionRequest(BaseModel):
     stop: Optional[Union[str, List[str]]] = None
     stream: bool = False
     stream_options: Optional[dict] = None
+    ignore_eos: bool = False  # vllm bench serve 发此参数；True=遇 EOS 不停跑满 max_tokens
     n: int = 1
 
 
@@ -320,11 +321,11 @@ def _spec_check_greedy(req) -> None:
                                  "采样请用非 spec 服务实例")
 
 
-async def _run_spec(prompt: str, max_tokens: int) -> dict:
+async def _run_spec(prompt: str, max_tokens: int, ignore_eos: bool = False) -> dict:
     """spec 路径：单序列同步 generate_spec_decode（锁串行化，executor 跑避免阻塞事件循环）。"""
     async with _spec_lock:
         def _call():
-            res = engine.generate_spec_decode(prompt, max_tokens)
+            res = engine.generate_spec_decode(prompt, max_tokens, ignore_eos=ignore_eos)
             # 可观测：慢请求直接看这行（acceptance 低→自由推理文本→tok/s 掉，属模型行为非 bug）
             n = len(res["tokens"])
             print(f"[spec] {n} tok {res['time_s']:.2f}s = {res['tok_s']:.1f} tok/s "
@@ -336,11 +337,12 @@ async def _run_spec(prompt: str, max_tokens: int) -> dict:
 
 
 async def _spec_stream(prompt, model, max_tokens, created, cid, prompt_tokens, kind,
-                       include_usage):
+                       include_usage, ignore_eos: bool = False):
     """spec 路径真流式 SSE：executor 线程跑 generate_spec_decode，on_tokens 回调经
     call_soon_threadsafe 把每步 accepted+bonus 一批 token 推进 asyncio.Queue，
     主协程逐批 yield SSE 帧（TTFT/ITL 真实反映 prefill/step 耗时）。
-    kind: "completion"（choices[i].text）/ "chat"（choices[i].delta.content）。"""
+    kind: "completion"（choices[i].text）/ "chat"（choices[i].delta.content）。
+    ignore_eos: 透传，True 时遇 EOS 不停。"""
     loop = asyncio.get_event_loop()
     q: "asyncio.Queue" = asyncio.Queue()
 
@@ -350,7 +352,8 @@ async def _spec_stream(prompt, model, max_tokens, created, cid, prompt_tokens, k
     async def _run():
         async with _spec_lock:
             def _call():
-                res = engine.generate_spec_decode(prompt, max_tokens, on_tokens=_cb)
+                res = engine.generate_spec_decode(prompt, max_tokens, on_tokens=_cb,
+                                                  ignore_eos=ignore_eos)
                 n = len(res["tokens"])
                 print(f"[spec] {n} tok {res['time_s']:.2f}s = {res['tok_s']:.1f} tok/s "
                       f"acc={res['avg_acceptance']:.3f} steps={res['num_steps']} "
@@ -430,7 +433,7 @@ async def v1_completions(req: CompletionRequest):
         ptok = len(engine.tokenizer.encode(p, add_special_tokens=True))
         include_usage = bool((req.stream_options or {}).get("include_usage", False))
         return await _spec_stream(p, model, max_tokens, created, cid, ptok,
-                                  "completion", include_usage)
+                                  "completion", include_usage, req.ignore_eos)
 
     if _spec_enabled():
         # spec 路径：逐 prompt 串行（单用户基准场景）
@@ -438,7 +441,7 @@ async def v1_completions(req: CompletionRequest):
         total_prompt = 0
         total_completion = 0
         for i, p in enumerate(prompts):
-            res = await _run_spec(p, max_tokens)
+            res = await _run_spec(p, max_tokens, ignore_eos=req.ignore_eos)
             ids = res["tokens"]
             total_prompt += len(engine.tokenizer.encode(p, add_special_tokens=True))
             total_completion += len(ids)
