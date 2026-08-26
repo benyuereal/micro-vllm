@@ -39,7 +39,7 @@ def main():
                        max_seqlen_q=P, max_seqlen_k=P)
 
     # warm
-    ctrl._target_forward(prompt_ids, positions, slot_mapping[:P], cu_q, cu_k, bt,
+    ctrl._forward(prompt_ids, positions, slot_mapping[:P], cu_q, cu_k, bt,
                          P, P, gdn_slot, collect_aux_from=0, gdn_checkpoint=False)
     torch.cuda.synchronize()
 

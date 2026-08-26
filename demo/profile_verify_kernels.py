@@ -33,7 +33,7 @@ def main():
     positions = torch.arange(P, device=device, dtype=torch.int64)
     cu_q = torch.tensor([0, P], device=device, dtype=torch.int32)
     cu_k = torch.tensor([0, P], device=device, dtype=torch.int32)
-    logits = ctrl._target_forward(prompt_ids, positions, slot_mapping[:P], cu_q, cu_k, bt,
+    logits = ctrl._forward(prompt_ids, positions, slot_mapping[:P], cu_q, cu_k, bt,
                                   P, P, gdn_slot, collect_aux_from=0, gdn_checkpoint=False)
     anchor = int(logits[-1].argmax())
     kv_len = P + 1
@@ -47,7 +47,7 @@ def main():
         vslot = slot_mapping[kv_len - 1: kv_len - 1 + M]
         vcu_q = torch.tensor([0, M], device=device, dtype=torch.int32)
         vcu_k = torch.tensor([0, kv_len - 1 + M], device=device, dtype=torch.int32)
-        vl = ctrl._target_forward(vid, vpos, vslot, vcu_q, vcu_k, bt, M, kv_len - 1 + M,
+        vl = ctrl._forward(vid, vpos, vslot, vcu_q, vcu_k, bt, M, kv_len - 1 + M,
                                   gdn_slot, collect_aux_from=kv_len - 1, gdn_checkpoint=True)
         ctrl._gdn_rollback(gdn_slot, 0)
         anchor = int(vl[0].argmax()); kv_len += 1
@@ -63,7 +63,7 @@ def main():
     torch.cuda.synchronize()
     with profile(activities=[ProfilerActivity.CUDA]) as prof:
         for _ in range(5):
-            vl = ctrl._target_forward(vid, vpos, vslot, vcu_q, vcu_k, bt, M, kv_len - 1 + M,
+            vl = ctrl._forward(vid, vpos, vslot, vcu_q, vcu_k, bt, M, kv_len - 1 + M,
                                       gdn_slot, collect_aux_from=kv_len - 1, gdn_checkpoint=True)
             ctrl._gdn_rollback(gdn_slot, 0)
         torch.cuda.synchronize()

@@ -36,14 +36,14 @@ def main():
     cu_k = torch.tensor([0, P], device=device, dtype=torch.int32)
 
     # warm
-    ctrl._target_forward(prompt_ids, positions, slot_mapping[:P], cu_q, cu_k, bt,
+    ctrl._forward(prompt_ids, positions, slot_mapping[:P], cu_q, cu_k, bt,
                          P, P, gdn_slot, collect_aux_from=0, gdn_checkpoint=False)
     torch.cuda.synchronize()
 
     for it in range(3):
         torch.cuda.synchronize()
         t0 = time.perf_counter()
-        logits = ctrl._target_forward(prompt_ids, positions, slot_mapping[:P], cu_q, cu_k, bt,
+        logits = ctrl._forward(prompt_ids, positions, slot_mapping[:P], cu_q, cu_k, bt,
                                       P, P, gdn_slot, collect_aux_from=0, gdn_checkpoint=False)
         torch.cuda.synchronize()
         print(f"prefill (P={P}) it{it}: {(time.perf_counter()-t0)*1000:.1f} ms")

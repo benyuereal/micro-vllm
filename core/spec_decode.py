@@ -157,11 +157,14 @@ class SpecDecodeController:
     # ------------------------------------------------------------------
     # target forward（走 adapter 路径，收集 aux，可选 GDN 检查点）
     # ------------------------------------------------------------------
-    def _target_forward(self, input_ids, positions, slot_mapping,
-                        cu_q, cu_k, block_table, max_sq, max_sk,
-                        gdn_slot, collect_aux_from, gdn_checkpoint,
-                        init_from_cp=False, init_state_s=None, init_state_c=None):
-        """跑一次 target prefill forward，返回 logits [M, vocab]。
+    def _forward(self, input_ids, positions, slot_mapping,
+                 cu_q, cu_k, block_table, max_sq, max_sk,
+                 gdn_slot, collect_aux_from, gdn_checkpoint,
+                 init_from_cp=False, init_state_s=None, init_state_c=None):
+        """跑一次 target 模型 forward（prefill/verify 共享本体），返回 logits [M, vocab]。
+
+        调用方走两个阶段薄封装（见下方 _prefill/_verify），它们各自定死参数语义；
+        本方法只认「跑 M 个 token」，不区分阶段。
 
         collect_aux_from: 从哪个绝对位置开始收集 aux（None=不收集），收集 M 个。
         gdn_checkpoint: 是否开 GDN 逐 token 检查点（verify 用）。
@@ -218,6 +221,52 @@ class SpecDecodeController:
             self.prefill_runner._gdn_cp_enabled = False
             self.prefill_runner._gdn_init_from_cp = False
         return out
+
+    # ------------------------------------------------------------------
+    # 阶段薄封装：_forward 的两个调用语义，参数各自定死，调用点自文档
+    # ------------------------------------------------------------------
+    def _prefill(self, prompt_ids, slot_mapping, gdn_slot):
+        """prefill 阶段：整条 prompt 一次 forward。收集 aux[0:P]，无 GDN 检查点
+        （prefill 后状态留在 pool，供首步 verify 作初始状态），走反量化 matmul。"""
+        P = prompt_ids.shape[0]
+        positions = self._arange[:P]
+        self._cu_q[0] = 0
+        self._cu_q[1] = P
+        self._cu_k[0] = 0
+        self._cu_k[1] = P
+        return self._forward(prompt_ids, positions, slot_mapping[:P],
+                             self._cu_q, self._cu_k, self._bt,
+                             P, P, gdn_slot, collect_aux_from=0, gdn_checkpoint=False)
+
+    def _verify(self, anchor, draft_tokens, kv_len, slot_mapping, gdn_slot):
+        """verify 阶段：anchor + N 个 draft（M=1+N token）一次 forward。
+        开 GDN 逐 token 检查点（accept 后按 accepted 回跳），收集 aux[kv_len-1:...]；
+        非首步 GDN 初始状态直接读 checkpoint[accepted_prev]（去 rollback）。
+        返回 vlogits [M, vocab]。
+
+        输入全部走常驻 buffer（零运行期分配）：verify_ids 前缀写、vpos=arange 切片、
+        vslot=slot_mapping 切片、cu_q/cu_k 前缀写。
+        """
+        M = 1 + self.N
+        self._verify_ids[0] = anchor
+        self._verify_ids[1:] = draft_tokens
+        vpos = self._arange[kv_len - 1: kv_len - 1 + M]
+        vslot = slot_mapping[kv_len - 1: kv_len - 1 + M]
+        self._cu_q[0] = 0
+        self._cu_q[1] = M
+        self._cu_k[0] = 0
+        self._cu_k[1] = kv_len - 1 + M
+        # 去 rollback：非首步 GDN 初始状态直接读 checkpoint[accepted_prev]
+        # （[n_gdn,...] 视图，token 索引 bake 进 base 指针），省掉接受后 copy_ 回 pool。
+        accepted_prev = self._gdn_accepted_prev
+        return self._forward(self._verify_ids, vpos, vslot, self._cu_q, self._cu_k,
+                             self._bt, M, kv_len - 1 + M, gdn_slot,
+                             collect_aux_from=kv_len - 1, gdn_checkpoint=True,
+                             init_from_cp=accepted_prev is not None,
+                             init_state_s=(self._gdn_cp_state[accepted_prev]
+                                           if accepted_prev is not None else None),
+                             init_state_c=(self._gdn_cp_conv[accepted_prev]
+                                           if accepted_prev is not None else None))
 
     # ------------------------------------------------------------------
     # GDN 状态回滚
@@ -315,7 +364,7 @@ class SpecDecodeController:
         gdn_slot = self._gdn_alloc()
         self.prefill_runner._gdn_state_pool[gdn_slot] = 0
         self.prefill_runner._gdn_conv_state_pool[gdn_slot] = 0
-        # 临时 KV slot（dummy，只为让 _target_forward 跑通编译）
+        # 临时 KV slot（dummy，只为让 _forward 跑通编译）
         seq_id = 999_999
         ok, slot_mapping, _ = self.cache_manager.alloc(seq_id, M, None)
         if ok:
@@ -328,9 +377,9 @@ class SpecDecodeController:
             cu_q = torch.tensor([0, M], device=device, dtype=torch.int32)
             cu_k = torch.tensor([0, M], device=device, dtype=torch.int32)
             try:
-                self._target_forward(input_ids, positions, slot_mapping, cu_q, cu_k,
-                                     bt, M, M, gdn_slot,
-                                     collect_aux_from=0, gdn_checkpoint=True)
+                self._forward(input_ids, positions, slot_mapping, cu_q, cu_k,
+                              bt, M, M, gdn_slot,
+                              collect_aux_from=0, gdn_checkpoint=True)
             finally:
                 self.cache_manager.free(seq_id)
         self._gdn_free(gdn_slot)
@@ -388,16 +437,7 @@ class SpecDecodeController:
 
         try:
             # ---- prefill prompt（收集 aux[0:P]）----
-            # 位置/cu_seqlens 走常驻 buffer（零运行期分配）：positions=arange 前缀切片，
-            # cu_q/cu_k 前缀写 [0, P]。
-            positions = self._arange[:P]
-            self._cu_q[0] = 0
-            self._cu_q[1] = P
-            self._cu_k[0] = 0
-            self._cu_k[1] = P
-            logits = self._target_forward(
-                prompt_ids, positions, slot_mapping[:P], self._cu_q, self._cu_k, bt,
-                P, P, gdn_slot, collect_aux_from=0, gdn_checkpoint=False)
+            logits = self._prefill(prompt_ids, slot_mapping, gdn_slot)
             anchor = int(logits[-1].argmax())
             generated = [anchor]
             kv_len = P + 1
@@ -419,34 +459,8 @@ class SpecDecodeController:
 
                 # 1. draft 提议
                 draft_tokens = self._draft_propose(anchor, kv_len)  # [N]
-                # 2. verify（1+N token，开 GDN 检查点，收集 aux[kv_len-1:...]）
-                # 输入全部走常驻 buffer（零运行期分配）：verify_ids 前缀写、vpos=arange
-                # 切片、vslot=slot_mapping 切片、cu_q/cu_k 前缀写。
-                M = 1 + self.N
-                self._verify_ids[0] = anchor
-                self._verify_ids[1:] = draft_tokens
-                vpos = self._arange[kv_len - 1: kv_len - 1 + M]
-                vslot = slot_mapping[kv_len - 1: kv_len - 1 + M]
-                self._cu_q[0] = 0
-                self._cu_q[1] = M
-                self._cu_k[0] = 0
-                self._cu_k[1] = kv_len - 1 + M
-                # 去 rollback：非首步 verify 的 GDN 初始状态直接读 checkpoint[accepted_prev]
-                # （[n_gdn,...] 视图，token 索引 bake 进 base 指针），省掉接受后 copy_ 回 pool。
-                if self._gdn_accepted_prev is not None:
-                    init_from_cp = True
-                    init_state_s = self._gdn_cp_state[self._gdn_accepted_prev]
-                    init_state_c = self._gdn_cp_conv[self._gdn_accepted_prev]
-                else:
-                    init_from_cp = False
-                    init_state_s = None
-                    init_state_c = None
-                vlogits = self._target_forward(
-                    self._verify_ids, vpos, vslot, self._cu_q, self._cu_k, bt,
-                    M, kv_len - 1 + M, gdn_slot,
-                    collect_aux_from=kv_len - 1, gdn_checkpoint=True,
-                    init_from_cp=init_from_cp,
-                    init_state_s=init_state_s, init_state_c=init_state_c)
+                # 2. verify（1+N token，开 GDN 检查点，收集 aux；输入走常驻 buffer）
+                vlogits = self._verify(anchor, draft_tokens, kv_len, slot_mapping, gdn_slot)
                 self.total_steps += 1
 
                 # 3. 贪心接受。draft/target 各 .cpu() 一次（共 2 次同步），Python 侧

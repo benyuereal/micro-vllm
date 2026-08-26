@@ -3,7 +3,7 @@
 段划分：
   draft: aux_gather / combine(fc) / precompute_ctx_kv / query_embed /
          forward_5L / select_tokens(lm_head+selector)
-  verify: _target_forward 整体（GEMM 主导，另列非 GEMM 参考）
+  verify: _forward 整体（GEMM 主导，另列非 GEMM 参考）
   accept: argmax + 贪心比较 + bonus（2 次 CPU-GPU 同步）
   rollback: 去 rollback 后为 0（GDN 初始状态直接读 checkpoint[accepted_prev]，
             省掉原 0.406ms/step 的 DtoD copy_ 回 pool）
@@ -62,7 +62,7 @@ def main():
     positions = torch.arange(P, device=device, dtype=torch.int64)
     cu_q = torch.tensor([0, P], device=device, dtype=torch.int32)
     cu_k = torch.tensor([0, P], device=device, dtype=torch.int32)
-    logits = ctrl._target_forward(prompt_ids, positions, slot_mapping[:P], cu_q, cu_k, bt,
+    logits = ctrl._forward(prompt_ids, positions, slot_mapping[:P], cu_q, cu_k, bt,
                                   P, P, gdn_slot, collect_aux_from=0, gdn_checkpoint=False)
     anchor = int(logits[-1].argmax())
     kv_len = P + 1
@@ -78,13 +78,13 @@ def main():
         vcu_q = torch.tensor([0, M], device=device, dtype=torch.int32)
         vcu_k = torch.tensor([0, kv_len - 1 + M], device=device, dtype=torch.int32)
         if accepted_prev is not None:
-            vl = ctrl._target_forward(vid, vpos, vslot, vcu_q, vcu_k, bt, M, kv_len - 1 + M,
+            vl = ctrl._forward(vid, vpos, vslot, vcu_q, vcu_k, bt, M, kv_len - 1 + M,
                                       gdn_slot, collect_aux_from=kv_len - 1, gdn_checkpoint=True,
                                       init_from_cp=True,
                                       init_state_s=ctrl._gdn_cp_state[accepted_prev],
                                       init_state_c=ctrl._gdn_cp_conv[accepted_prev])
         else:
-            vl = ctrl._target_forward(vid, vpos, vslot, vcu_q, vcu_k, bt, M, kv_len - 1 + M,
+            vl = ctrl._forward(vid, vpos, vslot, vcu_q, vcu_k, bt, M, kv_len - 1 + M,
                                       gdn_slot, collect_aux_from=kv_len - 1, gdn_checkpoint=True)
         accepted_prev = 0
         anchor = int(vl[0].argmax()); kv_len += 1
@@ -120,7 +120,7 @@ def main():
 
         # 去 rollback：verify 的 GDN 初始状态直接读 checkpoint[accepted_prev]（非首步）。
         if accepted_prev is not None:
-            ms, vlogits = timeit(lambda: ctrl._target_forward(
+            ms, vlogits = timeit(lambda: ctrl._forward(
                 torch.cat([torch.tensor([anchor], device=device), draft_tokens]),
                 torch.arange(kv_len - 1, kv_len - 1 + M, device=device, dtype=torch.int64),
                 slot_mapping[kv_len - 1: kv_len - 1 + M],
@@ -132,7 +132,7 @@ def main():
                 init_state_s=ctrl._gdn_cp_state[accepted_prev],
                 init_state_c=ctrl._gdn_cp_conv[accepted_prev]))
         else:
-            ms, vlogits = timeit(lambda: ctrl._target_forward(
+            ms, vlogits = timeit(lambda: ctrl._forward(
                 torch.cat([torch.tensor([anchor], device=device), draft_tokens]),
                 torch.arange(kv_len - 1, kv_len - 1 + M, device=device, dtype=torch.int64),
                 slot_mapping[kv_len - 1: kv_len - 1 + M],
