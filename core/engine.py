@@ -233,7 +233,9 @@ class InferenceEngine:
         # verify 阶段（M=1+N 固定 shape）进 CUDA graph：warmup 后捕获一次，
         # 稳态 verify（非首步，GDN 初始状态从 checkpoint 读）走 replay。
         # 捕获失败自动回退 eager（_verify_graph=None）。
-        self._spec_controller.capture_verify_graph()
+        # MICRO_VERIFY_GRAPH=0 强制关 graph（A/B 对比用）。
+        if os.environ.get("MICRO_VERIFY_GRAPH", "1") != "0":
+            self._spec_controller.capture_verify_graph()
         logger.info(f"投机解码控制器已构建: N={self.num_speculative_tokens} "
                     f"mask_token={mask_token_id} draft={draft_model_path} "
                     f"verify_graph={'on' if self._spec_controller._verify_graph is not None else 'off(eager)'}")
