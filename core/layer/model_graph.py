@@ -105,7 +105,8 @@ class ModelGraphRunner:
         for name in ("_h_buf", "_qkv", "_attn_out", "_residual",
                      "_x16", "_absorb_idx", "_cos_full", "_sin_full",
                      "_gdn_state_pool", "_gdn_conv_state_pool",
-                     "_gdn_seq_idx", "_gdn_is_real", "_gdn_prefill_seq_idx"):
+                     "_gdn_seq_idx", "_gdn_is_real", "_gdn_prefill_seq_idx",
+                     "_gdn_init_idx"):
             setattr(self, name, bufs.get(name))
 
     # ==========================================

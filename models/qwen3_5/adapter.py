@@ -93,7 +93,7 @@ def gdn_gbeta(a, b, a_log, dt_bias, g_buf, beta_buf, stride):
 def _gdn_conv_prefill_kernel(QKV, W, STATE, CU, SEQ_IDX,
                              CONV_DIM, STRIDE, N_GDN, GDN_L, K: tl.constexpr, BLOCK_C: tl.constexpr,
                              CHECKPOINT, CP_N_GDN, CP_ENABLED: tl.constexpr,
-                             INIT_STATE, INIT_FROM_CP: tl.constexpr):
+                             INIT_STATE, INIT_IDX, INIT_FROM_CP: tl.constexpr):
     pid_c = tl.program_id(0)
     c = pid_c * BLOCK_C + tl.arange(0, BLOCK_C)
     cmask = c < CONV_DIM
@@ -112,7 +112,10 @@ def _gdn_conv_prefill_kernel(QKV, W, STATE, CU, SEQ_IDX,
     # （INIT_STATE 指向 [n_gdn, 3, conv_dim]，token 索引已 bake 进 base 指针）读。
     # conv 是 bf16、recurrent 是 fp32，dtype/布局不同 → 两个 kernel 各自处理。
     if INIT_FROM_CP:
-        st_init = INIT_STATE + GDN_L * 3 * CONV_DIM + c
+        # CUDA graph 安全：token 索引从 device buffer 读（INIT_IDX[0]），INIT_STATE 指向
+        # 完整 checkpoint buffer base [M, n_gdn, 3, conv_dim]（非 bake 进指针的切片视图）。
+        init_t = tl.load(INIT_IDX).to(tl.int64)
+        st_init = INIT_STATE + (init_t * CP_N_GDN + GDN_L) * 3 * CONV_DIM + c
     else:
         st_init = st_base
     x0 = tl.load(st_init + 0, mask=cmask, other=0.0).to(tl.float32)
@@ -228,7 +231,7 @@ def _gdn_recurrent_prefill_kernel(QKV, G, BETA, STATE, OUT, CU, SEQ_IDX,
                                   DK: tl.constexpr, DV: tl.constexpr,
                                   N_GDN, GDN_L, SCALE, STRIDE, BLOCK_D: tl.constexpr,
                                   CHECKPOINT, CP_N_GDN, CP_ENABLED: tl.constexpr,
-                                  INIT_STATE, INIT_FROM_CP: tl.constexpr):
+                                  INIT_STATE, INIT_IDX, INIT_FROM_CP: tl.constexpr):
     s = tl.program_id(0)
     h = tl.program_id(1)
     start = tl.load(CU + s)
@@ -244,7 +247,10 @@ def _gdn_recurrent_prefill_kernel(QKV, G, BETA, STATE, OUT, CU, SEQ_IDX,
     # 省掉接受后 copy_ 回 pool 的 DtoD。首步 verify / 正常 prefill 仍从 pool 读。
     # 初始 load 在循环前，checkpoint store 在循环内 → 无读写竞争。
     if INIT_FROM_CP:
-        S_init = INIT_STATE + GDN_L * H * DK * DV + h * DK * DV
+        # CUDA graph 安全：token 索引从 device buffer 读（INIT_IDX[0]），INIT_STATE 指向
+        # 完整 checkpoint buffer base [M, n_gdn, H, DK, DV]（非 bake 进指针的切片视图）。
+        init_t = tl.load(INIT_IDX).to(tl.int64)
+        S_init = INIT_STATE + (init_t * CP_N_GDN + GDN_L) * H * DK * DV + h * DK * DV
     else:
         S_init = S
     S_m = tl.load(S_init + dk[:, None] * DV + dv[None, :]).to(tl.float32)
@@ -767,38 +773,43 @@ class Qwen3_5Adapter(ModelAdapter):
             # recurrent 是 fp32 [n_gdn,H,DK,DV]、conv 是 bf16 [n_gdn,3,conv_dim]，两个独立视图。
             # 首步 verify / 正常 prefill：INIT_FROM_CP=False，从 pool 读（INIT_STATE 传 pool 占位）。
             init_from_cp = bool(getattr(graph, "_gdn_init_from_cp", False))
+            # CUDA graph 安全：INIT_STATE 指向【完整 checkpoint buffer base】
+            # [M, n_gdn, ...]，token 索引从 device buffer _gdn_init_idx[0] 读
+            # （replay 时重读，非 capture 时 bake 的标量）。旧实现把 token 索引 bake
+            # 进切片视图指针（_gdn_cp_state[accepted_prev]），graph replay 会读错行。
+            init_idx = graph._gdn_init_idx
             if init_from_cp:
-                init_state_s = graph._gdn_init_state_s   # [n_gdn, H, DK, DV] fp32
-                init_state_c = graph._gdn_init_state_c   # [n_gdn, 3, conv_dim] bf16
+                init_state_s = cp_state                   # [M, n_gdn, H, DK, DV] fp32 base
+                init_state_c = cp_conv                     # [M, n_gdn, 3, conv_dim] bf16 base
             else:
-                init_state_s = state                      # 占位（kernel 内 INIT_FROM_CP=False 不读）
+                init_state_s = state                       # 占位（kernel 内 INIT_FROM_CP=False 不读）
                 init_state_c = conv_state
             if cp_enabled:
                 _gdn_conv_prefill_kernel[(triton.cdiv(conv_dim, 512), n_seqs)](
                     qkv, la._conv_w, conv_state, cu_seqlens, seq_idx,
                     conv_dim, in_dim, n_gdn, gdn_l, K=self._gdn_K, BLOCK_C=512,
                     CHECKPOINT=cp_conv, CP_N_GDN=n_gdn, CP_ENABLED=True,
-                    INIT_STATE=init_state_c, INIT_FROM_CP=init_from_cp)
+                    INIT_STATE=init_state_c, INIT_IDX=init_idx, INIT_FROM_CP=init_from_cp)
                 o = torch.empty(M, H * DV, dtype=h2d.dtype, device=dev)
                 _gdn_recurrent_prefill_kernel[(n_seqs, H)](
                     qkv, g, beta, state, o, cu_seqlens, seq_idx,
                     H=H, HK=HK, DK=DK, DV=DV, N_GDN=n_gdn, GDN_L=gdn_l, SCALE=scale,
                     STRIDE=in_dim, BLOCK_D=triton.next_power_of_2(max(DK, DV)),
                     CHECKPOINT=cp_state, CP_N_GDN=n_gdn, CP_ENABLED=True,
-                    INIT_STATE=init_state_s, INIT_FROM_CP=init_from_cp)
+                    INIT_STATE=init_state_s, INIT_IDX=init_idx, INIT_FROM_CP=init_from_cp)
             else:
                 _gdn_conv_prefill_kernel[(triton.cdiv(conv_dim, 512), n_seqs)](
                     qkv, la._conv_w, conv_state, cu_seqlens, seq_idx,
                     conv_dim, in_dim, n_gdn, gdn_l, K=self._gdn_K, BLOCK_C=512,
                     CHECKPOINT=conv_state, CP_N_GDN=n_gdn, CP_ENABLED=False,
-                    INIT_STATE=init_state_c, INIT_FROM_CP=init_from_cp)
+                    INIT_STATE=init_state_c, INIT_IDX=init_idx, INIT_FROM_CP=init_from_cp)
                 o = torch.empty(M, H * DV, dtype=h2d.dtype, device=dev)
                 _gdn_recurrent_prefill_kernel[(n_seqs, H)](
                     qkv, g, beta, state, o, cu_seqlens, seq_idx,
                     H=H, HK=HK, DK=DK, DV=DV, N_GDN=n_gdn, GDN_L=gdn_l, SCALE=scale,
                     STRIDE=in_dim, BLOCK_D=triton.next_power_of_2(max(DK, DV)),
                     CHECKPOINT=state, CP_N_GDN=n_gdn, CP_ENABLED=False,
-                    INIT_STATE=init_state_s, INIT_FROM_CP=init_from_cp)
+                    INIT_STATE=init_state_s, INIT_IDX=init_idx, INIT_FROM_CP=init_from_cp)
 
         if self._dbg_gdn is not None:
             self._dbg_gdn[-1]["qkv_post"] = qkv.detach().clone()
@@ -1026,6 +1037,10 @@ class Qwen3_5Adapter(ModelAdapter):
             "_gdn_seq_idx": torch.zeros(max_bs, dtype=torch.int32, device=device),
             "_gdn_is_real": torch.zeros(max_bs, dtype=torch.int32, device=device),
             "_gdn_prefill_seq_idx": torch.zeros(max_bs, dtype=torch.int32, device=device),
+            # CUDA graph 安全：GDN 初始状态 token 索引（device buffer，replay 时重读）。
+            # spec verify 非首步从 checkpoint[accepted_prev] 读初始状态，token 索引
+            # 每步变，不能 bake 进指针 → 存 buffer[0]，kernel 内 tl.load 读。
+            "_gdn_init_idx": torch.zeros(1, dtype=torch.int32, device=device),
         }
 
     # -------------------- 有状态层 batch 元信息 --------------------
