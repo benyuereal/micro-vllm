@@ -159,6 +159,21 @@ def marlin_make_empty_g_idx(device):
     return torch.empty(0, dtype=torch.int, device=device)
 
 
+def int8_to_packed(w_int8):
+    """int8 [N,K] → packed int32 [N,K/4]（byte i = (int8+128)&0xFF，4 int8/int32）。
+
+    与 adapter._unpack_linear 的解包互逆：w_int8[n,4k+i] = byte_i - 128
+    → packed[n,k] = b0 | (b1<<8) | (b2<<16) | (b3<<24)。供 marlin 模式从已解包的
+    int8 权重（融合后）重建 Marlin packed 布局，避免保留 checkpoint 的 int32。"""
+    N, K = w_int8.shape
+    w = w_int8.view(N, K // 4, 4).to(torch.int32)
+    b0 = w[:, :, 0] + 128
+    b1 = w[:, :, 1] + 128
+    b2 = w[:, :, 2] + 128
+    b3 = w[:, :, 3] + 128
+    return (b0 | (b1 << 8) | (b2 << 16) | (b3 << 24)).contiguous()
+
+
 def build_marlin(packed, scale_bf16, N, K, device):
     """checkpoint weight_packed int32 [N,K/4] + weight_scale bf16 [N,K/128] → Marlin 格式。
 
@@ -172,8 +187,7 @@ def build_marlin(packed, scale_bf16, N, K, device):
     padded_n, padded_k = marlin_padded_nk(N, K, GROUP)
     wq = marlin_pad_qweight(wq, N, K, padded_n, padded_k)
     wq = _mod.gptq_marlin_repack(
-        wq, marlin_make_empty_g_idx(device),
-        size_k=padded_k, size_n=padded_n, num_bits=8, is_a_8bit=False)
+        wq, marlin_make_empty_g_idx(device), padded_k, padded_n, 8, False)
     ws = marlin_permute_scales(
         marlin_pad_scales(ws, N, K, padded_n, padded_k, GROUP),
         size_k=padded_k, size_n=padded_n, group_size=GROUP, is_a_8bit=False)
@@ -187,15 +201,26 @@ def build_marlin(packed, scale_bf16, N, K, device):
 # ---------------------------------------------------------------------------
 # forward
 # ---------------------------------------------------------------------------
-def marlin_forward(m, x):
+def marlin_forward(m, x, out=None):
     """x bf16 [M,K] → bf16 [M,N]（复刻 apply_gptq_marlin_linear 调用）。
 
-    m 是 build_marlin 返回的 dict。"""
+    m 是 build_marlin 返回的 dict。out 可选（[M,N] 连续）：提供时写入 out 并返回
+    out（decode/verify 的 _lin 调用点传预分配 buffer 作 view）；否则返回新 tensor。
+    marlin_gemm 输出 [M, padded_n]（c_or_none 须 [M,padded_n] 连续）；padded_n==N 时
+    直接写 out（零临时），否则写临时再拷前 N 列。"""
+    M = x.shape[0]
     xp = marlin_pad_dim(x, m["K"], m["padded_k"])
-    out = _mod.marlin_gemm(
-        xp, None, m["wq"], None, m["ws"], None, None, m["zp"], m["g_idx"],
+    if out is not None and m["padded_n"] == m["N"]:
+        c = out  # [M, N] == [M, padded_n]，直接写
+    else:
+        c = torch.empty(M, m["padded_n"], dtype=x.dtype, device=x.device)
+    _mod.marlin_gemm(
+        xp, c, m["wq"], None, m["ws"], None, None, m["zp"], m["g_idx"],
         m["g_idx"], m["workspace"], _mod.marlin_u8b128_id(),
-        size_m=xp.shape[0], size_n=m["padded_n"], size_k=m["padded_k"],
-        is_k_full=True, use_atomic_add=False, use_fp32_reduce=False,
-        is_zp_float=False)
-    return marlin_unpad_output(out, m["N"], m["padded_n"])
+        M, m["padded_n"], m["padded_k"],
+        True, False, False, False)
+    if out is None:
+        return marlin_unpad_output(c, m["N"], m["padded_n"])
+    if m["padded_n"] != m["N"]:
+        out.copy_(c[:, :m["N"]])
+    return out

@@ -22,10 +22,14 @@ import triton.language as tl
 
 from kernel.gemv import gemv_or_matmul
 from kernel.gemv_int8 import w8_linear
+from kernel import marlin as _marlin
 
 
 def _lin(x, w, out, env):
-    """统一线性：w 为 bf16 [N,K] 或 (w_int8, scale) 元组（W8A16）。"""
+    """统一线性：w 为 bf16 [N,K] / (w_int8, scale) 元组（W8A16 tilelang）/
+    Marlin dict（W8A16 marlin 模式）。"""
+    if isinstance(w, dict) and "wq" in w:
+        return _marlin.marlin_forward(w, x, out)
     if isinstance(w, tuple):
         return w8_linear(x, w[0], w[1], out, env)
     return gemv_or_matmul(x, w, out, env)
@@ -81,8 +85,11 @@ def dense_swiglu(x, gu_w, d_w, m=None, w_is_nk=False):
         lead = x.shape[:-1]
         x2 = x.reshape(-1, x.shape[-1])
         M = m if m is not None else x2.shape[0]
-        gu_n = gu_w[0].shape[0] if isinstance(gu_w, tuple) else gu_w.shape[0]
-        d_n = d_w[0].shape[0] if isinstance(d_w, tuple) else d_w.shape[0]
+        # N 维：Marlin dict 取 ["N"]；(int8, scale) 元组取 [0].shape[0]；bf16 取 shape[0]。
+        gu_n = gu_w["N"] if isinstance(gu_w, dict) else (
+            gu_w[0].shape[0] if isinstance(gu_w, tuple) else gu_w.shape[0])
+        d_n = d_w["N"] if isinstance(d_w, dict) else (
+            d_w[0].shape[0] if isinstance(d_w, tuple) else d_w.shape[0])
         gate_up = torch.empty(M, gu_n, dtype=x.dtype, device=x.device)
         _lin(x2, gu_w, gate_up, "MICRO_GEMV_FFN")
         inter = gu_n // 2
