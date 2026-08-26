@@ -79,8 +79,10 @@ class ChatCompletionRequest(BaseModel):
     model: str
     messages: List[ChatMessage]
     max_tokens: Optional[int] = 128
-    temperature: Optional[float] = 0.7
-    top_p: Optional[float] = 0.9
+    # 默认 None（OpenAI 语义：未指定→服务端默认），而非 0.7。spec 路径对 None 走 greedy
+    # （与基准一致），仅当客户端显式指定非 0 temperature 才 400。
+    temperature: Optional[float] = None
+    top_p: Optional[float] = None
     stop: Optional[Union[str, List[str]]] = None
     stream: bool = False
     n: int = 1
@@ -89,8 +91,8 @@ class CompletionRequest(BaseModel):
     model: str
     prompt: Union[str, List[str]]
     max_tokens: Optional[int] = 128
-    temperature: Optional[float] = 0.7
-    top_p: Optional[float] = 0.9
+    temperature: Optional[float] = None
+    top_p: Optional[float] = None
     stop: Optional[Union[str, List[str]]] = None
     stream: bool = False
     n: int = 1
@@ -148,7 +150,13 @@ async def rank0_inference_loop():
 
         if batch_type == "waiting" or not batch:
             engine.tp_broadcast_waiting()
-            await asyncio.sleep(0.0)
+            # spec 模式：请求走 _run_spec 的 executor 线程（不经 scheduler），主循环
+            # 长期空转。tight poll 白烧 CPU 且与 executor 线程抢 GIL，加 5ms 睡眠降空转
+            # （非 spec 请求走 add_request，5ms 延迟对在线服务可忽略）。
+            if engine.spec_decode_enabled:
+                await asyncio.sleep(0.005)
+            else:
+                await asyncio.sleep(0.0)
             continue
 
         ctx = BatchInferenceContext(len(batch), batch_type, batch)
@@ -309,11 +317,25 @@ def _spec_enabled() -> bool:
     return engine is not None and engine.spec_decode_enabled
 
 
+def _spec_check_greedy(req) -> None:
+    """spec 路径（generate_spec_decode）是贪心专用：采样请求显式 400，不静默忽略。"""
+    if _spec_enabled() and (req.temperature is not None and req.temperature != 0):
+        raise HTTPException(400, "spec decode 路径当前仅支持 greedy（temperature=0），"
+                                 "采样请用非 spec 服务实例")
+
+
 async def _run_spec(prompt: str, max_tokens: int) -> dict:
     """spec 路径：单序列同步 generate_spec_decode（锁串行化，executor 跑避免阻塞事件循环）。"""
     async with _spec_lock:
         def _call():
-            return engine.generate_spec_decode(prompt, max_tokens)
+            res = engine.generate_spec_decode(prompt, max_tokens)
+            # 可观测：慢请求直接看这行（acceptance 低→自由推理文本→tok/s 掉，属模型行为非 bug）
+            n = len(res["tokens"])
+            print(f"[spec] {n} tok {res['time_s']:.2f}s = {res['tok_s']:.1f} tok/s "
+                  f"acc={res['avg_acceptance']:.3f} steps={res['num_steps']} "
+                  f"ptok={len(engine.tokenizer.encode(prompt, add_special_tokens=True))}",
+                  flush=True)
+            return res
         return await asyncio.get_event_loop().run_in_executor(None, _call)
 
 
@@ -321,6 +343,7 @@ async def _run_spec(prompt: str, max_tokens: int) -> dict:
 async def v1_completions(req: CompletionRequest):
     if not engine:
         raise HTTPException(503, "Model not loaded")
+    _spec_check_greedy(req)
     model = req.model or (SERVED_MODEL_NAME or engine.adapter.model_type)
     prompts = [req.prompt] if isinstance(req.prompt, str) else list(req.prompt)
     stop = _norm_stop(req.stop)
@@ -347,8 +370,11 @@ async def v1_completions(req: CompletionRequest):
     # 同一实例后续被 in-place 更新（output_ids 增长），持引用即可推导 finish_reason。
     futs = []
     for p in prompts:
-        sid = engine.add_request(p, max_tokens, temperature=req.temperature or 0.7,
-                                 top_p=req.top_p or 0.9, stop=stop)
+        # 注意：不能用 `req.temperature or 0.7`——temperature=0（greedy）会被 or 当成
+        # 假值替换成 0.7。显式判 None。
+        temp = 0.0 if req.temperature is None else req.temperature
+        topp = 0.9 if req.top_p is None else req.top_p
+        sid = engine.add_request(p, max_tokens, temperature=temp, top_p=topp, stop=stop)
         seq = next((s for s in engine.scheduler.waiting_queue if s.seq_id == sid), None)
         futs.append((p, seq, engine.new_completion_future(sid)))
     choices = []
@@ -389,8 +415,10 @@ async def v1_chat_completions(req: ChatCompletionRequest):
                              "finish_reason": "length" if len(ids) >= max_tokens else "stop"}],
                 "usage": _usage(prompt_tokens, len(ids))}
 
-    sid = engine.add_request(prompt, max_tokens, temperature=req.temperature or 0.7,
-                             top_p=req.top_p or 0.9, stop=stop)
+    # 显式判 None（不能 `or`：temperature=0 会被当假值替换成 0.7）
+    temp = 0.0 if req.temperature is None else req.temperature
+    topp = 0.9 if req.top_p is None else req.top_p
+    sid = engine.add_request(prompt, max_tokens, temperature=temp, top_p=topp, stop=stop)
     seq = next((s for s in engine.scheduler.waiting_queue if s.seq_id == sid), None)
     text = await engine.new_completion_future(sid)
     n_out = len(seq.output_ids) if seq else 0
@@ -408,8 +436,9 @@ async def _chat_stream(req, model, prompt, max_tokens, stop, created, cid, promp
         res = await _run_spec(prompt, max_tokens)
         text, ids = res["text"], res["tokens"]
     else:
-        sid = engine.add_request(prompt, max_tokens, temperature=req.temperature or 0.7,
-                                 top_p=req.top_p or 0.9, stop=stop)
+        temp = 0.0 if req.temperature is None else req.temperature
+        topp = 0.9 if req.top_p is None else req.top_p
+        sid = engine.add_request(prompt, max_tokens, temperature=temp, top_p=topp, stop=stop)
         seq = next((s for s in engine.scheduler.waiting_queue if s.seq_id == sid), None)
         text = await engine.new_completion_future(sid)
         ids = seq.output_ids if seq else []
