@@ -85,6 +85,7 @@ class ChatCompletionRequest(BaseModel):
     top_p: Optional[float] = None
     stop: Optional[Union[str, List[str]]] = None
     stream: bool = False
+    stream_options: Optional[dict] = None
     n: int = 1
 
 class CompletionRequest(BaseModel):
@@ -95,6 +96,7 @@ class CompletionRequest(BaseModel):
     top_p: Optional[float] = None
     stop: Optional[Union[str, List[str]]] = None
     stream: bool = False
+    stream_options: Optional[dict] = None
     n: int = 1
 
 
@@ -333,6 +335,82 @@ async def _run_spec(prompt: str, max_tokens: int) -> dict:
         return await asyncio.get_event_loop().run_in_executor(None, _call)
 
 
+async def _spec_stream(prompt, model, max_tokens, created, cid, prompt_tokens, kind,
+                       include_usage):
+    """spec 路径真流式 SSE：executor 线程跑 generate_spec_decode，on_tokens 回调经
+    call_soon_threadsafe 把每步 accepted+bonus 一批 token 推进 asyncio.Queue，
+    主协程逐批 yield SSE 帧（TTFT/ITL 真实反映 prefill/step 耗时）。
+    kind: "completion"（choices[i].text）/ "chat"（choices[i].delta.content）。"""
+    loop = asyncio.get_event_loop()
+    q: "asyncio.Queue" = asyncio.Queue()
+
+    def _cb(ids):  # executor 线程内调用
+        loop.call_soon_threadsafe(q.put_nowait, ids)
+
+    async def _run():
+        async with _spec_lock:
+            def _call():
+                res = engine.generate_spec_decode(prompt, max_tokens, on_tokens=_cb)
+                n = len(res["tokens"])
+                print(f"[spec] {n} tok {res['time_s']:.2f}s = {res['tok_s']:.1f} tok/s "
+                      f"acc={res['avg_acceptance']:.3f} steps={res['num_steps']} "
+                      f"ptok={prompt_tokens}", flush=True)
+                return res
+            return await loop.run_in_executor(None, _call)
+
+    task = asyncio.create_task(_run())
+    tok = engine.tokenizer
+
+    def _frame(text, finish=None, usage=None):
+        if kind == "chat":
+            delta = {"content": text} if text else {}
+            obj = {"id": cid, "object": "chat.completion.chunk", "created": created,
+                   "model": model,
+                   "choices": [{"index": 0, "delta": delta, "finish_reason": finish}]}
+        else:
+            obj = {"id": cid, "object": "text_completion", "created": created, "model": model,
+                   "choices": [{"index": 0, "text": text, "logprobs": None,
+                                "finish_reason": finish}]}
+        if usage is not None:
+            obj["usage"] = usage
+        return obj
+
+    async def gen():
+        if kind == "chat":
+            yield _sse({"id": cid, "object": "chat.completion.chunk", "created": created,
+                        "model": model,
+                        "choices": [{"index": 0,
+                                     "delta": {"role": "assistant", "content": ""},
+                                     "finish_reason": None}]})
+        try:
+            while True:
+                try:
+                    ids = await asyncio.wait_for(q.get(), timeout=0.5)
+                except asyncio.TimeoutError:
+                    if task.done():
+                        # generate 已返回：其内部 on_tokens 的 put 都先于 future 完成被调度，
+                        # 队列必已排空；再兜底 drain 一次防竞态
+                        while True:
+                            try:
+                                yield _sse(_frame(tok.decode(q.get_nowait(),
+                                                             skip_special_tokens=True)))
+                            except asyncio.QueueEmpty:
+                                break
+                        break
+                    continue
+                yield _sse(_frame(tok.decode(ids, skip_special_tokens=True)))
+            res = await task
+        except asyncio.CancelledError:  # 客户端断开：终止后台生成
+            task.cancel()
+            raise
+        ids = res["tokens"]
+        finish = "length" if len(ids) >= max_tokens else "stop"
+        yield _sse(_frame("", finish, _usage(prompt_tokens, len(ids)) if include_usage else None))
+        yield "data: [DONE]\n\n"
+
+    return StreamingResponse(gen(), media_type="text/event-stream")
+
+
 @app.post("/v1/completions")
 async def v1_completions(req: CompletionRequest):
     if not engine:
@@ -344,6 +422,15 @@ async def v1_completions(req: CompletionRequest):
     max_tokens = req.max_tokens or 128
     created = int(time.time())
     cid = f"cmpl-{uuid.uuid4().hex[:24]}"
+
+    if _spec_enabled() and req.stream:
+        # spec 路径真流式（vllm bench serve 走 /v1/completions stream:true）：
+        # 多 prompt 流式无意义（bench 单 prompt），取首 prompt
+        p = prompts[0]
+        ptok = len(engine.tokenizer.encode(p, add_special_tokens=True))
+        include_usage = bool((req.stream_options or {}).get("include_usage", False))
+        return await _spec_stream(p, model, max_tokens, created, cid, ptok,
+                                  "completion", include_usage)
 
     if _spec_enabled():
         # spec 路径：逐 prompt 串行（单用户基准场景）
@@ -396,6 +483,12 @@ async def v1_chat_completions(req: ChatCompletionRequest):
     created = int(time.time())
     cid = f"chatcmpl-{uuid.uuid4().hex[:24]}"
     prompt_tokens = len(engine.tokenizer.encode(prompt, add_special_tokens=True))
+
+    if req.stream and _spec_enabled():
+        # spec 路径走真逐 token 流式（_chat_stream 是"生成完再分块"假流式，TTFT 虚高）
+        include_usage = bool((req.stream_options or {}).get("include_usage", False))
+        return await _spec_stream(prompt, model, max_tokens, created, cid,
+                                  prompt_tokens, "chat", include_usage)
 
     if req.stream:
         return await _chat_stream(req, model, prompt, max_tokens, stop, created, cid, prompt_tokens)

@@ -297,8 +297,13 @@ class SpecDecodeController:
     # ------------------------------------------------------------------
     @torch.inference_mode()
     def generate(self, prompt_ids: List[int], max_tokens: int,
-                 eos_token_id: Optional[int] = None) -> List[int]:
-        """投机解码生成。返回新生成的 token 列表。"""
+                 eos_token_id: Optional[int] = None,
+                 on_tokens=None) -> List[int]:
+        """投机解码生成。返回新生成的 token 列表。
+
+        on_tokens: 可选回调，每提交一批 token（首 token / 每步 accepted+bonus）时
+            调用 on_tokens(List[int])。用于真流式（SSE 逐 token 推送）。None=不回调。
+        """
         device = self.device
         P = len(prompt_ids)
         # 先把真实 prompt token 载入静态 buffer（_prompt_buf 是 empty 未初始化，
@@ -348,6 +353,8 @@ class SpecDecodeController:
             generated = [anchor]
             kv_len = P + 1
             self.total_generated = 1
+            if on_tokens is not None:
+                on_tokens([anchor])
             # 首步 verify 无检查点（prefill 后 GDN 状态在 pool），初始状态从 pool 读。
             self._gdn_accepted_prev = None
 
@@ -410,6 +417,8 @@ class SpecDecodeController:
                 # 5. 提交 accepted 个 draft + 1 个 bonus
                 new_tokens = d_cpu[:accepted] + [bonus]
                 generated.extend(new_tokens)
+                if on_tokens is not None:
+                    on_tokens(new_tokens)
                 self.total_accepted += accepted
                 self.total_generated += len(new_tokens)
                 kv_len += len(new_tokens)

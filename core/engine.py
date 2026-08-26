@@ -663,11 +663,13 @@ class InferenceEngine:
         self.scheduler.running_sequences.clear()
         return results
 
-    def generate_spec_decode(self, prompt: str, max_tokens: int = 100) -> Dict[str, object]:
+    def generate_spec_decode(self, prompt: str, max_tokens: int = 100,
+                             on_tokens=None) -> Dict[str, object]:
         """投机解码生成（单序列，DFlash2 draft-verify-accept，greedy 确定性接受）。
 
         返回 {text, tokens, avg_acceptance, num_steps, time_s, tok_s}。
         输出与无投机 greedy 逐 token 一致（正确性保证）。
+        on_tokens: 可选回调，每提交一批 token 时调用（真流式用）。
         """
         if self._spec_controller is None:
             raise RuntimeError("投机解码未启用（构造时 spec_decode=True）")
@@ -679,7 +681,8 @@ class InferenceEngine:
 
         t0 = time.time()
         out_ids = self._spec_controller.generate(
-            prompt_ids, max_tokens, eos_token_id=self.eos_token_id)
+            prompt_ids, max_tokens, eos_token_id=self.eos_token_id,
+            on_tokens=on_tokens)
         elapsed = time.time() - t0
 
         text = self.tokenizer.decode(out_ids, skip_special_tokens=True)
