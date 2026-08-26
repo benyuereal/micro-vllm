@@ -56,7 +56,11 @@ def int8_gemm_triton(x, w_int8, scale, out=None):
     if out is None:
         out = torch.empty(M, N, dtype=x.dtype, device=x.device)
     BM = max(16, triton.next_power_of_2(M))
-    BN = 128
+    # BN=64 在 M=8(verify)/61/128(prefill) 全比 BN=128 快（FLUSH=1 冷读实测，
+    # gate N=17408 M=8: 196.1 vs 200.7us；M=128: 269 vs 327us）。BK=128 必须=group
+    # 尺寸（scale 每 128 元素一个，BK=256 会跨 group 读错 scale，且 per-element
+    # scale 会物化整块 fp32 scale tile → shared OOM）。
+    BN = 64
     BK = 128
     grid = (triton.cdiv(N, BN), triton.cdiv(M, BM))
     _triton_int8_gemm[grid](x, w_int8, scale, out, M, N, K,
@@ -90,12 +94,23 @@ def verify_gemm_enabled() -> bool:
 def _select_backend():
     """选 verify int8 GEMM 后端（缓存）。
 
-    MICRO_VERIFY_GEMM=tilelang|triton，默认 tilelang；ROCm（torch.version.hip 非空）
-    或 tilelang import 失败时自动 fallback triton（Triton 双平台可编译）。"""
+    MICRO_VERIFY_GEMM=tilelang|triton，默认 triton；ROCm（torch.version.hip 非空）
+    或 tilelang import 失败时 fallback triton（Triton 双平台可编译）。
+
+    默认 triton 的依据（M=8 verify, FLUSH=1 HBM 冷读, 受控对比 median-of-5）：
+    Triton 在寄存器内 dequant→bf16 再 tl.dot（无 bf16 shared round-trip，与 vLLM
+    Marlin W8A16 同思路——Marlin 也是寄存器 dequant 后走 bf16 mma，**非** int8
+    tensor-core mma），比 TileLang 的 shared 内 dequant→bf16 快：
+      gate N=17408:  triton 196.1 vs tilelang 201.2us
+      q_proj N=12288: triton 140.3 vs tilelang 157.7us
+      in_proj N=10240: triton 117.8 vs tilelang 125.4us
+    两者均 ~1.11-1.13x 慢于 Marlin（174.1/126.0/106.5us），差距来自 Marlin 的
+    深 cp.async pipeline + 128B 向量化 int8 权重读 + int8 驻留 shared（非 bf16），
+    非 mma 数值类型——详见 bench_tlo_worktree.py 实测。"""
     global _backend
     if _backend is not None:
         return _backend
-    want = os.environ.get("MICRO_VERIFY_GEMM", "tilelang").lower()
+    want = os.environ.get("MICRO_VERIFY_GEMM", "triton").lower()
     if torch.version.hip is not None:
         want = "triton"
     if want == "tilelang":
