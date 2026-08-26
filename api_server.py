@@ -441,7 +441,6 @@ if __name__ == "__main__":
     ap.add_argument("--num-spec-tokens", type=int, default=7)
     ap.add_argument("--served-model-name", default=os.environ.get("SERVED_MODEL_NAME", ""))
     args, _ = ap.parse_known_args()
-    global SERVED_MODEL_NAME
     if args.served_model_name:
         SERVED_MODEL_NAME = args.served_model_name
     print(f"Rank {get_rank()}: Loading model from {model_path}...")
