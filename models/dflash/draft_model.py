@@ -488,6 +488,24 @@ class DFlash2DraftModel(nn.Module):
         return [layer.self_attn.project_kv(context_states, context_positions)
                 for layer in self.layers]
 
+    def fill_context_kv(self, context_states, context_positions, out_k, out_v,
+                        start, end):
+        """增量版 precompute_context_kv：只算 [start,end) 这段 context 的 KV，直接写进
+        常驻 buffer（不建临时 list、不 cat）。hidden_norm/project_kv 都是 per-token
+        （RMSNorm 按行、proj/norm/RoPE 按行），故 [start,end) 的切片结果 == 全量结果的
+        [start,end) 切片，增量写与全量重算逐元素一致（数值等价）。
+
+        context_states: [end-start, hidden]（combine_hidden_states 输出，未 norm）
+        context_positions: [end-start] 绝对位置
+        out_k/out_v: [num_layers, max_len, KV, D] 常驻 buffer，写 [:, start:end]。
+        """
+        if self.use_aux_hidden_state:
+            context_states = self.hidden_norm(context_states)
+        for i, layer in enumerate(self.layers):
+            k, v = layer.self_attn.project_kv(context_states, context_positions)
+            out_k[i, start:end].copy_(k)
+            out_v[i, start:end].copy_(v)
+
     def forward(self, input_ids, positions, input_embeds=None, context_kv=None):
         """DFlash2 交叉注意力 forward。
 

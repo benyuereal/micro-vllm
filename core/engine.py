@@ -226,6 +226,10 @@ class InferenceEngine:
             self, draft_model,
             num_speculative_tokens=self.num_speculative_tokens,
             mask_token_id=mask_token_id, max_len=self.max_position)
+        # 预热：跑一次 dummy verify forward，触发所有层 verify int8 GEMM 的 TileLang
+        # JIT 编译（~3s/shape × 64 层）+ kernel 初始化。放构建时做，否则首个真实请求
+        # 被一次性编译拉低（实测首请求 23.7s vs 稳态 5.0s，差 ~18.5s 全在编译）。
+        self._spec_controller.warmup()
         logger.info(f"投机解码控制器已构建: N={self.num_speculative_tokens} "
                     f"mask_token={mask_token_id} draft={draft_model_path}")
 
@@ -659,11 +663,14 @@ class InferenceEngine:
         self.scheduler.running_sequences.clear()
         return results
 
-    def generate_spec_decode(self, prompt: str, max_tokens: int = 100) -> Dict[str, object]:
+    def generate_spec_decode(self, prompt: str, max_tokens: int = 100,
+                             on_tokens=None, ignore_eos: bool = False) -> Dict[str, object]:
         """投机解码生成（单序列，DFlash2 draft-verify-accept，greedy 确定性接受）。
 
         返回 {text, tokens, avg_acceptance, num_steps, time_s, tok_s}。
         输出与无投机 greedy 逐 token 一致（正确性保证）。
+        on_tokens: 可选回调，每提交一批 token 时调用（真流式用）。
+        ignore_eos: True 时遇 EOS 不停（跑满 max_tokens），对齐 OpenAI/vllm bench 语义。
         """
         if self._spec_controller is None:
             raise RuntimeError("投机解码未启用（构造时 spec_decode=True）")
@@ -675,7 +682,8 @@ class InferenceEngine:
 
         t0 = time.time()
         out_ids = self._spec_controller.generate(
-            prompt_ids, max_tokens, eos_token_id=self.eos_token_id)
+            prompt_ids, max_tokens, eos_token_id=self.eos_token_id,
+            on_tokens=on_tokens, ignore_eos=ignore_eos)
         elapsed = time.time() - t0
 
         text = self.tokenizer.decode(out_ids, skip_special_tokens=True)

@@ -78,6 +78,21 @@ class SpecDecodeController:
         self.aux_cache = torch.zeros(
             self.num_aux, max_len, self.hidden, dtype=self.dtype, device=self.device)
 
+        # 增量 context KV：draft attention 读的 context KV 由 aux 投影（combine→norm→
+        # 各层 k/v proj + k_norm + RoPE）。旧实现每步对 [0, ctx_len) 全量重算 → 每步
+        # O(ctx_len)，整段 O(n²)。改为常驻 buffer + 增量填充：每步只算本步 verify 新写入
+        # aux 的那几个位置（anchor + accepted 个，a+1 个），hot path 纯切片读。
+        # 形状 [num_draft_layers, max_len, num_kv_heads, head_dim] bf16。
+        _d = self.draft
+        self._ctx_k = torch.zeros(
+            _d.num_layers, max_len, _d.layers[0].self_attn.num_kv_heads,
+            _d.layers[0].self_attn.head_dim, dtype=self.dtype, device=self.device)
+        self._ctx_v = torch.zeros(
+            _d.num_layers, max_len, _d.layers[0].self_attn.num_kv_heads,
+            _d.layers[0].self_attn.head_dim, dtype=self.dtype, device=self.device)
+        # 已填充到哪个位置（_ctx_k/v 的 [0, done) 有效）。
+        self._ctx_kv_done = 0
+
         # 静态 buffer（init 预分配，热路径零运行期分配：只 copy_/索引写）。
         # 每步 verify/draft 的 ids/positions/cu_seqlens/block_table 都从这些 buffer 取。
         M = 1 + self.N
@@ -228,11 +243,24 @@ class SpecDecodeController:
         """
         ctx_len = kv_len - 1
         if ctx_len > 0:
-            # aux: [num_aux, ctx_len, hidden] → [ctx_len, num_aux*hidden]
-            aux = self.aux_cache[:, :ctx_len].permute(1, 0, 2).reshape(ctx_len, -1)
-            combined = self.draft.combine_hidden_states(aux)  # [ctx_len, hidden]
-            ctx_pos = self._arange[:ctx_len]
-            context_kv = self.draft.precompute_context_kv(combined, ctx_pos)
+            # 增量 context KV：热路径（generate 主循环里）_ctx_kv_done == ctx_len，
+            # 这里纯切片读常驻 buffer，零重算。对外部调用方（benchmark 脚本直接拿合成
+            # aux 调、不经 generate 流程填 buffer）自愈合：补填 [done, ctx_len)。
+            done = self._ctx_kv_done
+            if done < ctx_len:
+                if done > 0:
+                    aux = self.aux_cache[:, done:ctx_len].permute(1, 0, 2).reshape(ctx_len - done, -1)
+                else:
+                    aux = self.aux_cache[:, :ctx_len].permute(1, 0, 2).reshape(ctx_len, -1)
+                combined = self.draft.combine_hidden_states(aux)  # [ctx_len-done, hidden]
+                self.draft.fill_context_kv(
+                    combined, self._arange[done:ctx_len],
+                    self._ctx_k, self._ctx_v, done, ctx_len)
+                self._ctx_kv_done = ctx_len
+            context_kv = [
+                (self._ctx_k[i, :ctx_len], self._ctx_v[i, :ctx_len])
+                for i in range(self.draft.num_layers)
+            ]
         else:
             context_kv = None
 
@@ -256,6 +284,22 @@ class SpecDecodeController:
         # 回退：直接 argmax
         logits = self.lm_head(out[1:])
         return logits.argmax(dim=-1)  # [N]
+
+    # ------------------------------------------------------------------
+    # 增量 context KV 填充
+    # ------------------------------------------------------------------
+    def _fill_ctx_kv(self, start, end):
+        """把 aux_cache[:, start:end] 投影成 draft context KV 写进常驻 buffer。
+        start/end 是绝对位置；要求 aux_cache 在 [start,end) 已写好（prefill/verify 产出）。
+        只算 end-start 个位置（增量），不重算 [0,start)。"""
+        if end <= start or end > self.max_len:
+            return
+        aux = self.aux_cache[:, start:end].permute(1, 0, 2).reshape(end - start, -1)
+        combined = self.draft.combine_hidden_states(aux)  # [end-start, hidden]
+        self.draft.fill_context_kv(
+            combined, self._arange[start:end],
+            self._ctx_k, self._ctx_v, start, end)
+        self._ctx_kv_done = end
 
     # ------------------------------------------------------------------
     # 预热：编译 verify int8 GEMM kernel（verify M=1+N 的各层 shape）
@@ -297,8 +341,17 @@ class SpecDecodeController:
     # ------------------------------------------------------------------
     @torch.inference_mode()
     def generate(self, prompt_ids: List[int], max_tokens: int,
-                 eos_token_id: Optional[int] = None) -> List[int]:
-        """投机解码生成。返回新生成的 token 列表。"""
+                 eos_token_id: Optional[int] = None,
+                 on_tokens=None, ignore_eos: bool = False) -> List[int]:
+        """投机解码生成。返回新生成的 token 列表。
+
+        on_tokens: 可选回调，每提交一批 token（首 token / 每步 accepted+bonus）时
+            调用 on_tokens(List[int])。用于真流式（SSE 逐 token 推送）。None=不回调。
+        ignore_eos: True 时遇到 EOS 不停（跑满 max_tokens），对齐 OpenAI/vllm bench 语义。
+        """
+        # ignore_eos 时直接置 None，下方两处 EOS 检查自动短路
+        if ignore_eos:
+            eos_token_id = None
         device = self.device
         P = len(prompt_ids)
         # 先把真实 prompt token 载入静态 buffer（_prompt_buf 是 empty 未初始化，
@@ -315,6 +368,7 @@ class SpecDecodeController:
         self.total_steps = 0
         self.total_generated = 0
         self.aux_cache.zero_()
+        self._ctx_kv_done = 0
 
         # ---- 分配 KV cache（一次性 max_len 个 slot）----
         seq_id = 1_000_000
@@ -348,8 +402,13 @@ class SpecDecodeController:
             generated = [anchor]
             kv_len = P + 1
             self.total_generated = 1
+            if on_tokens is not None:
+                on_tokens([anchor])
             # 首步 verify 无检查点（prefill 后 GDN 状态在 pool），初始状态从 pool 读。
             self._gdn_accepted_prev = None
+            # 增量 context KV：prefill 已写好 aux[0:P]，投影填充 [0,P)（一次性 O(P)，
+            # 后续每步只增量填新 accepted 的位置）。
+            self._fill_ctx_kv(0, P)
 
             # ---- 投机解码主循环 ----
             while len(generated) < max_tokens:
@@ -410,8 +469,17 @@ class SpecDecodeController:
                 # 5. 提交 accepted 个 draft + 1 个 bonus
                 new_tokens = d_cpu[:accepted] + [bonus]
                 generated.extend(new_tokens)
+                if on_tokens is not None:
+                    on_tokens(new_tokens)
                 self.total_accepted += accepted
                 self.total_generated += len(new_tokens)
+                # 6. 增量 context KV：本步 verify 已写 aux [kv_len-1, kv_len-1+M)，其中
+                #    [kv_len-1, kv_len+accepted)（accepted+1 个位置，含 anchor）是下一步
+                #    draft 的新 context（下一步 ctx_len = kv_len+accepted+1-1 =
+                #    kv_len+accepted）。只投影这 accepted+1 个位置写进常驻 buffer，不重算
+                #    [0, kv_len-1)——把旧的每步 O(ctx_len) 全量重算降成 O(accepted+1)≈O(1)，
+                #    整段 O(n²)→O(n)。_ctx_kv_done 追到 kv_len+accepted = 下一步 ctx_len。
+                self._fill_ctx_kv(kv_len - 1, kv_len + accepted)
                 kv_len += len(new_tokens)
                 anchor = bonus
 
