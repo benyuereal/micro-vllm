@@ -38,7 +38,7 @@ from kernel.rmsnorm import (
     rmsnorm1_residual_fused,
 )
 from kernel.dense_mlp import dense_swiglu
-from kernel.gemv import gemv_or_matmul
+from kernel.gemv import gemv_or_matmul, gemv_v2
 from kernel.gemv_int8 import w8_linear
 from kernel.quant import quantize_per_channel
 from kernel import marlin as _marlin
