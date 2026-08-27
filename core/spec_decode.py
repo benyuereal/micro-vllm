@@ -455,6 +455,12 @@ class SpecEngine:
         graph 内写固定目的地：
           - _draft_out（[N] 提议 token）。
         失败（某 kernel 不可捕获）→ 留 _draft_model_graph=None，回退 eager。
+
+        注意（默认关，MICRO_DRAFT_GRAPH=1 才开）：attn_mask 强制 SDPA 走
+        mem-efficient 后端，与原变长 flash 后端在 bf16 级有差异，经 draft selector
+        的 argmax 放大成完全不同的提议 token → 接受率从 1.98 崩到 0.008（3x 吞吐
+        回归）。draft 提议质量直接决定投机解码吞吐，故默认走 eager（与原行为逐
+        token 一致）。此 graph 保留作结构拆分 + A/B 对比用。
         """
         if self._draft_model_graph is not None:
             return

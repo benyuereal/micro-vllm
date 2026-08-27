@@ -242,8 +242,13 @@ class InferenceEngine:
         # 小草稿模型（不碰 GDN 状态池/paged KV），forward 全固定 shape（query [1+N]），
         # 仅 attention 读变长 context KV——用固定长度 C + attn_mask 屏蔽无效位进 graph。
         # 捕获失败自动回退 eager（_draft_model_graph=None）。
-        # MICRO_DRAFT_GRAPH=0 强制关 graph（A/B 对比用）。
-        if os.environ.get("MICRO_DRAFT_GRAPH", "1") != "0":
+        #
+        # 默认关（MICRO_DRAFT_GRAPH=0）：mask 强制 SDPA 走 mem-efficient 后端，与原
+        # 变长 flash 后端在 bf16 级有差异，经 draft selector 的 argmax 放大成完全不同的
+        # 提议 token → 接受率从 1.98 崩到 0.008（3000 输出 per_step 55.6→57.7ms 且
+        # tok_s 53.7→17.5，3x 回归）。draft 提议质量直接决定投机解码吞吐，故默认走
+        # eager（与原行为逐 token 一致）。MICRO_DRAFT_GRAPH=1 可开（A/B 对比用）。
+        if os.environ.get("MICRO_DRAFT_GRAPH", "0") != "0":
             self._spec_engine.capture_draft_model_graph()
         logger.info(f"投机解码控制器已构建: N={self.num_speculative_tokens} "
                     f"mask_token={mask_token_id} draft={draft_model_path} "
