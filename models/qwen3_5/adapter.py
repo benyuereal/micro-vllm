@@ -761,7 +761,17 @@ class Qwen3_5Adapter(ModelAdapter):
             qz = torch.empty(M, qz_dim, dtype=h2d.dtype, device=dev)
             self._lin(h2d, la._in_w_qz, qz, "MICRO_GEMV_GDN")
             ba = torch.empty(M, 2 * H, dtype=h2d.dtype, device=dev)
-            self._lin(h2d, la._in_w_ba, ba, "MICRO_GEMV_GDN")
+            if bool(getattr(graph, "_gdn_cp_enabled", False)):
+                # verify（M=1+N）：ba 是 bf16 GEMM（b/a 不量化，走 gemv_or_matmul）。
+                # decode(M=1) 走 gemv_v2、verify(M=8) 走 torch.matmul——cuBLAS 对 M=8/M=1
+                # 选不同 tiling → bf16 归约顺序不同 → 逐行 1-ULP 差（max_abs 0.03125）→
+                # 经 g(衰减率)→GDN fp32 递归放大 ~129 步 → argmax 翻转(margin1.75)→ spec
+                # target 漂移进退化循环 → mid/long acc 崩塌。逐行 gemv_v2(M=1) 对齐 decode
+                # （bitwise 一致）。M 小(≤8)，8 次 launch 在 CUDA graph 内可忽略。
+                for _r in range(M):
+                    gemv_v2(h2d[_r:_r + 1], la._in_w_ba, ba[_r:_r + 1])
+            else:
+                self._lin(h2d, la._in_w_ba, ba, "MICRO_GEMV_GDN")
             qkv = qz[:, :conv_dim]
             z = qz[:, conv_dim:]
             b = ba[:, :H]
