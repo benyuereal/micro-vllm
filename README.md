@@ -59,7 +59,7 @@
 │         │                                                       │
 │         ▼                                                       │
 │  ┌─────────────────────────────────────────────────────────┐    │
-│  │  SpecDecodeController (DFlash2 draft-verify-accept)      │    │
+│  │  SpecEngine (DFlash2 draft-verify-accept)                │    │
 │  └─────────────────────────────────────────────────────────┘    │
 └─────────────────────────────────────────────────────────────────┘
 ```
@@ -73,7 +73,7 @@
 | `KVCacheManager` | PagedAttention KV-cache paging |
 | `ModelGraphRunner` | CUDA Graph capture and replay (decode) |
 | `ModelAdapter` | Per-architecture forward (Qwen / Qwen3 / Qwen3.5 / DeepSeek) |
-| `SpecDecodeController` | DFlash2 draft → target verify → greedy accept |
+| `SpecEngine` | DFlash2 draft → target verify → greedy accept |
 | `Sampler` | torch.compile token sampler |
 
 ---

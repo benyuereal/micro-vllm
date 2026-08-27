@@ -1,6 +1,6 @@
 """verify CUDA graph 前后 step time / tok/s 对比 + 3 次连续跑显存泄漏检查。
 
-用法：CUDA_VISIBLE_DEVICES=4 MICRO_W8A16=1 python3 /vllm-workspace/tmp/bench_verify_graph.py
+用法：CUDA_VISIBLE_DEVICES=4 MICRO_W8A16=1 python3 /vllm-workspace/tmp/bench_verify_model_graph.py
 """
 import os, sys, time
 REPO_ROOT = "/tmp/micro-vllm-verify-graph"
@@ -23,8 +23,8 @@ def main():
     eng = InferenceEngine(MODEL, max_batch_size=16, max_prefill_tokens=4096,
                           spec_decode=True, draft_model_path=DRAFT,
                           num_speculative_tokens=7)
-    ctrl = eng._spec_controller
-    print(f"verify_graph={'ON' if ctrl._verify_graph is not None else 'OFF(eager)'}")
+    ctrl = eng._spec_engine
+    print(f"verify_graph={'ON' if ctrl._verify_model_graph is not None else 'OFF(eager)'}")
 
     # warmup（摊销 TileLang 编译 + graph 已捕获）
     _ = eng.generate_spec_decode(PROMPT, 32)

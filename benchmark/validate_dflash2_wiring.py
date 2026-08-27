@@ -102,7 +102,7 @@ def main():
     args = ap.parse_args()
 
     from core.model_loader import load_model
-    from core.spec_decode import SpecDecodeController
+    from core.spec_decode import SpecEngine
 
     device = "cuda:0"
     dtype = torch.bfloat16
@@ -114,7 +114,7 @@ def main():
     print(f"合成 DFlash2 草稿: 2 层, target_layer_ids={target_layer_ids}, "
           f"mask_token={draft.mask_token_id}")
 
-    ctrl = SpecDecodeController(
+    ctrl = SpecEngine(
         target_model, draft, device, dtype,
         num_speculative_tokens=args.N, mask_token_id=draft.mask_token_id,
         max_len=2048, draft_is_target=False)

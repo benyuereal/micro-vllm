@@ -37,7 +37,7 @@ from models.base import PrefillMeta
 from kernel.gemm_int8_triton import set_verify_gemm
 
 
-class SpecDecodeController:
+class SpecEngine:
     """DFlash2 投机解码控制器（Qwen3.8 GDN 混合模型，复用 engine 模型）。"""
 
     def __init__(self, engine, draft_model, num_speculative_tokens: int,
@@ -119,7 +119,20 @@ class SpecDecodeController:
         # final_norm 输出（lm_head 之前）。graph 捕获到此为止，lm_head 在 replay 后
         # eager 跑（对齐非 spec decode：避免 [M,vocab] 大输出进 graph buffer）。
         self._vhidden = torch.empty(M, self.hidden, dtype=self.dtype, device=self.device)
-        self._verify_graph = None
+        self._verify_model_graph = None
+
+        # ---- draft CUDA graph 固定 buffer（与 verify graph 分开管理）----
+        # draft 模型 forward（embed → 5 层 decoder → select_draft_tokens）单独 capture
+        # 一个 graph。难点：draft attention 读 context KV [0:ctx_len]，ctx_len 每步增长
+        # （变长），graph 需固定 shape。解法：固定读 [0:C]（C=max_len），用 attn_mask
+        # 屏蔽 [ctx_len:C) 的无效 context 位置（exp(-inf)=0，softmax 结果与只读 [ctx_len)
+        # 完全一致）。query 位置 / mask 都是固定 buffer，replay 前 eager 填。
+        C = self.max_len
+        self._dpos = torch.empty(M, dtype=torch.int64, device=self.device)
+        # attn_mask 必须与 query 同 dtype（bf16）——SDPA 要求 bias dtype == query dtype。
+        self._dmask = torch.zeros(M, C + M, dtype=self.dtype, device=self.device)
+        self._draft_out = torch.empty(self.N, dtype=torch.int64, device=self.device)
+        self._draft_model_graph = None
 
         # GDN 状态检查点 buffer（verify 时逐 token 存，接受后回滚）
         self._gdn_cp_state = None
@@ -188,7 +201,7 @@ class SpecDecodeController:
             视图，token 索引已 bake 进 base 指针），省掉接受后 copy_ 回 pool 的 DtoD。
         graph_mode: verify CUDA graph 捕获/重放路径。True 时：
             - aux 写固定 _aux_tmp[ai]（目的地固定，graph 安全），不写 aux_cache
-              （目的地偏移每步变，replay 后由 _verify_graph 拷过去）。
+              （目的地偏移每步变，replay 后由 _verify_model_graph 拷过去）。
             - 只跑到 final_norm 写 _vhidden，不跑 lm_head（replay 后 eager 跑，
               对齐非 spec decode 避免 [M,vocab] 大输出进 graph buffer）。
             - 不做任何 host 侧 buffer 写（gdn_slot/init_idx 等由调用方在 capture
@@ -219,7 +232,7 @@ class SpecDecodeController:
             self.prefill_runner._gdn_init_state_c = init_state_c
         if not graph_mode:
             # host 侧写 buffer[0]：graph 捕获时会被 bake 成 capture 时的值，replay 不重读。
-            # graph_mode 下 gdn_slot 由 _verify_graph 在 capture 前 eager 写好。
+            # graph_mode 下 gdn_slot 由 _verify_model_graph 在 capture 前 eager 写好。
             self.prefill_runner._gdn_prefill_seq_idx[0] = gdn_slot
 
         try:
@@ -285,7 +298,7 @@ class SpecDecodeController:
         """
         M = 1 + self.N
         # 稳态 verify 走 CUDA graph（固定 M=1+N shape，GDN 初始状态从 checkpoint 读）
-        if self._verify_graph is not None and self._gdn_accepted_prev is not None:
+        if self._verify_model_graph is not None and self._gdn_accepted_prev is not None:
             return self._verify_graph_replay(anchor, draft_tokens, kv_len,
                                              slot_mapping, gdn_slot)
         # ---- eager 路径（首步 / graph 未捕获）----
@@ -315,7 +328,7 @@ class SpecDecodeController:
     # ------------------------------------------------------------------
     # verify CUDA graph：捕获 + 稳态 replay
     # ------------------------------------------------------------------
-    def capture_verify_graph(self):
+    def capture_verify_model_graph(self):
         """捕获 verify（M=1+N 固定 shape，稳态 init_from_cp=True）的 CUDA graph。
 
         固定 buffer（replay 前 eager 填，graph 读 device 内存）：
@@ -328,9 +341,9 @@ class SpecDecodeController:
         graph 内写固定目的地、replay 后 eager 补：
           - aux 写 _aux_tmp[ai]（固定），replay 后拷到 aux_cache[ai, kv_len-1:...]。
           - final_norm 写 _vhidden（固定），replay 后 eager 跑 lm_head。
-        失败（某 kernel 不可捕获）→ 留 _verify_graph=None，回退 eager。
+        失败（某 kernel 不可捕获）→ 留 _verify_model_graph=None，回退 eager。
         """
-        if self._verify_graph is not None:
+        if self._verify_model_graph is not None:
             return
         device = self.device
         M = 1 + self.N
@@ -382,12 +395,12 @@ class SpecDecodeController:
                               init_state_s=self._gdn_cp_state,
                               init_state_c=self._gdn_cp_conv,
                               graph_mode=True)
-            self._verify_graph = g
+            self._verify_model_graph = g
         except Exception as e:
             import logging
             logging.getLogger(__name__).warning(
                 f"verify CUDA graph 捕获失败，回退 eager: {e}")
-            self._verify_graph = None
+            self._verify_model_graph = None
         finally:
             self.cache_manager.free(seq_id)
             self._gdn_free(gdn_slot)
@@ -415,12 +428,106 @@ class SpecDecodeController:
         self.prefill_runner._gdn_prefill_seq_idx[0] = gdn_slot
         self.prefill_runner._gdn_init_idx[0] = self._gdn_accepted_prev
         # replay（GDN 状态池/检查点/paged KV 原地读写，aux→_aux_tmp，final_norm→_vhidden）
-        self._verify_graph.replay()
+        self._verify_model_graph.replay()
         # aux：固定 _aux_tmp[ai] → aux_cache[ai, kv_len-1:...]（目的地偏移每步变，eager 拷）
         for ai in range(self.num_aux):
             self.aux_cache[ai, kv_len - 1: kv_len - 1 + M].copy_(self._aux_tmp[ai])
         # lm_head（replay 后 eager 跑，_vhidden 是 final_norm 输出）
         return self.lm_head(self._vhidden)
+
+    # ------------------------------------------------------------------
+    # draft CUDA graph：捕获 + 稳态 replay（与 verify graph 分开管理）
+    # ------------------------------------------------------------------
+    def capture_draft_model_graph(self):
+        """捕获 draft 模型 forward（embed → 5 层 decoder → select_draft_tokens）的
+        CUDA graph。与 verify graph 分开：draft 是独立小草稿模型（不碰 GDN 状态池/
+        paged KV），只读 draft context KV（_ctx_k/_ctx_v）+ 共享 embed/lm_head。
+
+        难点：draft attention 读 context KV [0:ctx_len]，ctx_len 每步增长（变长），
+        graph 需固定 shape。解法：固定读 [0:C]（C=max_len），用 attn_mask 屏蔽
+        [ctx_len:C) 的无效 context 位置（exp(-inf)=0，softmax 结果与只读 [ctx_len)
+        完全一致）。query 位置 / mask / anchor 都是固定 buffer，replay 前 eager 填。
+
+        固定 buffer（replay 前 eager 填，graph 读 device 内存）：
+          - _query_ids[0]=anchor / _anchor_t[0]=anchor / _dpos / _dmask：动态输入。
+        固定地址原地读（graph 安全）：
+          - _ctx_k/_ctx_v（draft context KV 常驻 buffer，[0:C] 固定切片）。
+        graph 内写固定目的地：
+          - _draft_out（[N] 提议 token）。
+        失败（某 kernel 不可捕获）→ 留 _draft_model_graph=None，回退 eager。
+
+        注意（默认关，MICRO_DRAFT_GRAPH=1 才开）：attn_mask 强制 SDPA 走
+        mem-efficient 后端，与原变长 flash 后端在 bf16 级有差异，经 draft selector
+        的 argmax 放大成完全不同的提议 token → 接受率从 1.98 崩到 0.008（3x 吞吐
+        回归）。draft 提议质量直接决定投机解码吞吐，故默认走 eager（与原行为逐
+        token 一致）。此 graph 保留作结构拆分 + A/B 对比用。
+        """
+        if self._draft_model_graph is not None:
+            return
+        device = self.device
+        M = 1 + self.N
+        C = self.max_len
+        try:
+            # 填固定 buffer（dummy 值，capture 只记录结构/指针）
+            self._query_ids.fill_(0)
+            self._anchor_t[0] = 0
+            self._dpos.copy_(self._arange[:M])
+            self._dmask.fill_(0)
+            # warmup（eager，触发 draft 各层 kernel 编译 + 稳定 allocator）
+            for _ in range(3):
+                self._draft_forward_graph()
+            torch.cuda.synchronize()
+            g = torch.cuda.CUDAGraph()
+            with torch.no_grad(), torch.cuda.graph(g):
+                self._draft_forward_graph()
+            self._draft_model_graph = g
+        except Exception as e:
+            import logging
+            logging.getLogger(__name__).warning(
+                f"draft CUDA graph 捕获失败，回退 eager: {e}")
+            self._draft_model_graph = None
+
+    def _draft_forward_graph(self):
+        """draft forward 的 graph 体内（固定 shape，读固定 buffer）。
+        返回 [N] 提议 token（写进 _draft_out）。"""
+        M = 1 + self.N
+        C = self.max_len
+        query_embeds = self.embed(self._query_ids)
+        if self.input_embedding_scale != 1.0:
+            query_embeds = query_embeds * self.input_embedding_scale
+        context_kv = [
+            (self._ctx_k[i, :C], self._ctx_v[i, :C])
+            for i in range(self.draft.num_layers)
+        ]
+        out = self.draft.forward(self._query_ids, self._dpos,
+                                 input_embeds=query_embeds, context_kv=context_kv,
+                                 attn_mask=self._dmask)
+        # out: [1+N, hidden]，取 [1:]（N 个 mask 位置）
+        if self.draft.candidate_selector is not None:
+            draft = self.draft.select_draft_tokens(
+                out[1:].unsqueeze(0), self._anchor_t)
+        else:
+            logits = self.lm_head(out[1:])
+            draft = logits.argmax(dim=-1).unsqueeze(0)
+        self._draft_out.copy_(draft[0])
+        return self._draft_out
+
+    def _draft_graph_replay(self, anchor, ctx_len):
+        """稳态 draft 走 CUDA graph replay。返回 [N] 提议 token。
+
+        replay 前 eager 填固定 buffer（graph 读 device 内存）：anchor / query 位置 /
+        attn_mask（屏蔽 [ctx_len:C) 无效 context）。replay 后读 _draft_out。"""
+        M = 1 + self.N
+        C = self.max_len
+        self._query_ids[0] = anchor
+        self._anchor_t[0] = anchor
+        self._dpos.copy_(self._arange[ctx_len: ctx_len + M])
+        # attn_mask：[0:ctx_len] 有效(0)，[ctx_len:C) 屏蔽(-inf)，query [C:C+M] 有效(0)
+        self._dmask.fill_(0)
+        if ctx_len < C:
+            self._dmask[:, ctx_len:C].fill_(float("-inf"))
+        self._draft_model_graph.replay()
+        return self._draft_out
 
     # ------------------------------------------------------------------
     # GDN 状态回滚
@@ -445,6 +552,23 @@ class SpecDecodeController:
         返回 [N] int64 提议 token。
         """
         ctx_len = kv_len - 1
+        # 稳态 draft 走 CUDA graph（固定 context 长度 C + attn_mask 屏蔽无效位）。
+        # 需 ctx_len>0（graph 固定读 [0:C] context，ctx_len=0 无 context 走 eager）。
+        if self._draft_model_graph is not None and ctx_len > 0:
+            # 增量 context KV 补填（同 eager 路径，保证 [0:ctx_len] 有效）
+            done = self._ctx_kv_done
+            if done < ctx_len:
+                if done > 0:
+                    aux = self.aux_cache[:, done:ctx_len].permute(1, 0, 2).reshape(ctx_len - done, -1)
+                else:
+                    aux = self.aux_cache[:, :ctx_len].permute(1, 0, 2).reshape(ctx_len, -1)
+                combined = self.draft.combine_hidden_states(aux)  # [ctx_len-done, hidden]
+                self.draft.fill_context_kv(
+                    combined, self._arange[done:ctx_len],
+                    self._ctx_k, self._ctx_v, done, ctx_len)
+                self._ctx_kv_done = ctx_len
+            return self._draft_graph_replay(anchor, ctx_len)
+
         if ctx_len > 0:
             # 增量 context KV：热路径（generate 主循环里）_ctx_kv_done == ctx_len，
             # 这里纯切片读常驻 buffer，零重算。对外部调用方（benchmark 脚本直接拿合成

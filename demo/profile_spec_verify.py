@@ -15,7 +15,7 @@ def main():
     eng = InferenceEngine(MODEL, max_batch_size=16, max_prefill_tokens=4096,
                           spec_decode=True, draft_model_path=DRAFT,
                           num_speculative_tokens=7)
-    ctrl = eng._spec_controller
+    ctrl = eng._spec_engine
     device = eng.device
     prompt_ids = eng.tokenizer.encode(PROMPT, add_special_tokens=True)
     P = len(prompt_ids)

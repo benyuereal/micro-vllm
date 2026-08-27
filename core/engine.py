@@ -16,6 +16,8 @@ from .sequence import Sequence
 from .model_loader import load_model
 from .layer.sampler import Sampler
 from .context import DecodeContext
+from .tp_comm import TPCommunicator
+from .warmup import Warmup
 
 from core.parallel_config import get_rank, setup, get_world_size, rank0
 from core.inference_context import BatchInferenceContext
@@ -60,13 +62,13 @@ class InferenceEngine:
         self._init_distributed()
         self._init_model(model_path)
         self._init_config()
-        # 投机解码（DFlash2）配置。spec_decode=True 时构建 SpecDecodeController：
+        # 投机解码（DFlash2）配置。spec_decode=True 时构建 SpecEngine：
         #   draft_model_path=None → 自起草（草稿=目标模型，机制验证用）
         #   draft_model_path=路径 → 加载 DFlash2 小草稿模型（W8A16 目标就绪后端到端）
         self.spec_decode_enabled = spec_decode
         self.num_speculative_tokens = num_speculative_tokens
         self.mask_token_id = mask_token_id
-        self._spec_controller = None
+        self._spec_engine = None
 
         # 核心组件初始化
         self.device, self.dtype = self._auto_configure()
@@ -139,10 +141,9 @@ class InferenceEngine:
         self.sampler = Sampler()
         self._decode_ctx = DecodeContext()
         self._stream_event: Optional[StreamEvent] = None
-        # TP bcast1 紧凑协议：非 rank0 的本地 seq store（seq_id→Sequence）+ 上步
-        # batch ids（判断 batch 是否变化）。rank0 仅用 _tp_last_batch_ids。
-        self._tp_seq_store: Dict[int, "Sequence"] = {}
-        self._tp_last_batch_ids: Optional[List[int]] = None
+        # TP rank 间通信（bcast1/bcast2 紧凑协议），依赖显式注入（见 core/tp_comm.py）。
+        self._tp_comm = TPCommunicator(
+            self.device, self.tokenizer, self._decode_ctx, self.scheduler)
         # decode batch 脏标志：True 时 prepare() 重建元数据。稳定 decode 每步 batch
         # 成员/顺序不变，仅当有序列完成 / prefill 新进 / append 跨 block 分配时置脏，
         # 避免每步构建 512 元素列表 + 比较的 ~1.2ms CPU 开销（见 DecodeContext.prepare）。
@@ -178,6 +179,7 @@ class InferenceEngine:
         # 预热 sampler 编译路径（torch.compile reduce-overhead 首次调用每个 shape
         # 会捕获 CUDA Graph ~1-2s）。不预热时首个多 batch prefill/decode 会卡秒级。
         # 对所有 cap_sizes 用 temp>0 路径（触发 _compiled_sample）各跑一次。
+        self._warmup = Warmup(self)
         self._warmup_sampler(cap_sizes)
         # 预热 prefill eager 路径：cuBLAS/flash 首次跑每个 (B,S) shape 会选算法/编译，
         # 首个真实多 batch prefill 多耗 ~100-200ms。用短 dummy prompt 在主 batch size 跑一次。
@@ -192,13 +194,13 @@ class InferenceEngine:
 
         # 投机解码控制器（DFlash2）。在 CUDA graph 捕获后构建（需 device/dtype 就绪）。
         if self.spec_decode_enabled:
-            self._build_spec_controller(draft_model_path)
+            self._build_spec_engine(draft_model_path)
 
         # 注册退出钩子
         atexit.register(self.shutdown)
 
-    def _build_spec_controller(self, draft_model_path: Optional[str]):
-        """构建 SpecDecodeController（Qwen3.8 GDN 混合模型适配版）。
+    def _build_spec_engine(self, draft_model_path: Optional[str]):
+        """构建 SpecEngine（Qwen3.8 GDN 混合模型适配版）。
 
         显存复用 engine 模型：不 load 27GB 新副本，控制器直接用 self.model /
         adapter / prefill_runner / cache_manager（权重已 prepare_weights，走 adapter
@@ -207,7 +209,7 @@ class InferenceEngine:
         draft_model_path=路径 → 加载 DFlash2 小草稿模型（load_dflash2_draft），
         其 embed_tokens / lm_head 从 engine 的 target 共享（同 vocab/hidden）。
         """
-        from core.spec_decode import SpecDecodeController
+        from core.spec_decode import SpecEngine
         device = self.device
         dtype = self.dtype
         if draft_model_path is None:
@@ -222,87 +224,44 @@ class InferenceEngine:
             self.adapter.embed(self.model), self.adapter.lm_head(self.model))
         mask_token_id = getattr(draft_cfg, "dflash_config", {}).get(
             "mask_token_id", self.mask_token_id)
-        self._spec_controller = SpecDecodeController(
+        self._spec_engine = SpecEngine(
             self, draft_model,
             num_speculative_tokens=self.num_speculative_tokens,
             mask_token_id=mask_token_id, max_len=self.max_position)
         # 预热：跑一次 dummy verify forward，触发所有层 verify int8 GEMM 的 TileLang
         # JIT 编译（~3s/shape × 64 层）+ kernel 初始化。放构建时做，否则首个真实请求
         # 被一次性编译拉低（实测首请求 23.7s vs 稳态 5.0s，差 ~18.5s 全在编译）。
-        self._spec_controller.warmup()
+        self._spec_engine.warmup()
         # verify 阶段（M=1+N 固定 shape）进 CUDA graph：warmup 后捕获一次，
         # 稳态 verify（非首步，GDN 初始状态从 checkpoint 读）走 replay。
-        # 捕获失败自动回退 eager（_verify_graph=None）。
+        # 捕获失败自动回退 eager（_verify_model_graph=None）。
         # MICRO_VERIFY_GRAPH=0 强制关 graph（A/B 对比用）。
         if os.environ.get("MICRO_VERIFY_GRAPH", "1") != "0":
-            self._spec_controller.capture_verify_graph()
+            self._spec_engine.capture_verify_model_graph()
+        # draft 模型单独 capture 一个 graph（与 verify graph 分开管理）：draft 是独立
+        # 小草稿模型（不碰 GDN 状态池/paged KV），forward 全固定 shape（query [1+N]），
+        # 仅 attention 读变长 context KV——用固定长度 C + attn_mask 屏蔽无效位进 graph。
+        # 捕获失败自动回退 eager（_draft_model_graph=None）。
+        #
+        # 默认关（MICRO_DRAFT_GRAPH=0）：mask 强制 SDPA 走 mem-efficient 后端，与原
+        # 变长 flash 后端在 bf16 级有差异，经 draft selector 的 argmax 放大成完全不同的
+        # 提议 token → 接受率从 1.98 崩到 0.008（3000 输出 per_step 55.6→57.7ms 且
+        # tok_s 53.7→17.5，3x 回归）。draft 提议质量直接决定投机解码吞吐，故默认走
+        # eager（与原行为逐 token 一致）。MICRO_DRAFT_GRAPH=1 可开（A/B 对比用）。
+        if os.environ.get("MICRO_DRAFT_GRAPH", "0") != "0":
+            self._spec_engine.capture_draft_model_graph()
         logger.info(f"投机解码控制器已构建: N={self.num_speculative_tokens} "
                     f"mask_token={mask_token_id} draft={draft_model_path} "
-                    f"verify_graph={'on' if self._spec_controller._verify_graph is not None else 'off(eager)'}")
+                    f"verify_graph={'on' if self._spec_engine._verify_model_graph is not None else 'off(eager)'} "
+                    f"draft_graph={'on' if self._spec_engine._draft_model_graph is not None else 'off(eager)'}")
 
+    # 初始化预热（sampler 编译路径 / prefill eager 路径）：实现抽到 core/warmup.py
+    # 的 Warmup 类，engine 保留薄调用。
     def _warmup_sampler(self, batch_sizes):
-        """对所有捕获的 batch_size 预热 sampler 编译路径，消除首次调用的 ~1-2s 捕获开销。
-
-        greedy（argmax）路径无编译开销；此处预热的是 temp>0 的 _compiled_sample 路径，
-        覆盖连续批处理下任意 batch_size 首次采样。"""
-        vocab = self.config.vocab_size
-        dtype = next(self.model.parameters()).dtype
-        for bs in batch_sizes:
-            fake_logits = torch.zeros(bs, vocab, dtype=dtype, device=self.device)
-            temps = torch.full((bs,), 0.01, device=self.device)
-            topp = torch.ones(bs, device=self.device)
-            rep = torch.ones(bs, device=self.device)
-            self.sampler(fake_logits, temps, topp, 1000,
-                         prev_tokens=None, rep_penalties=rep,
-                         all_greedy=False, any_rep_pen=False)
-        # 也预热 repetition-penalty 路径（bs=1 足矣，scatter 形状随 vocab 而靘认 prev_tokens 长度）
-        fake_logits = torch.zeros(1, vocab, dtype=dtype, device=self.device)
-        prev = torch.tensor([[0, 1, 2]], dtype=torch.long, device=self.device)
-        rep = torch.tensor([1.1], device=self.device)
-        self.sampler(fake_logits, torch.tensor([0.01], device=self.device),
-                     torch.ones(1, device=self.device), 1000,
-                     prev_tokens=prev, rep_penalties=rep,
-                     all_greedy=False, any_rep_pen=True)
+        self._warmup.warmup_sampler(batch_sizes)
 
     def _warmup_prefill(self, batch_sizes):
-        """预热 prefill eager 路径，消除 cuBLAS/flash 首次跑每个 (B,S) shape 的算法选择开销。
-
-        用极短 dummy prompt（~8 token）在代表性 batch size 跑一次 prefill+少量 decode，
-        然后立即释放这些 dummy seq 的 KV block。代表 batch 取 cap_sizes 中 ≤32 的若干档
-        （大 batch 算法选择与小 batch 同路径，无需每档都跑）。"""
-        # 选代表性 batch size：小 bs 密集测，大 bs 取一档（64）即可覆盖 cuBLAS 大矩阵路径。
-        warm_sizes = [b for b in batch_sizes if b <= 32]
-        if 64 in batch_sizes:
-            warm_sizes.append(64)
-        dummy_prompt = "warmup "  # ~2 token
-        sid_base = 10_000_000  # 避免与真实 seq_id 冲突
-        for bs in warm_sizes:
-            dummy_seqs = []
-            for i in range(bs):
-                seq = Sequence(sid_base + i, dummy_prompt, self.tokenizer, max_tokens=2)
-                seq.temperature = 0.01; seq.top_p = 1.0
-                if self.eos_token_id is not None:
-                    seq.eos_token_id = self.eos_token_id
-                self.scheduler.add_request(seq)
-                dummy_seqs.append(seq)
-            # 跑 prefill + 1 decode（触发该 batch_size 的 prefill GEMM/flash + decode graph replay）
-            for _ in range(20):
-                b, bt = self.get_next_batch()
-                if not b:
-                    break
-                ctx = BatchInferenceContext(len(b), bt, b)
-                self.step(ctx); self.collect(ctx); self.update_sequences(ctx.sequences)
-                if not self.scheduler.running_sequences and not self.scheduler.waiting_queue:
-                    break
-            # 清理 dummy seq 的 KV（释放 block）+ GDN 状态池 slot（幂等：已释放则 no-op）
-            for seq in dummy_seqs:
-                try:
-                    self.cache_manager.free(seq.seq_id)
-                except Exception:
-                    pass
-                self.adapter.on_seq_finished(seq)
-            self.scheduler.running_sequences.clear()
-            self.scheduler.finished_sequences.clear()
+        self._warmup.warmup_prefill(batch_sizes)
 
     def _init_distributed(self):
         setup()
@@ -501,129 +460,22 @@ class InferenceEngine:
                 dctx.prev_tokens = torch.cat(
                     [dctx.prev_tokens, new_col], dim=1)             # [bs, L+1]
 
-    def _tp_token_buf(self, bs: int) -> torch.Tensor:
-        """常驻 [max_bs] int64 广播缓冲。dist.broadcast 是异步 GPU op，若直接广播
-        sampler 返回的临时 next_tokens 张量，下一步该张量被重新赋值/释放而广播
-        仍在读 → cudaErrorIllegalAddress（use-after-free）。广播常驻缓冲（永不释放，
-        同 stream 上 copy→broadcast 有序）规避此问题。"""
-        if not hasattr(self, "_tp_token_buf_t") or self._tp_token_buf_t is None:
-            self._tp_token_buf_t = torch.empty(
-                self.scheduler.max_batch_size, dtype=torch.int64, device=self.device)
-        return self._tp_token_buf_t
-
+    # TP rank 间通信（bcast1/bcast2 紧凑协议）：实现抽到 core/tp_comm.py 的
+    # TPCommunicator，engine 保留薄调用（api_server / benchmark 走 engine.tp_* 入口）。
     def tp_broadcast_tokens(self, ctx: BatchInferenceContext):
-        """TP bcast2：decode 热路径只广播本步采样 token（[bs] GPU 张量），
-        替代完整 Sequence 广播（省 ~2.8ms/步 的 pickle+NCCL 往返）。
-        prefill 批次无 decode next_tokens，回退完整 ctx 广播（非 rank0 需
-        prefill_done/_next_token/state 推进）。"""
-        if get_world_size() <= 1 or not rank0():
-            return
-        if ctx.batch_type == "decode":
-            buf = self._tp_token_buf(ctx.batch_size)
-            buf[:ctx.batch_size].copy_(self._decode_ctx.next_tokens, non_blocking=True)
-            dist.broadcast(buf[:ctx.batch_size], src=0)
-        else:
-            ctx.broadcast()
+        self._tp_comm.broadcast_tokens(ctx)
 
     def tp_receive_tokens(self, ctx: BatchInferenceContext) -> List[Sequence]:
-        """TP bcast2 接收，返回供 update_sequences 使用的 seq 列表。
-        decode：收 [bs] 采样 token 写回本地 seq._next_token（本地 seq 由 bcast1
-        建立，update_sequences 本地 append 推进 output_ids/position/finished）；
-        prefill：回退完整 receive（非 rank0 需 prefill_done/_next_token/state 推进）。"""
-        if get_world_size() <= 1 or rank0():
-            return ctx.sequences
-        if ctx.batch_type == "decode":
-            buf = self._tp_token_buf(ctx.batch_size)
-            dist.broadcast(buf[:ctx.batch_size], src=0)
-            toks = buf[:ctx.batch_size].tolist()
-            for i, seq in enumerate(ctx.sequences):
-                seq._next_token = toks[i]
-            return ctx.sequences
-        recv = BatchInferenceContext.receive(self.tokenizer)
-        return recv.sequences
-
-    _TP_TYPE_CODE = {"decode": 0, "prefill": 1, "waiting": 2}
-    _TP_TYPE_NAME = {0: "decode", 1: "prefill", 2: "waiting"}
-
-    def _tp_meta_buf(self):
-        """常驻 [4] int64 广播缓冲：[batch_size, type_code, done, flag]。单次 GPU
-        张量广播（~0.1ms，无 pickle），替代 broadcast_object_list 的 meta（~0.3ms +
-        跨 rank 失步）。done 折进 meta（done 在 bcast1 前由 scheduler 状态算出）；
-        flag 是 decode 的 batch-unchanged 标志（0=复用本地 seq store，1=完整广播
-        seq 列表）。done+flag 都折进同一次广播，省掉每步两次独立小广播往返。"""
-        if not hasattr(self, "_tp_meta_buf_t") or self._tp_meta_buf_t is None:
-            self._tp_meta_buf_t = torch.empty(4, dtype=torch.int64, device=self.device)
-        return self._tp_meta_buf_t
+        return self._tp_comm.receive_tokens(ctx)
 
     def tp_broadcast_batch(self, ctx: BatchInferenceContext, done: bool = False):
-        """TP bcast1（紧凑）：单次 meta [batch_size, type_code, done, flag] GPU
-        张量广播（~0.1ms，无 pickle）。
-        decode 稳态（batch 成员+顺序不变）flag=0，非 rank0 复用本地 seq store；
-        batch 变化（seq 完成/新 prefill 转 decode）flag=1 + 完整 seq 列表；
-        prefill 直接完整广播 seq 列表。
-        替代每步 pickle 全部 32 个 Sequence（~2.0ms/步）。"""
-        if get_world_size() <= 1 or not rank0():
-            return
-        meta = self._tp_meta_buf()
-        meta[0] = ctx.batch_size
-        meta[1] = self._TP_TYPE_CODE[ctx.batch_type]
-        meta[2] = 1 if done else 0
-        if ctx.batch_type == "decode":
-            ids = [s.seq_id for s in ctx.sequences]
-            flag = 0 if ids == self._tp_last_batch_ids else 1
-            meta[3] = flag
-            dist.broadcast(meta, src=0)
-            if flag == 1:
-                BatchInferenceContext.broadcast_seqs(ctx)
-            self._tp_last_batch_ids = ids
-        else:
-            meta[3] = 1
-            dist.broadcast(meta, src=0)
-            BatchInferenceContext.broadcast_seqs(ctx)
+        self._tp_comm.broadcast_batch(ctx, done)
 
     def tp_broadcast_waiting(self, done: bool = False):
-        """TP waiting：只广播 meta（type=waiting, done），非 rank0 据此空转。"""
-        if get_world_size() <= 1 or not rank0():
-            return
-        meta = self._tp_meta_buf()
-        meta[0] = 0
-        meta[1] = self._TP_TYPE_CODE["waiting"]
-        meta[2] = 1 if done else 0
-        meta[3] = 0
-        dist.broadcast(meta, src=0)
+        self._tp_comm.broadcast_waiting(done)
 
     def tp_receive_batch(self) -> Tuple[BatchInferenceContext, bool]:
-        """TP bcast1 接收，返回 (ctx, done)。ctx 带 .sequences（供 step() 用），
-        done 折在 meta[2]（省掉每步一次独立的 done 广播往返）。
-        decode 稳态（flag=0）：复用本地 seq store（output_ids 已由 bcast2+
-        update_sequences 同步，get_next_input_ids 即上步 token）；flag=1：
-        完整 receive seq 列表并更新 store。prefill：完整 receive。"""
-        if get_world_size() <= 1 or rank0():
-            return None, False
-        meta = self._tp_meta_buf()
-        dist.broadcast(meta, src=0)
-        bs = int(meta[0].item())
-        batch_type = self._TP_TYPE_NAME[int(meta[1].item())]
-        done = bool(int(meta[2].item()))
-        ctx = BatchInferenceContext(bs, batch_type)
-        if batch_type == "waiting":
-            return ctx, done
-        if batch_type == "decode":
-            if int(meta[3].item()) == 0:
-                # 稳态：复用本地 store（ids 与 rank0 相同，含 padding 重复）
-                ctx.sequences = [self._tp_seq_store[sid] for sid in self._tp_last_batch_ids]
-            else:
-                seqs = BatchInferenceContext.receive_seqs(bs, self.tokenizer)
-                for s in seqs:
-                    self._tp_seq_store[s.seq_id] = s
-                self._tp_last_batch_ids = [s.seq_id for s in seqs]
-                ctx.sequences = seqs
-        else:
-            seqs = BatchInferenceContext.receive_seqs(bs, self.tokenizer)
-            for s in seqs:
-                self._tp_seq_store[s.seq_id] = s
-            ctx.sequences = seqs
-        return ctx, done
+        return self._tp_comm.receive_batch()
 
     def _decode(self, ctx: BatchInferenceContext):
         """同步 decode：launch + collect，供 step() 和 non-rank0 路径调用。"""
@@ -678,7 +530,7 @@ class InferenceEngine:
         on_tokens: 可选回调，每提交一批 token 时调用（真流式用）。
         ignore_eos: True 时遇 EOS 不停（跑满 max_tokens），对齐 OpenAI/vllm bench 语义。
         """
-        if self._spec_controller is None:
+        if self._spec_engine is None:
             raise RuntimeError("投机解码未启用（构造时 spec_decode=True）")
         prompt_ids = self.tokenizer.encode(prompt, add_special_tokens=True)
         cap = self.max_position
@@ -687,7 +539,7 @@ class InferenceEngine:
         max_tokens = max(1, min(max_tokens, cap - len(prompt_ids)))
 
         t0 = time.time()
-        out_ids = self._spec_controller.generate(
+        out_ids = self._spec_engine.generate(
             prompt_ids, max_tokens, eos_token_id=self.eos_token_id,
             on_tokens=on_tokens, ignore_eos=ignore_eos)
         elapsed = time.time() - t0
@@ -696,8 +548,8 @@ class InferenceEngine:
         return {
             "text": text,
             "tokens": out_ids,
-            "avg_acceptance": self._spec_controller.avg_acceptance,
-            "num_steps": self._spec_controller.total_steps,
+            "avg_acceptance": self._spec_engine.avg_acceptance,
+            "num_steps": self._spec_engine.total_steps,
             "time_s": elapsed,
             "tok_s": len(out_ids) / elapsed if elapsed > 0 else 0.0,
         }
