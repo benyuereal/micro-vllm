@@ -22,11 +22,3 @@ def dequantize_per_channel(w_int8: torch.Tensor, scale: torch.Tensor,
                            dtype=torch.bfloat16) -> torch.Tensor:
     """w_int8 [N,K] + scale [N] → w [N,K] dtype。"""
     return (w_int8.float() * scale.unsqueeze(1)).to(dtype)
-
-
-def quantize_all(weights: dict) -> dict:
-    """批量量化 {name: w[N,K]} → {name: (w_int8, scale)}。"""
-    out = {}
-    for name, w in weights.items():
-        out[name] = quantize_per_channel(w)
-    return out

@@ -94,14 +94,6 @@ class ModelAdapter(ABC):
         用 flash_attn_func（自包含，不读 cache 前缀）暂不支持。默认 False（保守）。"""
         return False
 
-    def supports_varlen_prefill(self, cfg) -> bool:
-        """该架构是否支持变长一次性 prefill（同一 batch 内不同 seq 长度，用 cu_seqlens
-        掩码 + block_table 读 paged cache，无需等长分组/padding）。Qwen3 GQA +
-        flash_attn_varlen_func(block_table=...) 支持；DeepSeek MLA prefill 用定长
-        flash_attn_func 自包含（k/v 是本步算出的完整 prompt），改 varlen 不带 block_table
-        即可，latent 另写 paged cache。默认 False（保守）。"""
-        return False
-
     def context_length_limit(self, cfg) -> int:
         """该架构支持的上下文长度硬上限（cos/sin 表覆盖范围 / kernel 静态 shape 约束）。
         返回 None 表示无架构侧限制，由 engine 构造参数 max_context_length 决定。

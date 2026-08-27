@@ -83,12 +83,6 @@ class DeepSeekAdapter(ModelAdapter):
         # DeepSeek 用 MoE，dense 层的 intermediate_size；MoE expert 尺寸单独处理
         return getattr(cfg, "intermediate_size", cfg.moe_intermediate_size) // world_size
 
-    def supports_varlen_prefill(self, cfg) -> bool:
-        # MLA prefill 用 flash_attn_varlen_func（cu_seqlens 掩码各 seq 边界），k/v 是本步算出
-        # 的完整 prompt（自包含，不读 cache 前缀），latent 另按 slot_mapping 写 paged cache。
-        # 故支持同 batch 内不同 seq 长度变长拼接；但不支持 chunked 续写（见 supports_chunked_prefill）。
-        return True
-
     def context_length_limit(self, cfg):
         # MLA decode kernel 把 max_len 进静态 shape（block_table 列数 / cos_k 行数），
         # cos/sin 表只覆盖 1024。即使 engine max_context_length 设更大，DeepSeek 仍钳到 1024。

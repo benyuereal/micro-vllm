@@ -51,11 +51,6 @@ class Qwen3Adapter(ModelAdapter):
         # 从 cos/sin pool gather 正确位置。已验证 chunked vs 非 chunked 输出完全一致。
         return True
 
-    def supports_varlen_prefill(self, cfg) -> bool:
-        # flash_attn_varlen_func 支持 block_table 读 paged cache，同 batch 内各 seq 长度
-        # 可不同（cu_seqlens 掩码），无需等长分组/padding。
-        return True
-
     @staticmethod
     def _ln_eps(ln, cfg):
         """兼容 HF RMSNorm 的两种 eps 属性名（eps / variance_epsilon），回退 cfg.rms_norm_eps。"""

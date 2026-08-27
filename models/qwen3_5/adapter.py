@@ -507,9 +507,6 @@ class Qwen3_5Adapter(ModelAdapter):
     def supports_chunked_prefill(self, cfg) -> bool:
         return True
 
-    def supports_varlen_prefill(self, cfg) -> bool:
-        return True
-
     @staticmethod
     def _ln_eps(ln, cfg):
         return getattr(ln, "eps", None) or getattr(ln, "variance_epsilon", cfg.rms_norm_eps)
@@ -922,8 +919,9 @@ class Qwen3_5Adapter(ModelAdapter):
         ).squeeze(1)
 
         # attn_output_gate：gate = q_proj 后半（qkv[:, q_dim:2*q_dim]）
+        # Triton in-place（attn *= sigmoid(gate)），替代 sigmoid+cast+mul 三个 elementwise kernel。
         gate = qkv[:, q_dim:2 * q_dim].view(bs, nh, hd)
-        attn = attn * torch.sigmoid(gate.float()).to(attn.dtype)
+        attn_gate_inplace(attn, gate)
 
         out_buf = graph._attn_out[:bs]
         return self._lin(attn.reshape(bs, -1), sa._o_w, out_buf, "MICRO_GEMV_O")

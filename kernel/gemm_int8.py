@@ -106,10 +106,6 @@ def _int8_gemm_kernel_fast(M, N, K, NG, BLOCK_M, BLOCK_N, BLOCK_K, dtype):
     return main
 
 
-def int8_gemm_available() -> bool:
-    return True
-
-
 def int8_gemm(x, w_int8, scale, out=None):
     """W8A16 int8 分块 GEMM（group-128）。x [M,K] bf16, w_int8 [N,K] int8,
     scale [N,K/128] fp32 → out [M,N] bf16（原地）。M 小（2-32）时权重 HBM 只读一次。
