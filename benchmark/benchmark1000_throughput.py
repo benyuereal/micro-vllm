@@ -17,7 +17,7 @@ nano:  llm.generate(prompts, sampling_params)。
   - 空闲 GPU（CUDA_VISIBLE_DEVICES 由调用方指定，如 CUDA_VISIBLE_DEVICES=1）
   - micro 路径自动定位为本仓库根目录（脚本所在目录的上一级）
   - nano-vllm 路径默认 /models/nano-vllm，可用环境变量 NANO_VLLM_PATH 覆盖
-  - 模型路径默认 /models/Qwen3-0.6B，可用环境变量 MODEL_PATH 覆盖
+  - 模型路径默认 /models/Qwen3.8-27B-INT8-W8A16-MTP，可用环境变量 MODEL_PATH 覆盖
 
 最新基准（L20 / Qwen3-0.6B / bf16，N=1000，max_tokens 40-80 随机）：
   micro 28110 tok/s（三轮 28122/28098/28110） vs nano 27638 tok/s（27622/27653），micro +1.7%
@@ -29,7 +29,7 @@ REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, REPO_ROOT)
 
 NANO_VLLM_PATH = os.environ.get("NANO_VLLM_PATH", "/models/nano-vllm")
-MODEL = os.environ.get("MODEL_PATH", "/models/Qwen3-0.6B")
+MODEL = os.environ.get("MODEL_PATH", "/models/Qwen3.8-27B-INT8-W8A16-MTP")
 
 import torch
 torch.manual_seed(0)

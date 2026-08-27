@@ -15,13 +15,13 @@
   - 空闲 GPU（CUDA_VISIBLE_DEVICES 由调用方指定，如 CUDA_VISIBLE_DEVICES=1）
   - micro 路径自动定位为本仓库根目录（脚本所在目录的上一级）
   - nano-vllm 路径默认 /models/nano-vllm，可用环境变量 NANO_VLLM_PATH 覆盖
-  - 模型路径默认 /models/Qwen3-0.6B，可用环境变量 MODEL_PATH 覆盖
+  - 模型路径默认 /models/Qwen3.8-27B-INT8-W8A16-MTP，可用环境变量 MODEL_PATH 覆盖
 """
 import os, sys, time, statistics
 
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 NANO_VLLM_PATH = os.environ.get("NANO_VLLM_PATH", "/models/nano-vllm")
-MODEL = os.environ.get("MODEL_PATH", "/models/Qwen3-0.6B")
+MODEL = os.environ.get("MODEL_PATH", "/models/Qwen3.8-27B-INT8-W8A16-MTP")
 
 MODE = sys.argv[1]
 # micro graph 路径固定 1024 上下文（>1024 留待 tile op 恢复），故 IN+OUT ≤ 1024。

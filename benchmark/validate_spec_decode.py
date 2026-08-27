@@ -28,7 +28,7 @@ context 长度（kv_len-1）排除 stale 区，故安全。
 
 用法：
   CUDA_VISIBLE_DEVICES=3 python3 benchmark/validate_spec_decode.py \
-      --model /models/Qwen3-0.6B --N 3 --max-new 64
+      --model /models/Qwen3.8-27B-INT8-W8A16-MTP --N 3 --max-new 64
 """
 import argparse
 import time
@@ -335,7 +335,7 @@ def spec_decode(target, draft, prompt_ids, max_new, N, device, mask_token_id=0):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--model", default="/models/Qwen3-0.6B")
+    ap.add_argument("--model", default="/models/Qwen3.8-27B-INT8-W8A16-MTP")
     ap.add_argument("--N", type=int, default=3, help="投机 token 数")
     ap.add_argument("--max-new", type=int, default=64)
     ap.add_argument("--prompt", default="The capital of France is, and the reason is that")

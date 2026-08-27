@@ -7,7 +7,7 @@
 
 用法：
   CUDA_VISIBLE_DEVICES=3 python3 benchmark/benchmark_spec_decode.py \
-      --model /models/Qwen3-0.6B --N 3 --max-new 64
+      --model /models/Qwen3.8-27B-INT8-W8A16-MTP --N 3 --max-new 64
 """
 import argparse
 import os
@@ -43,7 +43,7 @@ def plain_greedy_controller(ctrl, prompt_ids, max_new, eos=None):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--model", default="/models/Qwen3-0.6B")
+    ap.add_argument("--model", default="/models/Qwen3.8-27B-INT8-W8A16-MTP")
     ap.add_argument("--N", type=int, default=3)
     ap.add_argument("--max-new", type=int, default=64)
     ap.add_argument("--prompt", default="The capital of France is, and the reason is that")
