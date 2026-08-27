@@ -463,19 +463,19 @@ class InferenceEngine:
     # TP rank 间通信（bcast1/bcast2 紧凑协议）：实现抽到 core/tp_comm.py 的
     # TPCommunicator，engine 保留薄调用（api_server / benchmark 走 engine.tp_* 入口）。
     def tp_broadcast_tokens(self, ctx: BatchInferenceContext):
-        self._tp_comm.broadcast_tokens(ctx)
+        self._tp_comm.bcast_tokens(ctx)
 
     def tp_receive_tokens(self, ctx: BatchInferenceContext) -> List[Sequence]:
-        return self._tp_comm.receive_tokens(ctx)
+        return self._tp_comm.recv_tokens(ctx)
 
     def tp_broadcast_batch(self, ctx: BatchInferenceContext, done: bool = False):
-        self._tp_comm.broadcast_batch(ctx, done)
+        self._tp_comm.bcast_batch(ctx, done)
 
     def tp_broadcast_waiting(self, done: bool = False):
-        self._tp_comm.broadcast_waiting(done)
+        self._tp_comm.bcast_waiting(done)
 
     def tp_receive_batch(self) -> Tuple[BatchInferenceContext, bool]:
-        return self._tp_comm.receive_batch()
+        return self._tp_comm.recv_batch()
 
     def _decode(self, ctx: BatchInferenceContext):
         """同步 decode：launch + collect，供 step() 和 non-rank0 路径调用。"""

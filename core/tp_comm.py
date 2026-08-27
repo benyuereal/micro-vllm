@@ -70,7 +70,7 @@ class TPCommunicator:
     # ------------------------------------------------------------------
     # bcast2：decode 采样 token
     # ------------------------------------------------------------------
-    def broadcast_tokens(self, ctx: BatchInferenceContext):
+    def bcast_tokens(self, ctx: BatchInferenceContext):
         """TP bcast2：decode 热路径只广播本步采样 token（[bs] GPU 张量），
         替代完整 Sequence 广播（省 ~2.8ms/步 的 pickle+NCCL 往返）。
         prefill 批次无 decode next_tokens，回退完整 ctx 广播（非 rank0 需
@@ -84,7 +84,7 @@ class TPCommunicator:
         else:
             ctx.broadcast()
 
-    def receive_tokens(self, ctx: BatchInferenceContext) -> List["Sequence"]:
+    def recv_tokens(self, ctx: BatchInferenceContext) -> List["Sequence"]:
         """TP bcast2 接收，返回供 update_sequences 使用的 seq 列表。
         decode：收 [bs] 采样 token 写回本地 seq._next_token（本地 seq 由 bcast1
         建立，update_sequences 本地 append 推进 output_ids/position/finished）；
@@ -104,7 +104,7 @@ class TPCommunicator:
     # ------------------------------------------------------------------
     # bcast1：batch 元数据 + seq 列表
     # ------------------------------------------------------------------
-    def broadcast_batch(self, ctx: BatchInferenceContext, done: bool = False):
+    def bcast_batch(self, ctx: BatchInferenceContext, done: bool = False):
         """TP bcast1（紧凑）：单次 meta [batch_size, type_code, done, flag] GPU
         张量广播（~0.1ms，无 pickle）。
         decode 稳态（batch 成员+顺序不变）flag=0，非 rank0 复用本地 seq store；
@@ -130,7 +130,7 @@ class TPCommunicator:
             dist.broadcast(meta, src=0)
             BatchInferenceContext.broadcast_seqs(ctx)
 
-    def broadcast_waiting(self, done: bool = False):
+    def bcast_waiting(self, done: bool = False):
         """TP waiting：只广播 meta（type=waiting, done），非 rank0 据此空转。"""
         if get_world_size() <= 1 or not rank0():
             return
@@ -141,7 +141,7 @@ class TPCommunicator:
         meta[3] = 0
         dist.broadcast(meta, src=0)
 
-    def receive_batch(self) -> Tuple[BatchInferenceContext, bool]:
+    def recv_batch(self) -> Tuple[BatchInferenceContext, bool]:
         """TP bcast1 接收，返回 (ctx, done)。ctx 带 .sequences（供 step() 用），
         done 折在 meta[2]（省掉每步一次独立的 done 广播往返）。
         decode 稳态（flag=0）：复用本地 seq store（output_ids 已由 bcast2+
