@@ -41,8 +41,9 @@ from kernel.rotary import apply_rope_decode
 # marlin_forward。draft 每步读 ~2.7GB bf16 权重（d.fwd 6.22ms），int8 减半 → 省 ~3-4ms/step。
 # 只转 draft 自有权重：embed_tokens/lm_head 与 target 共享（同对象），转了会破坏 target。
 # 正确性：draft 提议对 hidden 扰动不敏感（rel_std≤0.01 提议变化 ≤1.4%，实测），int8
-# group-128 噪声 ~0.5% 相对 → 接受率风险低（e2e 验证）。
-_DRAFT_INT8 = os.environ.get("MICRO_DRAFT_INT8", "0") == "1"
+# group-128 噪声 ~0.5% 相对 → 接受率风险低（e2e 验证 acceptance 4.312 保持）。
+# 默认开（MICRO_DRAFT_INT8=0 可关）：d.fwd 6.22→4.03ms，per_step -4.0%。
+_DRAFT_INT8 = os.environ.get("MICRO_DRAFT_INT8", "1") == "1"
 
 
 # ---- DFlash2 grouped conv 融合 kernel（taps=2 特化）----

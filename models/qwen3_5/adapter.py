@@ -62,9 +62,10 @@ _MARLIN = _MICRO_VERIFY_GEMM == "marlin"
 # 收益：lm_head 每 spec step 被调 2 次（verify M=8 + draft M=7 共享 target lm_head），
 # bf16 每次读 2.54GB（3.53ms）→ int8 读 1.27GB（1.77ms）→ 省 ~3.5ms/step（~6.5%）。
 # 正确性：lm_head 被 verify/draft/非spec decode 共享，全路径对称走 int8 → spec==非spec
-# 等价性保持（两者一致），draft/target 一致（接受率保持）。输出相对原 bf16 模型有
-# int8 量化微差（top2 margin 小时 argmax 可能翻转），e2e 需验证连贯性 + 接受率。
-_LMHEAD_INT8 = os.environ.get("MICRO_LMHEAD_INT8", "0") == "1"
+# 等价性保持（两者一致），draft/target 一致（接受率保持）。模型本身已 W8A16（64 层
+# int8），lm_head 在 quant ignore 列表存 bf16——转 int8 是【补全】W8A16 量化，非新近似。
+# 默认开（MICRO_LMHEAD_INT8=0 可关）：per_step 55.61→50.65ms(-6.3%)，acceptance 保持。
+_LMHEAD_INT8 = os.environ.get("MICRO_LMHEAD_INT8", "1") == "1"
 
 try:
     from flash_attn import flash_attn_with_kvcache, flash_attn_varlen_func

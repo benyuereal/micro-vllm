@@ -226,7 +226,8 @@ class InferenceEngine:
         # bf16→int8（embed/lm_head 与 target 共享，跳过）。draft 每步读 ~2.7GB bf16
         # 权重（d.fwd 6.22ms），int8 减半 → 省 ~3-4ms/step。draft 提议对 hidden 扰动
         # 不敏感（rel_std≤0.01 提议变化 ≤1.4%），int8 噪声 ~0.5% 相对 → 接受率风险低。
-        if os.environ.get("MICRO_DRAFT_INT8", "0") == "1":
+        # 默认开（MICRO_DRAFT_INT8=0 可关）。
+        if os.environ.get("MICRO_DRAFT_INT8", "1") == "1":
             draft_model.convert_to_int8()
         mask_token_id = getattr(draft_cfg, "dflash_config", {}).get(
             "mask_token_id", self.mask_token_id)
