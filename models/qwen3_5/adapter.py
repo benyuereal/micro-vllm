@@ -57,6 +57,15 @@ _W8A16 = os.environ.get("MICRO_W8A16", "0") == "1"
 _MICRO_VERIFY_GEMM = os.environ.get("MICRO_VERIFY_GEMM", "marlin").lower()
 _MARLIN = _MICRO_VERIFY_GEMM == "marlin"
 
+# lm_head int8（Marlin）开关：MICRO_LMHEAD_INT8=1 时把 bf16 lm_head（2.54GB，quant
+# ignore 列表存 bf16）group-128 量化成 int8 Marlin（1.27GB），forward 走 marlin_forward。
+# 收益：lm_head 每 spec step 被调 2 次（verify M=8 + draft M=7 共享 target lm_head），
+# bf16 每次读 2.54GB（3.53ms）→ int8 读 1.27GB（1.77ms）→ 省 ~3.5ms/step（~6.5%）。
+# 正确性：lm_head 被 verify/draft/非spec decode 共享，全路径对称走 int8 → spec==非spec
+# 等价性保持（两者一致），draft/target 一致（接受率保持）。输出相对原 bf16 模型有
+# int8 量化微差（top2 margin 小时 argmax 可能翻转），e2e 需验证连贯性 + 接受率。
+_LMHEAD_INT8 = os.environ.get("MICRO_LMHEAD_INT8", "0") == "1"
+
 try:
     from flash_attn import flash_attn_with_kvcache, flash_attn_varlen_func
 except ImportError:
@@ -740,6 +749,15 @@ class Qwen3_5Adapter(ModelAdapter):
             block._is_gdn = is_gdn
             block._prepared = True
         torch.cuda.empty_cache()
+
+        # lm_head int8（Marlin）：bf16 lm_head（2.54GB，quant ignore 存 bf16）→ int8
+        # Marlin（1.27GB），forward 走 marlin_forward。每 spec step 被调 2 次（verify
+        # M=8 + draft M=7 共享 target lm_head），省 ~3.5ms/step（~6.5%）。全路径对称
+        # 走 int8（verify/draft/非spec decode 共享）→ spec==非spec 等价性保持。
+        if _LMHEAD_INT8:
+            from kernel.marlin import linear_to_marlin
+            model.lm_head = linear_to_marlin(model.lm_head)
+            torch.cuda.empty_cache()
 
     # -------------------- GDN 公共 --------------------
     def _gdn_forward(self, la, h2d, graph, bs, is_decode,
