@@ -5,17 +5,14 @@ KV 缓存张量形状 [num_blocks, block_size, num_heads, head_size]，每层一
 1 Sequence → 动态增长的多个 Block。分配/释放 O(1)（deque 空闲块列表）。
 参考：vLLM / PagedAttention (arxiv 2309.06180)。
 """
-from typing import List
-
 import torch
 import collections
 
 try:
     import triton
     import triton.language as tl
-    from flash_attn import flash_attn_varlen_func, flash_attn_with_kvcache
 except ImportError:
-    print('Please install flash-attn from https://www.flash-attn.org')
+    print('Please install triton')
 
 
 # 把本步算出的 k/v 按 slot_mapping scatter 写入 paged KV cache。

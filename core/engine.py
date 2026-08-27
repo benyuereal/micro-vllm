@@ -628,8 +628,7 @@ class InferenceEngine:
     def _decode(self, ctx: BatchInferenceContext):
         """同步 decode：launch + collect，供 step() 和 non-rank0 路径调用。"""
         self.launch(ctx)
-        batch, bs, logits = ctx.sequences, ctx.batch_size, ctx.logits
-        self.cache_manager.commit(bs)
+        self.cache_manager.commit(ctx.batch_size)
 
     def generate(self, prompts: List[str], max_tokens: int = 100,
                  temperature: float = 0.7, top_p: float = 0.9,
@@ -665,7 +664,7 @@ class InferenceEngine:
             try:
                 results[seq_map[seq.seq_id]] = self.tokenizer.decode(out_ids, skip_special_tokens=True)
             except:
-                results[seq_map[seq.seq_id]] = f"[Error]"
+                results[seq_map[seq.seq_id]] = "[Error]"
         
         self.scheduler.running_sequences.clear()
         return results
@@ -925,12 +924,10 @@ class InferenceEngine:
             if seq.stop_strings and not seq.is_finished():
                 text = tokenizer.decode(seq.output_ids, skip_special_tokens=True)
                 hit_idx = -1
-                hit_len = 0
                 for s in seq.stop_strings:
                     i = text.find(s)
                     if i != -1 and (hit_idx == -1 or i < hit_idx):
                         hit_idx = i
-                        hit_len = len(s)
                 if hit_idx != -1:
                     # 截断 output_ids：近似按字符数砍（base 模型停止串通常对齐 token 边界，
                     # 多砍一两个 token 不影响展示，client 还会再做一次精确截断）。

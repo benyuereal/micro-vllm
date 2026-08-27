@@ -20,7 +20,6 @@ register：acc_p[H, kv_lora]=[16,512] fp32 = 32 regs/thread；acc_s/acc_s_cast �
 import torch
 import tilelang
 import tilelang.language as T
-from tilelang.carver.arch import driver
 
 
 _TORCH_TO_TL = {torch.float16: T.float16, torch.bfloat16: T.bfloat16}
@@ -36,7 +35,6 @@ def fused_mla_decode_kernel(
 ):
     """Fused MLA decode（split-KV, weight-absorption）。每 program = (batch, split)，所有 H 在一个 program 内。"""
     accum_dtype = T.float32
-    kvb_out = qk_nope + v_head              # 256 per head
     half_qk_rope = qk_rope // 2             # 32
     scale = float(softmax_scale * 1.44269504)  # log2(e)
     K_TILE = 128

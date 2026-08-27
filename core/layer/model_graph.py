@@ -4,9 +4,7 @@ import torch
 from typing import Dict, List
 
 from core.paged_attention import PagedAttention
-from kernel.rmsnorm import (
-    rmsnorm_, rmsnorm1_, rmsnorm_residual_gemm as rmsnorm_residual,
-)
+from kernel.rmsnorm import rmsnorm_, rmsnorm1_
 from kernel.rotary import compute_slot_mapping
 from .rope import RoPE
 from core.parallel_config import get_rank, get_world_size, all_reduce

@@ -5,7 +5,6 @@ QwenAdapter - Qwen-1 / Qwen2 / Qwen2.5 (GQA + SwiGLU) 适配器。
 保证 Qwen 路径行为零回归。
 """
 import torch
-import torch.nn.functional as F
 
 from models.base import ModelAdapter
 from kernel.rmsnorm import rmsnorm_, rmsnorm_residual_gemm as rmsnorm_residual

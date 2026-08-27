@@ -1,4 +1,4 @@
-from typing import Tuple, Union, List, Optional
+from typing import Tuple, List, Optional
 import torch
 import time
 

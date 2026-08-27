@@ -73,17 +73,6 @@ class Sampler:
         return torch.where(mask > 0, penalized, logits)
 
     @staticmethod
-    @torch.compile(fullgraph=True, dynamic=True)
-    def _gumbel_sample(logits, temp):
-        """Gumbel-max 采样（等价于按 softmax(logits/temp) 分布采样）。
-        softmax(logits/temp) / Exp(1) 的 argmax ≈ 按概率采样，单 fused kernel，无 topk/sort。
-        避免原地操作（div_/exponential_ 会破坏 reduce-overhead 的 cudagraph 捕获）。"""
-        logits = logits.float() / temp.unsqueeze(dim=1)
-        probs = torch.softmax(logits, dim=-1)
-        noise = torch.empty_like(probs).exponential_(1).clamp_min(1e-10)
-        return (probs / noise).argmax(dim=-1)
-
-    @staticmethod
     def _sample_impl(logits, temp, top_p, top_k):
         # 整个采样在一个 fused kernel 内
         logits = logits / temp[:, None]

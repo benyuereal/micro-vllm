@@ -20,9 +20,6 @@
 （草稿 KV 只需保留 sliding window 内，且每步 query 只有 1+N 个 token，
 不需要 paged cache——context KV 由 target hidden states 每步重算）。
 """
-import math
-from typing import List, Optional
-
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -89,12 +86,6 @@ def _grouped_conv_fused(hidden_states, delta, base, num_groups, group_size):
 # ---------------------------------------------------------------------------
 # RoPE（half-split / Llama 风格 rotate_half，与 Qwen3 一致）
 # ---------------------------------------------------------------------------
-def _rope_half_split(x, cos, sin):
-    """x [..., d]，cos/sin [..., d//2]。返回旋转后的 x。"""
-    x1, x2 = x.chunk(2, dim=-1)
-    return torch.cat([x1 * cos - x2 * sin, x2 * cos + x1 * sin], dim=-1)
-
-
 def _build_rope_cache(head_dim, max_pos, theta, device, dtype):
     """预计算 cos/sin 表 [max_pos, head_dim//2]。"""
     inv_freq = 1.0 / (theta ** (torch.arange(0, head_dim, 2, device=device).float() / head_dim))

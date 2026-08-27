@@ -1,9 +1,8 @@
 from collections import deque
-from typing import List, Tuple, Dict, Optional
+from typing import List, Tuple
 from transformers import AutoTokenizer
 from .sequence import Sequence
 import logging
-import time
 
 logger = logging.getLogger(__name__)
 

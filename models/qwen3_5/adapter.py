@@ -29,7 +29,6 @@
 """
 import os
 import torch
-import torch.nn.functional as F
 import triton
 import triton.language as tl
 
@@ -746,8 +745,6 @@ class Qwen3_5Adapter(ModelAdapter):
         torch.cuda.empty_cache()
 
     # -------------------- GDN 公共 --------------------
-    _dbg_gdn = None  # 调试：list of dict（每 GDN 层中间量）
-
     def _gdn_forward(self, la, h2d, graph, bs, is_decode,
                      cu_seqlens=None, seq_idx=None):
         M = h2d.shape[0]
@@ -789,10 +786,6 @@ class Qwen3_5Adapter(ModelAdapter):
         g = torch.empty(M, H, dtype=torch.float32, device=dev)
         beta = torch.empty(M, H, dtype=h2d.dtype, device=dev)
         gdn_gbeta(a, b, la._a_log, la._dt_bias, g, beta, stride=ba_stride)
-        if self._dbg_gdn is not None:
-            self._dbg_gdn.append({"qkv_pre": qkv.detach().clone(), "z": z.detach().clone(),
-                                  "b": b.detach().clone(), "a": a.detach().clone(),
-                                  "g": g.detach().clone(), "beta": beta.detach().clone()})
 
         state = graph._gdn_state_pool
         conv_state = graph._gdn_conv_state_pool
@@ -860,9 +853,6 @@ class Qwen3_5Adapter(ModelAdapter):
                     CHECKPOINT=state, CP_N_GDN=n_gdn, CP_ENABLED=False,
                     INIT_STATE=init_state_s, INIT_IDX=init_idx, INIT_FROM_CP=init_from_cp)
 
-        if self._dbg_gdn is not None:
-            self._dbg_gdn[-1]["qkv_post"] = qkv.detach().clone()
-            self._dbg_gdn[-1]["o"] = o.detach().clone()
         og = torch.empty(M, H * DV, dtype=h2d.dtype, device=dev)
         _gdn_norm_gated_kernel[(M, H)](o, z, la._norm_w, og,
                                        H=H, DV=DV, eps=la._norm_eps,
@@ -870,9 +860,6 @@ class Qwen3_5Adapter(ModelAdapter):
                                        BLOCK_D=triton.next_power_of_2(DV))
         out = torch.empty(M, h2d.shape[1], dtype=h2d.dtype, device=dev)
         self._lin(og, la._o_w, out, "MICRO_GEMV_GDN")
-        if self._dbg_gdn is not None:
-            self._dbg_gdn[-1]["og"] = og.detach().clone()
-            self._dbg_gdn[-1]["out"] = out.detach().clone()
         return out
 
     # -------------------- decode 单层钩子 --------------------
@@ -885,13 +872,9 @@ class Qwen3_5Adapter(ModelAdapter):
         self._lin(graph._h_buf[:bs], attn._qkv_w, qkv_buf, "MICRO_GEMV_QKV")
         return qkv_buf
 
-    _dbg_dec = None  # 调试：list of 每层输出 residual stream（decode）
-
     def compute_next_qkv(self, block_next, mlp_out_prev, res_prev, graph, bs):
         # 返回 (attn_input, residual)：decode 循环 `qkv, h = compute_next_qkv(...)` 解包两值。
         # GDN 层 attn_input = 归一化后的 h（投影延迟到 attention 内做）；full 层 = 投影后 qkv。
-        if self._dbg_dec is not None:
-            self._dbg_dec.append((mlp_out_prev + res_prev).detach().clone())
         rmsnorm1_residual(
             mlp_out_prev, res_prev, block_next._in_ln_w,
             graph._h_buf[:bs], graph._residual[:bs], block_next._in_ln_eps
@@ -960,17 +943,11 @@ class Qwen3_5Adapter(ModelAdapter):
         return mlp_out, graph._residual[:bs]
 
     # -------------------- prefill 单层钩子 --------------------
-    _dbg = None  # 调试：list of (layer_idx, in_h, out_h) 或 None
-
     def prefill(self, block, h, layer_idx, graph, cache_manager, meta):
-        if self._dbg is not None:
-            self._dbg.append((layer_idx, h.detach().clone()))
         if block._is_gdn:
             out = self._prefill_gdn(block, h, graph, meta)
         else:
             out = self._prefill_full(block, h, layer_idx, graph, cache_manager, meta)
-        if self._dbg is not None:
-            self._dbg[-1] = (layer_idx, self._dbg[-1][1], out.detach().clone())
         return out
 
     def _prefill_full(self, block, h, layer_idx, graph, cache_manager, meta):
@@ -1102,7 +1079,7 @@ class Qwen3_5Adapter(ModelAdapter):
             return seq._gdn_slot
         if not shared["free"]:
             raise RuntimeError(
-                f"GDN 状态池耗尽（并发序列 > 池大小）。max_batch_size 需 ≥ 并发数。")
+                "GDN 状态池耗尽（并发序列 > 池大小）。max_batch_size 需 ≥ 并发数。")
         slot = shared["free"].pop()
         shared["in_use"][seq.seq_id] = slot
         seq._gdn_slot = slot

@@ -1,15 +1,7 @@
 import torch
 import logging
-from typing import List
-from kernel.rmsnorm import rmsnorm_residual_fused, rmsnorm
-from core.parallel_config import all_reduce
 from .model_graph import ModelGraphRunner
 from models.base import PrefillMeta
-
-try:
-    from flash_attn import flash_attn_with_kvcache
-except ImportError:
-    flash_attn_with_kvcache = None
 
 logger = logging.getLogger(__name__)
 

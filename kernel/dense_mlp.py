@@ -14,7 +14,6 @@ DeepSeek / Qwen 的 dense MLP 都是 SwiGLU: out = (silu(gate) * up) @ d_w。
 
 DeepSeek MoE expert 权重 _e_gu 另用 [gate|up]，TileLang moe kernel 内部写死，与本文件无关。
 """
-import os
 import torch
 import torch.nn.functional as F
 import triton

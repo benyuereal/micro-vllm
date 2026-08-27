@@ -198,7 +198,6 @@ class DeepSeekAdapter(ModelAdapter):
                 # shared experts（合并成单个大 MLP）
                 if self._n_shared is not None and hasattr(mlp, "shared_experts"):
                     se = mlp.shared_experts
-                    s_inter = inter * self._n_shared
                     mlp._shared_gu = torch.cat([se.gate_proj.weight.data, se.up_proj.weight.data], dim=0).t().contiguous()
                     mlp._shared_d = se.down_proj.weight.data.t().contiguous()
                 else:
