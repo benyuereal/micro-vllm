@@ -224,3 +224,84 @@ def marlin_forward(m, x, out=None):
     if m["padded_n"] != m["N"]:
         out.copy_(c[:, :m["N"]])
     return out
+
+
+# ---------------------------------------------------------------------------
+# MarlinLinear：bf16 nn.Linear → int8 Marlin 的通用替换模块
+# ---------------------------------------------------------------------------
+class MarlinLinear(torch.nn.Module):
+    """bf16 nn.Linear 的 int8 Marlin 版（group-128 量化，forward 走 marlin_forward）。
+
+    用于把 memory-bound 的小 M GEMM（draft 5 层 / lm_head 等）的 bf16 权重读减半。
+    接口对齐 nn.Linear：__call__(x) → [M, N]；.weight 属性保留（Marlin packed，
+    非 bf16，供检查/调试）。bias 不支持（本仓库 Linear 全 bias=False）。
+    """
+
+    def __init__(self, m: dict):
+        super().__init__()
+        self._m = m
+        self.weight = m["wq"]  # Marlin packed（非 bf16）
+        self.in_features = m["K"]
+        self.out_features = m["N"]
+
+    def forward(self, x):
+        # nn.Linear 支持任意前导维（[*, K]）；Marlin 只吃 2D [M,K] → 展平再还原
+        if x.dim() == 2:
+            return marlin_forward(self._m, x)
+        shape = x.shape
+        out = marlin_forward(self._m, x.reshape(-1, shape[-1]))
+        return out.reshape(*shape[:-1], self.out_features)
+
+
+def quantize_group128(w_bf16: torch.Tensor, group: int = GROUP):
+    """bf16 [N,K] → (int8 [N,K], scale fp32 [N,K/group])，分块避免 fp32 全量临时 OOM。"""
+    N, K = w_bf16.shape
+    assert K % group == 0, f"K={K} 非 group={group} 倍数"
+    device = w_bf16.device
+    w_int8 = torch.empty(N, K, dtype=torch.int8, device=device)
+    scale = torch.empty(N, K // group, dtype=torch.float32, device=device)
+    CH = 4096
+    for s in range(0, N, CH):
+        e = min(s + CH, N)
+        wf = w_bf16[s:e].float().view(e - s, K // group, group)
+        amax = wf.abs().amax(dim=2, keepdim=True).clamp_min(1e-8)
+        sc = (amax / 127.0).squeeze(2)  # [ch, K/group]
+        # 量化：w_int8 = round(w / scale) = round(w * 127 / amax)（值域 [-127,127]）。
+        # 注意不能 round(w / amax)（值域 [-1,1]，int8 全 0/±1 → 反量化 127x 偏小）。
+        q = torch.round(wf * 127.0 / amax).clamp(-127, 127).to(torch.int8)
+        w_int8[s:e] = q.view(e - s, K)
+        scale[s:e] = sc
+    return w_int8, scale
+
+
+def build_marlin_from_int8(w_int8, scale, N, K, device):
+    """int8 [N,K] + scale [N,K/128] → Marlin dict（分块 pack 避免 int32 全量 OOM）。"""
+    assert marlin_available(), "Marlin kernel 不可用"
+    packed = torch.empty(N, K // 4, dtype=torch.int32, device=device)
+    CH = 16384
+    for s in range(0, N, CH):
+        e = min(s + CH, N)
+        packed[s:e] = int8_to_packed(w_int8[s:e])
+    del w_int8
+    m = build_marlin(packed, scale.to(torch.bfloat16), N, K, device)
+    del packed, scale
+    return m
+
+
+def linear_to_marlin(linear: torch.nn.Module, group: int = GROUP) -> MarlinLinear:
+    """bf16 nn.Linear → MarlinLinear（原地量化，释放 bf16 权重）。
+
+    显存管理：量化（bf16+int8 峰值 ~1.5x）→ 释放 bf16 → 分块 pack+build。
+    调用方随后把原 Linear 模块替换成返回值。
+    """
+    w_bf16 = linear.weight.data
+    N, K = w_bf16.shape
+    device = w_bf16.device
+    w_int8, scale = quantize_group128(w_bf16, group)
+    # 释放 bf16 权重（腾显存给 pack/build 峰值）
+    del w_bf16
+    linear.weight.data = torch.empty(0, device=device)
+    torch.cuda.empty_cache()
+    m = build_marlin_from_int8(w_int8, scale, N, K, device)
+    torch.cuda.empty_cache()
+    return MarlinLinear(m)

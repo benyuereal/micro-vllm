@@ -20,6 +20,7 @@
 （草稿 KV 只需保留 sliding window 内，且每步 query 只有 1+N 个 token，
 不需要 paged cache——context KV 由 target hidden states 每步重算）。
 """
+import os
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -34,6 +35,14 @@ import triton.language as tl
 from kernel.rmsnorm import rmsnorm as _triton_rmsnorm
 from kernel.rmsnorm import rmsnorm_residual_fused as _triton_rmsnorm_res
 from kernel.rotary import apply_rope_decode
+
+# draft 5 层 int8（Marlin）开关：MICRO_DRAFT_INT8=1 时把 draft 自有 Linear（q/k/v/o/
+# gate/up/down/kernel_projection/fc/hidden_projection）bf16→int8 Marlin，forward 走
+# marlin_forward。draft 每步读 ~2.7GB bf16 权重（d.fwd 6.22ms），int8 减半 → 省 ~3-4ms/step。
+# 只转 draft 自有权重：embed_tokens/lm_head 与 target 共享（同对象），转了会破坏 target。
+# 正确性：draft 提议对 hidden 扰动不敏感（rel_std≤0.01 提议变化 ≤1.4%，实测），int8
+# group-128 噪声 ~0.5% 相对 → 接受率风险低（e2e 验证）。
+_DRAFT_INT8 = os.environ.get("MICRO_DRAFT_INT8", "0") == "1"
 
 
 # ---- DFlash2 grouped conv 融合 kernel（taps=2 特化）----
@@ -464,6 +473,40 @@ class DFlash2DraftModel(nn.Module):
         草稿 checkpoint 不含这两组权重（同 vocab/hidden，直接复用 target 的）。"""
         self.embed_tokens = target_embed_tokens
         self.lm_head = target_lm_head
+
+    def convert_to_int8(self):
+        """draft 自有 Linear（q/k/v/o/gate/up/down/kernel_projection/fc/
+        hidden_projection）bf16→int8 Marlin。embed_tokens/lm_head 与 target 共享
+        （同对象），跳过（转了会破坏 target）。fc 的 K=hidden*num_aux 须 128 倍数
+        （5120*5=25600 ✓）。"""
+        from kernel.marlin import linear_to_marlin
+        converted = 0
+        # 逐层 attention + mlp + conv
+        for layer in self.layers:
+            attn = layer.self_attn
+            for name in ("q_proj", "k_proj", "v_proj", "o_proj"):
+                setattr(attn, name, linear_to_marlin(getattr(attn, name)))
+                converted += 1
+            mlp = layer.mlp
+            for name in ("gate_proj", "up_proj", "down_proj"):
+                setattr(mlp, name, linear_to_marlin(getattr(mlp, name)))
+                converted += 1
+            if layer.use_conv:
+                layer.attention_conv.kernel_projection = linear_to_marlin(
+                    layer.attention_conv.kernel_projection)
+                layer.mlp_conv.kernel_projection = linear_to_marlin(
+                    layer.mlp_conv.kernel_projection)
+                converted += 2
+        # fc（aux hidden 投影）+ hidden_projection（selector）
+        if self.use_aux_hidden_state:
+            self.fc = linear_to_marlin(self.fc)
+            converted += 1
+        if self.candidate_selector is not None:
+            self.candidate_selector.hidden_projection = linear_to_marlin(
+                self.candidate_selector.hidden_projection)
+            converted += 1
+        torch.cuda.empty_cache()
+        print(f"[DFlash2] draft int8: 转换 {converted} 个 Linear → Marlin", flush=True)
 
     def combine_hidden_states(self, aux_hidden_states):
         """target 中间层 hidden 拼接 [C, num_aux*target_hidden] → fc → [C, hidden]。
