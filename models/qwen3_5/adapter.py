@@ -970,21 +970,45 @@ class Qwen3_5Adapter(ModelAdapter):
         return mlp_out, graph._residual[:bs]
 
     # -------------------- prefill 单层钩子 --------------------
+    # 正常 prefill 路径（model_prefill.py / 其他 adapter 共享调用点）：h 是完整残差流，
+    # residual=None，返回 h（1 值），行为与 Bug #2 修复前完全一致（pre-attn rmsnorm1(h_bf16)
+    # mean_sq bf16 对齐 HF，residual add bf16）。
     def prefill(self, block, h, layer_idx, graph, cache_manager, meta):
         if block._is_gdn:
-            out = self._prefill_gdn(block, h, graph, meta)
-        else:
-            out = self._prefill_full(block, h, layer_idx, graph, cache_manager, meta)
-        return out
+            return self._prefill_gdn(block, h, None, graph, meta)[2]
+        return self._prefill_full(block, h, None, layer_idx, graph, cache_manager, meta)[2]
 
-    def _prefill_full(self, block, h, layer_idx, graph, cache_manager, meta):
+    # spec verify 路径（spec_decode.py 专用）：Bug #2 修复——层间传 (mlp_out, residual)
+    # 分离（不预加 bf16），pre-attention norm 用 fused rmsnorm1_residual（mean_sq 在 fp32
+    # mlp_out+residual 上算，对齐 decode compute_next_qkv→rmsnorm1_residual）。原
+    # rmsnorm1(h_bf16) 在 bf16 舍入后 residual 上算 mean_sq → 1-ULP 差经 48 GDN 层×129 步
+    # 累积 → margin1.75 翻转 → spec target 漂移进循环。返回 (mlp_out, residual, h)：
+    # h=(mlp_out+residual) bf16 供 aux 收集 / 逐层 dump / 下一层。
+    def prefill_verify(self, block, mlp_out, residual, layer_idx, graph, cache_manager, meta):
+        if block._is_gdn:
+            return self._prefill_gdn(block, mlp_out, residual, graph, meta)
+        return self._prefill_full(block, mlp_out, residual, layer_idx, graph, cache_manager, meta)
+
+    def _prefill_full(self, block, mlp_out, residual, layer_idx, graph, cache_manager, meta):
         sa = block.self_attn
         nh, kvh, hd = graph.num_heads, graph.kv_num_heads, graph.head_size
         q_dim = nh * hd
         kv_dim = kvh * hd
-        T = h.shape[0]
+        T = mlp_out.shape[0]
 
-        normed = rmsnorm1(h, block._in_ln_w, block._in_ln_eps)
+        # pre-attention norm：verify（_gdn_cp_enabled）用 fused（mean_sq 在 fp32
+        # mlp_out+residual 上算，对齐 decode compute_next_qkv→rmsnorm1_residual）；正常
+        # prefill 用 rmsnorm1(h_bf16)（mean_sq bf16，对齐 HF，行为不变）。layer 0
+        # （residual=None）：h=mlp_out（embed），无 residual 可加，用 rmsnorm1。
+        if residual is None:
+            normed = rmsnorm1(mlp_out, block._in_ln_w, block._in_ln_eps)
+            h = mlp_out
+        elif bool(getattr(graph, "_gdn_cp_enabled", False)):
+            normed, h = rmsnorm1_residual_fused(
+                mlp_out, residual, block._in_ln_w, block._in_ln_eps)
+        else:
+            h = mlp_out + residual
+            normed = rmsnorm1(h, block._in_ln_w, block._in_ln_eps)
         qkv = self._lin_prefill(normed, sa._qkv_w)  # [T, 2*q_dim+2*kv_dim]（[q|gate|k|v]）
         k_off = 2 * q_dim
         q = qkv[..., :q_dim].reshape(T, nh, hd).contiguous()
@@ -1018,27 +1042,46 @@ class Qwen3_5Adapter(ModelAdapter):
 
         normed, residual = rmsnorm1_residual_fused(out, h, block._post_ln_w, block._post_ln_eps)
         mlp_out = dense_swiglu(normed, block.mlp._gu, block.mlp._d, T, w_is_nk=True)
-        return mlp_out + residual
+        # 返回 (mlp_out, residual, R_L)：R_L 是下一层残差流。verify 用 fp32 add（对齐
+        # decode 非末层 rmsnorm1_residual 的 fp32 add→round bf16）；正常 prefill 用 bf16
+        # PyTorch add（对齐 HF，64-token HF 对齐不受影响）。
+        if bool(getattr(graph, "_gdn_cp_enabled", False)):
+            R_L = (mlp_out.float() + residual.float()).to(mlp_out.dtype)
+        else:
+            R_L = mlp_out + residual
+        return mlp_out, residual, R_L
 
-    def _prefill_gdn(self, block, h, graph, meta):
-        # 完整一层（对齐 _prefill_full / HF Qwen3_5DecoderLayer）：
-        #   residual = h
-        #   h = input_layernorm(h)          # 1-centered
-        #   h = GDN(h)                       # 投影+conv+recurrent+norm_gated+out_proj
-        #   h = residual + h
-        #   h = post_attention_layernorm(h)  # 1-centered
-        #   h = mlp(h)
-        #   h = residual + h
+    def _prefill_gdn(self, block, mlp_out, residual, graph, meta):
+        # 完整一层（对齐 _prefill_full / HF Qwen3_5DecoderLayer）。Bug #2 修复：层间传
+        # (mlp_out, residual) 分离，pre-attention norm 用 fused（mean_sq fp32，对齐 decode）。
+        #   h = mlp_out + residual          # 残差流（layer 0: h=mlp_out=embed）
+        #   normed = rmsnorm1_residual_fused(mlp_out, residual)  # pre-attn norm（fp32 mean_sq）
+        #   gdn_out = GDN(normed)
+        #   res_after_attn = h + gdn_out    # post-attn 残差
+        #   mlp_out_L = mlp(rmsnorm1_residual_fused(gdn_out, h))
+        #   返回 (mlp_out_L, res_after_attn, R_L)：R_L = mlp_out_L + res_after_attn（bf16）
         n_seqs = meta.n_seqs
         seq_idx = graph._gdn_prefill_seq_idx[:n_seqs]
         cu = meta.cu_seqlens_q
-        T = h.shape[0]
-        normed = rmsnorm1(h, block._in_ln_w, block._in_ln_eps)
+        T = mlp_out.shape[0]
+        if residual is None:
+            normed = rmsnorm1(mlp_out, block._in_ln_w, block._in_ln_eps)
+            h = mlp_out
+        else:
+            normed, h = rmsnorm1_residual_fused(
+                mlp_out, residual, block._in_ln_w, block._in_ln_eps)
         gdn_out = self._gdn_forward(block.linear_attn, normed, graph, T,
                                     is_decode=False, cu_seqlens=cu, seq_idx=seq_idx)
-        normed2, residual = rmsnorm1_residual_fused(gdn_out, h, block._post_ln_w, block._post_ln_eps)
-        mlp_out = dense_swiglu(normed2, block.mlp._gu, block.mlp._d, T, w_is_nk=True)
-        return mlp_out + residual
+        normed2, res_after_attn = rmsnorm1_residual_fused(
+            gdn_out, h, block._post_ln_w, block._post_ln_eps)
+        mlp_out_L = dense_swiglu(normed2, block.mlp._gu, block.mlp._d, T, w_is_nk=True)
+        # R_L 下一层残差流：verify 用 fp32 add（对齐 decode）；正常 prefill 用 bf16 PyTorch
+        # add（对齐 HF，64-token HF 对齐不受影响）。
+        if bool(getattr(graph, "_gdn_cp_enabled", False)):
+            R_L = (mlp_out_L.float() + res_after_attn.float()).to(mlp_out_L.dtype)
+        else:
+            R_L = mlp_out_L + res_after_attn
+        return mlp_out_L, res_after_attn, R_L
 
     # -------------------- buffer 分配 --------------------
     # GDN 状态池是【类级单例】：prefill runner 与 decode runner 是独立实例（各自
