@@ -17,6 +17,7 @@ from .model_loader import load_model
 from .layer.sampler import Sampler
 from .context import DecodeContext
 from .tp_comm import TPCommunicator
+from .warmup import Warmup
 
 from core.parallel_config import get_rank, setup, get_world_size, rank0
 from core.inference_context import BatchInferenceContext
@@ -178,6 +179,7 @@ class InferenceEngine:
         # 预热 sampler 编译路径（torch.compile reduce-overhead 首次调用每个 shape
         # 会捕获 CUDA Graph ~1-2s）。不预热时首个多 batch prefill/decode 会卡秒级。
         # 对所有 cap_sizes 用 temp>0 路径（触发 _compiled_sample）各跑一次。
+        self._warmup = Warmup(self)
         self._warmup_sampler(cap_sizes)
         # 预热 prefill eager 路径：cuBLAS/flash 首次跑每个 (B,S) shape 会选算法/编译，
         # 首个真实多 batch prefill 多耗 ~100-200ms。用短 dummy prompt 在主 batch size 跑一次。
@@ -240,69 +242,13 @@ class InferenceEngine:
                     f"mask_token={mask_token_id} draft={draft_model_path} "
                     f"verify_graph={'on' if self._spec_controller._verify_graph is not None else 'off(eager)'}")
 
+    # 初始化预热（sampler 编译路径 / prefill eager 路径）：实现抽到 core/warmup.py
+    # 的 Warmup 类，engine 保留薄调用。
     def _warmup_sampler(self, batch_sizes):
-        """对所有捕获的 batch_size 预热 sampler 编译路径，消除首次调用的 ~1-2s 捕获开销。
-
-        greedy（argmax）路径无编译开销；此处预热的是 temp>0 的 _compiled_sample 路径，
-        覆盖连续批处理下任意 batch_size 首次采样。"""
-        vocab = self.config.vocab_size
-        dtype = next(self.model.parameters()).dtype
-        for bs in batch_sizes:
-            fake_logits = torch.zeros(bs, vocab, dtype=dtype, device=self.device)
-            temps = torch.full((bs,), 0.01, device=self.device)
-            topp = torch.ones(bs, device=self.device)
-            rep = torch.ones(bs, device=self.device)
-            self.sampler(fake_logits, temps, topp, 1000,
-                         prev_tokens=None, rep_penalties=rep,
-                         all_greedy=False, any_rep_pen=False)
-        # 也预热 repetition-penalty 路径（bs=1 足矣，scatter 形状随 vocab 而靘认 prev_tokens 长度）
-        fake_logits = torch.zeros(1, vocab, dtype=dtype, device=self.device)
-        prev = torch.tensor([[0, 1, 2]], dtype=torch.long, device=self.device)
-        rep = torch.tensor([1.1], device=self.device)
-        self.sampler(fake_logits, torch.tensor([0.01], device=self.device),
-                     torch.ones(1, device=self.device), 1000,
-                     prev_tokens=prev, rep_penalties=rep,
-                     all_greedy=False, any_rep_pen=True)
+        self._warmup.warmup_sampler(batch_sizes)
 
     def _warmup_prefill(self, batch_sizes):
-        """预热 prefill eager 路径，消除 cuBLAS/flash 首次跑每个 (B,S) shape 的算法选择开销。
-
-        用极短 dummy prompt（~8 token）在代表性 batch size 跑一次 prefill+少量 decode，
-        然后立即释放这些 dummy seq 的 KV block。代表 batch 取 cap_sizes 中 ≤32 的若干档
-        （大 batch 算法选择与小 batch 同路径，无需每档都跑）。"""
-        # 选代表性 batch size：小 bs 密集测，大 bs 取一档（64）即可覆盖 cuBLAS 大矩阵路径。
-        warm_sizes = [b for b in batch_sizes if b <= 32]
-        if 64 in batch_sizes:
-            warm_sizes.append(64)
-        dummy_prompt = "warmup "  # ~2 token
-        sid_base = 10_000_000  # 避免与真实 seq_id 冲突
-        for bs in warm_sizes:
-            dummy_seqs = []
-            for i in range(bs):
-                seq = Sequence(sid_base + i, dummy_prompt, self.tokenizer, max_tokens=2)
-                seq.temperature = 0.01; seq.top_p = 1.0
-                if self.eos_token_id is not None:
-                    seq.eos_token_id = self.eos_token_id
-                self.scheduler.add_request(seq)
-                dummy_seqs.append(seq)
-            # 跑 prefill + 1 decode（触发该 batch_size 的 prefill GEMM/flash + decode graph replay）
-            for _ in range(20):
-                b, bt = self.get_next_batch()
-                if not b:
-                    break
-                ctx = BatchInferenceContext(len(b), bt, b)
-                self.step(ctx); self.collect(ctx); self.update_sequences(ctx.sequences)
-                if not self.scheduler.running_sequences and not self.scheduler.waiting_queue:
-                    break
-            # 清理 dummy seq 的 KV（释放 block）+ GDN 状态池 slot（幂等：已释放则 no-op）
-            for seq in dummy_seqs:
-                try:
-                    self.cache_manager.free(seq.seq_id)
-                except Exception:
-                    pass
-                self.adapter.on_seq_finished(seq)
-            self.scheduler.running_sequences.clear()
-            self.scheduler.finished_sequences.clear()
+        self._warmup.warmup_prefill(batch_sizes)
 
     def _init_distributed(self):
         setup()
