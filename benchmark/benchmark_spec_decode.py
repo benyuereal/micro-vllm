@@ -1,7 +1,7 @@
 """DFlash2 投机解码 engine 集成基准（Qwen3-0.6B 自起草）。
 
 验证 + 性能：
-1. 正确性：engine 的 SpecDecodeController（prepared 权重布局）投机解码输出
+1. 正确性：engine 的 SpecEngine（prepared 权重布局）投机解码输出
    与同权重 plain greedy（单 token/步，causal）逐 token 一致。
 2. 性能：单用户 decode 吞吐对比（投机解码 vs plain greedy），平均接受 token 数。
 
@@ -55,7 +55,7 @@ def main():
         args.model, max_batch_size=8, max_context_length=2048,
         spec_decode=True, draft_model_path=None,
         num_speculative_tokens=args.N, mask_token_id=args.mask_token)
-    ctrl = engine._spec_controller
+    ctrl = engine._spec_engine
     tokenizer = engine.tokenizer
     prompt_ids = tokenizer.encode(args.prompt, add_special_tokens=True)
     print(f"Prompt ({len(prompt_ids)} tokens): {args.prompt!r}")

@@ -73,7 +73,7 @@ def int8_gemm_triton(x, w_int8, scale, out=None):
 # ---------------------------------------------------------------------------
 # verify（M≤8）双后端分派
 # ---------------------------------------------------------------------------
-# 投机解码 verify forward（M=1+N≈8）开关：由 SpecDecodeController 在 verify 前后
+# 投机解码 verify forward（M=1+N≈8）开关：由 SpecEngine 在 verify 前后
 # 设置。开时 adapter._lin_prefill 把 group-128 int8 路由到 verify_int8_gemm
 # （TileLang 默认 / Triton 备选），权重 HBM 只读一次（shared 内 dequant→bf16 +
 # GEMM），比原 CUDA tiled GEMV 快 ~12x（mlp_gu 3.59ms→0.29ms）。

@@ -271,10 +271,13 @@ class DFlashAttention(nn.Module):
         self.rope_theta = rope_theta
         self._cos, self._sin = _build_rope_cache(head_dim, max_pos, rope_theta, device, dtype)
 
-    def forward(self, positions, hidden_states, context_kv=None):
+    def forward(self, positions, hidden_states, context_kv=None, attn_mask=None):
         """positions: [T] 绝对位置。hidden_states: [T, hidden]（1+N query token）。
         context_kv: 可选 (k_ctx [C, KV, D], v_ctx [C, KV, D])——target 中间层 hidden
         预计算的 context KV（DFlash2 核心：草稿 attention 读 context + query）。
+        attn_mask: 可选加性 mask [T, C+T]（0=有效, -inf=屏蔽）。用于 draft CUDA graph：
+        context KV 固定到长度 C（graph 需固定 shape），mask 屏蔽 [ctx_len:C) 的无效
+        context 位置（exp(-inf)=0，softmax 结果与只读 [ctx_len) 完全一致）。None=不 mask。
         返回 [T, hidden]。"""
         q = self.q_proj(hidden_states).view(-1, self.num_heads, self.head_dim)
         k = self.k_proj(hidden_states).view(-1, self.num_kv_heads, self.head_dim)
@@ -300,9 +303,12 @@ class DFlashAttention(nn.Module):
         n_rep = self.num_heads // self.num_kv_heads
         k = k.repeat_interleave(n_rep, dim=1)
         v = v.view(-1, self.num_kv_heads, self.head_dim).repeat_interleave(n_rep, dim=1)
+        # attn_mask（draft CUDA graph 用）：q/k/v 是 3D [H, T, D]（无 batch 维），
+        # 故 mask 保持 2D [T, C+T]（SDPA 自动广播到 head 维）。加性 mask 屏蔽位
+        # exp(-inf)=0，softmax 结果与只读 [ctx_len) 完全一致。
         attn = F.scaled_dot_product_attention(
             q.transpose(0, 1), k.transpose(0, 1), v.transpose(0, 1),
-            is_causal=False, scale=self.scaling,
+            is_causal=False, scale=self.scaling, attn_mask=attn_mask,
         )
         attn = attn.transpose(0, 1).reshape(-1, self.q_size)
         return self.o_proj(attn)
@@ -344,7 +350,7 @@ class DFlashDecoderLayer(nn.Module):
             self.attention_conv = DFlashGroupedConv(**conv_args)
             self.mlp_conv = DFlashGroupedConv(**conv_args)
 
-    def forward(self, positions, hidden_states, residual, context_kv=None):
+    def forward(self, positions, hidden_states, residual, context_kv=None, attn_mask=None):
         if residual is None:
             residual = hidden_states
             hidden_states = self.input_layernorm(hidden_states)
@@ -354,7 +360,7 @@ class DFlashDecoderLayer(nn.Module):
         if self.use_conv:
             hidden_states, coefficients = self.attention_conv.prepare(hidden_states)
         hidden_states = self.self_attn(positions=positions, hidden_states=hidden_states,
-                                       context_kv=context_kv)
+                                       context_kv=context_kv, attn_mask=attn_mask)
         if self.use_conv:
             hidden_states = self.attention_conv.finish(hidden_states, coefficients)
 
@@ -506,13 +512,16 @@ class DFlash2DraftModel(nn.Module):
             out_k[i, start:end].copy_(k)
             out_v[i, start:end].copy_(v)
 
-    def forward(self, input_ids, positions, input_embeds=None, context_kv=None):
+    def forward(self, input_ids, positions, input_embeds=None, context_kv=None,
+                attn_mask=None):
         """DFlash2 交叉注意力 forward。
 
         - query：input_embeds（[1+N, hidden]，= target embed_tokens([anchor]+[mask]*N)
           * input_embedding_scale）。input_embeds=None 时回退 embed_input_ids(input_ids)。
         - context：context_kv（每层 (k_ctx, v_ctx)），由 precompute_context_kv 从
           target aux hidden states（combine_hidden_states 后）投影产出。
+        - attn_mask：可选加性 mask [T, C+T]（draft CUDA graph 用，屏蔽固定 context
+          长度里 [ctx_len:C) 的无效位置）。None=不 mask。
 
         返回 last_hidden_states [1+N, hidden]。
         """
@@ -523,7 +532,8 @@ class DFlash2DraftModel(nn.Module):
         residual = None
         for i, layer in enumerate(self.layers):
             ckv = context_kv[i] if context_kv is not None else None
-            hidden_states, residual = layer(positions, hidden_states, residual, context_kv=ckv)
+            hidden_states, residual = layer(positions, hidden_states, residual,
+                                            context_kv=ckv, attn_mask=attn_mask)
         hidden_states, _ = self.norm(hidden_states, residual)
         return hidden_states
 

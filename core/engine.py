@@ -62,13 +62,13 @@ class InferenceEngine:
         self._init_distributed()
         self._init_model(model_path)
         self._init_config()
-        # 投机解码（DFlash2）配置。spec_decode=True 时构建 SpecDecodeController：
+        # 投机解码（DFlash2）配置。spec_decode=True 时构建 SpecEngine：
         #   draft_model_path=None → 自起草（草稿=目标模型，机制验证用）
         #   draft_model_path=路径 → 加载 DFlash2 小草稿模型（W8A16 目标就绪后端到端）
         self.spec_decode_enabled = spec_decode
         self.num_speculative_tokens = num_speculative_tokens
         self.mask_token_id = mask_token_id
-        self._spec_controller = None
+        self._spec_engine = None
 
         # 核心组件初始化
         self.device, self.dtype = self._auto_configure()
@@ -194,13 +194,13 @@ class InferenceEngine:
 
         # 投机解码控制器（DFlash2）。在 CUDA graph 捕获后构建（需 device/dtype 就绪）。
         if self.spec_decode_enabled:
-            self._build_spec_controller(draft_model_path)
+            self._build_spec_engine(draft_model_path)
 
         # 注册退出钩子
         atexit.register(self.shutdown)
 
-    def _build_spec_controller(self, draft_model_path: Optional[str]):
-        """构建 SpecDecodeController（Qwen3.8 GDN 混合模型适配版）。
+    def _build_spec_engine(self, draft_model_path: Optional[str]):
+        """构建 SpecEngine（Qwen3.8 GDN 混合模型适配版）。
 
         显存复用 engine 模型：不 load 27GB 新副本，控制器直接用 self.model /
         adapter / prefill_runner / cache_manager（权重已 prepare_weights，走 adapter
@@ -209,7 +209,7 @@ class InferenceEngine:
         draft_model_path=路径 → 加载 DFlash2 小草稿模型（load_dflash2_draft），
         其 embed_tokens / lm_head 从 engine 的 target 共享（同 vocab/hidden）。
         """
-        from core.spec_decode import SpecDecodeController
+        from core.spec_decode import SpecEngine
         device = self.device
         dtype = self.dtype
         if draft_model_path is None:
@@ -224,23 +224,31 @@ class InferenceEngine:
             self.adapter.embed(self.model), self.adapter.lm_head(self.model))
         mask_token_id = getattr(draft_cfg, "dflash_config", {}).get(
             "mask_token_id", self.mask_token_id)
-        self._spec_controller = SpecDecodeController(
+        self._spec_engine = SpecEngine(
             self, draft_model,
             num_speculative_tokens=self.num_speculative_tokens,
             mask_token_id=mask_token_id, max_len=self.max_position)
         # 预热：跑一次 dummy verify forward，触发所有层 verify int8 GEMM 的 TileLang
         # JIT 编译（~3s/shape × 64 层）+ kernel 初始化。放构建时做，否则首个真实请求
         # 被一次性编译拉低（实测首请求 23.7s vs 稳态 5.0s，差 ~18.5s 全在编译）。
-        self._spec_controller.warmup()
+        self._spec_engine.warmup()
         # verify 阶段（M=1+N 固定 shape）进 CUDA graph：warmup 后捕获一次，
         # 稳态 verify（非首步，GDN 初始状态从 checkpoint 读）走 replay。
-        # 捕获失败自动回退 eager（_verify_graph=None）。
+        # 捕获失败自动回退 eager（_verify_model_graph=None）。
         # MICRO_VERIFY_GRAPH=0 强制关 graph（A/B 对比用）。
         if os.environ.get("MICRO_VERIFY_GRAPH", "1") != "0":
-            self._spec_controller.capture_verify_graph()
+            self._spec_engine.capture_verify_model_graph()
+        # draft 模型单独 capture 一个 graph（与 verify graph 分开管理）：draft 是独立
+        # 小草稿模型（不碰 GDN 状态池/paged KV），forward 全固定 shape（query [1+N]），
+        # 仅 attention 读变长 context KV——用固定长度 C + attn_mask 屏蔽无效位进 graph。
+        # 捕获失败自动回退 eager（_draft_model_graph=None）。
+        # MICRO_DRAFT_GRAPH=0 强制关 graph（A/B 对比用）。
+        if os.environ.get("MICRO_DRAFT_GRAPH", "1") != "0":
+            self._spec_engine.capture_draft_model_graph()
         logger.info(f"投机解码控制器已构建: N={self.num_speculative_tokens} "
                     f"mask_token={mask_token_id} draft={draft_model_path} "
-                    f"verify_graph={'on' if self._spec_controller._verify_graph is not None else 'off(eager)'}")
+                    f"verify_graph={'on' if self._spec_engine._verify_model_graph is not None else 'off(eager)'} "
+                    f"draft_graph={'on' if self._spec_engine._draft_model_graph is not None else 'off(eager)'}")
 
     # 初始化预热（sampler 编译路径 / prefill eager 路径）：实现抽到 core/warmup.py
     # 的 Warmup 类，engine 保留薄调用。
@@ -518,7 +526,7 @@ class InferenceEngine:
         on_tokens: 可选回调，每提交一批 token 时调用（真流式用）。
         ignore_eos: True 时遇 EOS 不停（跑满 max_tokens），对齐 OpenAI/vllm bench 语义。
         """
-        if self._spec_controller is None:
+        if self._spec_engine is None:
             raise RuntimeError("投机解码未启用（构造时 spec_decode=True）")
         prompt_ids = self.tokenizer.encode(prompt, add_special_tokens=True)
         cap = self.max_position
@@ -527,7 +535,7 @@ class InferenceEngine:
         max_tokens = max(1, min(max_tokens, cap - len(prompt_ids)))
 
         t0 = time.time()
-        out_ids = self._spec_controller.generate(
+        out_ids = self._spec_engine.generate(
             prompt_ids, max_tokens, eos_token_id=self.eos_token_id,
             on_tokens=on_tokens, ignore_eos=ignore_eos)
         elapsed = time.time() - t0
@@ -536,8 +544,8 @@ class InferenceEngine:
         return {
             "text": text,
             "tokens": out_ids,
-            "avg_acceptance": self._spec_controller.avg_acceptance,
-            "num_steps": self._spec_controller.total_steps,
+            "avg_acceptance": self._spec_engine.avg_acceptance,
+            "num_steps": self._spec_engine.total_steps,
             "time_s": elapsed,
             "tok_s": len(out_ids) / elapsed if elapsed > 0 else 0.0,
         }
