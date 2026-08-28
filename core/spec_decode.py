@@ -29,7 +29,6 @@ KV cache（paged）：
 （draft==target argmax 则接受，首个不匹配处 bonus=target 预测）。单序列下与不开投机
 解码的贪心输出逐 token 一致。
 """
-import os
 from typing import List, Optional
 
 import torch
@@ -149,46 +148,6 @@ class SpecEngine:
         self.total_steps = 0
         self.total_generated = 0
 
-        # per-position 接受率诊断（MICRO_SPEC_POS_STATS=1 开启，默认关零开销）。
-        # 按上下文长度分档（short<512 / mid 512-1500 / long>=1500，ctx_len=kv_len-1）：
-        #   prefix[b][i] = 前缀接受到位置 i 的步数（accepted > i）
-        #   match[b][i]  = draft[i]==target[i] 的步数（含前缀已断的步，参考用）
-        self._pos_stats = None
-        if os.environ.get("MICRO_SPEC_POS_STATS", "0") == "1":
-            self._pos_stats = self._new_pos_stats()
-
-    def _new_pos_stats(self):
-        return {
-            "steps": 0,
-            "steps_b": {"short": 0, "mid": 0, "long": 0},
-            "prefix": {b: [0] * self.N for b in ("short", "mid", "long")},
-            "match": {b: [0] * self.N for b in ("short", "mid", "long")},
-        }
-
-    def _pos_bucket(self, ctx_len):
-        if ctx_len < 512:
-            return "short"
-        if ctx_len < 1500:
-            return "mid"
-        return "long"
-
-    def pos_stats_report(self):
-        """per-position 接受率报告（诊断用）。返回 dict：各档 prefix/match 接受率曲线。"""
-        if self._pos_stats is None:
-            return None
-        st = self._pos_stats
-        out = {"steps": st["steps"], "buckets": {}}
-        for b in ("short", "mid", "long"):
-            nb = st["steps_b"][b]
-            out["buckets"][b] = {
-                "steps": nb,
-                "prefix_rate": [st["prefix"][b][i] / nb if nb else 0.0
-                                for i in range(self.N)],
-                "match_rate": [st["match"][b][i] / nb if nb else 0.0
-                               for i in range(self.N)],
-            }
-        return out
-
     # ------------------------------------------------------------------
     # GDN 检查点 buffer
     # ------------------------------------------------------------------
@@ -283,46 +242,20 @@ class SpecEngine:
                 block_table=block_table, n_seqs=1,
                 max_seqlen_q=max_sq, max_seqlen_k=max_sk)
 
-            # Bug #2 修复：verify（gdn_checkpoint=True）层间保持 (mlp_out, residual) 分离
-            # （不预加 bf16），pre-attention norm 用 fused rmsnorm1_residual（mean_sq 在
-            # fp32 mlp_out+residual 上算，对齐 decode compute_next_qkv→rmsnorm1_residual）。
-            # 原 rmsnorm1(h_bf16) 在 bf16 舍入后 residual 上算 mean_sq → 1-ULP 差经 48 GDN
-            # 层×129 步累积 → margin1.75 翻转 → spec target 漂移进循环。prefill（M=P，
-            # gdn_checkpoint=False）走旧 prefill（h 完整残差流，rmsnorm1(h_bf16) 对齐 HF，
-            # 64-token HF 对齐不受影响）。
-            if gdn_checkpoint:
-                mlp_out = h  # layer 0：embed 输出
-                residual = None
-                for layer_idx in range(self.num_layers):
-                    block = self.blocks[layer_idx]
-                    mlp_out, residual, h = self.adapter.prefill_verify(
-                        block, mlp_out, residual, layer_idx, self.prefill_runner,
-                        self.cache_manager, meta)
-                    if collect_aux_from is not None and layer_idx in self.aux_index:
-                        ai = self.aux_index[layer_idx]
-                        if graph_mode:
-                            # 固定目的地（graph 安全）；replay 后拷到 aux_cache 正确偏移。
-                            self._aux_tmp[ai].copy_(h)
-                        else:
-                            start = collect_aux_from
-                            end = start + M
-                            if end <= self.max_len:
-                                self.aux_cache[ai, start:end].copy_(h)
-            else:
-                for layer_idx in range(self.num_layers):
-                    block = self.blocks[layer_idx]
-                    h = self.adapter.prefill(block, h, layer_idx, self.prefill_runner,
-                                             self.cache_manager, meta)
-                    if collect_aux_from is not None and layer_idx in self.aux_index:
-                        ai = self.aux_index[layer_idx]
-                        if graph_mode:
-                            # 固定目的地（graph 安全）；replay 后拷到 aux_cache 正确偏移。
-                            self._aux_tmp[ai].copy_(h)
-                        else:
-                            start = collect_aux_from
-                            end = start + M
-                            if end <= self.max_len:
-                                self.aux_cache[ai, start:end].copy_(h)
+            for layer_idx in range(self.num_layers):
+                block = self.blocks[layer_idx]
+                h = self.adapter.prefill(block, h, layer_idx, self.prefill_runner,
+                                         self.cache_manager, meta)
+                if collect_aux_from is not None and layer_idx in self.aux_index:
+                    ai = self.aux_index[layer_idx]
+                    if graph_mode:
+                        # 固定目的地（graph 安全）；replay 后拷到 aux_cache 正确偏移。
+                        self._aux_tmp[ai].copy_(h)
+                    else:
+                        start = collect_aux_from
+                        end = start + M
+                        if end <= self.max_len:
+                            self.aux_cache[ai, start:end].copy_(h)
 
             h = self.final_norm(h)
             if graph_mode:
@@ -761,8 +694,6 @@ class SpecEngine:
         self.total_accepted = 0
         self.total_steps = 0
         self.total_generated = 0
-        if self._pos_stats is not None:
-            self._pos_stats = self._new_pos_stats()
         self.aux_cache.zero_()
         self._ctx_kv_done = 0
 
@@ -822,17 +753,6 @@ class SpecEngine:
                     else:
                         break
                 bonus = t_cpu[accepted]
-                # per-position 诊断（MICRO_SPEC_POS_STATS=1）：本步 ctx_len=kv_len-1
-                if self._pos_stats is not None:
-                    st = self._pos_stats
-                    b = self._pos_bucket(kv_len - 1)
-                    st["steps"] += 1
-                    st["steps_b"][b] += 1
-                    for i in range(self.N):
-                        if d_cpu[i] == t_cpu[i]:
-                            st["match"][b][i] += 1
-                        if accepted > i:
-                            st["prefix"][b][i] += 1
 
                 # 4. 去 rollback：不再 copy_ 回 pool。记录 accepted，下一步 verify 的
                 #    GDN 初始状态直接读 checkpoint[accepted]（见上方 init_from_cp）。
