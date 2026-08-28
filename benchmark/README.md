@@ -8,14 +8,22 @@
 
 | 脚本 | 测什么 | 用法 |
 |:-----|:-------|:-----|
-| `benchmark1000_throughput.py` | **1000 请求连续批处理** micro vs nano 公平对比（同进程、同请求、同排空语义） | `python3 benchmark1000_throughput.py <N> <max_tokens> <micro\|nano\|both>` |
-| `benchmark_throuput.py` | **三方对比** micro vs vLLM 0.21.0 vs nano，128 in / 256 out，bs=1/32/64 聚合吞吐 | `python3 benchmark_throuput.py <micro\|vllm\|nano> <N>` |
-| `benchmark_single_user.py` | **单用户长上下文** 256 in / 768 out（合计 1024），7 轮中位数，单请求 wall time | `python3 benchmark_single_user.py <micro\|vllm\|nano>` |
+| `bench_throughput.py` | **统一吞吐基准**：`--n 1` 单用户长上下文（256 in / 768 out，7 轮中位数，单请求 wall time）；`--n N` N 请求连续批处理（全入队排空，聚合 tok/s + req/s + 完成数）。后端 micro / vllm / nano / all | 见下方"压测指令" |
+| `validate_spec_decode.py` | **spec 机制正确性验证**：DFlash2 草稿/验证/接受率逐层核对（保留，勿动） | `python3 benchmark/validate_spec_decode.py` |
+| `benchmark_spec_decode.py` | **engine 集成 spec 正确性 + 加速比**：整图 spec 路径 token 对齐 + 吞吐对比（保留，勿动） | `python3 benchmark/benchmark_spec_decode.py` |
 
-环境变量（可选）：`MODEL_PATH`（默认 `/models/Qwen3-0.6B`）、
+`bench_throughput.py` 参数：
+
+- `--n`：1 = 单用户模式（多轮中位数，tok/s = out/wall，含 prefill，口径三者一致）；N>1 = 批量模式（temp=0.6，ignore_eos 跑满随机 max_tokens）
+- `--in-tok` / `--out-tok` / `--rounds`：单用户模式输入/输出 token 数与轮数（默认 256 / 768 / 7）
+- `--max-tok`：批量模式随机 max_tokens 上限，实际取 [max-tok/2, max-tok]（默认 80）
+- `--max-batch`：micro 引擎 `max_batch_size`（决定 GDN 状态池大小，类级单例 pool=max_bs）。27B 在 44GiB 卡上 64/512 会 OOM（池 9GiB/70GiB + 权重/KV ~37GiB），默认 16；单用户 bs=1 足够，批量模式按并发需求调大
+- `--backend`：`micro`（InferenceEngine 直接驱动）/ `vllm`（vllm.LLM，仅单用户模式）/ `nano`（nanovllm）/ `all`（该模式支持的全部后端，独立子进程先后跑）
+
+环境变量（可选）：`MODEL_PATH`（默认 `/models/Qwen3.8-27B-INT8-W8A16-MTP`）、
 `NANO_VLLM_PATH`（默认 `/models/nano-vllm`）。
 
-## 最新基准数据（L20 / Qwen3-0.6B / bf16，2026-08-24）
+## 历史基准数据（L20 / Qwen3-0.6B / bf16，2026-08-24）
 
 ### 三方对比 · 批次吞吐（128 in / 256 out，temp=0.01）
 
@@ -50,20 +58,12 @@ micro 领先 +9.7%。
 ## 压测指令
 
 ```bash
-# 1000 请求连续批处理（micro / nano / both 同进程先后跑）
-CUDA_VISIBLE_DEVICES=1 python3 benchmark1000_throughput.py 1000 80 micro
-CUDA_VISIBLE_DEVICES=1 python3 benchmark1000_throughput.py 1000 80 nano
-CUDA_VISIBLE_DEVICES=1 python3 benchmark1000_throughput.py 1000 80 both
-
-# 三方对比 bs=1/32/64（128 in / 256 out，temp=0.01，ignore_eos 跑满）
-for f in micro vllm nano; do
-  for bs in 1 32 64; do
-    CUDA_VISIBLE_DEVICES=1 python3 benchmark_throuput.py $f $bs
-  done
-done
-
 # 单用户长上下文（256 in / 768 out，7 轮中位数）
-for f in micro vllm nano; do
-  CUDA_VISIBLE_DEVICES=1 python3 benchmark_single_user.py $f
-done
+CUDA_VISIBLE_DEVICES=1 python3 benchmark/bench_throughput.py --n 1 --backend micro
+CUDA_VISIBLE_DEVICES=1 python3 benchmark/bench_throughput.py --n 1 --backend all   # micro+vllm+nano 独立子进程
+
+# N 请求连续批处理（N=1000，max_tokens 40-80 随机）
+CUDA_VISIBLE_DEVICES=1 python3 benchmark/bench_throughput.py --n 1000 --max-tok 80 --backend micro
+CUDA_VISIBLE_DEVICES=1 python3 benchmark/bench_throughput.py --n 1000 --max-tok 80 --backend nano
+CUDA_VISIBLE_DEVICES=1 python3 benchmark/bench_throughput.py --n 1000 --max-tok 80 --backend all
 ```
