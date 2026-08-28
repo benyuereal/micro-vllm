@@ -1016,50 +1016,26 @@ class Qwen3_5Adapter(ModelAdapter):
         k = qkv[..., k_off:k_off + kv_dim].reshape(T, kvh, hd).contiguous()
         v = qkv[..., k_off + kv_dim:].reshape(T, kvh, hd).contiguous()
 
+        q = rmsnorm1(q, sa._q_norm_w, sa._q_norm_eps)
+        k = rmsnorm1(k, sa._k_norm_w, sa._k_norm_eps)
+
         # partial RoPE：Triton in-place（前 rot 维 half-split，rot 后不动），替代 PyTorch
         # 的 cos/sin gather + 4 slice + 4 mul + 2 add + 2 cat（每张量 ~12 小 kernel）。
         cos_pool = graph.attention._cos_pool
         sin_pool = graph.attention._sin_pool
         pos = meta.position_ids.long()
-        if bool(getattr(graph, "_gdn_cp_enabled", False)):
-            # spec verify：用 decode 同款 fused qk_norm+rope（fp32 norm 贯穿 RoPE），
-            # 对齐 decode 路径（_attention_full_decode 用 qk_norm_rope_partial_inplace）。
-            # 原 rmsnorm1 先把 normed q/k round 到 bf16 再 rope，比 decode 多一次 bf16
-            # 舍入 → per-step 微差经 16 full-attn 残差 + GDN 递归放大 → spec target 漂移。
-            qk_norm_rope_partial_inplace(q, T, 0, nh, hd, sa._q_norm_w,
-                                         cos_pool, sin_pool, pos, sa._q_norm_eps)
-            qk_norm_rope_partial_inplace(k, T, 0, kvh, hd, sa._k_norm_w,
-                                         cos_pool, sin_pool, pos, sa._k_norm_eps)
-        else:
-            q = rmsnorm1(q, sa._q_norm_w, sa._q_norm_eps)
-            k = rmsnorm1(k, sa._k_norm_w, sa._k_norm_eps)
-            rope_partial_inplace(q, cos_pool, sin_pool, pos)
-            rope_partial_inplace(k, cos_pool, sin_pool, pos)
+        rope_partial_inplace(q, cos_pool, sin_pool, pos)
+        rope_partial_inplace(k, cos_pool, sin_pool, pos)
 
         k_cache, v_cache = cache_manager.get(layer_idx)
         store_kvcache(k, v, k_cache, v_cache, meta.slot_mapping)
-        # verify（_gdn_cp_enabled=True，M=1+N 小）：用 flash_attn_with_kvcache 对齐 decode
-        # 路径（decode 用 with_kvcache seqlen=1）。varlen 与 with_kvcache 是不同 kernel，
-        # bf16 累加顺序不同 → per-step 微差经 GDN 递归放大 ~129 步 → spec target 漂移进
-        # 退化循环 → acc 崩塌。M 个 query 是序列末尾 M 个位置，cache_seqlens=kv_len-1+M，
-        # causal=True 时 query j 读 KV[0, kv_len-1+j]，与 varlen 的 causal mask 一致。
-        if bool(getattr(graph, "_gdn_cp_enabled", False)):
-            cache_seqlens = meta.cu_seqlens_k[1:2]  # [1] int32 = kv_len-1+M
-            attn = flash_attn_with_kvcache(
-                q=q.unsqueeze(0),  # [1, M, nh, hd]
-                k_cache=k_cache, v_cache=v_cache,
-                cache_seqlens=cache_seqlens, block_table=meta.block_table,
-                causal=True, window_size=(-1, -1), alibi_slopes=None,
-                num_splits=0,
-            ).squeeze(0)  # [M, nh, hd]
-        else:
-            attn = flash_attn_varlen_func(
-                q=q, k=k_cache, v=v_cache,
-                cu_seqlens_q=meta.cu_seqlens_q, cu_seqlens_k=meta.cu_seqlens_k,
-                max_seqlen_q=meta.max_seqlen_q, max_seqlen_k=meta.max_seqlen_k,
-                softmax_scale=hd ** -0.5, causal=True,
-                block_table=meta.block_table,
-            )
+        attn = flash_attn_varlen_func(
+            q=q, k=k_cache, v=v_cache,
+            cu_seqlens_q=meta.cu_seqlens_q, cu_seqlens_k=meta.cu_seqlens_k,
+            max_seqlen_q=meta.max_seqlen_q, max_seqlen_k=meta.max_seqlen_k,
+            softmax_scale=hd ** -0.5, causal=True,
+            block_table=meta.block_table,
+        )
         # attn_output_gate：Triton in-place（attn *= sigmoid(gate)），替代 sigmoid+cast+mul。
         attn_gate_inplace(attn, gate)
         out = self._lin_prefill(attn.reshape(T, -1), sa._o_w)
