@@ -32,7 +32,7 @@ import torch
 import triton
 import triton.language as tl
 
-from models.base import ModelAdapter
+from models.gqa_base import GQAAdapter
 from kernel.rmsnorm import (
     rmsnorm1, rmsnorm1_, rmsnorm1_residual_gemm as rmsnorm1_residual,
     rmsnorm1_residual_fused,
@@ -428,7 +428,7 @@ def attn_gate_inplace(attn, gate):
 # Adapter
 # =====================================================================
 
-class Qwen3_5Adapter(ModelAdapter):
+class Qwen3_5Adapter(GQAAdapter):
     model_type = "qwen3_5"
 
     # full attention 层走 prerope+store+pure-flash（slot_mapping/flash_seqlens 由
@@ -516,10 +516,6 @@ class Qwen3_5Adapter(ModelAdapter):
 
     def supports_chunked_prefill(self, cfg) -> bool:
         return True
-
-    @staticmethod
-    def _ln_eps(ln, cfg):
-        return getattr(ln, "eps", None) or getattr(ln, "variance_epsilon", cfg.rms_norm_eps)
 
     # -------------------- W8A16 统一线性分派 --------------------
     def _q(self, w):
@@ -667,6 +663,50 @@ class Qwen3_5Adapter(ModelAdapter):
             w = (w_int8.float() * sc).to(x.dtype)
         return torch.matmul(x, w.t())
 
+    # -------------------- 虚方法 override：norm 变体（1-centered） --------------------
+    def _norm_inplace(self, h, w, out, eps):
+        """Qwen3.5：1-centered RMSNorm（out = x*rrms*(1+w)）。"""
+        rmsnorm1_(h, w, out, eps)
+
+    def _norm_residual(self, x, res, w, out_normed, out_residual, eps):
+        """Qwen3.5：1-centered RMSNorm(x+residual) 贴边融合。"""
+        rmsnorm1_residual(x, res, w, out_normed, out_residual, eps)
+
+    # -------------------- 虚方法 override：GDN 分支 --------------------
+    def _block_is_gdn(self, block) -> bool:
+        return block._is_gdn
+
+    def _attention_gdn_decode(self, h_normed, block, bs, graph):
+        # on_decode_batch 已填 graph._gdn_seq_idx + graph._gdn_is_real（常驻 buffer，
+        # graph 安全）。kernel 读 is_real 跳过 pad 行（不重复更新状态）。
+        return self._gdn_forward(block.linear_attn, h_normed, graph, bs,
+                                 is_decode=True)
+
+    # -------------------- 虚方法 override：qkv 布局 / QK-Norm+RoPE / attn gate --------------------
+    def _qkv_dim(self, model) -> int:
+        # 权重可能是 Marlin dict（无 .shape），按 config 计算：[q|gate|k|v]。
+        tc = self._tcfg
+        return (tc.num_attention_heads * tc.head_dim * 2
+                + 2 * tc.num_key_value_heads * tc.head_dim)
+
+    def _k_offset(self, graph) -> int:
+        # qkv 布局 [q|gate|k|v]：k 段偏移 2*q_dim（gate 占 q_dim 宽）。
+        return 2 * graph.num_heads * graph.head_size
+
+    def _qk_norm_rope(self, qkv, bs, seg_offset, num_heads, head_size,
+                      norm_w, cos_pool, sin_pool, cache_lens, eps):
+        """Qwen3.5：1-centered QK-Norm + partial RoPE（前 rot 维 half-split）。"""
+        qk_norm_rope_partial_inplace(
+            qkv, bs, seg_offset, num_heads, head_size, norm_w,
+            cos_pool, sin_pool, cache_lens, eps)
+
+    def _apply_attn_gate(self, attn, qkv, graph, bs):
+        # attn_output_gate：gate = q_proj 后半（qkv[:, q_dim:2*q_dim]）。
+        # Triton in-place（attn *= sigmoid(gate)），替代 sigmoid+cast+mul 三个 elementwise kernel。
+        q_dim = graph.num_heads * graph.head_size
+        gate = qkv[:, q_dim:2 * q_dim].view(bs, graph.num_heads, graph.head_size)
+        attn_gate_inplace(attn, gate)
+
     # -------------------- 权重预处理 --------------------
     def prepare_weights(self, model, world_size, rank):
         blocks = self.blocks(model)
@@ -733,20 +773,16 @@ class Qwen3_5Adapter(ModelAdapter):
                 attn._k_norm_w = attn.k_norm.weight.data.clone()
                 attn._q_norm_eps = self._ln_eps(attn.q_norm, cfg)
                 attn._k_norm_eps = self._ln_eps(attn.k_norm, cfg)
-                attn.q_proj = attn.k_proj = attn.v_proj = attn.o_proj = None
-                attn.q_norm = attn.k_norm = None
+                self._release_attn(attn)
 
             mlp = block.mlp
             w_up = self._unpack_linear(mlp.up_proj, world_size, rank)
             w_gate = self._unpack_linear(mlp.gate_proj, world_size, rank)
             mlp._gu = self._store_w(self._q(self._cat_w([w_up, w_gate])))
             mlp._d = self._store_w(self._q(self._unpack_linear(mlp.down_proj, world_size, rank, chunk_dim=1)))
-            mlp.gate_proj = mlp.up_proj = mlp.down_proj = None
+            self._release_mlp(mlp)
 
-            block._in_ln_w = block.input_layernorm.weight.data.clone()
-            block._in_ln_eps = self._ln_eps(block.input_layernorm, cfg)
-            block._post_ln_w = block.post_attention_layernorm.weight.data.clone()
-            block._post_ln_eps = self._ln_eps(block.post_attention_layernorm, cfg)
+            self._prepare_ln(block, cfg)
             block._is_gdn = is_gdn
             block._prepared = True
         torch.cuda.empty_cache()
@@ -888,86 +924,11 @@ class Qwen3_5Adapter(ModelAdapter):
         self._lin(og, la._o_w, out, "MICRO_GEMV_GDN")
         return out
 
-    # -------------------- decode 单层钩子 --------------------
-    def compute_qkv(self, block, h, graph, bs):
-        rmsnorm1_(h, block._in_ln_w, graph._h_buf[:bs], block._in_ln_eps)
-        if block._is_gdn:
-            return graph._h_buf[:bs]
-        attn = block.self_attn
-        qkv_buf = graph._qkv[:bs]
-        self._lin(graph._h_buf[:bs], attn._qkv_w, qkv_buf, "MICRO_GEMV_QKV")
-        return qkv_buf
-
-    def compute_next_qkv(self, block_next, mlp_out_prev, res_prev, graph, bs):
-        # 返回 (attn_input, residual)：decode 循环 `qkv, h = compute_next_qkv(...)` 解包两值。
-        # GDN 层 attn_input = 归一化后的 h（投影延迟到 attention 内做）；full 层 = 投影后 qkv。
-        rmsnorm1_residual(
-            mlp_out_prev, res_prev, block_next._in_ln_w,
-            graph._h_buf[:bs], graph._residual[:bs], block_next._in_ln_eps
-        )
-        if block_next._is_gdn:
-            return graph._h_buf[:bs], graph._residual[:bs]
-        attn = block_next.self_attn
-        qkv_buf = graph._qkv[:bs]
-        self._lin(graph._h_buf[:bs], attn._qkv_w, qkv_buf, "MICRO_GEMV_QKV")
-        return qkv_buf, graph._residual[:bs]
-
-    def attention(self, attn_input, block, layer_idx, bs, graph, cache_manager, block_table):
-        if block._is_gdn:
-            return self._attention_gdn_decode(attn_input, block, bs, graph)
-        return self._attention_full_decode(attn_input, block, layer_idx, bs,
-                                           graph, cache_manager, block_table)
-
-    def _attention_full_decode(self, qkv, block, layer_idx, bs, graph,
-                               cache_manager, block_table):
-        sa = block.self_attn
-        nh, kvh, hd = graph.num_heads, graph.kv_num_heads, graph.head_size
-        q_dim = nh * hd
-        kv_dim = kvh * hd
-        k_off = 2 * q_dim  # [q | gate | k | v]
-        cache_lens = cache_manager._cache_seqlens_buffer[:bs]
-
-        qk_norm_rope_partial_inplace(
-            qkv, bs, 0, nh, hd, sa._q_norm_w,
-            graph.attention._cos_pool, graph.attention._sin_pool, cache_lens, sa._q_norm_eps)
-        qk_norm_rope_partial_inplace(
-            qkv, bs, k_off, kvh, hd, sa._k_norm_w,
-            graph.attention._cos_pool, graph.attention._sin_pool, cache_lens, sa._k_norm_eps)
-
-        q = qkv[:, :q_dim].view(bs, nh, hd)
-        k = qkv[:, k_off:k_off + kv_dim].view(bs, kvh, hd)
-        v = qkv[:, k_off + kv_dim:].view(bs, kvh, hd)
-
-        k_cache, v_cache = cache_manager.get(layer_idx)
-        store_kvcache(k, v, k_cache, v_cache, graph._slot_mapping[:bs])
-        attn = flash_attn_with_kvcache(
-            q=q.unsqueeze(1), k_cache=k_cache, v_cache=v_cache,
-            cache_seqlens=graph._flash_seqlens[:bs], block_table=block_table,
-            causal=True, window_size=(-1, -1), alibi_slopes=None,
-            num_splits=0 if bs == 1 else (0 if bs >= 32 else max(1, 32 // max(1, bs * 4)))
-        ).squeeze(1)
-
-        # attn_output_gate：gate = q_proj 后半（qkv[:, q_dim:2*q_dim]）
-        # Triton in-place（attn *= sigmoid(gate)），替代 sigmoid+cast+mul 三个 elementwise kernel。
-        gate = qkv[:, q_dim:2 * q_dim].view(bs, nh, hd)
-        attn_gate_inplace(attn, gate)
-
-        out_buf = graph._attn_out[:bs]
-        return self._lin(attn.reshape(bs, -1), sa._o_w, out_buf, "MICRO_GEMV_O")
-
-    def _attention_gdn_decode(self, h_normed, block, bs, graph):
-        # on_decode_batch 已填 graph._gdn_seq_idx + graph._gdn_is_real（常驻 buffer，
-        # graph 安全）。kernel 读 is_real 跳过 pad 行（不重复更新状态）。
-        return self._gdn_forward(block.linear_attn, h_normed, graph, bs,
-                                 is_decode=True)
-
-    def compute_ffn(self, block, attn_out, residual, graph, bs):
-        rmsnorm1_residual(
-            attn_out, residual, block._post_ln_w,
-            graph._h_buf[:bs], graph._residual[:bs], block._post_ln_eps
-        )
-        mlp_out = dense_swiglu(graph._h_buf[:bs], block.mlp._gu, block.mlp._d, bs, w_is_nk=True)
-        return mlp_out, graph._residual[:bs]
+    # 注：compute_qkv / compute_next_qkv / attention / compute_ffn 的公共骨架
+    # （norm + 投影 + swiglu，GDN 分支经 _block_is_gdn/_attention_gdn_decode 虚方法）
+    # 已抽到 GQAAdapter（models/gqa_base.py）。本类 override 的虚方法：
+    #   _norm_inplace/_norm_residual（1-centered）、_block_is_gdn、_attention_gdn_decode、
+    #   _qkv_dim、_k_offset、_qk_norm_rope（partial）、_apply_attn_gate、_lin/_lin_prefill（int8/Marlin）。
 
     # -------------------- prefill 单层钩子 --------------------
     def prefill(self, block, h, layer_idx, graph, cache_manager, meta):
