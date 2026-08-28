@@ -6,7 +6,6 @@ from typing import Dict, List
 from core.paged_attention import PagedAttention
 from kernel.rmsnorm import rmsnorm_, rmsnorm1_
 from kernel.rotary import compute_slot_mapping
-from .rope import RoPE
 from core.parallel_config import get_rank, get_world_size, all_reduce
 from models import build_adapter
 import torch._dynamo
@@ -63,7 +62,6 @@ class ModelGraphRunner:
                                         max_blocks=max_blocks_for_pool,
                                         rope_dim=self.adapter.rope_dim(model.config),
                                         rope_theta=self.adapter.rope_theta(model.config))
-        self.rope = RoPE()
 
         # 初始化
         self.adapter.prepare_weights(self.model, self.world_size, self.rank)

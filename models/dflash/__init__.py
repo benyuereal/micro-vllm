@@ -6,9 +6,7 @@
   （predecessor/successor codebook 边打分）。
 - 权重从 HF safetensors 直接加载（AutoModelForCausalLM 不认识 DFlash2DraftModel
   架构，需手动映射）。
-- 自起草模式（self-draft）：草稿模型 = 目标模型本身（如 Qwen3-0.6B），
-  无 conv/selector，直接对 1+N 个 query token 做非因果 forward 后 argmax。
 """
-from .draft_model import DFlash2DraftModel, load_dflash2_draft, SelfDraftModel
+from .draft_model import DFlash2DraftModel, load_dflash2_draft
 
-__all__ = ["DFlash2DraftModel", "load_dflash2_draft", "SelfDraftModel"]
+__all__ = ["DFlash2DraftModel", "load_dflash2_draft"]

@@ -11,8 +11,6 @@
 
 本文件实现：
 - DFlash2DraftModel：完整 DFlash2 草稿模型（conv + selector + 5 层 sliding attn）。
-- SelfDraftModel：自起草模式（草稿=目标模型本身，无 conv/selector），用于
-  Qwen3-0.6B 机制正确性验证。
 - load_dflash2_draft：从 HF safetensors 加载 DFlash2 权重。
 
 注意：本文件只做模型定义与权重加载，不涉及 KV cache / paged attention。
@@ -316,7 +314,7 @@ class DFlashAttention(nn.Module):
 
     def project_kv(self, hidden_states, positions):
         """hidden_states [C, hidden]（context token）→ (k [C, KV, D], v [C, KV, D])。
-        用于 precompute_context_kv：target 中间层 hidden 投影成草稿 context KV。"""
+        用于 fill_context_kv：target 中间层 hidden 投影成草稿 context KV。"""
         k = self.k_proj(hidden_states).view(-1, self.num_kv_heads, self.head_dim)
         v = self.v_proj(hidden_states).view(-1, self.num_kv_heads, self.head_dim)
         k = self.k_norm(k)
@@ -400,7 +398,7 @@ class DFlash2DraftModel(nn.Module):
     - 每步 query = 1+N token（bonus + N mask），经【共享 embed_tokens】得 query hidden，
       过 5 层 sliding-window 非因果 decoder。
     - context KV：target 中间层 hidden（target_layer_ids）拼接 → fc → hidden_norm →
-      各层 k/v proj + k_norm + RoPE（precompute_context_kv）。草稿 query attention
+      各层 k/v proj + k_norm + RoPE（fill_context_kv）。草稿 query attention
       读 context + 本步 query（非因果）。
     - 候选：草稿 mask 位置 hidden → 【共享 lm_head】→ top_k 候选 → selector 边打分
       → 贪心 walk 选一条连贯路径（select_draft_tokens）。
@@ -408,7 +406,7 @@ class DFlash2DraftModel(nn.Module):
     forward(input_ids, positions, context_kv, input_embeds) -> last_hidden_states [T, hidden]
       - input_ids: [T]（1+N query token：bonus + N mask）
       - positions: [T] 绝对位置
-      - context_kv: 可选 list（每层 (k_ctx, v_ctx)），由 precompute_context_kv 产出
+      - context_kv: 可选 list（每层 (k_ctx, v_ctx)），由 fill_context_kv 产出
       - input_embeds: 可选 [T, hidden]（= 共享 embed_tokens(input_ids)）；缺省自算
     """
 
@@ -511,27 +509,14 @@ class DFlash2DraftModel(nn.Module):
 
     def combine_hidden_states(self, aux_hidden_states):
         """target 中间层 hidden 拼接 [C, num_aux*target_hidden] → fc → [C, hidden]。
-        （hidden_norm 在 precompute_context_kv 里做，对齐 vLLM。）"""
+        （hidden_norm 在 fill_context_kv 里做，对齐 vLLM。）"""
         if not self.use_aux_hidden_state:
             return aux_hidden_states
         return self.fc(aux_hidden_states)
 
-    def precompute_context_kv(self, context_states, context_positions):
-        """DFlash2 核心：context hidden（fc 投影后 [C, hidden]）→ hidden_norm →
-        各层 k/v proj + k_norm + RoPE，供草稿 attention 读取。
-
-        context_states: [C, hidden]（combine_hidden_states 输出）
-        context_positions: [C] 绝对位置
-        返回 list of (k [C, KV, D], v [C, KV, D])，每层一个。
-        """
-        if self.use_aux_hidden_state:
-            context_states = self.hidden_norm(context_states)
-        return [layer.self_attn.project_kv(context_states, context_positions)
-                for layer in self.layers]
-
     def fill_context_kv(self, context_states, context_positions, out_k, out_v,
                         start, end):
-        """增量版 precompute_context_kv：只算 [start,end) 这段 context 的 KV，直接写进
+        """增量版 context KV 填充：只算 [start,end) 这段 context 的 KV，直接写进
         常驻 buffer（不建临时 list、不 cat）。hidden_norm/project_kv 都是 per-token
         （RMSNorm 按行、proj/norm/RoPE 按行），故 [start,end) 的切片结果 == 全量结果的
         [start,end) 切片，增量写与全量重算逐元素一致（数值等价）。
@@ -553,7 +538,7 @@ class DFlash2DraftModel(nn.Module):
 
         - query：input_embeds（[1+N, hidden]，= target embed_tokens([anchor]+[mask]*N)
           * input_embedding_scale）。input_embeds=None 时回退 embed_input_ids(input_ids)。
-        - context：context_kv（每层 (k_ctx, v_ctx)），由 precompute_context_kv 从
+        - context：context_kv（每层 (k_ctx, v_ctx)），由 fill_context_kv 从
           target aux hidden states（combine_hidden_states 后）投影产出。
         - attn_mask：可选加性 mask [T, C+T]（draft CUDA graph 用，屏蔽固定 context
           长度里 [ctx_len:C) 的无效位置）。None=不 mask。
@@ -609,99 +594,6 @@ class DFlash2DraftModel(nn.Module):
             draft[:, step] = candidate_ids[arange, step, idx]
             previous = idx
         return draft
-
-
-# ---------------------------------------------------------------------------
-# 自起草模型（草稿=目标模型本身，用于 Qwen3-0.6B 机制验证）
-# ---------------------------------------------------------------------------
-class SelfDraftModel(nn.Module):
-    """自起草：直接复用目标模型的 decoder 层做非因果 forward。
-
-    与 DFlash2 的区别：无 conv/selector/aux_hidden_state，输入就是 input_ids 的
-    embedding。forward 对 1+N 个 query token 做非因果 attention（每个 token 能看到
-    全部 1+N 个），返回 last_hidden_states。
-
-    注意：这里用目标模型的权重，但 attention 是非因果的（草稿语义）。目标模型
-    的 q/k/v/o/norm/mlp 权重直接复用。
-    """
-
-    def __init__(self, target_model, cfg, dtype, device, num_speculative_tokens, max_pos=4096):
-        super().__init__()
-        self.cfg = cfg
-        self.dtype = dtype
-        self.vocab_size = cfg.vocab_size
-        self.hidden_size = cfg.hidden_size
-        self.num_layers = cfg.num_hidden_layers
-        self.block_size = 1 + num_speculative_tokens
-
-        rope_theta = getattr(cfg, "rope_theta", 1000000)
-        self.embed_tokens = target_model.model.embed_tokens
-        self.norm = RMSNorm(cfg.hidden_size, eps=cfg.rms_norm_eps, dtype=dtype)
-        self.norm.weight.data = target_model.model.norm.weight.data.clone()
-        # 复用目标模型的层权重，但包一层非因果 attention
-        self.layers = nn.ModuleList([
-            _SelfDraftLayer(target_model.model.layers[i], cfg, dtype, device, rope_theta, max_pos)
-            for i in range(self.num_layers)
-        ])
-        self.lm_head = target_model.lm_head
-
-    def forward(self, input_ids, positions, aux_hidden_states=None):
-        hidden_states = self.embed_tokens(input_ids)
-        residual = None
-        for layer in self.layers:
-            hidden_states, residual = layer(positions, hidden_states, residual)
-        hidden_states, _ = self.norm(hidden_states, residual)
-        return hidden_states
-
-    def compute_candidates(self, hidden_states):
-        logits = self.lm_head(hidden_states)
-        top_k = 1
-        unary_logits, candidate_ids = torch.topk(logits, top_k, dim=-1)
-        return candidate_ids.squeeze(-1), unary_logits.squeeze(-1)
-
-    def select_draft_tokens(self, hidden_states, anchor_token_ids):
-        """自起草：每个 mask 位置直接 argmax。hidden_states [num_reqs, N, hidden]。"""
-        num_reqs, N, _ = hidden_states.shape
-        logits = self.lm_head(hidden_states)
-        return logits.argmax(dim=-1)  # [num_reqs, N]
-
-
-class _SelfDraftLayer(nn.Module):
-    """复用目标模型一层的权重，但 attention 改为非因果。"""
-
-    def __init__(self, target_block, cfg, dtype, device, rope_theta, max_pos):
-        super().__init__()
-        self.target_block = target_block
-        self.self_attn = DFlashAttention(
-            cfg.hidden_size, cfg.num_attention_heads, cfg.num_key_value_heads,
-            cfg.head_dim, cfg.rms_norm_eps, None, rope_theta, max_pos, dtype, device,
-        )
-        # 拷贝目标模型权重
-        sa = self.self_attn
-        tb = target_block.self_attn
-        sa.q_proj.weight.data = tb.q_proj.weight.data.clone()
-        sa.k_proj.weight.data = tb.k_proj.weight.data.clone()
-        sa.v_proj.weight.data = tb.v_proj.weight.data.clone()
-        sa.o_proj.weight.data = tb.o_proj.weight.data.clone()
-        sa.q_norm.weight.data = tb.q_norm.weight.data.clone()
-        sa.k_norm.weight.data = tb.k_norm.weight.data.clone()
-        self.mlp = target_block.mlp
-        # HF RMSNorm 不支持 fused residual，用本文件 RMSNorm 包一层并拷贝权重
-        self.input_layernorm = RMSNorm(cfg.hidden_size, eps=cfg.rms_norm_eps, dtype=dtype)
-        self.input_layernorm.weight.data = target_block.input_layernorm.weight.data.clone()
-        self.post_attention_layernorm = RMSNorm(cfg.hidden_size, eps=cfg.rms_norm_eps, dtype=dtype)
-        self.post_attention_layernorm.weight.data = target_block.post_attention_layernorm.weight.data.clone()
-
-    def forward(self, positions, hidden_states, residual):
-        if residual is None:
-            residual = hidden_states
-            hidden_states = self.input_layernorm(hidden_states)
-        else:
-            hidden_states, residual = self.input_layernorm(hidden_states, residual)
-        hidden_states = self.self_attn(positions=positions, hidden_states=hidden_states)
-        hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
-        hidden_states = self.mlp(hidden_states)
-        return hidden_states, residual
 
 
 # ---------------------------------------------------------------------------

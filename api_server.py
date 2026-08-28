@@ -22,7 +22,6 @@ from core.engine import InferenceEngine
 from core.inference_context import BatchInferenceContext
 from core.model_loader import get_model_path_from_cli
 from core.parallel_config import get_rank, rank0, setup
-from core.sequence import Sequence
 
 # 全局变量
 engine: Optional[InferenceEngine] = None

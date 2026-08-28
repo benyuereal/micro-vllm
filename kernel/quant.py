@@ -16,9 +16,3 @@ def quantize_per_channel(w: torch.Tensor):
     scale = amax / 127.0                                       # [N,1]
     w_int8 = torch.round(w / scale).clamp(-127, 127).to(torch.int8)
     return w_int8, scale.squeeze(1).contiguous()               # scale [N]
-
-
-def dequantize_per_channel(w_int8: torch.Tensor, scale: torch.Tensor,
-                           dtype=torch.bfloat16) -> torch.Tensor:
-    """w_int8 [N,K] + scale [N] → w [N,K] dtype。"""
-    return (w_int8.float() * scale.unsqueeze(1)).to(dtype)

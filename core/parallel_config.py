@@ -136,8 +136,3 @@ def register_graph_buffers():
     ca = _ctx.custom_ar
     if ca is not None and not ca.disabled:
         ca.register_graph_buffers()
-
-def barrier():
-    if get_world_size() > 1 and dist.is_initialized():
-        # 新增：指定默认group为WORLD，避免parallel_group为None时报错
-        dist.barrier(group=get_group() or dist.group.WORLD)

@@ -489,45 +489,6 @@ class InferenceEngine:
         self.launch(ctx)
         self.cache_manager.commit(ctx.batch_size)
 
-    def generate(self, prompts: List[str], max_tokens: int = 100,
-                 temperature: float = 0.7, top_p: float = 0.9,
-                 repetition_penalty: float = 1.0, stop=None) -> Dict[str, str]:
-        seq_ids = [self.add_request(p, max_tokens, temperature=temperature, top_p=top_p,
-                                    repetition_penalty=repetition_penalty, stop=stop) for p in prompts]
-        seq_map = {sid: p for sid, p in zip(seq_ids, prompts)}
-        # 清理上轮残留的已完成序列，避免 get_finished_results 返回过期 seq 导致 KeyError
-        self.scheduler.finished_sequences.clear()
-
-        # 简易事件循环（对齐 api_server 的 rank0 推理循环语义）
-        for _ in range(max_tokens * len(prompts) + 64):  # 安全上限
-            batch, batch_type = self.get_next_batch()
-
-            # waiting：请求未攒够批次，等 prefill_timeout 到期再调度
-            if batch_type == "waiting" or not batch:
-                if not self.scheduler.running_sequences and not self.scheduler.waiting_queue:
-                    break
-                time.sleep(0.001)
-                continue
-
-            ctx = BatchInferenceContext(len(batch), batch_type, batch)
-            self.step(ctx)
-            self.collect(ctx)
-            self.update_sequences(ctx.sequences)
-
-            if not self.scheduler.running_sequences and not self.scheduler.waiting_queue:
-                break
-
-        # 结果收集
-        results = {}
-        for seq, out_ids in self.scheduler.get_finished_results():
-            try:
-                results[seq_map[seq.seq_id]] = self.tokenizer.decode(out_ids, skip_special_tokens=True)
-            except:
-                results[seq_map[seq.seq_id]] = "[Error]"
-        
-        self.scheduler.running_sequences.clear()
-        return results
-
     def generate_spec_decode(self, prompt: str, max_tokens: int = 100,
                              on_tokens=None, ignore_eos: bool = False) -> Dict[str, object]:
         """投机解码生成（单序列，DFlash2 draft-verify-accept，greedy 确定性接受）。

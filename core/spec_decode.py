@@ -10,7 +10,7 @@
 2. aux hidden state 收集：GDN 是顺序有状态的，不能 re-forward context（会二次推进
    递归状态）。故 aux 在主 forward 内收集——prefill/verify 每层 forward 后，若该层在
    target_layer_ids 里，就把 hidden state 写进滚动 aux_cache[ai, pos]。draft 的 context
-   KV 由 aux_cache 投影（combine_hidden_states → precompute_context_kv）。
+   KV 由 aux_cache 投影（combine_hidden_states → fill_context_kv）。
 
 3. 显存复用 engine 模型：不 load 27GB 新副本，直接用 engine 的 self.model / adapter /
    prefill_runner / cache_manager。
@@ -528,19 +528,6 @@ class SpecEngine:
             self._dmask[:, ctx_len:C].fill_(float("-inf"))
         self._draft_model_graph.replay()
         return self._draft_out
-
-    # ------------------------------------------------------------------
-    # GDN 状态回滚
-    # ------------------------------------------------------------------
-    def _gdn_rollback(self, gdn_slot, accepted):
-        """把 GDN 递归/conv 状态回滚到 checkpoint[accepted]。
-        checkpoint[t] = 处理完 verify_ids[t]（0-indexed）后的状态。
-        保留 anchor + accepted 个 draft = 前 1+accepted 个 token 的状态 = checkpoint[accepted]。"""
-        if self._gdn_cp_state is None:
-            return
-        pool = self._gdn_pool()
-        pool["state"][gdn_slot].copy_(self._gdn_cp_state[accepted])
-        pool["conv"][gdn_slot].copy_(self._gdn_cp_conv[accepted])
 
     # ------------------------------------------------------------------
     # draft 提议
