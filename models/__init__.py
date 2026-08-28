@@ -25,6 +25,11 @@ def build_adapter(cfg) -> ModelAdapter:
         from .qwen3_5.adapter import Qwen3_5Adapter
         return Qwen3_5Adapter()
 
+    # Qwen3 (GQA + SwiGLU + QK-Norm，HF 命名，head_dim 独立)
+    if model_type == "qwen3" or any("qwen3" in a for a in archs):
+        from .qwen3.adapter import Qwen3Adapter
+        return Qwen3Adapter()
+
     raise ValueError(
         f"unsupported model_type={model_type!r} archs={archs!r} "
         f"(仅支持 deepseek_v2/v3 与 qwen3_5)")
