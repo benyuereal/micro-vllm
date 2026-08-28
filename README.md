@@ -6,7 +6,7 @@
 
 > A high-performance LLM inference engine built **from scratch** — PagedAttention, Flash Attention, CUDA Graph, continuous batching, hand-written CUDA/Triton/TileLang kernels, **W8A16 quantization**, **speculative decoding (DFlash2)**, and a **GDN (Gated DeltaNet) hybrid-attention** model stack. No vLLM/SGLang runtime dependency: the whole engine is ~8k lines of Python you can read end to end.
 >
-> 🚀 **Headline**: single-GPU **Qwen3.8-27B (W8A16) + DFlash2 speculative decoding** hits **101.5 tok/s = 1.77× vLLM** (57.4 tok/s) on an L20. Non-spec single-user long-context (Qwen3-0.6B) reaches **410 tok/s**, +6.5% over vLLM.
+> 🚀 **Headline**: single-GPU **Qwen3.8-27B (W8A16) + DFlash2 speculative decoding** hits **56.8 tok/s = 1.04× vLLM** (54.4 tok/s) on an L20, fair offline comparison (both in-process, same prompt, 3000-out, 3-run median). Non-spec single-user long-context (Qwen3-0.6B) reaches **410 tok/s**, +6.5% over vLLM.
 
 ## ✨ Features
 
@@ -14,7 +14,7 @@
 * 💾 **PagedAttention** — KV-cache paging, ~5% fragmentation, no pre-allocation waste
 * ⚡ **Flash Attention v2** — auto RoPE, zero-copy paged KV, flash-decoding (auto split-KV) for bs=1
 * 🔥 **CUDA Graph** — whole-graph capture for decode; pre-captured across batch sizes
-* 🎲 **Speculative Decoding (DFlash2)** — N=7 draft / M=8 verify, greedy accept, GDN state checkpoint-rollback; **1.77× vLLM** on Qwen3.8-27B
+* 🎲 **Speculative Decoding (DFlash2)** — N=7 draft / M=8 verify, greedy accept, GDN state checkpoint-rollback; **1.04× vLLM** on Qwen3.8-27B (fair offline, same prompt, 3000-out, 3-run median)
 * 🧮 **W8A16 Quantization** — Marlin-format int8 group-128 weights, TileLang verify GEMM + hand-written int8 GEMV
 * 🌊 **GDN Hybrid Attention** — Gated DeltaNet linear-attention layers (no KV cache, recursive state) mixed with full attention
 * 🧠 **MLA + MoE** — Multi-head Latent Attention and Mixture-of-Experts (DeepSeek-V2-Lite)
@@ -162,12 +162,14 @@ res = engine.generate_spec_decode("prompt", max_tokens=3000)
 
 ### Speculative Decoding · Single-GPU (L20 / Qwen3.8-27B W8A16 + DFlash2)
 
-| Framework | Throughput (tok/s) | Relative |
-|:-----|:----------------:|:--------:|
-| **micro-vllm** | **101.5** | **1.77×** |
-| vLLM (TP1, DFlash2) | 57.4 | 1.00× |
+Fair offline comparison: both engines in-process (no HTTP), same prompt, 3000-out, greedy, N=7, each on a dedicated GPU, 3-run median:
 
-Edge comes from the W8A16 int8 verify GEMM/GEMV + CUDA Graph amortizing launch overhead at the fixed M=8 verify shape.
+| Framework | Throughput (tok/s) | Per-step (ms) | Acc (tok/step) | Relative |
+|:-----|:----------------:|:------------:|:-------------:|:--------:|
+| **micro-vllm** | **56.8** | **50.9** | 1.889 | **1.04×** |
+| vLLM (TP1, DFlash2) | 54.4 | 54.4 | **1.959** | 1.00× |
+
+The two are near-parity. vLLM has a slightly higher acceptance rate (1.959 vs 1.889); micro-vllm wins on per-step latency (50.9 vs 54.4 ms) from the W8A16 int8 verify GEMM/GEMV + CUDA Graph at the fixed M=8 verify shape, netting a 4.4% throughput edge. (An earlier "1.14–1.24×" figure compared micro offline against vLLM over HTTP `bench serve`, which understated vLLM — corrected here.)
 
 ### Single-User Long-Context (L20 / Qwen3-0.6B bf16)
 

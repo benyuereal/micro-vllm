@@ -301,7 +301,7 @@ async def generate_stream(req: GenerateReq):
 
 # ------------------------------
 # OpenAI 兼容端点（与 vLLM 对齐：/v1/chat/completions、/v1/completions、/v1/models）
-# spec 启用时单请求走 generate_spec_decode（DFlash2 draft-verify-accept，101.5 tok/s 路径）；
+# spec 启用时单请求走 generate_spec_decode（DFlash2 draft-verify-accept，57.8 tok/s 路径）；
 # 未启用走 continuous batching 的 add_request 循环。
 # ------------------------------
 @app.get("/v1/models")
