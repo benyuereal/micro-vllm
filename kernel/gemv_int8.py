@@ -54,15 +54,15 @@ def w8_linear(x, w_int8, scale, out=None, env="MICRO_GEMV"):
       - [N, K/128]（group-128，Qwen3.8 预量化）→ gemv_int8_group
     M=1 且 int8 kernel 可用且 env 开启 → 手写 int8 GEMV（权重带宽减半）；
     否则反量化 int8→bf16 后 x @ w.t()（prefill M>1 走此路，compute-bound 反量化开销可忽略）。
-    投机解码 verify（M≤8，verify_gemm 开，group-128）→ 双后端 int8 GEMM
-    （TileLang 默认 / Triton 备选，MICRO_VERIFY_GEMM 切换），权重 HBM 只读一次。
+    投机解码 verify（M≤8，verify_gemm 开，group-128）→ TileLang int8 GEMM
+    （gemm_int8），权重 HBM 只读一次。
     """
     M = x.shape[0]
     N = w_int8.shape[0]
     if out is None:
         out = torch.empty(M, N, dtype=x.dtype, device=x.device)
     is_group = scale.dim() == 2
-    # 投机解码 verify（M=1+N≤8）：双后端 int8 GEMM（权重 HBM 只读一次，shared 内
+    # 投机解码 verify（M=1+N≤8）：TileLang int8 GEMM（权重 HBM 只读一次，shared 内
     # dequant→bf16 + GEMM），比 int8 GEMV 的 M× 权重读快 ~12x（mlp_gu 3.59ms→0.29ms）。
     # w8_linear 是 verify 路径所有 int8 线性（MLP dense_swiglu + attention _lin_prefill）
     # 的统一分派点，故在此路由。
@@ -81,7 +81,7 @@ def w8_linear(x, w_int8, scale, out=None, env="MICRO_GEMV"):
             _mod.gemv_int8(x, w_int8, scale, out)
     elif is_group and M <= 128:
         # 小 M prefill（32 < M ≤ 128，如投机解码 prompt prefill M≈61）：group-128 int8
-        # 走双后端 int8 GEMM（TileLang 默认 / Triton 备选），权重 HBM 只读一次。
+        # 走 TileLang int8 GEMM，权重 HBM 只读一次。
         # 原路径反量化整份 int8 权重到 bf16（w_int8.float()*sc 物化 4x fp32 临时 +
         # bf16 拷贝，mlp_gu M=61 反量化占 7.29ms/7.9ms），int8 GEMM 快 22x（0.35ms）。
         # 只影响 prefill（M>32）；decode（M≤32）仍走 int8 GEMV，不受影响。

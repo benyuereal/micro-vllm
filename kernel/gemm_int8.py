@@ -6,9 +6,11 @@
 [BLOCK_N, BLOCK_K] tile），shared 内 dequant→bf16，T.gemm 累加。M=8 时比 GEMV 快
 12-31x（实测 mlp_gu 3.6ms→0.3ms），maxdiff=0.0（与反量化 matmul 完全一致）。
 
-仅用于投机解码 verify（M 小）。正常 decode（M=1）走 GEMV、prefill（M 大）走反量化
-matmul，均不受影响（由 kernel.gemm_int8_triton.set_verify_gemm 开关控制，
-MICRO_VERIFY_GEMM=tilelang|triton 选后端，本模块是 tilelang 后端）。
+仅用于投机解码 verify（M 小）+ 小 M prefill（32 < M ≤ 128）。正常 decode（M=1）
+走 GEMV、大 M prefill 走反量化 matmul，均不受影响。调用链：
+kernel.gemm_int8_triton.verify_int8_gemm（开关 set_verify_gemm，SpecEngine 在 verify
+前后设置；MICRO_VERIFY_GEMM=marlin 默认模式下权重是 Marlin dict，本模块不可达，
+作为显式 env 指定的 fallback 保留）。
 """
 import torch
 import tilelang

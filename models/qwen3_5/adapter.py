@@ -51,7 +51,7 @@ _W8A16 = os.environ.get("MICRO_W8A16", "0") == "1"
 # verify int8 GEMM 后端：MICRO_VERIFY_GEMM=marlin|tilelang，默认 marlin。
 # marlin 模式：权重存 Marlin 格式（repacked int8，同字节数），verify/decode/prefill
 #   的 int8 线性全走 marlin_forward（CUTLASS C++，int8 tensor-core mma）。
-# tilelang 模式：保持 (int8 [N,K], scale) 元组 + TileLang/Triton GEMM（原行为）。
+# 非 marlin 模式：保持 (int8 [N,K], scale) 元组 + TileLang GEMM（原行为）。
 # 显存约束：Marlin repacked 与 int8 [N,K] 同字节（24.33GB），不能两者共存（~67G OOM），
 #   故 marlin 模式用 Marlin 格式【替换】int8（非额外保留）。
 _MICRO_VERIFY_GEMM = os.environ.get("MICRO_VERIFY_GEMM", "marlin").lower()
@@ -637,9 +637,9 @@ class Qwen3_5Adapter(GQAAdapter):
         反量化后 x @ w.t()（compute-bound，反量化开销可忽略）。
         scale 两种：[N]（per-channel）→ unsqueeze(1)；[N,K/128]（group-128）→ repeat_interleave 128。
 
-        投机解码 verify（M 小，verify_gemm 开）：group-128 int8 走双后端 int8 GEMM
-        （TileLang 默认 / Triton 备选，MICRO_VERIFY_GEMM 切换；权重 HBM 只读一次，
-        shared 内 dequant→bf16 + GEMM），避免反量化 54GB bf16 权重/层。
+        投机解码 verify（M 小，verify_gemm 开）：group-128 int8 走 TileLang int8
+        GEMM（权重 HBM 只读一次，shared 内 dequant→bf16 + GEMM），避免反量化
+        54GB bf16 权重/层。
 
         小 M prefill（M≤128，如投机解码 prompt prefill M≈61）：同样走 int8 GEMM。
         原路径反量化整份 int8 权重到 bf16（w_int8.float()*sc 物化 4x fp32 临时 +

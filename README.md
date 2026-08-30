@@ -96,12 +96,12 @@ cache_manager.free(seq_id)               # Free cache
 
 ### 3. W8A16 Quantization
 
-Marlin-format int8 weights (group-128, byte-128 encoding) with two decode paths:
+Marlin-format int8 weights (group-128, byte-128 encoding):
 
-* **Verify GEMM** (`kernel/gemm_int8_triton.py`) — TileLang int8 GEMM for the fixed M=8 speculative-verify shape
-* **int8 GEMV** (`kernel/gemv_int8.cu`) — hand-written CUDA for M=1 decode
-
-`lm_head` stays bf16; int8 dequant is a temporary compute, never persisted.
+* **Marlin GEMM** (`kernel/marlin/`) — default backend (`MICRO_VERIFY_GEMM=marlin`): all int8 linears (verify / decode / prefill) go through the CUTLASS Marlin int8 kernel
+* **TileLang verify GEMM** (`kernel/gemm_int8.py`) — fallback for `MICRO_VERIFY_GEMM=tilelang`: int8 GEMM for small-M verify / prefill, weights read once from HBM
+* **int8 GEMV** (`kernel/gemv_int8.cu`) — hand-written CUDA for M≤32 decode in the non-Marlin fallback
+* **lm_head int8** (`MICRO_LMHEAD_INT8=1`, default) — the bf16 lm_head (2.54GB) is quantized to int8 Marlin (1.27GB); halves the per-step weight read
 
 ### 4. GDN (Gated DeltaNet) Hybrid Attention
 

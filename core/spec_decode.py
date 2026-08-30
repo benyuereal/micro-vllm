@@ -282,10 +282,9 @@ class SpecEngine:
         M = input_ids.shape[0]
         h = self.embed(input_ids)
 
-        # verify（M=1+N≈8）走双后端 int8 GEMM（TileLang 默认 / Triton 备选，
-        # MICRO_VERIFY_GEMM 切换）：权重 HBM 只读一次（shared 内 dequant→bf16 +
-        # GEMM），比原 CUDA tiled GEMV 快 ~12x（mlp_gu 3.59ms→0.29ms）。
-        # prefill（M 大）本就走反量化 matmul，不受影响。
+        # verify（M=1+N≈8）开 int8 GEMM 路由（MICRO_VERIFY_GEMM 非 marlin 时生效，
+        # TileLang 权重 HBM 只读一次，比 int8 GEMV 的 M× 权重读快 ~12x；marlin
+        # 默认模式下权重是 Marlin dict，本开关无可路由对象）。
         set_verify_gemm(bool(gdn_checkpoint))
 
         # GDN 检查点开关（graph=prefill_runner 的 buffer）。prefill_runner 与 engine
