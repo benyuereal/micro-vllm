@@ -759,12 +759,7 @@ class Qwen3_5Adapter(GQAAdapter):
                 # 行重排对 bf16 和 int8 都成立（int8 的 scale 随行一起重排）。
                 w_q = self._unpack_linear(attn.q_proj, world_size, rank)  # [2*nh*hd, hidden]
                 nh, hd = tc.num_attention_heads, tc.head_dim
-                if isinstance(w_q, tuple):
-                    w_q = self._reorder_qgate(w_q, nh, hd)
-                else:
-                    w_q = w_q.view(nh, 2 * hd, -1)
-                    w_q = torch.cat([w_q[:, :hd, :].reshape(-1, w_q.shape[-1]),
-                                     w_q[:, hd:, :].reshape(-1, w_q.shape[-1])], dim=0).contiguous()
+                w_q = self._reorder_qgate(w_q, nh, hd)  # 交错 [q|g] → 连续 [q 全部|g 全部]
                 w_k = self._unpack_linear(attn.k_proj, world_size, rank)
                 w_v = self._unpack_linear(attn.v_proj, world_size, rank)
                 attn._qkv_w = self._store_w(self._q(self._cat_w([w_q, w_k, w_v])))
@@ -888,32 +883,23 @@ class Qwen3_5Adapter(GQAAdapter):
             else:
                 init_state_s = state                       # 占位（kernel 内 INIT_FROM_CP=False 不读）
                 init_state_c = conv_state
-            if cp_enabled:
-                _gdn_conv_prefill_kernel[(triton.cdiv(conv_dim, 512), n_seqs)](
-                    qkv, la._conv_w, conv_state, cu_seqlens, seq_idx,
-                    conv_dim, in_dim, n_gdn, gdn_l, K=self._gdn_K, BLOCK_C=512,
-                    CHECKPOINT=cp_conv, CP_N_GDN=n_gdn, CP_ENABLED=True,
-                    INIT_STATE=init_state_c, INIT_IDX=init_idx, INIT_FROM_CP=init_from_cp)
-                o = torch.empty(M, H * DV, dtype=h2d.dtype, device=dev)
-                _gdn_recurrent_prefill_kernel[(n_seqs, H)](
-                    qkv, g, beta, state, o, cu_seqlens, seq_idx,
-                    H=H, HK=HK, DK=DK, DV=DV, N_GDN=n_gdn, GDN_L=gdn_l, SCALE=scale,
-                    STRIDE=in_dim, BLOCK_D=triton.next_power_of_2(max(DK, DV)),
-                    CHECKPOINT=cp_state, CP_N_GDN=n_gdn, CP_ENABLED=True,
-                    INIT_STATE=init_state_s, INIT_IDX=init_idx, INIT_FROM_CP=init_from_cp)
-            else:
-                _gdn_conv_prefill_kernel[(triton.cdiv(conv_dim, 512), n_seqs)](
-                    qkv, la._conv_w, conv_state, cu_seqlens, seq_idx,
-                    conv_dim, in_dim, n_gdn, gdn_l, K=self._gdn_K, BLOCK_C=512,
-                    CHECKPOINT=conv_state, CP_N_GDN=n_gdn, CP_ENABLED=False,
-                    INIT_STATE=init_state_c, INIT_IDX=init_idx, INIT_FROM_CP=init_from_cp)
-                o = torch.empty(M, H * DV, dtype=h2d.dtype, device=dev)
-                _gdn_recurrent_prefill_kernel[(n_seqs, H)](
-                    qkv, g, beta, state, o, cu_seqlens, seq_idx,
-                    H=H, HK=HK, DK=DK, DV=DV, N_GDN=n_gdn, GDN_L=gdn_l, SCALE=scale,
-                    STRIDE=in_dim, BLOCK_D=triton.next_power_of_2(max(DK, DV)),
-                    CHECKPOINT=state, CP_N_GDN=n_gdn, CP_ENABLED=False,
-                    INIT_STATE=init_state_s, INIT_IDX=init_idx, INIT_FROM_CP=init_from_cp)
+            # cp_enabled（verify 检查点）：CHECKPOINT 指向 checkpoint buffer（逐 token
+            # 存状态）；否则指向 pool 自身（CP_ENABLED=False，kernel 内分支被编译掉，
+            # 零开销）。两分支仅 CHECKPOINT 目的地 + CP_ENABLED 不同，统一为一次 launch。
+            cp_conv_dst = cp_conv if cp_enabled else conv_state
+            cp_state_dst = cp_state if cp_enabled else state
+            _gdn_conv_prefill_kernel[(triton.cdiv(conv_dim, 512), n_seqs)](
+                qkv, la._conv_w, conv_state, cu_seqlens, seq_idx,
+                conv_dim, in_dim, n_gdn, gdn_l, K=self._gdn_K, BLOCK_C=512,
+                CHECKPOINT=cp_conv_dst, CP_N_GDN=n_gdn, CP_ENABLED=cp_enabled,
+                INIT_STATE=init_state_c, INIT_IDX=init_idx, INIT_FROM_CP=init_from_cp)
+            o = torch.empty(M, H * DV, dtype=h2d.dtype, device=dev)
+            _gdn_recurrent_prefill_kernel[(n_seqs, H)](
+                qkv, g, beta, state, o, cu_seqlens, seq_idx,
+                H=H, HK=HK, DK=DK, DV=DV, N_GDN=n_gdn, GDN_L=gdn_l, SCALE=scale,
+                STRIDE=in_dim, BLOCK_D=triton.next_power_of_2(max(DK, DV)),
+                CHECKPOINT=cp_state_dst, CP_N_GDN=n_gdn, CP_ENABLED=cp_enabled,
+                INIT_STATE=init_state_s, INIT_IDX=init_idx, INIT_FROM_CP=init_from_cp)
 
         og = torch.empty(M, H * DV, dtype=h2d.dtype, device=dev)
         _gdn_norm_gated_kernel[(M, H)](o, z, la._norm_w, og,
