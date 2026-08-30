@@ -149,76 +149,19 @@ class SpecEngine:
         self.total_steps = 0
         self.total_generated = 0
 
-        # target 置信度诊断（MICRO_SPEC_TGT_CONF=1 开启，默认关零开销）。
-        # 目的：把"draft 错"的步分成 B 桶（target 很确定但 draft 猜错，draft 可救）
-        # 与 A 桶（target 自己不确定，救不了）。每个 draft 位置 p 记录：
-        #   target_conf[p] = softmax(verify_logits[p])[target_argmax[p]]
-        # 只统计到本步第一个 mismatch 位置为止（p <= accepted）：之后位置的 target
-        # 预测条件在错误前缀上，"正确 token"定义变了，conf 无意义。
-        # 按上下文长度分档（short<512 / mid 512-1500 / long>=1500，ctx_len=kv_len-1）
-        # + all 汇总。
+        # target 置信度诊断（MICRO_SPEC_TGT_CONF=1 开启，默认关零开销）：
+        # B/A 分桶（draft 错但 target 确定 vs target 自己不确定）。实现见
+        # core/spec_conf_diag.py；关时 self._tc_stats=None，热路径零开销。
         self._tc_stats = None
         if os.environ.get("MICRO_SPEC_TGT_CONF", "0") == "1":
-            self._tc_stats = self._new_tc_stats()
-
-    def _new_tc_stats(self):
-        N = self.N
-
-        def _blank():
-            return {
-                "steps": 0,
-                "valid": [0] * N,          # p 有效（p<=accepted）的步数
-                "match": [0] * N,          # draft[p]==target[p] 的步数
-                "misB5": [0] * N, "misA5": [0] * N,   # mismatch 且 conf>=0.5 / <0.5
-                "misB9": [0] * N, "misA9": [0] * N,   # mismatch 且 conf>=0.9 / <0.9
-                "conf": [[] for _ in range(N)],        # 有效位置 conf 全量（分布用）
-                "conf_mis": [[] for _ in range(N)],    # mismatch 位置 conf（分布用）
-            }
-
-        return {"all": _blank(), "short": _blank(), "mid": _blank(), "long": _blank()}
-
-    def _tc_bucket(self, ctx_len):
-        if ctx_len < 512:
-            return "short"
-        if ctx_len < 1500:
-            return "mid"
-        return "long"
+            from core.spec_conf_diag import TargetConfDiag
+            self._tc_stats = TargetConfDiag(self.N)
 
     def tc_stats_report(self):
-        """target 置信度诊断报告。每位置 p：valid/match 率、mismatch 的 B/A 分桶
-        （阈值 0.5 与 0.9）、conf 分布（均值/分位数）。"""
+        """target 置信度诊断报告（MICRO_SPEC_TGT_CONF=1 时；关则 None）。"""
         if self._tc_stats is None:
             return None
-        out = {}
-        for name, st in self._tc_stats.items():
-            nb = st["steps"]
-            if nb == 0:
-                out[name] = {"steps": 0}
-                continue
-            pos = {}
-            for p in range(self.N):
-                nv = st["valid"][p]
-                if nv == 0:
-                    pos[str(p)] = {"valid": 0}
-                    continue
-                confs = sorted(st["conf"][p])
-
-                def _q(f, _c=confs):
-                    return _c[min(len(_c) - 1, int(f * len(_c)))]
-
-                cm = st["conf_mis"][p]
-                pos[str(p)] = {
-                    "valid": nv,
-                    "match_rate": st["match"][p] / nv,
-                    "mis": nv - st["match"][p],
-                    "B5": st["misB5"][p], "A5": st["misA5"][p],
-                    "B9": st["misB9"][p], "A9": st["misA9"][p],
-                    "conf_mean": sum(confs) / len(confs),
-                    "conf_p10": _q(0.1), "conf_p50": _q(0.5), "conf_p90": _q(0.9),
-                    "conf_mis_mean": (sum(cm) / len(cm)) if cm else None,
-                }
-            out[name] = {"steps": nb, "pos": pos}
-        return out
+        return self._tc_stats.report()
 
     # ------------------------------------------------------------------
     # GDN 检查点 buffer
@@ -753,7 +696,7 @@ class SpecEngine:
         self.total_steps = 0
         self.total_generated = 0
         if self._tc_stats is not None:
-            self._tc_stats = self._new_tc_stats()
+            self._tc_stats.reset()
         self.aux_cache.zero_()
         self._ctx_kv_done = 0
 
@@ -815,37 +758,10 @@ class SpecEngine:
                 bonus = t_cpu[accepted]
 
                 # target 置信度诊断（MICRO_SPEC_TGT_CONF=1）：只统计到本步第一个
-                # mismatch 位置为止（p <= accepted）——之后位置的 target 预测条件在
-                # 错误前缀上，"正确 token"定义变了，conf 无意义。conf[p] = target 在
-                # 位置 p 对自己 greedy token 的 softmax 概率（fp32，vocab 248k 下
-                # 8 行 softmax 临时 ~8MB，可忽略）。
+                # mismatch 位置为止（p <= accepted）。
                 if self._tc_stats is not None:
-                    st = self._tc_stats
-                    b = self._tc_bucket(kv_len - 1)
-                    for s in (st["all"], st[b]):
-                        s["steps"] += 1
-                    conf = torch.softmax(vlogits.float(), dim=-1)
-                    conf = conf.gather(1, target_preds.unsqueeze(1)).squeeze(1)
-                    conf_cpu = conf.cpu().tolist()
-                    # draft 位置只有 0..N-1（p=N 是 bonus，非 draft 提议）。
-                    # accepted<N 时有效到 accepted（首个 mismatch）；accepted==N 时到 N-1。
-                    for p in range(min(accepted + 1, self.N)):
-                        for s in (st["all"], st[b]):
-                            s["valid"][p] += 1
-                            s["conf"][p].append(conf_cpu[p])
-                            if d_cpu[p] == t_cpu[p]:
-                                s["match"][p] += 1
-                            else:
-                                c = conf_cpu[p]
-                                s["conf_mis"][p].append(c)
-                                if c >= 0.5:
-                                    s["misB5"][p] += 1
-                                else:
-                                    s["misA5"][p] += 1
-                                if c >= 0.9:
-                                    s["misB9"][p] += 1
-                                else:
-                                    s["misA9"][p] += 1
+                    self._tc_stats.record(vlogits, target_preds, d_cpu, t_cpu,
+                                          accepted, kv_len)
 
                 # 4. 去 rollback：不再 copy_ 回 pool。记录 accepted，下一步 verify 的
                 #    GDN 初始状态直接读 checkpoint[accepted]（见上方 init_from_cp）。
