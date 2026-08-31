@@ -149,7 +149,7 @@ def _sse(obj) -> str:
 # 核心推理逻辑
 # ------------------------------
 async def rank0_inference_loop():
-    print(f"Rank 0: Inference loop started")
+    print("Rank 0: Inference loop started")
 
     while running:
         batch, batch_type = engine.get_next_batch()
@@ -217,7 +217,6 @@ async def generate(req: GenerateReq):
 async def batch_generate(req: BatchGenerateReq):
     if not engine:
         raise HTTPException(503, "Model not loaded")
-    start = time.time()
     # 全部入队后统一 await：所有 prompt 进同一批 continuous batching。
     futs = []
     for p in req.prompts:

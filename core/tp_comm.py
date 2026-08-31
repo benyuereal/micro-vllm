@@ -15,13 +15,16 @@
   - bcast2: decode 热路径只广播本步采样 token（[bs] GPU 张量），替代完整
     Sequence 广播（省 ~2.8ms/步 的 pickle+NCCL 往返）。prefill 批次回退完整 ctx 广播。
 """
-from typing import Dict, List, Optional, Tuple
+from typing import TYPE_CHECKING, Dict, List, Optional, Tuple
 
 import torch
 import torch.distributed as dist
 
-from core.parallel_config import get_rank, get_world_size, rank0
+from core.parallel_config import get_world_size, rank0
 from core.inference_context import BatchInferenceContext
+
+if TYPE_CHECKING:
+    from core.sequence import Sequence
 
 
 class TPCommunicator:

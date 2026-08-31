@@ -478,9 +478,7 @@ class SpecEngine:
         """
         if self._draft_model_graph is not None:
             return
-        device = self.device
         M = 1 + self.N
-        C = self.max_len
         try:
             # 填固定 buffer（dummy 值，capture 只记录结构/指针）
             self._query_ids.fill_(0)
@@ -504,7 +502,6 @@ class SpecEngine:
     def _draft_forward_graph(self):
         """draft forward 的 graph 体内（固定 shape，读固定 buffer）。
         返回 [N] 提议 token（写进 _draft_out）。"""
-        M = 1 + self.N
         C = self.max_len
         query_embeds = self.embed(self._query_ids)
         if self.input_embedding_scale != 1.0:

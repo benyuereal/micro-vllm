@@ -189,7 +189,6 @@ class DraftRunner:
         h = self.model.model.embed_tokens(input_ids)
         cos = self.cos[positions].unsqueeze(1)
         sin = self.sin[positions].unsqueeze(1)
-        end = ctx_len + T
         # 临时 KV buffer 存本步 1+N query 的 KV（context 读目标 cache）
         k_q = torch.empty(T, self.num_kv_heads, self.head_dim, dtype=self.dtype, device=self.device)
         v_q = torch.empty_like(k_q)

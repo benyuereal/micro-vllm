@@ -27,7 +27,6 @@ alloc_bufs）。本文件只保留 Qwen3 的差异点：
   复用 PagedAttention 的 _cos_pool/_sin_pool（已按 adapter.rope_theta 用 1e6 预计算）。
 - tie_word_embeddings=true：lm_head.weight is embed_tokens.weight。
 """
-import torch
 
 from models.gqa_base import GQAAdapter
 from kernel.rmsnorm import rmsnorm, rmsnorm_residual, qk_norm_inplace

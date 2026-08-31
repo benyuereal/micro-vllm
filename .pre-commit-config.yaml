@@ -1,0 +1,10 @@
+# 最小 pre-commit：只挡真 bug（E9 语法错误 + F pyflakes 未定义名/未用变量/未用 import）。
+# 不引入风格规则、不做 format（历史代码风格不一，全量重排噪音大且破坏最小 diff）。
+# 安装：pre-commit install
+# 手动跑：pre-commit run --all-files
+repos:
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.16.5
+    hooks:
+      - id: ruff
+        args: [--select, "E9,F", --fix]

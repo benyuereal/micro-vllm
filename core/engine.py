@@ -1,6 +1,5 @@
 import os
 import torch
-import torch.distributed as dist
 import time
 import asyncio
 import logging
