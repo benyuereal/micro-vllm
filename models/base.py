@@ -128,7 +128,7 @@ class ModelAdapter(ABC):
 
     def final_norm_one_centered(self) -> bool:
         """final_norm 是否 1-centered（out = x*rrms*(1+w)）。Qwen3.5 是，Qwen3/DeepSeek 否。
-        model_graph 的 decode 末层据此选 rmsnorm_ / rmsnorm1_。"""
+        model_graph 的 decode 末层据此选 rmsnorm 的 one_centered 参数。"""
         return False
 
     def lm_head(self, model):

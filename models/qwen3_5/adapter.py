@@ -6,7 +6,7 @@
 - 24 层混合：layer_types 里 "linear_attention"(GDN) 与 "full_attention" 交替
   （full_attention_interval=4：第 4/8/12/16/20/24 层 full）。
 - RMSNorm 是 1-centered：out = x * rrms * (1 + w)（Qwen3 是 x * w）。
-  用 kernel.rmsnorm 的 rmsnorm1* 系列。
+  用 kernel.rmsnorm 的 one_centered=True（1-centered）。
 - full attention：q_proj 输出 2*heads*head_dim，view(-1, head_dim*2) 后 chunk(2)
   → 交错布局：query = 偶数 head_dim 块、gate = 奇数块（非连续！）。
   QK-Norm（1-centered, per-head on head_dim），partial rotary（前 64 维 half-split），
@@ -33,10 +33,7 @@ import triton
 import triton.language as tl
 
 from models.gqa_base import GQAAdapter
-from kernel.rmsnorm import (
-    rmsnorm1, rmsnorm1_, rmsnorm1_residual_gemm as rmsnorm1_residual,
-    rmsnorm1_residual_fused,
-)
+from kernel.rmsnorm import rmsnorm, rmsnorm_residual
 from kernel.dense_mlp import dense_swiglu
 from kernel.gemv import gemv_or_matmul, gemv_v2
 from kernel.gemv_int8 import w8_linear
@@ -666,11 +663,11 @@ class Qwen3_5Adapter(GQAAdapter):
     # -------------------- 虚方法 override：norm 变体（1-centered） --------------------
     def _norm_inplace(self, h, w, out, eps):
         """Qwen3.5：1-centered RMSNorm（out = x*rrms*(1+w)）。"""
-        rmsnorm1_(h, w, out, eps)
+        rmsnorm(h, w, eps, out=out, one_centered=True)
 
     def _norm_residual(self, x, res, w, out_normed, out_residual, eps):
         """Qwen3.5：1-centered RMSNorm(x+residual) 贴边融合。"""
-        rmsnorm1_residual(x, res, w, out_normed, out_residual, eps)
+        rmsnorm_residual(x, res, w, eps, out_normed=out_normed, out_residual=out_residual, one_centered=True)
 
     # -------------------- 虚方法 override：GDN 分支 --------------------
     def _block_is_gdn(self, block) -> bool:
@@ -931,7 +928,7 @@ class Qwen3_5Adapter(GQAAdapter):
         kv_dim = kvh * hd
         T = h.shape[0]
 
-        normed = rmsnorm1(h, block._in_ln_w, block._in_ln_eps)
+        normed = rmsnorm(h, block._in_ln_w, block._in_ln_eps, one_centered=True)
         qkv = self._lin_prefill(normed, sa._qkv_w)  # [T, 2*q_dim+2*kv_dim]（[q|gate|k|v]）
         k_off = 2 * q_dim
         q = qkv[..., :q_dim].reshape(T, nh, hd).contiguous()
@@ -939,8 +936,8 @@ class Qwen3_5Adapter(GQAAdapter):
         k = qkv[..., k_off:k_off + kv_dim].reshape(T, kvh, hd).contiguous()
         v = qkv[..., k_off + kv_dim:].reshape(T, kvh, hd).contiguous()
 
-        q = rmsnorm1(q, sa._q_norm_w, sa._q_norm_eps)
-        k = rmsnorm1(k, sa._k_norm_w, sa._k_norm_eps)
+        q = rmsnorm(q, sa._q_norm_w, sa._q_norm_eps, one_centered=True)
+        k = rmsnorm(k, sa._k_norm_w, sa._k_norm_eps, one_centered=True)
 
         # partial RoPE：Triton in-place（前 rot 维 half-split，rot 后不动），替代 PyTorch
         # 的 cos/sin gather + 4 slice + 4 mul + 2 add + 2 cat（每张量 ~12 小 kernel）。
@@ -963,7 +960,7 @@ class Qwen3_5Adapter(GQAAdapter):
         attn_gate_inplace(attn, gate)
         out = self._lin_prefill(attn.reshape(T, -1), sa._o_w)
 
-        normed, residual = rmsnorm1_residual_fused(out, h, block._post_ln_w, block._post_ln_eps)
+        normed, residual = rmsnorm_residual(out, h, block._post_ln_w, block._post_ln_eps, one_centered=True)
         mlp_out = dense_swiglu(normed, block.mlp._gu, block.mlp._d, T, w_is_nk=True)
         return mlp_out + residual
 
@@ -980,10 +977,10 @@ class Qwen3_5Adapter(GQAAdapter):
         seq_idx = graph._gdn_prefill_seq_idx[:n_seqs]
         cu = meta.cu_seqlens_q
         T = h.shape[0]
-        normed = rmsnorm1(h, block._in_ln_w, block._in_ln_eps)
+        normed = rmsnorm(h, block._in_ln_w, block._in_ln_eps, one_centered=True)
         gdn_out = self._gdn_forward(block.linear_attn, normed, graph, T,
                                     is_decode=False, cu_seqlens=cu, seq_idx=seq_idx)
-        normed2, residual = rmsnorm1_residual_fused(gdn_out, h, block._post_ln_w, block._post_ln_eps)
+        normed2, residual = rmsnorm_residual(gdn_out, h, block._post_ln_w, block._post_ln_eps, one_centered=True)
         mlp_out = dense_swiglu(normed2, block.mlp._gu, block.mlp._d, T, w_is_nk=True)
         return mlp_out + residual
 

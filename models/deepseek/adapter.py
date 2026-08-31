@@ -12,7 +12,7 @@ import torch
 import torch.nn.functional as F
 
 from models.base import ModelAdapter
-from kernel.rmsnorm import rmsnorm, rmsnorm_, rmsnorm_residual_gemm as rmsnorm_residual
+from kernel.rmsnorm import rmsnorm, rmsnorm_residual
 from kernel.dense_mlp import dense_swiglu
 from .moe import moe_forward
 # 融合 MLA decode kernel（latent→rmsnorm+RoPE+paged flash，weight-absorption）。
@@ -291,7 +291,7 @@ class DeepSeekAdapter(ModelAdapter):
     # ==================== decode 单层钩子 ====================
     def compute_qkv(self, block, h, graph, bs):
         # input_layernorm → normed x 写进 _x16[:,0,:]（strided view，pre-MLA kernel 读 [bs,16,hidden] row 0）
-        rmsnorm_(h, block._in_ln_w, graph._x16[:bs, 0, :], block._in_ln_eps)
+        rmsnorm(h, block._in_ln_w, block._in_ln_eps, out=graph._x16[:bs, 0, :])
         return graph._x16[:bs, 0, :]  # normed（residual 由调用方传）
 
     def compute_next_qkv(self, block_next, mlp_out_prev, res_prev, graph, bs):

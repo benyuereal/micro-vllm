@@ -4,7 +4,7 @@ import torch
 from typing import Dict, List
 
 from core.paged_attention import PagedAttention
-from kernel.rmsnorm import rmsnorm_, rmsnorm1_
+from kernel.rmsnorm import rmsnorm
 from kernel.rotary import compute_slot_mapping
 from core.parallel_config import get_rank, get_world_size, all_reduce
 from models import build_adapter
@@ -142,12 +142,12 @@ class ModelGraphRunner:
 
         # final_norm 用融合 rmsnorm 直写 _hidden（省 HF 原生 RMSNorm 的 2 个 bf16↔fp32 D2D copy，
         # 且省 _hidden[:bs]=h 的 1MB copy）。图捕获时 _hidden[:bs] 即此 kernel 输出，无需额外赋值。
-        # Qwen3.5 的 final_norm 是 1-centered（x*rrms*(1+w)），须用 rmsnorm1_；
-        # Qwen3/DeepSeek 是标准（x*rrms*w），用 rmsnorm_。
+        # Qwen3.5 的 final_norm 是 1-centered（x*rrms*(1+w)），one_centered=True；
+        # Qwen3/DeepSeek 是标准（x*rrms*w），one_centered=False。
         if self.adapter.final_norm_one_centered():
-            rmsnorm1_(h, self._final_norm_w, self._hidden[:bs], self._final_norm_eps)
+            rmsnorm(h, self._final_norm_w, self._final_norm_eps, out=self._hidden[:bs], one_centered=True)
         else:
-            rmsnorm_(h, self._final_norm_w, self._hidden[:bs], self._final_norm_eps)
+            rmsnorm(h, self._final_norm_w, self._final_norm_eps, out=self._hidden[:bs])
         return self._hidden[:bs]  # lm_head 移出 graph（见 forward），避免 155MB logits D2D copy
 
     def capture(self, cache_manager, batch_sizes: List[int] = [1, 2, 4, 8, 16, 32]):

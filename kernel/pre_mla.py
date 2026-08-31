@@ -14,7 +14,7 @@ execution gap（graph 路径 +2.0%，见 premla-persistent-roi）。
 - pre_kva: kva_proj GEMM + store epilogue（latent 直写 paged cache）。
 - absorb:  q_nope @ kvb_w_kn_t → A（M=16 per-head GEMV）。
 
-X16 row0 由调用方 rmsnorm_ 预填（graph._x16[:bs,0,:]），rows1-15 恒零。
+X16 row0 由调用方 rmsnorm 预填（graph._x16[:bs,0,:]），rows1-15 恒零。
 M=16 零填充（mma.h 要求 M%16==0），只读 row 0 真实数据。bf16，fp32 累加。
 """
 import torch
@@ -38,7 +38,7 @@ def premla_persistent_kernel(
     block_size, max_seq_blocks, n_blocks, max_pos, dtype,
 ):
     """3-phase persistent: pre_qkv(144)∥pre_kva(9) → absorb(128)。
-    输出 A[bs*h_attn, kv_lora]（out_idx=10）。X16 由调用方 rmsnorm_ 预填 row0（graph._x16[:bs]），
+    输出 A[bs*h_attn, kv_lora]（out_idx=10）。X16 由调用方 rmsnorm 预填 row0（graph._x16[:bs]），
     QOut 需预分配传入。bs>1 路径暂不支持（kernel 内硬编码 [0,...]，仅 bs=1 ROI 验证用）。
     Cos/Sin 传全池 [max_pos, qk_rope]，kernel 内部按 NewPos gather（省外部 cos[new_pos] gather+cast）。"""
     accum = T.float32

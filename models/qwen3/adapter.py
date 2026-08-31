@@ -30,9 +30,7 @@ alloc_bufs）。本文件只保留 Qwen3 的差异点：
 import torch
 
 from models.gqa_base import GQAAdapter
-from kernel.rmsnorm import (
-    rmsnorm, rmsnorm_residual_fused, qk_norm_inplace,
-)
+from kernel.rmsnorm import rmsnorm, rmsnorm_residual, qk_norm_inplace
 from kernel.dense_mlp import dense_swiglu
 from kernel.rotary import qk_norm_rope_inplace
 
@@ -130,7 +128,7 @@ class Qwen3Adapter(GQAAdapter):
 
         out = self._lin_prefill(attn_out.view(-1, graph.num_heads * graph.head_size), attn._o_w)
         out = all_reduce(out)  # TP: o_proj 按输入维切分，各 rank 持部分和，须 allreduce
-        normed, residual = rmsnorm_residual_fused(out, h, block._post_ln_w, block._post_ln_eps)
+        normed, residual = rmsnorm_residual(out, h, block._post_ln_w, block._post_ln_eps)
         mlp_out = dense_swiglu(normed, block.mlp._gu, block.mlp._d, out.shape[0], w_is_nk=True)
         mlp_out = all_reduce(mlp_out)  # TP: down_proj 按输入维切分，各 rank 持部分和，须 allreduce
         return mlp_out + residual

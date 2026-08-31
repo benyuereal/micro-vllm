@@ -26,12 +26,12 @@ import triton
 import triton.language as tl
 
 # 复用仓库现成 Triton kernel（pointwise/递归类小算子允许 Triton，GEMM 走 cuBLAS/int8）：
-# - rmsnorm / rmsnorm_residual_fused：非 1-centered RMSNorm（Qwen3 风格 out=x*rrms*w），
+# - rmsnorm / rmsnorm_residual：非 1-centered RMSNorm（Qwen3 风格 out=x*rrms*w），
 #   替代 PyTorch 的 float/pow/mean/rsqrt/mul/cast 碎片 op（每层 4 个 norm × 5 层）。
 # - apply_rope_decode：in-place half-split RoPE（[T, heads, dim] + cos/sin 表 + positions），
 #   替代 PyTorch 的 chunk/cat/mul 碎片 op。
 from kernel.rmsnorm import rmsnorm as _triton_rmsnorm
-from kernel.rmsnorm import rmsnorm_residual_fused as _triton_rmsnorm_res
+from kernel.rmsnorm import rmsnorm_residual as _triton_rmsnorm_res
 from kernel.rotary import apply_rope_decode
 
 # draft 5 层 int8（Marlin）开关：MICRO_DRAFT_INT8=1 时把 draft 自有 Linear（q/k/v/o/
@@ -122,7 +122,7 @@ class RMSNorm(nn.Module):
         if residual is None:
             return self._norm(x)
         # fused：new_residual = x + residual；normed = norm(new_residual) * weight。
-        # Triton rmsnorm_residual_fused 一次 kernel 算 (normed, x+residual)。
+        # Triton rmsnorm_residual 一次 kernel 算 (normed, x+residual)。
         return _triton_rmsnorm_res(x, residual, self.weight, self.eps)
 
 

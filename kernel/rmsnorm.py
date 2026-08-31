@@ -1,13 +1,16 @@
 """RMSNorm kernels（Triton）。
 
-8 个近重复 kernel 整合为 1 个参数化核心 `_rmsnorm_core`（constexpr 标志
-ONE_CENTERED / HAS_RESIDUAL），wrapper 负责分配/传 buffer。全部公开函数签名不变。
+一个参数化核心 `_rmsnorm_core`（constexpr 标志 ONE_CENTERED / HAS_RESIDUAL）覆盖
+全部变体，公开 API 只有两个函数：
+- rmsnorm(x, w, eps, out=None, one_centered=False)：out = x*rrms*w（或 x*rrms*(1+w)）
+- rmsnorm_residual(x, r, w, eps, out_normed=None, out_residual=None, one_centered=False)：
+  返回 (normed, x+r)
 
-变体维度：
-- ONE_CENTERED：False=标准 x*rrms*w（Qwen3/DeepSeek）；True=1-centered x*rrms*(1+w)（Qwen3.5）
-- HAS_RESIDUAL：False=norm(x)；True=norm(x+r) 并输出 x+r
-- 输出：新 tensor（prefill）vs 预分配 buffer（decode graph 贴边融合）——kernel 体相同，
-  仅 Y 指向不同，由 wrapper 决定。
+变体维度全部参数化：
+- one_centered：False=标准 x*rrms*w（Qwen3/DeepSeek）；True=1-centered x*rrms*(1+w)
+  （Qwen3.5，HF Qwen3_5RMSNorm 权重以 0 为中心初始化，1 是隐式 bias）
+- residual：rmsnorm_residual 算 norm(x+r) 并输出 x+r（residual 与 normed 用同一 x+r）
+- 输出：out=None 分配新 tensor（prefill）；传预分配 buffer 则原地写（decode graph 贴边融合）
 
 TileLang 实验结论（见 /vllm-workspace/tmp/rmsnorm_result.md）：raw kernel 快 ~25% 且
 graph-capturable，但 decode 已在 CUDA Graph 内（launch 开销已消），e2e ROI 仅 ~1%；且
@@ -84,72 +87,29 @@ def _launch(x, r, y, res_out, w, eps, one_centered, has_residual, block_size):
     )
 
 
-# ==================== 标准 RMSNorm（x*rrms*w，Qwen3/DeepSeek）====================
-
-def rmsnorm(x: torch.Tensor, weight: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
-    """标准 RMSNorm：out = x * rrms * w。返回新 tensor（prefill 路径用）。"""
-    y = torch.empty_like(x)
-    _launch(x, None, y, None, weight, eps, False, False, _block_size(x.shape[-1], 8192))
-    return y
-
-
-def rmsnorm_residual_fused(x: torch.Tensor, residual: torch.Tensor, weight: torch.Tensor,
-                           eps: float = 1e-6) -> Tuple[torch.Tensor, torch.Tensor]:
-    """RMSNorm(x+residual)：返回 (normed, x+residual)。prefill 路径用。"""
-    y = torch.empty_like(x)
-    res = torch.empty_like(x)
-    _launch(x, residual, y, res, weight, eps, False, True, _block_size(x.shape[-1], 8192))
-    return y, res
+def rmsnorm(x: torch.Tensor, weight: torch.Tensor, eps: float = 1e-6,
+            out: torch.Tensor = None, one_centered: bool = False) -> torch.Tensor:
+    """RMSNorm：out = x*rrms*w（one_centered=True 时 x*rrms*(1+w)，Qwen3.5）。
+    out=None 返回新 tensor（prefill）；传预分配 buffer 则原地写（decode graph 贴边融合）。"""
+    if out is None:
+        out = torch.empty_like(x)
+    _launch(x, None, out, None, weight, eps, one_centered, False, _block_size(x.shape[-1], 8192))
+    return out
 
 
-def rmsnorm_(x: torch.Tensor, weight: torch.Tensor, out_buffer: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
-    """RMSNorm 结果直接写入 out_buffer（matmul 输入），decode 贴边融合用。"""
-    _launch(x, None, out_buffer, None, weight, eps, False, False, _block_size(x.shape[-1], 2048))
-    return out_buffer
-
-
-def rmsnorm_residual_gemm(x: torch.Tensor, residual: torch.Tensor, weight: torch.Tensor,
-                          out_normed_buffer: torch.Tensor, out_residual_buffer: torch.Tensor,
-                          eps: float = 1e-6) -> Tuple[torch.Tensor, torch.Tensor]:
-    """RMSNorm(x+residual) 贴边融合版：normed 与 residual 均写预分配 buffer，decode graph 路径用。"""
-    _launch(x, residual, out_normed_buffer, out_residual_buffer, weight, eps, False, True,
+def rmsnorm_residual(x: torch.Tensor, residual: torch.Tensor, weight: torch.Tensor,
+                     eps: float = 1e-6, out_normed: torch.Tensor = None,
+                     out_residual: torch.Tensor = None,
+                     one_centered: bool = False) -> Tuple[torch.Tensor, torch.Tensor]:
+    """RMSNorm(x+residual)：返回 (normed, x+residual)。
+    out_*=None 分配新 tensor（prefill）；传预分配 buffer 则原地写（decode graph 贴边融合）。"""
+    if out_normed is None:
+        out_normed = torch.empty_like(x)
+    if out_residual is None:
+        out_residual = torch.empty_like(x)
+    _launch(x, residual, out_normed, out_residual, weight, eps, one_centered, True,
             _block_size(x.shape[-1], 8192))
-    return out_normed_buffer, out_residual_buffer
-
-
-# ==================== 1-centered RMSNorm（x*rrms*(1+w)，Qwen3.5 专用）====================
-# HF Qwen3_5RMSNorm: output = _norm(x.float()) * (1.0 + weight.float())，与 Qwen3 的
-# x * w 不同（权重以 0 为中心初始化，1 是隐式 bias）。
-
-def rmsnorm1(x: torch.Tensor, weight: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
-    """1-centered RMSNorm（Qwen3.5）：out = x * rrms * (1 + w)。返回新 tensor。"""
-    y = torch.empty_like(x)
-    _launch(x, None, y, None, weight, eps, True, False, _block_size(x.shape[-1], 8192))
-    return y
-
-
-def rmsnorm1_residual_fused(x: torch.Tensor, residual: torch.Tensor, weight: torch.Tensor,
-                            eps: float = 1e-6) -> Tuple[torch.Tensor, torch.Tensor]:
-    """1-centered RMSNorm(x+residual)：返回 (normed, x+residual)。prefill 路径用。"""
-    y = torch.empty_like(x)
-    res = torch.empty_like(x)
-    _launch(x, residual, y, res, weight, eps, True, True, _block_size(x.shape[-1], 8192))
-    return y, res
-
-
-def rmsnorm1_(x: torch.Tensor, weight: torch.Tensor, out_buffer: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
-    """1-centered RMSNorm 结果直接写入 out_buffer（decode 贴边融合用）。"""
-    _launch(x, None, out_buffer, None, weight, eps, True, False, _block_size(x.shape[-1], 2048))
-    return out_buffer
-
-
-def rmsnorm1_residual_gemm(x: torch.Tensor, residual: torch.Tensor, weight: torch.Tensor,
-                           out_normed_buffer: torch.Tensor, out_residual_buffer: torch.Tensor,
-                           eps: float = 1e-6) -> Tuple[torch.Tensor, torch.Tensor]:
-    """1-centered RMSNorm(x+residual) 贴边融合版：decode graph 路径用。"""
-    _launch(x, residual, out_normed_buffer, out_residual_buffer, weight, eps, True, True,
-            _block_size(x.shape[-1], 8192))
-    return out_normed_buffer, out_residual_buffer
+    return out_normed, out_residual
 
 
 # ==================== QK-Norm：融合 qkv buffer 的 q/k 段原地 per-head RMSNorm（Qwen3 专用）====================

@@ -16,7 +16,7 @@ _unpack_linear 等），Qwen3 是纯 bf16。基类把「线性层调用」和「
 int8 路径全部留在 Qwen3.5 的 override 里，不破坏。
 
 差异点（留虚方法 / 子类 override）：
-- norm 变体：Qwen3 用 rmsnorm*（非 1-centered），Qwen3.5 用 rmsnorm1*（1-centered）。
+- norm 变体：Qwen3 标准 rmsnorm，Qwen3.5 用 one_centered=True（1-centered）。
 - 线性分派：Qwen3 用 gemv_or_matmul（bf16），Qwen3.5 用 _lin（bf16/int8/Marlin）。
 - QK-Norm+RoPE kernel：Qwen3 用 qk_norm_rope_inplace（全 head_dim），
   Qwen3.5 用 qk_norm_rope_partial_inplace（partial rot，1-centered）。
@@ -27,9 +27,7 @@ int8 路径全部留在 Qwen3.5 的 override 里，不破坏。
 import torch
 
 from models.base import ModelAdapter
-from kernel.rmsnorm import (
-    rmsnorm_, rmsnorm_residual_gemm as rmsnorm_residual,
-)
+from kernel.rmsnorm import rmsnorm, rmsnorm_residual
 from kernel.dense_mlp import dense_swiglu
 from kernel.gemv import gemv_or_matmul
 from core.cache_manager import store_kvcache
@@ -55,12 +53,12 @@ class GQAAdapter(ModelAdapter):
 
     # -------------------- 虚方法：norm 变体 --------------------
     def _norm_inplace(self, h, w, out, eps):
-        """input_layernorm（decode，写预分配 buffer）。Qwen3=rmsnorm_，Qwen3.5=rmsnorm1_。"""
-        rmsnorm_(h, w, out, eps)
+        """input_layernorm（decode，写预分配 buffer）。Qwen3 标准，Qwen3.5 override 为 1-centered。"""
+        rmsnorm(h, w, eps, out=out)
 
     def _norm_residual(self, x, res, w, out_normed, out_residual, eps):
-        """post-norm(residual) 贴边融合（decode）。Qwen3=rmsnorm_residual，Qwen3.5=rmsnorm1_residual。"""
-        rmsnorm_residual(x, res, w, out_normed, out_residual, eps)
+        """post-norm(residual) 贴边融合（decode）。Qwen3 标准，Qwen3.5 override 为 1-centered。"""
+        rmsnorm_residual(x, res, w, eps, out_normed=out_normed, out_residual=out_residual)
 
     # -------------------- 虚方法：线性分派 --------------------
     def _lin(self, x, w, out, env="MICRO_GEMV"):
