@@ -8,9 +8,13 @@
 
 仅用于投机解码 verify（M 小）+ 小 M prefill（32 < M ≤ 128）。正常 decode（M=1）
 走 GEMV、大 M prefill 走反量化 matmul，均不受影响。调用链：
-kernel.gemm_int8_triton.verify_int8_gemm（开关 set_verify_gemm，SpecEngine 在 verify
-前后设置；MICRO_VERIFY_GEMM=marlin 默认模式下权重是 Marlin dict，本模块不可达，
+verify_int8_gemm（开关 set_verify_gemm，SpecEngine 在 verify 前后设置；
+MICRO_VERIFY_GEMM=marlin 默认模式下权重是 Marlin dict，本模块不可达，
 作为显式 env 指定的 fallback 保留）。
+
+历史注：本文件曾叫 gemm_int8_triton.py 并含 Triton int8 GEMM 后端，因 Marlin 成为
+verify GEMM 默认后端且实测 TileLang 快于 Triton（M=8 gate N=17408: 188.6 vs
+196.1us）已删除 Triton 后端，开关+wrapper 一并并入本文件。
 """
 import torch
 import tilelang
@@ -18,6 +22,27 @@ import tilelang.language as T
 
 # (M, N, K, dtype) → 编译好的 kernel
 _kernel_cache = {}
+
+# verify（M≤8）int8 GEMM 开关：由 SpecEngine 在 verify forward 前后设置
+# （core/spec_decode.py）。开时 gemv_int8.w8_linear / adapter._lin_prefill 把
+# group-128 int8 线性路由到 verify_int8_gemm（本文件 int8_gemm，权重 HBM 只读一次），
+# 比 int8 GEMV 的 M× 权重读快 ~12x（mlp_gu 3.59ms→0.29ms）。
+_verify_gemm_enabled = False
+
+
+def set_verify_gemm(v: bool):
+    global _verify_gemm_enabled
+    _verify_gemm_enabled = v
+
+
+def verify_gemm_enabled() -> bool:
+    return _verify_gemm_enabled
+
+
+def verify_int8_gemm(x, w_int8, scale, out=None):
+    """verify int8 GEMM（group-128，TileLang）。x [M,K] bf16, w_int8 [N,K] int8,
+    scale [N,K/128] fp32 → out [M,N] bf16。"""
+    return int8_gemm(x, w_int8, scale, out)
 
 _TORCH_TO_TL = {
     torch.bfloat16: T.bfloat16,

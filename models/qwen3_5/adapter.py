@@ -654,7 +654,7 @@ class Qwen3_5Adapter(GQAAdapter):
         if isinstance(w, tuple):
             w_int8, scale = w
             if scale.dim() == 2:
-                from kernel.gemm_int8_triton import verify_int8_gemm
+                from kernel.gemm_int8 import verify_int8_gemm
                 if x.shape[0] <= 128:
                     return verify_int8_gemm(x, w_int8, scale)
                 sc = scale.repeat_interleave(128, dim=1)

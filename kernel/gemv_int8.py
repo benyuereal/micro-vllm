@@ -67,7 +67,7 @@ def w8_linear(x, w_int8, scale, out=None, env="MICRO_GEMV"):
     # w8_linear 是 verify 路径所有 int8 线性（MLP dense_swiglu + attention _lin_prefill）
     # 的统一分派点，故在此路由。
     if is_group and M <= 8:
-        from kernel.gemm_int8_triton import verify_gemm_enabled, verify_int8_gemm
+        from kernel.gemm_int8 import verify_gemm_enabled, verify_int8_gemm
         if verify_gemm_enabled():
             return verify_int8_gemm(x, w_int8, scale, out)
     # decode（M=bs，小）走 int8 GEMV（kernel 支持 M>1 via grid.y，权重带宽减半，且
@@ -86,7 +86,7 @@ def w8_linear(x, w_int8, scale, out=None, env="MICRO_GEMV"):
         # bf16 拷贝，mlp_gu M=61 反量化占 7.29ms/7.9ms），int8 GEMM 快 22x（0.35ms）。
         # 只影响 prefill（M>32）；decode（M≤32）仍走 int8 GEMV，不受影响。
         # M>128 时 int8 GEMM 的 BLOCK_M 超 shared mem 上限（M=256 编译失败），回退反量化。
-        from kernel.gemm_int8_triton import verify_int8_gemm
+        from kernel.gemm_int8 import verify_int8_gemm
         return verify_int8_gemm(x, w_int8, scale, out)
     else:
         # 反量化：per-channel scale [N]→[N,1]；group scale [N,K/128]→repeat_interleave 128

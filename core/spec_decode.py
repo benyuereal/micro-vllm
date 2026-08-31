@@ -35,7 +35,7 @@ from typing import List, Optional
 import torch
 
 from models.base import PrefillMeta
-from kernel.gemm_int8_triton import set_verify_gemm
+from kernel.gemm_int8 import set_verify_gemm
 
 
 class SpecEngine:
