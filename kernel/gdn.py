@@ -1,13 +1,12 @@
-"""Qwen3.5 GDN（Gated DeltaNet）+ full-attention 辅助 Triton kernels。
+"""Qwen3.5 GDN（Gated DeltaNet）Triton kernels。
 
 从 models/qwen3_5/adapter.py 迁出（纯 kernel 代码，归类到 kernel/）。
 pointwise/递归类允许 Triton；GEMM 走 gemv/cuBLAS（adapter 侧）。
+full-attention 辅助 kernel（qk_norm_rope_partial/rope_partial/attn_gate）
+在 kernel/rotary.py（与 Qwen3 的 qk_norm_rope_inplace 同类）。
 
 公开 API：
 - gdn_gbeta：g = -exp(A_log)*softplus(a+dt_bias)（fp32），beta = sigmoid(b)
-- qk_norm_rope_partial_inplace：full-attention decode 的 QK-Norm(1-centered)+partial RoPE
-- rope_partial_inplace：prefill 纯 partial RoPE（无 norm）
-- attn_gate_inplace：attn *= sigmoid(gate)
 - _gdn_conv_prefill/decode_kernel、_gdn_recurrent_prefill/decode_kernel、
   _gdn_norm_gated_kernel：GDN 层内部 kernel（adapter 直接 launch）
 """
@@ -135,6 +134,25 @@ def _gdn_conv_decode_kernel(QKV, W, STATE, SEQ_IDX, IS_REAL,
 # state_pool [POOL, n_gdn, H, DK, DV] fp32。
 # qkv 布局 [M, 2*H*DK + H*DV]：q[0:H*DK] k[H*DK:2*H*DK] v[2*H*DK:]。
 # decode：每 (row, head) 一个 program；prefill：每 (seq, head) 一个 program 循环 token。
+
+@triton.jit
+def _gdn_delta_step(S_m, q, k, v, g, beta, SCALE: tl.constexpr):
+    """单步 delta rule（decode/prefill 共享，Triton 内联）：
+    l2norm(q,k) → S*=exp(g) → kv_mem=S@k → delta=(v-kv_mem)*beta → S+=k⊗delta → o=S@q。
+    返回 (S_m, o)。q/k/v 以 fp32 参与（对齐 HF：l2norm/scale/累加全 fp32）。
+    注意：kv_mem[j] = sum_i S[i,j]*k[i]，k 须沿 DK 轴（axis 0）广播 → k[:, None]。
+    误用 k[None, :] 会沿 DV 轴广播，算成 k[j]*sum_i S[i,j]（方向错，state 全错）。
+    """
+    q = q * tl.rsqrt(tl.sum(q * q) + 1e-6) * SCALE
+    k = k * tl.rsqrt(tl.sum(k * k) + 1e-6)
+    S_m = S_m * tl.exp(g)
+    kv_mem = tl.sum(S_m * k[:, None], axis=0)
+    delta = (v - kv_mem) * beta
+    S_m += k[:, None] * delta[None, :]
+    o = tl.sum(S_m * q[:, None], axis=0)
+    return S_m, o
+
+
 @triton.jit
 def _gdn_recurrent_decode_kernel(QKV, G, BETA, STATE, OUT, SEQ_IDX, IS_REAL,
                                  H: tl.constexpr, HK: tl.constexpr,
@@ -165,17 +183,7 @@ def _gdn_recurrent_decode_kernel(QKV, G, BETA, STATE, OUT, SEQ_IDX, IS_REAL,
     g = tl.load(G + row * H + h).to(tl.float32)
     beta = tl.load(BETA + row * H + h).to(tl.float32)
 
-    q = q * tl.rsqrt(tl.sum(q * q) + 1e-6) * SCALE
-    k = k * tl.rsqrt(tl.sum(k * k) + 1e-6)
-
-    ge = tl.exp(g)
-    S_m = S_m * ge
-    # kv_mem[j] = sum_i S[i,j]*k[i]：k 须沿 DK 轴（axis 0）广播 → k[:, None]。
-    # 误用 k[None, :] 会沿 DV 轴广播，算成 k[j]*sum_i S[i,j]（方向错，state 全错）。
-    kv_mem = tl.sum(S_m * k[:, None], axis=0)
-    delta = (v - kv_mem) * beta
-    S_m += k[:, None] * delta[None, :]
-    o = tl.sum(S_m * q[:, None], axis=0)
+    S_m, o = _gdn_delta_step(S_m, q, k, v, g, beta, SCALE)
 
     tl.store(S + dk[:, None] * DV + dv[None, :], S_m.to(STATE.dtype.element_ty))
     o_base = OUT + row.to(tl.int64) * (H * DV) + h * DV
@@ -224,15 +232,7 @@ def _gdn_recurrent_prefill_kernel(QKV, G, BETA, STATE, OUT, CU, SEQ_IDX,
         v = tl.load(v_base + dv).to(tl.float32)
         g = tl.load(G + t.to(tl.int64) * H + h).to(tl.float32)
         beta = tl.load(BETA + t.to(tl.int64) * H + h).to(tl.float32)
-        q = q * tl.rsqrt(tl.sum(q * q) + 1e-6) * SCALE
-        k = k * tl.rsqrt(tl.sum(k * k) + 1e-6)
-        ge = tl.exp(g)
-        S_m = S_m * ge
-        # kv_mem[j] = sum_i S[i,j]*k[i]：k 沿 DK 轴广播 → k[:, None]（见 decode kernel 注释）
-        kv_mem = tl.sum(S_m * k[:, None], axis=0)
-        delta = (v - kv_mem) * beta
-        S_m += k[:, None] * delta[None, :]
-        o = tl.sum(S_m * q[:, None], axis=0)
+        S_m, o = _gdn_delta_step(S_m, q, k, v, g, beta, SCALE)
         o_base = OUT + t.to(tl.int64) * (H * DV) + h * DV
         tl.store(o_base + dv, o.to(OUT.dtype.element_ty))
         # 投机解码：每 token 存递归状态检查点（[t, gdn_l, H, DK, DV]），供接受后回滚。
@@ -257,106 +257,3 @@ def _gdn_norm_gated_kernel(O, Z, W, OUT, H: tl.constexpr, DV: tl.constexpr, eps,
     rrms = tl.rsqrt(tl.sum(o * o) / DV + eps)
     y = o * rrms * w * (z * tl.sigmoid(z))
     tl.store(OUT + row.to(tl.int64) * (H * DV) + h * DV + dv, y.to(OUT.dtype.element_ty))
-
-
-# ---- full attention decode：QK-Norm(1-centered) + partial RoPE（前 rot 维 half-split）----
-@triton.jit
-def _qk_norm_rope_partial_kernel(QKV, W, COS, SIN, POS,
-                                 stride_qkv_row, seg_offset, head_size: tl.constexpr,
-                                 num_heads: tl.constexpr, rot: tl.constexpr,
-                                 eps, BLOCK_H: tl.constexpr, BLOCK_R: tl.constexpr):
-    pid = tl.program_id(0)
-    batch_idx = pid // num_heads
-    head_idx = pid % num_heads
-    base = batch_idx * stride_qkv_row + seg_offset + head_idx * head_size
-    pos = tl.load(POS + batch_idx)
-
-    offs = tl.arange(0, BLOCK_H)
-    mask = offs < head_size
-    x = tl.load(QKV + base + offs, mask=mask, other=0.0).to(tl.float32)
-    rrms = tl.rsqrt(tl.sum(x * x, axis=0) / head_size + eps)
-    w = tl.load(W + offs, mask=mask, other=0.0).to(tl.float32)
-    xn = x * rrms * (1.0 + w)
-
-    r_offs = tl.arange(0, BLOCK_R)
-    r_mask = r_offs < rot // 2
-    c = tl.load(COS + pos * (rot // 2) + r_offs, mask=r_mask, other=0.0).to(tl.float32)
-    s = tl.load(SIN + pos * (rot // 2) + r_offs, mask=r_mask, other=0.0).to(tl.float32)
-    x1 = tl.load(QKV + base + r_offs, mask=r_mask, other=0.0).to(tl.float32)
-    x2 = tl.load(QKV + base + rot // 2 + r_offs, mask=r_mask, other=0.0).to(tl.float32)
-    w1 = tl.load(W + r_offs, mask=r_mask, other=0.0).to(tl.float32)
-    w2 = tl.load(W + rot // 2 + r_offs, mask=r_mask, other=0.0).to(tl.float32)
-    xn1 = x1 * rrms * (1.0 + w1)
-    xn2 = x2 * rrms * (1.0 + w2)
-    o1 = (xn1 * c - xn2 * s).to(QKV.dtype.element_ty)
-    o2 = (xn2 * c + xn1 * s).to(QKV.dtype.element_ty)
-    tl.store(QKV + base + r_offs, o1, mask=r_mask)
-    tl.store(QKV + base + rot // 2 + r_offs, o2, mask=r_mask)
-    p_mask = (offs >= rot) & (offs < head_size)
-    tl.store(QKV + base + offs, xn.to(QKV.dtype.element_ty), mask=p_mask)
-
-
-def qk_norm_rope_partial_inplace(qkv_buf, bs, seg_offset, num_heads, head_size,
-                                 norm_weight, cos_pool, sin_pool, positions, eps=1e-6):
-    rot = cos_pool.shape[1] * 2
-    BLOCK_H = triton.next_power_of_2(head_size)
-    BLOCK_R = triton.next_power_of_2(rot // 2)
-    _qk_norm_rope_partial_kernel[(bs * num_heads,)](
-        qkv_buf, norm_weight, cos_pool, sin_pool, positions,
-        qkv_buf.stride(0), seg_offset, head_size, num_heads, rot,
-        eps, BLOCK_H=BLOCK_H, BLOCK_R=BLOCK_R)
-
-
-# ---- prefill 纯 partial RoPE（无 norm）：in-place half-split 前 rot 维 ----
-# 替代 _prefill_full 里 PyTorch 的 cos/sin gather + 4 slice + 4 mul + 2 add + 2 cat
-# （每 (q,k) 张量 ~12 个小 kernel × 2 × 16 full 层 = ~384 次 launch/verify）。
-# 一个 program = (token, head)，只读写前 rot 维（rot 之后维度不动）。
-@triton.jit
-def _rope_partial_inplace_kernel(X, COS, SIN, POS,
-                                 stride_t, stride_h,
-                                 head_size: tl.constexpr, rot: tl.constexpr,
-                                 BLOCK_R: tl.constexpr):
-    t = tl.program_id(0)
-    h = tl.program_id(1)
-    pos = tl.load(POS + t)
-    base = t.to(tl.int64) * stride_t + h * stride_h
-    r_offs = tl.arange(0, BLOCK_R)
-    r_mask = r_offs < rot // 2
-    c = tl.load(COS + pos * (rot // 2) + r_offs, mask=r_mask, other=0.0).to(tl.float32)
-    s = tl.load(SIN + pos * (rot // 2) + r_offs, mask=r_mask, other=0.0).to(tl.float32)
-    x1 = tl.load(X + base + r_offs, mask=r_mask, other=0.0).to(tl.float32)
-    x2 = tl.load(X + base + rot // 2 + r_offs, mask=r_mask, other=0.0).to(tl.float32)
-    o1 = (x1 * c - x2 * s).to(X.dtype.element_ty)
-    o2 = (x2 * c + x1 * s).to(X.dtype.element_ty)
-    tl.store(X + base + r_offs, o1, mask=r_mask)
-    tl.store(X + base + rot // 2 + r_offs, o2, mask=r_mask)
-
-
-def rope_partial_inplace(x, cos_pool, sin_pool, positions):
-    """x [T, H, head_dim] in-place partial RoPE（前 rot 维 half-split，rot 后不动）。
-    positions [T] int64。cos/sin 表 [max_pos, rot//2]（PagedAttention 池）。"""
-    T, H, hd = x.shape
-    rot = cos_pool.shape[1] * 2
-    BLOCK_R = triton.next_power_of_2(rot // 2)
-    _rope_partial_inplace_kernel[(T, H)](
-        x, cos_pool, sin_pool, positions,
-        x.stride(0), x.stride(1),
-        head_size=hd, rot=rot, BLOCK_R=BLOCK_R)
-
-
-# ---- attn_output_gate：out = attn * sigmoid(gate)（fp32 sigmoid，bf16 输出）----
-# 替代 PyTorch 的 sigmoid + cast + mul 三个 elementwise kernel（× 16 full 层）。
-@triton.jit
-def _attn_gate_kernel(ATTN, GATE, BLOCK: tl.constexpr):
-    pid = tl.program_id(0)
-    offs = pid * BLOCK + tl.arange(0, BLOCK)
-    a = tl.load(ATTN + offs).to(tl.float32)
-    g = tl.load(GATE + offs).to(tl.float32)
-    tl.store(ATTN + offs, (a * tl.sigmoid(g)).to(ATTN.dtype.element_ty))
-
-
-def attn_gate_inplace(attn, gate):
-    """attn [T, nh, hd]（in-place *= sigmoid(gate)），gate 同形状。"""
-    n = attn.numel()
-    BLOCK = 1024
-    _attn_gate_kernel[(triton.cdiv(n, BLOCK),)](attn, gate, BLOCK=BLOCK)

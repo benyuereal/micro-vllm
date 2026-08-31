@@ -34,11 +34,12 @@ import triton
 from models.gqa_base import GQAAdapter
 from kernel.rmsnorm import rmsnorm, rmsnorm_residual
 from kernel.gdn import (
-    gdn_gbeta, qk_norm_rope_partial_inplace, rope_partial_inplace, attn_gate_inplace,
+    gdn_gbeta,
     _gdn_conv_prefill_kernel, _gdn_conv_decode_kernel,
     _gdn_recurrent_prefill_kernel, _gdn_recurrent_decode_kernel,
     _gdn_norm_gated_kernel,
 )
+from kernel.rotary import qk_norm_rope_partial_inplace, rope_partial_inplace, attn_gate_inplace
 from kernel.dense_mlp import dense_swiglu
 from kernel.gemv import gemv_or_matmul, gemv_v2
 from kernel.gemv_int8 import w8_linear
