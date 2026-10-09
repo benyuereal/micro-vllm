@@ -29,7 +29,6 @@ KV cache（paged）：
 （draft==target argmax 则接受，首个不匹配处 bonus=target 预测）。单序列下与不开投机
 解码的贪心输出逐 token 一致。
 """
-import os
 from typing import List, Optional
 
 import torch
@@ -148,20 +147,6 @@ class SpecEngine:
         self.total_accepted = 0
         self.total_steps = 0
         self.total_generated = 0
-
-        # target 置信度诊断（MICRO_SPEC_TGT_CONF=1 开启，默认关零开销）：
-        # B/A 分桶（draft 错但 target 确定 vs target 自己不确定）。实现见
-        # core/spec_conf_diag.py；关时 self._tc_stats=None，热路径零开销。
-        self._tc_stats = None
-        if os.environ.get("MICRO_SPEC_TGT_CONF", "0") == "1":
-            from core.spec_conf_diag import TargetConfDiag
-            self._tc_stats = TargetConfDiag(self.N)
-
-    def tc_stats_report(self):
-        """target 置信度诊断报告（MICRO_SPEC_TGT_CONF=1 时；关则 None）。"""
-        if self._tc_stats is None:
-            return None
-        return self._tc_stats.report()
 
     # ------------------------------------------------------------------
     # GDN 检查点 buffer
@@ -692,8 +677,6 @@ class SpecEngine:
         self.total_accepted = 0
         self.total_steps = 0
         self.total_generated = 0
-        if self._tc_stats is not None:
-            self._tc_stats.reset()
         self.aux_cache.zero_()
         self._ctx_kv_done = 0
 
@@ -753,12 +736,6 @@ class SpecEngine:
                     else:
                         break
                 bonus = t_cpu[accepted]
-
-                # target 置信度诊断（MICRO_SPEC_TGT_CONF=1）：只统计到本步第一个
-                # mismatch 位置为止（p <= accepted）。
-                if self._tc_stats is not None:
-                    self._tc_stats.record(vlogits, target_preds, d_cpu, t_cpu,
-                                          accepted, kv_len)
 
                 # 4. 去 rollback：不再 copy_ 回 pool。记录 accepted，下一步 verify 的
                 #    GDN 初始状态直接读 checkpoint[accepted]（见上方 init_from_cp）。

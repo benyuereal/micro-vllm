@@ -201,11 +201,6 @@ class Scheduler:
             self.running_sequences.remove(seq)
         self.finished_sequences.append(seq)
 
-    def get_finished_results(self):
-        results = [(seq, seq.full_ids) for seq in self.finished_sequences]
-        self.finished_sequences.clear()
-        return results
-
     def is_finished(self, seq_id: int) -> bool:
         """判断指定序列是否已完成（不在 waiting 和 running 中）。"""
         for seq in self.waiting_queue:
